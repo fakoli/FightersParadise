@@ -1,8 +1,16 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Fighters Paradise Banner" width="100%">
+</p>
+
 # Fighters Paradise
 
-A modern reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen_(game_engine)) 2D fighting game engine in Rust, with full backward compatibility for existing MUGEN content (.sff, .air, .cns, .cmd, .def, .snd files).
+<p align="center">
+  A modern reimplementation of the <a href="https://en.wikipedia.org/wiki/Mugen_(game_engine)">MUGEN</a> 2D fighting game engine in Rust, with full backward compatibility for existing MUGEN content (.sff, .air, .cns, .cmd, .def, .snd files).
+</p>
 
-> **Status: Early Development (v0.1.0)** — Sprites render, animations play, characters walk and jump. Core engine systems are still in progress.
+<p align="center">
+  <strong>Status: Early Development (v0.1.0)</strong> — Sprites render, animations play, characters walk and jump. Core engine systems are still in progress.
+</p>
 
 ## Demo
 
