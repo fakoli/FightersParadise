@@ -1,0 +1,10 @@
+[package]
+name = "fp-core"
+description = "Core types, math primitives, and error handling for Fighters Paradise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

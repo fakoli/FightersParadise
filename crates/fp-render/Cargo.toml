@@ -1,0 +1,13 @@
+[package]
+name = "fp-render"
+description = "WebGPU sprite batch renderer with palette lookup shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

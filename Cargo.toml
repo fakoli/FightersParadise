@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fp-core",
+    "crates/fp-formats",
+    "crates/fp-vm",
+    "crates/fp-input",
+    "crates/fp-physics",
+    "crates/fp-combat",
+    "crates/fp-character",
+    "crates/fp-stage",
+    "crates/fp-render",
+    "crates/fp-audio",
+    "crates/fp-ui",
+    "crates/fp-storyboard",
+    "crates/fp-engine",
+    "crates/fp-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/user/FightersParadise"
+
+[workspace.dependencies]
+# Internal crates
+fp-core = { path = "crates/fp-core" }
+fp-formats = { path = "crates/fp-formats" }
+fp-vm = { path = "crates/fp-vm" }
+fp-input = { path = "crates/fp-input" }
+fp-physics = { path = "crates/fp-physics" }
+fp-combat = { path = "crates/fp-combat" }
+fp-character = { path = "crates/fp-character" }
+fp-stage = { path = "crates/fp-stage" }
+fp-render = { path = "crates/fp-render" }
+fp-audio = { path = "crates/fp-audio" }
+fp-ui = { path = "crates/fp-ui" }
+fp-storyboard = { path = "crates/fp-storyboard" }
+fp-engine = { path = "crates/fp-engine" }
+
+# External dependencies
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nom = "7"
+wgpu = "24"
+sdl2 = { version = "0.37", features = ["raw-window-handle"] }
+bytemuck = { version = "1", features = ["derive"] }
+rodio = "0.20"
+slotmap = "1"
+pollster = "0.4"

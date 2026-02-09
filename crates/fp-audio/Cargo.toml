@@ -1,0 +1,10 @@
+[package]
+name = "fp-audio"
+description = "Sound mixer, BGM playback, and SFX channel management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+tracing.workspace = true

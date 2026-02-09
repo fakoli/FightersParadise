@@ -1,0 +1,10 @@
+[package]
+name = "fp-storyboard"
+description = "Cutscene and storyboard playback system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+tracing.workspace = true

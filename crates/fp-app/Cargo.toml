@@ -1,0 +1,16 @@
+[package]
+name = "fp-app"
+description = "Fighters Paradise application binary (SDL2 window + game loop)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+fp-formats.workspace = true
+fp-render.workspace = true
+sdl2.workspace = true
+wgpu.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+pollster.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "fp-stage"
+description = "Stage loading, background elements, camera, and stage controllers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+tracing.workspace = true

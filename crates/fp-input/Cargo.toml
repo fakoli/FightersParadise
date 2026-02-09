@@ -1,0 +1,10 @@
+[package]
+name = "fp-input"
+description = "Input handling, buffering, and command sequence recognition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core.workspace = true
+tracing.workspace = true
