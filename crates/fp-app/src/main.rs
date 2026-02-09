@@ -6,17 +6,23 @@
 //! # Usage
 //!
 //! ```text
-//! cargo run -p fp-app [path/to/file.sff]
+//! cargo run -p fp-app -- <file.sff> <file.air>    # animate from SFF+AIR
+//! cargo run -p fp-app -- <file.sff>                # show first sprite
+//! cargo run -p fp-app                              # checkerboard test pattern
 //! ```
 //!
-//! If an SFF file path is provided, the first sprite (group 0, image 0) is
-//! displayed with its palette. Otherwise a procedurally generated test pattern
-//! (checkerboard) is shown to verify the rendering pipeline works.
+//! When both SFF and AIR files are provided, the character's animations play
+//! in a loop. Use Left/Right arrows to cycle animation actions and Space to
+//! restart the current action.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
+use fp_core::SpriteId;
+use fp_formats::air::{AirFile, AnimAction};
+use fp_formats::sff::SffFile;
+use fp_render::{AnimController, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
@@ -24,11 +30,10 @@ use sdl2::keyboard::Keycode;
 const WINDOW_WIDTH: u32 = 640;
 /// Window height in pixels.
 const WINDOW_HEIGHT: u32 = 480;
-/// Fixed timestep duration: 1/60th of a second (≈16.667ms).
+/// Fixed timestep duration: 1/60th of a second (~16.667ms).
 const TICK_DURATION: Duration = Duration::from_nanos(16_666_667);
 
 fn main() {
-    // Initialise structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,6 +46,183 @@ fn main() {
     if let Err(e) = run() {
         tracing::error!("Fatal error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Cached GPU textures for a single sprite.
+struct CachedSprite {
+    texture: SpriteTexture,
+    palette: PaletteTexture,
+    axis_x: i16,
+    axis_y: i16,
+}
+
+/// Holds the loaded character data for animation playback.
+struct CharacterData {
+    sff: SffFile,
+    air: AirFile,
+    /// Sorted list of available action numbers for cycling.
+    action_list: Vec<i32>,
+    /// Current index into `action_list`.
+    action_index: usize,
+    /// Animation controller driving playback.
+    anim: AnimController,
+    /// Texture cache keyed by SpriteId.
+    sprite_cache: HashMap<SpriteId, CachedSprite>,
+}
+
+impl CharacterData {
+    fn new(sff: SffFile, air: AirFile) -> Self {
+        let mut action_list: Vec<i32> = air.actions.keys().copied().collect();
+        action_list.sort();
+
+        let first_action_num = action_list.first().copied().unwrap_or(0);
+        let first_action = air
+            .action(first_action_num)
+            .cloned()
+            .unwrap_or(AnimAction {
+                action_number: 0,
+                frames: vec![],
+                loopstart: 0,
+            });
+
+        tracing::info!(
+            "Loaded {} actions: {:?}",
+            action_list.len(),
+            &action_list[..action_list.len().min(20)]
+        );
+        tracing::info!("Starting with action {first_action_num}");
+
+        Self {
+            sff,
+            air,
+            action_list,
+            action_index: 0,
+            anim: AnimController::new(first_action),
+            sprite_cache: HashMap::new(),
+        }
+    }
+
+    /// Switch to the next action in the sorted list.
+    fn next_action(&mut self) {
+        if self.action_list.is_empty() {
+            return;
+        }
+        self.action_index = (self.action_index + 1) % self.action_list.len();
+        self.switch_to_current_action();
+    }
+
+    /// Switch to the previous action in the sorted list.
+    fn prev_action(&mut self) {
+        if self.action_list.is_empty() {
+            return;
+        }
+        self.action_index = if self.action_index == 0 {
+            self.action_list.len() - 1
+        } else {
+            self.action_index - 1
+        };
+        self.switch_to_current_action();
+    }
+
+    /// Restart the current action from frame 0.
+    fn restart_action(&mut self) {
+        self.switch_to_current_action();
+    }
+
+    fn switch_to_current_action(&mut self) {
+        let action_num = self.action_list[self.action_index];
+        if let Some(action) = self.air.action(action_num) {
+            tracing::info!(
+                "Switched to action {} ({} frames)",
+                action_num,
+                action.frames.len()
+            );
+            self.anim.set_action(action.clone());
+        }
+    }
+
+    /// Get or create cached GPU textures for a given sprite ID.
+    fn get_or_create_sprite(
+        &mut self,
+        sprite_id: SpriteId,
+        renderer: &Renderer,
+    ) -> Option<&CachedSprite> {
+        if self.sprite_cache.contains_key(&sprite_id) {
+            return self.sprite_cache.get(&sprite_id);
+        }
+
+        // Find sprite index in SFF
+        let (index, sff_sprite) = self
+            .sff
+            .sprites
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())?;
+
+        let axis_x = sff_sprite.axis_x;
+        let axis_y = sff_sprite.axis_y;
+        let width = sff_sprite.width;
+        let height = sff_sprite.height;
+        let pal_idx = sff_sprite.palette_index as usize;
+
+        // Decode pixel data
+        let pixels = match self.sff.decode_sprite(index) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to decode sprite {sprite_id}: {e}");
+                return None;
+            }
+        };
+
+        // Get palette
+        let palette_data = match self.sff.palette(pal_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to load palette {pal_idx} for sprite {sprite_id}: {e}");
+                return None;
+            }
+        };
+
+        if width == 0 || height == 0 {
+            tracing::warn!("Sprite {sprite_id} has zero dimensions ({width}x{height})");
+            return None;
+        }
+
+        let texture = SpriteTexture::new(
+            renderer.device(),
+            renderer.queue(),
+            width as u32,
+            height as u32,
+            &pixels,
+        );
+        let palette = PaletteTexture::new(renderer.device(), renderer.queue(), &palette_data);
+
+        self.sprite_cache.insert(
+            sprite_id,
+            CachedSprite {
+                texture,
+                palette,
+                axis_x,
+                axis_y,
+            },
+        );
+
+        self.sprite_cache.get(&sprite_id)
+    }
+}
+
+/// Map AIR blend mode to renderer blend mode + alpha.
+fn map_blend_mode(
+    air_blend: &fp_formats::air::BlendMode,
+) -> (fp_render::BlendMode, f32) {
+    match air_blend {
+        fp_formats::air::BlendMode::Normal => (fp_render::BlendMode::Normal, 1.0),
+        fp_formats::air::BlendMode::Additive => (fp_render::BlendMode::Additive, 1.0),
+        fp_formats::air::BlendMode::AdditiveAlpha(a) => {
+            (fp_render::BlendMode::Additive, *a as f32 / 256.0)
+        }
+        fp_formats::air::BlendMode::Subtractive => (fp_render::BlendMode::Subtractive, 1.0),
     }
 }
 
@@ -82,13 +264,44 @@ fn run() -> fp_core::FpResult<()> {
         WINDOW_HEIGHT,
     ))?;
 
-    // --- Load sprite content ---
-    let sff_path = std::env::args().nth(1);
-    let (sprite_tex, palette_tex) = if let Some(ref path) = sff_path {
-        load_sff_sprite(&renderer, Path::new(path))?
-    } else {
-        tracing::info!("No SFF file provided; showing test pattern");
-        generate_test_pattern(&renderer)
+    // --- Load content based on CLI args ---
+    let args: Vec<String> = std::env::args().collect();
+
+    enum Mode {
+        Animated(Box<CharacterData>),
+        Static(SpriteTexture, PaletteTexture),
+        TestPattern(SpriteTexture, PaletteTexture),
+    }
+
+    let mut mode = match args.len() {
+        3 => {
+            // fp-app <sff> <air>
+            let sff_path = Path::new(&args[1]);
+            let air_path = Path::new(&args[2]);
+            tracing::info!("Loading SFF: {}", sff_path.display());
+            tracing::info!("Loading AIR: {}", air_path.display());
+
+            let sff = SffFile::load(sff_path)?;
+            tracing::info!(
+                "SFF loaded: {} sprites, {} palettes",
+                sff.sprites.len(),
+                sff.palettes.len()
+            );
+
+            let air = AirFile::load(air_path)?;
+            Mode::Animated(Box::new(CharacterData::new(sff, air)))
+        }
+        2 => {
+            // fp-app <sff> — static first sprite
+            let (s, p) = load_sff_sprite(&renderer, Path::new(&args[1]))?;
+            Mode::Static(s, p)
+        }
+        _ => {
+            tracing::info!("No files provided; showing test pattern");
+            tracing::info!("Usage: fp-app <file.sff> <file.air>");
+            let (s, p) = generate_test_pattern(&renderer);
+            Mode::TestPattern(s, p)
+        }
     };
 
     // --- Main loop ---
@@ -117,6 +330,33 @@ fn run() -> fp_core::FpResult<()> {
                 } => {
                     renderer.resize(w as u32, h as u32);
                 }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    repeat: false,
+                    ..
+                } => {
+                    if let Mode::Animated(ref mut data) = mode {
+                        data.next_action();
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    repeat: false,
+                    ..
+                } => {
+                    if let Mode::Animated(ref mut data) = mode {
+                        data.prev_action();
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Space),
+                    repeat: false,
+                    ..
+                } => {
+                    if let Mode::Animated(ref mut data) = mode {
+                        data.restart_action();
+                    }
+                }
                 _ => {}
             }
         }
@@ -127,22 +367,63 @@ fn run() -> fp_core::FpResult<()> {
         previous = current;
 
         while accumulator >= TICK_DURATION {
-            // Game logic tick would go here
+            if let Mode::Animated(ref mut data) = mode {
+                data.anim.tick();
+            }
             accumulator -= TICK_DURATION;
+        }
+
+        // Ensure the current animation frame's sprite is cached before borrowing
+        // the renderer for the frame (avoids borrow conflict).
+        if let Mode::Animated(ref mut data) = mode {
+            let sprite_id = data.anim.current_frame().sprite;
+            data.get_or_create_sprite(sprite_id, &renderer);
         }
 
         // Render
         let mut frame = renderer.begin_frame()?;
-        frame.clear(0.1, 0.1, 0.15); // dark blue-gray background
+        frame.clear(0.1, 0.1, 0.15);
 
-        // Center the sprite on screen
         let (win_w, win_h) = window.size();
-        let params = SpriteDrawParams {
-            x: (win_w as f32 - sprite_tex.width as f32) / 2.0,
-            y: (win_h as f32 - sprite_tex.height as f32) / 2.0,
-            ..Default::default()
-        };
-        frame.draw_sprite(&sprite_tex, &palette_tex, &params);
+
+        match mode {
+            Mode::Animated(ref data) => {
+                let anim_frame = data.anim.current_frame();
+                let sprite_id = anim_frame.sprite;
+
+                if let Some(cached) = data.sprite_cache.get(&sprite_id) {
+                    let center_x = win_w as f32 / 2.0;
+                    let center_y = win_h as f32 * 0.7; // ground line at 70%
+
+                    let draw_x =
+                        center_x - cached.axis_x as f32 + anim_frame.offset.x as f32;
+                    let draw_y =
+                        center_y - cached.axis_y as f32 + anim_frame.offset.y as f32;
+
+                    let (render_blend, alpha) = map_blend_mode(&anim_frame.blend);
+
+                    let params = SpriteDrawParams {
+                        x: draw_x,
+                        y: draw_y,
+                        flip_h: anim_frame.flip_h,
+                        flip_v: anim_frame.flip_v,
+                        blend: render_blend,
+                        alpha,
+                        ..Default::default()
+                    };
+                    frame.draw_sprite(&cached.texture, &cached.palette, &params);
+                }
+            }
+            Mode::Static(ref sprite_tex, ref palette_tex)
+            | Mode::TestPattern(ref sprite_tex, ref palette_tex) => {
+                let params = SpriteDrawParams {
+                    x: (win_w as f32 - sprite_tex.width as f32) / 2.0,
+                    y: (win_h as f32 - sprite_tex.height as f32) / 2.0,
+                    ..Default::default()
+                };
+                frame.draw_sprite(sprite_tex, palette_tex, &params);
+            }
+        }
 
         frame.finish();
     }
@@ -157,7 +438,7 @@ fn load_sff_sprite(
     path: &Path,
 ) -> fp_core::FpResult<(SpriteTexture, PaletteTexture)> {
     tracing::info!("Loading SFF file: {}", path.display());
-    let sff = fp_formats::sff::SffFile::load(path)?;
+    let sff = SffFile::load(path)?;
 
     tracing::info!(
         "SFF loaded: {} sprites, {} palettes",
@@ -165,13 +446,11 @@ fn load_sff_sprite(
         sff.palettes.len()
     );
 
-    // Use the first sprite
     let sprite = sff.sprites.first().ok_or_else(|| {
         fp_core::FpError::not_found("sprite", "SFF file contains no sprites")
     })?;
 
-    let sprite_index = 0;
-    let pixels = sff.decode_sprite(sprite_index)?;
+    let pixels = sff.decode_sprite(0)?;
     let palette_data = sff.palette(sprite.palette_index as usize)?;
 
     tracing::info!(
@@ -204,14 +483,11 @@ fn generate_test_pattern(renderer: &Renderer) -> (SpriteTexture, PaletteTexture)
     for y in 0..size {
         for x in 0..size {
             let checker = ((x / tile) + (y / tile)) % 2;
-            // Use palette indices 1 and 2 (index 0 is transparent)
             pixels[(y * size + x) as usize] = if checker == 0 { 1 } else { 2 };
         }
     }
 
-    // Build a simple palette: index 0 = transparent black, 1 = white, 2 = dark gray
     let mut palette = [0u8; 1024];
-    // Index 0: transparent (R=0, G=0, B=0, A=0) — already zero
     // Index 1: white
     palette[4] = 255;
     palette[5] = 255;
@@ -233,8 +509,7 @@ fn generate_test_pattern(renderer: &Renderer) -> (SpriteTexture, PaletteTexture)
     }
 
     let sprite_tex = SpriteTexture::new(renderer.device(), renderer.queue(), size, size, &pixels);
-    let palette_tex =
-        PaletteTexture::new(renderer.device(), renderer.queue(), &palette);
+    let palette_tex = PaletteTexture::new(renderer.device(), renderer.queue(), &palette);
 
     (sprite_tex, palette_tex)
 }

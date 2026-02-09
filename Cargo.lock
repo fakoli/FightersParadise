@@ -286,6 +286,8 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "fp-core",
+ "fp-formats",
+ "pollster",
  "thiserror 2.0.18",
  "tracing",
  "wgpu",

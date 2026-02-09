@@ -7,7 +7,11 @@ license.workspace = true
 
 [dependencies]
 fp-core.workspace = true
+fp-formats.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

@@ -10,6 +10,8 @@ pub struct SpriteVertex {
     pub position: [f32; 2],
     /// Texture coordinates (0.0–1.0).
     pub uv: [f32; 2],
+    /// Per-vertex opacity multiplier (0.0–1.0).
+    pub alpha: f32,
 }
 
 impl SpriteVertex {
@@ -30,6 +32,12 @@ impl SpriteVertex {
                     offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x2,
+                },
+                // alpha
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32,
                 },
             ],
         }
