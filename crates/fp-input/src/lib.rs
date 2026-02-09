@@ -5,3 +5,11 @@
 //! matching for special move detection.
 
 #![warn(missing_docs)]
+
+pub mod buffer;
+pub mod command;
+pub mod state;
+
+pub use buffer::InputBuffer;
+pub use command::{compile_command, CommandDef, CommandElement, CommandMatcher, InputModifier};
+pub use state::{Button, DirToken, Direction, InputState, LogicalDirection, BUTTON_COUNT};

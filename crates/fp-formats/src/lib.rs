@@ -8,16 +8,17 @@
 //!
 //! - [`sff`] — Sprite File Format (SFF v1/v2) — indexed-color sprite containers
 //! - [`air`] — Animation file format — frame sequences with timing and collision boxes
+//! - [`cmd`] — CMD command file format — input command sequences and timing
 //! - [`def`] — DEF configuration files — simple INI-like key/value config
 //!
 //! Future modules (not yet implemented):
 //! - `cns` — Character state definitions
-//! - `cmd` — Input command definitions
 //! - `snd` — Sound container format
 //! - `fnt` — Font format
 
 #![warn(missing_docs)]
 
 pub mod air;
+pub mod cmd;
 pub mod def;
 pub mod sff;

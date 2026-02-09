@@ -3,3 +3,23 @@
 *.swp
 *.swo
 .DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Environment
+.env
+.env.*
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# MUGEN content files (not shipped with repo)
+*.sff
+*.snd
+*.fnt
+
+# OS
+Thumbs.db

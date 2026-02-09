@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 fp-core.workspace = true
 fp-formats.workspace = true
+fp-input.workspace = true
+fp-physics.workspace = true
 fp-render.workspace = true
 sdl2.workspace = true
 wgpu.workspace = true

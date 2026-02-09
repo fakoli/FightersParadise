@@ -206,6 +206,8 @@ version = "0.1.0"
 dependencies = [
  "fp-core",
  "fp-formats",
+ "fp-input",
+ "fp-physics",
  "fp-render",
  "pollster",
  "sdl2",

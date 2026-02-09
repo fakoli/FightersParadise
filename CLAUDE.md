@@ -5,11 +5,13 @@ A modern reimplementation of the MUGEN 2D fighting game engine in Rust, with ful
 ## Build & Run
 
 ```bash
-cargo build --workspace          # Build everything
-cargo run -p fp-app              # Run with test pattern
-cargo run -p fp-app -- path.sff  # Run with SFF file
-cargo test --workspace           # Run all tests
-cargo clippy --workspace         # Lint (must pass with zero warnings)
+cargo build --workspace                            # Build everything
+cargo run -p fp-app                                # Run with test pattern
+cargo run -p fp-app -- file.sff file.air           # Playable character
+cargo run -p fp-app -- file.sff file.air file.cmd  # Playable + commands
+cargo run -p fp-app -- file.sff                    # Static sprite viewer
+cargo test --workspace                             # Run all tests (131)
+cargo clippy --workspace                           # Lint (must pass with zero warnings)
 ```
 
 **macOS prerequisite**: SDL2 must be installed via Homebrew (`brew install sdl2`). The `.cargo/config.toml` adds `/opt/homebrew/lib` to the linker path automatically.
@@ -21,12 +23,12 @@ Cargo workspace with 14 crates under `crates/`:
 | Crate | Status | Purpose |
 |-------|--------|---------|
 | `fp-core` | Implemented | Shared types (`Vec2`, `Rect`, `SpriteId`, `FpError`) |
-| `fp-formats` | Implemented | MUGEN file parsers (SFF v2 done; AIR, CNS, CMD, DEF, SND, FNT planned) |
+| `fp-formats` | Implemented | MUGEN file parsers (SFF v2, AIR, CMD, DEF done; CNS, SND, FNT planned) |
 | `fp-render` | Implemented | wgpu sprite renderer with palette lookup shader |
-| `fp-app` | Implemented | SDL2 window, 60Hz game loop, entry point |
+| `fp-app` | Implemented | SDL2 window, 60Hz game loop, playable character with state machine |
 | `fp-vm` | Stub | Bytecode compiler + stack VM for expressions |
-| `fp-input` | Stub | Input buffering + command recognition |
-| `fp-physics` | Stub | Physics bodies + AABB collision |
+| `fp-input` | Implemented | Input buffering (60-frame ring buffer) + command recognition |
+| `fp-physics` | Implemented | Euler physics, gravity, ground plane; AABB collision pending |
 | `fp-combat` | Stub | HitDef, damage, juggle, guard |
 | `fp-character` | Stub | Character struct + state machine |
 | `fp-stage` | Stub | Stage loading, backgrounds, camera |
