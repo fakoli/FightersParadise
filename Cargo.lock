@@ -229,6 +229,7 @@ name = "fp-character"
 version = "0.1.0"
 dependencies = [
  "fp-core",
+ "fp-formats",
  "fp-vm",
  "tracing",
 ]

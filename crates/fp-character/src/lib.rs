@@ -15,8 +15,19 @@
 //! VM ([`fp-vm`](fp_vm)) can evaluate real KFM triggers (`Time`, `StateNo`,
 //! `Vel Y`, `var(1)`, `command = "fwd"`, …) against a concrete entity.
 //!
-//! Out of scope here (later tasks): the `.cns`/`.air` loader that builds a
-//! [`Character`] from files (task 5.2), the per-tick state-machine executor that
+//! ## Loading characters from disk (task 5.2)
+//!
+//! [`LoadedCharacter::load`] turns a character `.def` path into a ready-to-run
+//! [`LoadedCharacter`]: it parses the `.def`, resolves and loads the referenced
+//! SFF/AIR/CNS(+`stcommon`)/CMD/SND files relative to the `.def` directory,
+//! reads the character constants from the CNS `[Data]`/`[Size]`/`[Velocity]`/
+//! `[Movement]` groups, merges the CNS state files in MUGEN order (`stcommon`
+//! last, fill-missing only), and **compiles every trigger and controller
+//! parameter expression** via [`fp_vm::parse_str`] at load time. A bad
+//! expression compiles to a const-`0` [`fp_vm::Expr`] with a `tracing::warn!`;
+//! missing optional files are warn-logged and skipped. See the [`loader`] module.
+//!
+//! Out of scope here (later tasks): the per-tick state-machine executor that
 //! runs controllers and mutates this state (task 5.3), real get-hit state
 //! (Phase 6), and multi-entity redirection (Phase 7).
 //!
@@ -41,6 +52,12 @@
 //! [`StateType`], [`MoveType`], and [`Physics`].
 
 #![warn(missing_docs)]
+
+pub mod loader;
+
+pub use loader::{
+    CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup, LoadedCharacter,
+};
 
 use fp_core::Vec2;
 use fp_vm::{EvalContext, Value};
@@ -211,6 +228,15 @@ const CODE_U: i32 = 7;
 const AXIS_X: i32 = 0;
 /// Axis code passed by the evaluator for the `Y` component of `Pos`/`Vel`.
 const AXIS_Y: i32 = 1;
+
+/// Sentinel returned by `AnimElemTime(n)` when element `n` has **not yet been
+/// reached**.
+///
+/// MUGEN reports the time-since-element as negative until the cursor reaches
+/// that element; the VM's `AnimElem = N, op M` lowering treats `AnimElemTime(N)
+/// >= 0` as the "reached" guard, so a future element must read negative to keep
+/// the tail from spuriously firing. `-1` is the conventional MUGEN value.
+const ANIM_ELEM_NOT_REACHED: i32 = -1;
 
 /// Static, per-character constants (the `.cns` `[Data]`/`[Size]`/`[Velocity]`
 /// groups and friends).
@@ -585,10 +611,16 @@ impl EvalContext for Character {
             // `AnimElemTime(n)` is the time since element `n` (one-based) was
             // reached. Task 5.1 models only "time in the *current* element": if
             // the requested element is the current one, return its elapsed time;
-            // otherwise the safe default. The executor (5.3) refines this.
+            // otherwise the element has **not yet been reached**, which MUGEN
+            // reports as a NEGATIVE value. Returning the negative sentinel
+            // [`ANIM_ELEM_NOT_REACHED`] (rather than the `0` safe default) is
+            // load-bearing: the VM lowers `AnimElem = N, op M` to a "reached"
+            // guard of `AnimElemTime(N) >= 0`, so a not-yet-reached element must
+            // read negative or the tail would spuriously fire (5.1 follow-up a).
             return match first_int() {
                 Some(n) if n == self.anim_elem + 1 => Value::Int(self.anim_elem_time),
-                _ => Value::DEFAULT,
+                Some(_) => Value::Int(ANIM_ELEM_NOT_REACHED),
+                None => Value::DEFAULT,
             };
         }
         if name.eq_ignore_ascii_case("StateNo") {
@@ -1079,6 +1111,28 @@ mod tests {
         assert_eq!(ev("AnimElem = 3, = 4", &ch), Value::Int(1));
         // 4 > 10 → false (but still reached, so the tail evaluates, not panics).
         assert_eq!(ev("AnimElem = 3, > 10", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn animelem_time_future_element_is_negative_sentinel() {
+        // 5.1 follow-up (a): a not-yet-reached element must read NEGATIVE so the
+        // VM's `AnimElem = N, op M` reached-guard (`AnimElemTime(N) >= 0`) does
+        // not spuriously fire. The current element is 1 (anim_elem 0); element 5
+        // is in the future.
+        let mut ch = Character::new();
+        ch.anim_elem = 0; // one-based element 1 is current
+        ch.anim_elem_time = 3;
+        // Direct trigger read: future element reports a negative value.
+        assert!(
+            ch.trigger("AnimElemTime", &[Value::Int(5)]).to_int() < 0,
+            "AnimElemTime for a future element must be negative"
+        );
+        // End-to-end through the VM: `AnimElem = 5, >= 0` must NOT fire because
+        // element 5 has not been reached (the reached-guard sees a negative
+        // element time). The tail evaluates to Value::Int(0), never panics.
+        assert_eq!(ev("AnimElem = 5, >= 0", &ch), Value::Int(0));
+        // The current element (1) IS reached, so `AnimElem = 1, >= 0` fires.
+        assert_eq!(ev("AnimElem = 1, >= 0", &ch), Value::Int(1));
     }
 
     #[test]
