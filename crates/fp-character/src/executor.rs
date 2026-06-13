@@ -35,12 +35,16 @@
 //!    then time-in-state and the animation element/time advance from the AIR
 //!    action frame durations.
 //!
-//! ## Controller dispatch (this task)
+//! ## Controller dispatch
 //!
-//! Only the controllers required for 5.3 are dispatched: `ChangeState`,
-//! `VelSet`, `VelAdd`, `CtrlSet`, and `Null`. Any other controller type is a
-//! safe no-op (debug-logged) and is deferred to task 5.4. The dispatch never
-//! panics; a malformed parameter resolves to its safe default.
+//! The dispatch handles the core MOVEMENT/CONTROL controllers needed to run
+//! KFM's basic states. From task 5.3: `ChangeState`, `VelSet`, `VelAdd`,
+//! `CtrlSet`, and `Null`. Added in task 5.4: `ChangeAnim` (and the
+//! `ChangeAnim2` alias), `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`,
+//! `StateTypeSet`, `Turn`, and a `PlaySnd` stub (parsed and logged; real audio
+//! is Phase 8). Any other controller type is a safe no-op (debug-logged) and is
+//! deferred to a later task. The dispatch never panics; a malformed parameter
+//! resolves to its safe default.
 //!
 //! [03 §3]: ../../../docs/knowledge-base/03-engine-architecture.md
 
@@ -50,7 +54,9 @@ use fp_formats::air::AirFile;
 use fp_vm::{eval, EvalContext, Value};
 
 use crate::loader::{CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup};
-use crate::{Character, LoadedCharacter, MoveType, Physics, StateType};
+use crate::{
+    Character, Facing, LoadedCharacter, MoveType, Physics, StateType, NUM_FVARS, NUM_VARS,
+};
 
 /// Upper bound on `ChangeState` transitions resolved within a single tick.
 ///
@@ -196,10 +202,28 @@ impl Character {
                 self.run_controller(states, &ctrl, idx, report);
             }
 
-            // If no transition happened, we're done with the current state.
-            if report.transitions == transitions_before || self.state_no == current {
+            // We are done with this state unless a ChangeState moved us to a
+            // *different* numbered state, in which case we re-enter the loop to
+            // process the destination this same tick. A self-transition
+            // (ChangeState into `current`) leaves `state_no == current` and so
+            // also exits here — correct, since looping on it would never settle.
+            //
+            // The earlier `report.transitions == transitions_before` clause was
+            // redundant: a no-transition pass cannot change `state_no`, so
+            // "no transition" always implies `state_no == current`. The
+            // debug_assert below pins that transition-count invariant — we only
+            // fall through to loop again when at least one real transition (to a
+            // different state) was counted this iteration, so the per-tick guard
+            // counts genuine transitions.
+            if self.state_no == current {
                 return;
             }
+            debug_assert!(
+                report.transitions > transitions_before,
+                "looping requires a counted transition; state_no moved {current} -> {} \
+                 but transitions did not advance ({transitions_before})",
+                self.state_no
+            );
 
             guard += 1;
             if guard >= MAX_TRANSITIONS_PER_TICK {
@@ -229,7 +253,17 @@ impl Character {
 
         // The controller qualified (gating passed). Apply `persistent` to decide
         // whether it actually fires on this qualifying tick.
-        let key = (self.state_no, idx);
+        //
+        // Key the firing count by the controller's OWNING state number
+        // (`ctrl.state_number`), not the live `self.state_no`. While a special
+        // state (-3/-2/-1) runs, `self.state_no` is still the *current* numbered
+        // state, so keying by it would make a special-state controller and a
+        // current-state controller that share an index collide on one persistent
+        // count. Keying by the owning state number keeps each controller's
+        // per-entry count independent. (The full `(state_number, idx)` pair is
+        // still needed because two controllers in the same state share a
+        // state_number but differ by index.)
+        let key = (ctrl.state_number, idx);
         let qualifying_count = self.fire_counts.entry(key).or_insert(0);
         *qualifying_count += 1;
         let count = *qualifying_count;
@@ -299,9 +333,11 @@ impl Character {
 
     /// Dispatches a controller that has qualified to fire this tick.
     ///
-    /// Handles only the controllers in scope for task 5.3
-    /// (`ChangeState`/`VelSet`/`VelAdd`/`CtrlSet`/`Null`); every other type is a
-    /// safe no-op, debug-logged and deferred to task 5.4.
+    /// Handles the core MOVEMENT/CONTROL controllers: `ChangeState`, `VelSet`,
+    /// `VelAdd`, `CtrlSet`, `Null` (task 5.3) plus `ChangeAnim`/`ChangeAnim2`,
+    /// `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`, `StateTypeSet`,
+    /// `Turn`, and a `PlaySnd` stub (task 5.4). Every other type is a safe
+    /// no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
         states: &HashMap<i32, CompiledState>,
@@ -317,12 +353,36 @@ impl Character {
             self.ctrl_vel_add(ctrl);
         } else if kind.eq_ignore_ascii_case("CtrlSet") {
             self.ctrl_ctrl_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("PosSet") {
+            self.ctrl_pos_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("PosAdd") {
+            self.ctrl_pos_add(ctrl);
+        } else if kind.eq_ignore_ascii_case("ChangeAnim")
+            || kind.eq_ignore_ascii_case("ChangeAnim2")
+        {
+            // ChangeAnim2 aliases ChangeAnim here. (In MUGEN, ChangeAnim2 selects
+            // the *opponent's* anim table during a custom-state throw; with a
+            // single entity there is no distinct table yet, so it behaves as
+            // ChangeAnim.)
+            self.ctrl_change_anim(ctrl);
+        } else if kind.eq_ignore_ascii_case("VarSet") {
+            self.ctrl_var_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("VarAdd") {
+            self.ctrl_var_add(ctrl);
+        } else if kind.eq_ignore_ascii_case("VarRangeSet") {
+            self.ctrl_var_range_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("StateTypeSet") {
+            self.ctrl_state_type_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("Turn") {
+            self.ctrl_turn();
+        } else if kind.eq_ignore_ascii_case("PlaySnd") {
+            self.ctrl_play_snd(ctrl);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
-            // Unrecognized in this task → safe no-op, deferred to 5.4.
+            // Unrecognized in this task → safe no-op, deferred to a later task.
             tracing::debug!(
-                "tick: unhandled controller type {kind:?} in state {} (deferred to 5.4)",
+                "tick: unhandled controller type {kind:?} in state {} (deferred)",
                 ctrl.state_number
             );
         }
@@ -383,6 +443,278 @@ impl Character {
     fn ctrl_ctrl_set(&mut self, ctrl: &CompiledController) {
         if let Some(expr) = ctrl.params.get("value") {
             self.ctrl = self.eval_value(expr).as_bool();
+        }
+    }
+
+    /// `PosSet`: set the x/y position components from the `x`/`y` parameters. A
+    /// missing component leaves that axis unchanged.
+    fn ctrl_pos_set(&mut self, ctrl: &CompiledController) {
+        if let Some(expr) = ctrl.params.get("x") {
+            self.pos.x = self.eval_value(expr).to_float();
+        }
+        if let Some(expr) = ctrl.params.get("y") {
+            self.pos.y = self.eval_value(expr).to_float();
+        }
+    }
+
+    /// `PosAdd`: add to the x/y position components from the `x`/`y` parameters.
+    /// A missing component adds nothing on that axis.
+    fn ctrl_pos_add(&mut self, ctrl: &CompiledController) {
+        if let Some(expr) = ctrl.params.get("x") {
+            self.pos.x += self.eval_value(expr).to_float();
+        }
+        if let Some(expr) = ctrl.params.get("y") {
+            self.pos.y += self.eval_value(expr).to_float();
+        }
+    }
+
+    /// `ChangeAnim`: switch to the animation named by the `value` parameter and
+    /// reset the animation cursor.
+    ///
+    /// The element index and element-time reset to the start of the new action
+    /// (MUGEN restarts a `ChangeAnim` at element 1). An optional `elem`
+    /// parameter selects a one-based starting element; it is stored zero-based
+    /// and clamped to `>= 0` (the per-tick animation advance clamps it into the
+    /// action's range, so an out-of-range value never panics). A missing `value`
+    /// is a safe no-op.
+    fn ctrl_change_anim(&mut self, ctrl: &CompiledController) {
+        let Some(value_expr) = ctrl.params.get("value") else {
+            tracing::debug!(
+                "tick: ChangeAnim in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.anim = self.eval_value(value_expr).to_int();
+        // MUGEN's optional `elem` is one-based; store it zero-based. Default to
+        // the first element when absent.
+        let start_elem = match ctrl.params.get("elem") {
+            Some(expr) => self.eval_value(expr).to_int().saturating_sub(1).max(0),
+            None => 0,
+        };
+        self.anim_elem = start_elem;
+        self.anim_elem_time = 0;
+    }
+
+    /// `VarSet`: assign a single variable to the value of an expression.
+    ///
+    /// Supports the MUGEN parameter forms (case-insensitive keys):
+    /// - `var(i) = expr` (key `var(i)`) → integer bank,
+    /// - `fvar(i) = expr` → float bank,
+    /// - `sysvar(i) = expr` → system integer bank,
+    /// - `sysfvar(i) = expr` → system float bank,
+    /// - `v = i` + `value = expr` → integer bank,
+    /// - `fv = i` + `value = expr` → float bank.
+    ///
+    /// An out-of-range index or an unrecognized form is a safe no-op.
+    fn ctrl_var_set(&mut self, ctrl: &CompiledController) {
+        // Indexed-key forms: `var(i)`, `fvar(i)`, `sysvar(i)`, `sysfvar(i)`.
+        for (key, expr) in &ctrl.params {
+            if let Some((bank, index)) = parse_var_bank_key(key) {
+                let value = self.eval_value(expr);
+                self.assign_var(bank, index, value);
+                // A VarSet sets exactly one variable; the first matching key wins.
+                return;
+            }
+        }
+        // `v`/`fv` + `value` form.
+        if let Some(value_expr) = ctrl.params.get("value") {
+            let value = self.eval_value(value_expr);
+            if let Some(index_expr) = ctrl.params.get("v") {
+                let index = self.eval_value(index_expr).to_int();
+                self.assign_var(VarBank::Int, index, value);
+            } else if let Some(index_expr) = ctrl.params.get("fv") {
+                let index = self.eval_value(index_expr).to_int();
+                self.assign_var(VarBank::Float, index, value);
+            } else {
+                tracing::debug!(
+                    "tick: VarSet in state {} has `value` but no `v`/`fv` index; ignored",
+                    ctrl.state_number
+                );
+            }
+        }
+    }
+
+    /// `VarAdd`: add an expression's value to a single variable.
+    ///
+    /// Accepts the same parameter forms as [`Self::ctrl_var_set`]. An
+    /// out-of-range index or unrecognized form is a safe no-op.
+    fn ctrl_var_add(&mut self, ctrl: &CompiledController) {
+        for (key, expr) in &ctrl.params {
+            if let Some((bank, index)) = parse_var_bank_key(key) {
+                let delta = self.eval_value(expr);
+                self.add_var(bank, index, delta);
+                return;
+            }
+        }
+        if let Some(value_expr) = ctrl.params.get("value") {
+            let delta = self.eval_value(value_expr);
+            if let Some(index_expr) = ctrl.params.get("v") {
+                let index = self.eval_value(index_expr).to_int();
+                self.add_var(VarBank::Int, index, delta);
+            } else if let Some(index_expr) = ctrl.params.get("fv") {
+                let index = self.eval_value(index_expr).to_int();
+                self.add_var(VarBank::Float, index, delta);
+            } else {
+                tracing::debug!(
+                    "tick: VarAdd in state {} has `value` but no `v`/`fv` index; ignored",
+                    ctrl.state_number
+                );
+            }
+        }
+    }
+
+    /// `VarRangeSet`: set a contiguous range of variables to one value.
+    ///
+    /// Parameters (case-insensitive): `value = expr` sets the integer bank,
+    /// `fvalue = expr` sets the float bank; `first`/`last` bound the inclusive
+    /// index range (both default to covering the whole bank when absent — MUGEN
+    /// defaults `first` to `0` and `last` to the bank's maximum index). Indices
+    /// outside the bank are skipped; the controller never panics.
+    fn ctrl_var_range_set(&mut self, ctrl: &CompiledController) {
+        let first = ctrl
+            .params
+            .get("first")
+            .map_or(0, |e| self.eval_value(e).to_int());
+        // `value` targets the int bank; `fvalue` targets the float bank.
+        if let Some(value_expr) = ctrl.params.get("value") {
+            let value = self.eval_value(value_expr);
+            let last = ctrl
+                .params
+                .get("last")
+                .map_or(NUM_VARS as i32 - 1, |e| self.eval_value(e).to_int());
+            for index in first..=last {
+                self.assign_var(VarBank::Int, index, value);
+            }
+        }
+        if let Some(value_expr) = ctrl.params.get("fvalue") {
+            let value = self.eval_value(value_expr);
+            let last = ctrl
+                .params
+                .get("last")
+                .map_or(NUM_FVARS as i32 - 1, |e| self.eval_value(e).to_int());
+            for index in first..=last {
+                self.assign_var(VarBank::Float, index, value);
+            }
+        }
+    }
+
+    /// `StateTypeSet`: override the state/move-type/physics categories without a
+    /// state transition.
+    ///
+    /// Reads `statetype`/`movetype`/`physics` from the controller's params as
+    /// bare letter tokens (the param value's raw source text, since the letter is
+    /// an identifier rather than a number). An absent or unrecognized token
+    /// leaves that category unchanged.
+    fn ctrl_state_type_set(&mut self, ctrl: &CompiledController) {
+        if let Some(expr) = ctrl.params.get("statetype") {
+            if let Some(t) = StateType::from_token(expr.source.trim()) {
+                if t != StateType::Unchanged {
+                    self.state_type = t;
+                }
+            }
+        }
+        if let Some(expr) = ctrl.params.get("movetype") {
+            if let Some(m) = MoveType::from_token(expr.source.trim()) {
+                if m != MoveType::Unchanged {
+                    self.move_type = m;
+                }
+            }
+        }
+        if let Some(expr) = ctrl.params.get("physics") {
+            if let Some(p) = Physics::from_token(expr.source.trim()) {
+                if p != Physics::Unchanged {
+                    self.physics = p;
+                }
+            }
+        }
+    }
+
+    /// `Turn`: flip the character's facing (right ↔ left).
+    fn ctrl_turn(&mut self) {
+        self.facing = match self.facing {
+            Facing::Right => Facing::Left,
+            Facing::Left => Facing::Right,
+        };
+    }
+
+    /// `PlaySnd` (stub): parse the `value` parameter and log it; no audio is
+    /// produced. Real sound playback arrives in Phase 8.
+    fn ctrl_play_snd(&mut self, ctrl: &CompiledController) {
+        // `value` is a `group, index` sound reference; keep the raw source for
+        // diagnostics. The expression VM cannot represent the pair, so the raw
+        // text is the useful artifact here.
+        let value = ctrl
+            .params
+            .get("value")
+            .map_or("<none>", |e| e.source.as_str());
+        tracing::debug!(
+            "tick: PlaySnd {value:?} in state {} (audio is Phase 8; no-op)",
+            ctrl.state_number
+        );
+    }
+
+    // ---- Variable-bank helpers --------------------------------------------
+
+    /// Assigns `value` to variable `index` of `bank`, narrowing/widening to the
+    /// bank's element type. An out-of-range index is a debug-logged no-op.
+    fn assign_var(&mut self, bank: VarBank, index: i32, value: Value) {
+        let Ok(i) = usize::try_from(index) else {
+            tracing::debug!("tick: var assign with negative index {index}; ignored");
+            return;
+        };
+        match bank {
+            VarBank::Int => {
+                if let Some(slot) = self.vars.get_mut(i) {
+                    *slot = value.to_int();
+                }
+            }
+            VarBank::Float => {
+                if let Some(slot) = self.fvars.get_mut(i) {
+                    *slot = value.to_float();
+                }
+            }
+            VarBank::SysInt => {
+                if let Some(slot) = self.sysvars.get_mut(i) {
+                    *slot = value.to_int();
+                }
+            }
+            VarBank::SysFloat => {
+                if let Some(slot) = self.sysfvars.get_mut(i) {
+                    *slot = value.to_float();
+                }
+            }
+        }
+    }
+
+    /// Adds `delta` to variable `index` of `bank`. An out-of-range index is a
+    /// debug-logged no-op.
+    fn add_var(&mut self, bank: VarBank, index: i32, delta: Value) {
+        let Ok(i) = usize::try_from(index) else {
+            tracing::debug!("tick: var add with negative index {index}; ignored");
+            return;
+        };
+        match bank {
+            VarBank::Int => {
+                if let Some(slot) = self.vars.get_mut(i) {
+                    *slot = slot.wrapping_add(delta.to_int());
+                }
+            }
+            VarBank::Float => {
+                if let Some(slot) = self.fvars.get_mut(i) {
+                    *slot += delta.to_float();
+                }
+            }
+            VarBank::SysInt => {
+                if let Some(slot) = self.sysvars.get_mut(i) {
+                    *slot = slot.wrapping_add(delta.to_int());
+                }
+            }
+            VarBank::SysFloat => {
+                if let Some(slot) = self.sysfvars.get_mut(i) {
+                    *slot += delta.to_float();
+                }
+            }
         }
     }
 
@@ -573,6 +905,46 @@ fn persistent_allows(persistent: i32, count: i32) -> bool {
         // Negative / unexpected → behave like the default.
         _ => true,
     }
+}
+
+/// Which variable bank a `VarSet`/`VarAdd` target refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarBank {
+    /// Integer bank (`var(i)`).
+    Int,
+    /// Float bank (`fvar(i)`).
+    Float,
+    /// System integer bank (`sysvar(i)`).
+    SysInt,
+    /// System float bank (`sysfvar(i)`).
+    SysFloat,
+}
+
+/// Parses a `var(i)`-style controller parameter key into its bank and index.
+///
+/// Recognizes (the key is already lowercased by the CNS parser):
+/// `var(i)`, `fvar(i)`, `sysvar(i)`, `sysfvar(i)`. The index is the integer
+/// between the parentheses. Returns `None` for any other key (so the caller
+/// falls through to the `v`/`fv` + `value` form).
+fn parse_var_bank_key(key: &str) -> Option<(VarBank, i32)> {
+    let key = key.trim();
+    // Order matters: check the longer `sysfvar`/`sysvar`/`fvar` prefixes before
+    // the `var` prefix so `sysvar(0)` is not mis-read as bank `var`.
+    let (bank, rest) = if let Some(rest) = key.strip_prefix("sysfvar") {
+        (VarBank::SysFloat, rest)
+    } else if let Some(rest) = key.strip_prefix("sysvar") {
+        (VarBank::SysInt, rest)
+    } else if let Some(rest) = key.strip_prefix("fvar") {
+        (VarBank::Float, rest)
+    } else if let Some(rest) = key.strip_prefix("var") {
+        (VarBank::Int, rest)
+    } else {
+        return None;
+    };
+    // `rest` must be `(<digits>)` (whitespace tolerated inside).
+    let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let index = inner.parse::<i32>().ok()?;
+    Some((bank, index))
 }
 
 /// Parses a `velset` value (`"x, y"`) into `(x, y)`. A missing or non-numeric
@@ -2226,5 +2598,814 @@ mod tests {
         assert!(!report.transition_cap_hit);
         // prev_state_no reflects the LAST hop (1 -> 2).
         assert_eq!(ch.prev_state_no, 1);
+    }
+
+    // =====================================================================
+    // Task 5.4: core MOVEMENT/CONTROL controllers + the remaining 5.3
+    // review follow-ups (#2 prev_state_no after a -1 ChangeState, #3
+    // special-vs-current persistent=0 collision keyed by ctrl.state_number).
+    // =====================================================================
+
+    // ---- 5.4 AC: ChangeAnim resets the element/time cursor ----
+
+    #[test]
+    fn change_anim_sets_anim_and_resets_cursor() {
+        // ChangeAnim value=5 must switch the anim and reset elem/elem_time to the
+        // start of the new action (then the per-tick advance moves elem_time to 1).
+        let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], {
+            let mut air = tiny_air(0, &[5]);
+            add_action(&mut air, 5, &[10, 10]);
+            air
+        });
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 3;
+        ch.anim_elem_time = 42;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim, 5, "anim switched");
+        assert_eq!(ch.anim_elem, 0, "element reset");
+        assert_eq!(ch.anim_elem_time, 1, "elem time reset to 0 then advanced one tick");
+    }
+
+    #[test]
+    fn change_anim_with_elem_starts_at_one_based_element() {
+        // ChangeAnim with elem=2 starts at one-based element 2 → zero-based 1.
+        let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5"), ("elem", "2")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], {
+            let mut air = tiny_air(0, &[5]);
+            add_action(&mut air, 5, &[10, 10, 10]);
+            air
+        });
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim, 5);
+        assert_eq!(ch.anim_elem, 1, "elem=2 (one-based) → zero-based 1");
+    }
+
+    #[test]
+    fn change_anim2_aliases_change_anim() {
+        // ChangeAnim2 behaves as ChangeAnim for a single entity.
+        let c = ctrl(0, "ChangeAnim2", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], {
+            let mut air = tiny_air(0, &[5]);
+            add_action(&mut air, 5, &[10]);
+            air
+        });
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim, 5, "ChangeAnim2 switched the anim like ChangeAnim");
+    }
+
+    #[test]
+    fn change_anim_without_value_is_safe_noop() {
+        let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 7;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "dispatch ran");
+        assert_eq!(ch.anim, 7, "no value → anim unchanged");
+    }
+
+    // ---- 5.4 AC: PosSet / PosAdd move the entity ----
+
+    #[test]
+    fn pos_set_sets_components_and_missing_axis_unchanged() {
+        let only_x = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "50")]);
+        let lc = loaded(vec![stand_n(0, vec![only_x])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.pos = Vec2::new(1.0, 2.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.x - 50.0).abs() < 1e-6, "x set");
+        assert!((ch.pos.y - 2.0).abs() < 1e-6, "y left unchanged");
+
+        let both = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "3"), ("y", "-4")]);
+        let lc2 = loaded(vec![stand_n(0, vec![both])], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.physics = Physics::None;
+        ch2.pos = Vec2::new(0.0, 0.0);
+        lc2.tick(&mut ch2);
+        assert!((ch2.pos.x - 3.0).abs() < 1e-6);
+        assert!((ch2.pos.y - (-4.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pos_add_accumulates_both_axes() {
+        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "2"), ("y", "-1")]);
+        let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.pos = Vec2::new(10.0, 10.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.x - 12.0).abs() < 1e-6);
+        assert!((ch.pos.y - 9.0).abs() < 1e-6);
+    }
+
+    // ---- 5.4 AC: VarSet / VarAdd across int/float/sys banks ----
+
+    #[test]
+    fn var_set_indexed_keys_target_correct_bank() {
+        // var(1), fvar(2), sysvar(3), sysfvar(4) each set their own bank.
+        let set_int = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("var(1)", "7")]);
+        let set_float = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("fvar(2)", "1.5")]);
+        let set_sys = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("sysvar(3)", "9")]);
+        let set_sysf = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("sysfvar(4)", "2.5")]);
+        let lc = loaded(
+            vec![stand_n(0, vec![set_int, set_float, set_sys, set_sysf])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[1], 7, "var(1) set in int bank");
+        assert!((ch.fvars[2] - 1.5).abs() < 1e-6, "fvar(2) set in float bank");
+        assert_eq!(ch.sysvars[3], 9, "sysvar(3) set in sys int bank");
+        assert!((ch.sysfvars[4] - 2.5).abs() < 1e-6, "sysfvar(4) set in sys float bank");
+    }
+
+    #[test]
+    fn var_set_v_value_form_targets_int_bank() {
+        // The `v = i` + `value = expr` form sets the integer bank at index i.
+        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "5"), ("value", "42")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[5], 42);
+    }
+
+    #[test]
+    fn var_set_fv_value_form_targets_float_bank() {
+        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("fv", "3"), ("value", "0.25")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!((ch.fvars[3] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn var_add_accumulates_in_int_and_float_banks() {
+        let add_int = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("var(0)", "3")]);
+        let add_float = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("fvar(0)", "1.5")]);
+        let lc = loaded(vec![stand_n(0, vec![add_int, add_float])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[0] = 10;
+        ch.fvars[0] = 2.0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[0], 13);
+        assert!((ch.fvars[0] - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn var_set_out_of_range_index_is_safe_noop() {
+        // An index beyond the bank size must not panic and must change nothing.
+        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("var(999)", "1")]);
+        let neg = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "-1"), ("value", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![c, neg])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 2, "both dispatched without panic");
+        assert!(ch.vars.iter().all(|&v| v == 0), "no slot was written");
+    }
+
+    // ---- 5.4 AC: VarRangeSet sets a contiguous range ----
+
+    #[test]
+    fn var_range_set_sets_int_range_inclusive() {
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5"), ("first", "2"), ("last", "4")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[1], 0, "below range untouched");
+        assert_eq!(ch.vars[2], 5);
+        assert_eq!(ch.vars[3], 5);
+        assert_eq!(ch.vars[4], 5);
+        assert_eq!(ch.vars[5], 0, "above range untouched");
+    }
+
+    #[test]
+    fn var_range_set_float_bank_via_fvalue() {
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("fvalue", "1.0"), ("first", "0"), ("last", "2")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!((ch.fvars[0] - 1.0).abs() < 1e-6);
+        assert!((ch.fvars[1] - 1.0).abs() < 1e-6);
+        assert!((ch.fvars[2] - 1.0).abs() < 1e-6);
+        assert!((ch.fvars[3] - 0.0).abs() < 1e-6, "above range untouched");
+    }
+
+    #[test]
+    fn var_range_set_default_range_covers_whole_bank_without_panic() {
+        // No first/last → whole int bank set; the upper bound equals the bank max
+        // so the inclusive loop never indexes out of range.
+        let c = ctrl(0, "VarRangeSet", &[], &[(1, &["1"])], None, &[("value", "8")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!(ch.vars.iter().all(|&v| v == 8), "whole int bank set to 8");
+    }
+
+    // ---- 5.4 AC: StateTypeSet updates the category flags ----
+
+    #[test]
+    fn state_type_set_updates_statetype_movetype_physics() {
+        let c = ctrl(
+            0,
+            "StateTypeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("statetype", "A"), ("movetype", "A"), ("physics", "A")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.state_type = StateType::Standing;
+        ch.move_type = MoveType::Idle;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_type, StateType::Air);
+        assert_eq!(ch.move_type, MoveType::Attack);
+        assert_eq!(ch.physics, Physics::Air);
+    }
+
+    #[test]
+    fn state_type_set_partial_and_unchanged_token_keep_others() {
+        // Only movetype given → statetype/physics untouched. A `U` token is the
+        // explicit "unchanged" no-op.
+        let c = ctrl(
+            0,
+            "StateTypeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("movetype", "H"), ("statetype", "U")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.state_type = StateType::Crouching;
+        ch.move_type = MoveType::Idle;
+        lc.tick(&mut ch);
+        assert_eq!(ch.move_type, MoveType::BeingHit, "movetype updated");
+        assert_eq!(ch.state_type, StateType::Crouching, "U token left statetype unchanged");
+    }
+
+    // ---- 5.4 AC: Turn flips facing ----
+
+    #[test]
+    fn turn_flips_facing() {
+        let c = ctrl(0, "Turn", &[], &[(1, &["1"])], Some("0"), &[]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.facing = Facing::Right;
+        lc.tick(&mut ch);
+        assert_eq!(ch.facing, Facing::Left, "Turn flipped right → left");
+        // A second entry (persistent=0 re-arms on re-entry, but here we just call
+        // the controller method semantics directly via a fresh char).
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.physics = Physics::None;
+        ch2.facing = Facing::Left;
+        lc.tick(&mut ch2);
+        assert_eq!(ch2.facing, Facing::Right, "Turn flipped left → right");
+    }
+
+    // ---- 5.4 AC: PlaySnd is a safe no-op stub ----
+
+    #[test]
+    fn play_snd_is_safe_noop() {
+        // PlaySnd parses its value and logs; it must not panic or mutate state.
+        let c = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "1, 0")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(3.0, 4.0);
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
+        assert!((ch.vel.x - 3.0).abs() < 1e-6);
+        assert!((ch.vel.y - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn play_snd_without_value_does_not_panic() {
+        let c = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1);
+    }
+
+    // ---- 5.4 helper: parse_var_bank_key unit coverage ----
+
+    #[test]
+    fn parse_var_bank_key_recognizes_all_banks() {
+        assert_eq!(parse_var_bank_key("var(0)"), Some((VarBank::Int, 0)));
+        assert_eq!(parse_var_bank_key("fvar(12)"), Some((VarBank::Float, 12)));
+        assert_eq!(parse_var_bank_key("sysvar(3)"), Some((VarBank::SysInt, 3)));
+        assert_eq!(parse_var_bank_key("sysfvar(4)"), Some((VarBank::SysFloat, 4)));
+        // Whitespace inside the parens is tolerated.
+        assert_eq!(parse_var_bank_key("var( 7 )"), Some((VarBank::Int, 7)));
+        // sysvar must not be mis-parsed as the `var` bank.
+        assert_ne!(parse_var_bank_key("sysvar(1)").map(|(b, _)| b), Some(VarBank::Int));
+        // Non-var keys and malformed forms → None.
+        assert_eq!(parse_var_bank_key("value"), None);
+        assert_eq!(parse_var_bank_key("var"), None);
+        assert_eq!(parse_var_bank_key("var()"), None);
+        assert_eq!(parse_var_bank_key("var(x)"), None);
+    }
+
+    // ---- 5.3 review fix (2): prev_state_no correct after a -1 ChangeState ----
+
+    #[test]
+    fn prev_state_no_correct_after_special_state_change_state() {
+        // A ChangeState fired from [Statedef -1] (the command bridge) sends us from
+        // state 7 to state 50. prev_state_no must record 7 (the state we left),
+        // not -1 (the special state that issued the ChangeState).
+        let cmd = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "50")]);
+        let lc = loaded(
+            vec![
+                stand_n(-1, vec![cmd]),
+                stand_n(7, vec![]),
+                stand_n(50, vec![]),
+            ],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 7;
+        ch.prev_state_no = -999;
+        let report = lc.tick(&mut ch);
+        assert!(report.transitions >= 1);
+        assert_eq!(ch.state_no, 50, "-1 ChangeState redirected the current state");
+        assert_eq!(ch.prev_state_no, 7, "prev_state_no is the state we left, not -1");
+    }
+
+    // ---- 5.3 review fix (3): fire_counts keyed by ctrl.state_number ----
+
+    #[test]
+    fn persistent_zero_collision_resolved_across_special_and_current() {
+        // A persistent=0 controller at index 0 in special state -2 AND a
+        // persistent=0 controller at index 0 in the current state 0. Keying
+        // fire_counts by ctrl.state_number (not self.state_no) keeps their
+        // once-per-entry counts independent, so BOTH fire on the first tick.
+        // (If they shared a key, the second to qualify would see count==2 and be
+        // suppressed by persistent=0.)
+        let in_neg2 = ctrl(-2, "VarAdd", &[], &[(1, &["1"])], Some("0"), &[("var(0)", "10")]);
+        let in_cur = ctrl(0, "VarAdd", &[], &[(1, &["1"])], Some("0"), &[("var(1)", "1")]);
+        let lc = loaded(
+            vec![stand_n(-2, vec![in_neg2]), stand_n(0, vec![in_cur])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 2, "both once-per-entry controllers fired");
+        assert_eq!(ch.vars[0], 10, "special -2 idx0 fired");
+        assert_eq!(ch.vars[1], 1, "current 0 idx0 fired despite same index");
+        // A second tick: each is once-per-entry, neither refires.
+        let report2 = lc.tick(&mut ch);
+        assert_eq!(report2.controllers_fired, 0, "both already fired this entry");
+        assert_eq!(ch.vars[0], 10);
+        assert_eq!(ch.vars[1], 1);
+    }
+
+    // =====================================================================
+    // Proctor (task 5.4): edge-case, error-path, and MUGEN-semantics coverage
+    // for the new controllers + the 5.3 review follow-ups, layered on top of
+    // Forge's tests. Each block names the acceptance criterion it exercises.
+    // All synthetic; the gated real-KFM tick lives above.
+    // =====================================================================
+
+    // ---- AC2 (5.3 fix #1): the collapsed exit clause + invariant debug_assert -
+
+    #[test]
+    fn no_fire_pass_exits_without_tripping_invariant() {
+        // A current state whose only controller never fires (trigger false) takes
+        // the `self.state_no == current` exit path with zero transitions. The
+        // collapsed clause + debug_assert must NOT trip (no counted transition is
+        // required because state_no never moved). In a debug build the assert is
+        // live, so this directly exercises the invariant on the no-transition path.
+        let c = ctrl(0, "VelAdd", &[], &[(1, &["0"])], None, &[("x", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::<f32>::ZERO;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 0);
+        assert_eq!(report.controllers_fired, 0);
+        assert!(!report.transition_cap_hit);
+        assert_eq!(ch.state_no, 0);
+    }
+
+    #[test]
+    fn self_transition_exits_via_collapsed_clause_no_assert_trip() {
+        // A ChangeState into the CURRENT state number counts a transition but leaves
+        // state_no == current, so the loop exits via `if self.state_no == current`
+        // BEFORE the debug_assert (which only guards the "moved to a different
+        // state" fall-through). This pins that a self-transition does not loop and
+        // does not trip the invariant in a debug build.
+        let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        let report = lc.tick(&mut ch);
+        // Exactly one self-transition; the cap is never hit (no looping).
+        assert_eq!(report.transitions, 1);
+        assert!(!report.transition_cap_hit);
+        assert_eq!(ch.state_no, 0);
+    }
+
+    // ---- AC1/AC3: VarSet/VarAdd cross-type coercion into the target bank ----
+
+    #[test]
+    fn var_set_indexed_key_coerces_value_to_bank_type() {
+        // Setting a FLOAT bank via an int-looking expression stores it as f32, and
+        // setting an INT bank via a float-looking expression truncates to i32
+        // (Value::to_int / to_float coercion at the bank boundary).
+        let to_float = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("fvar(0)", "3")]);
+        let to_int = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("var(0)", "1.9")]);
+        let lc = loaded(vec![stand_n(0, vec![to_float, to_int])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!((ch.fvars[0] - 3.0).abs() < 1e-6, "int expr widened into float bank");
+        assert_eq!(ch.vars[0], 1, "float expr truncated into int bank");
+    }
+
+    #[test]
+    fn var_set_first_indexed_key_wins_when_multiple_present() {
+        // A VarSet sets exactly one variable. When several indexed keys are present
+        // (malformed authoring), the implementation returns after the first match.
+        // HashMap iteration order is unspecified, so assert the INVARIANT that holds
+        // regardless of which key was chosen: exactly one of the two targets is set
+        // (to its own value) and the other is untouched — never both, never a panic.
+        let c = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("var(0)", "11"), ("var(1)", "22")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        let set0 = ch.vars[0] == 11 && ch.vars[1] == 0;
+        let set1 = ch.vars[1] == 22 && ch.vars[0] == 0;
+        assert!(set0 ^ set1, "exactly one indexed key wins; got vars={:?}", &ch.vars[0..2]);
+    }
+
+    #[test]
+    fn var_add_v_value_form_targets_int_bank() {
+        // VarAdd via the `v = i` + `value = expr` form accumulates in the int bank.
+        let c = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("v", "2"), ("value", "5")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[2] = 10;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[2], 15, "v/value VarAdd accumulates in int bank");
+    }
+
+    #[test]
+    fn var_add_fv_value_form_targets_float_bank() {
+        let c = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("fv", "1"), ("value", "0.5")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.fvars[1] = 2.0;
+        lc.tick(&mut ch);
+        assert!((ch.fvars[1] - 2.5).abs() < 1e-6, "fv/value VarAdd accumulates in float bank");
+    }
+
+    #[test]
+    fn var_set_value_without_index_is_safe_noop() {
+        // `value` present but neither an indexed key nor `v`/`fv`: nothing to target
+        // → safe no-op (debug-logged), no panic, no slot written.
+        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("value", "99")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "dispatched");
+        assert!(ch.vars.iter().all(|&v| v == 0), "no int slot written");
+        assert!(ch.fvars.iter().all(|&v| v == 0.0), "no float slot written");
+    }
+
+    #[test]
+    fn var_add_wraps_on_overflow_without_panic() {
+        // VarAdd uses wrapping_add on the int bank, so adding past i32::MAX wraps
+        // rather than panicking (the engine must never crash on adversarial state).
+        let c = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("var(0)", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[0] = i32::MAX;
+        lc.tick(&mut ch); // must not panic
+        assert_eq!(ch.vars[0], i32::MIN, "i32::MAX + 1 wraps to i32::MIN");
+    }
+
+    // ---- AC1/AC3: VarRangeSet boundary and combined-bank semantics ----
+
+    #[test]
+    fn var_range_set_first_greater_than_last_writes_nothing() {
+        // An inverted range (first > last) yields an empty inclusive loop: no slots
+        // are written and nothing panics.
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5"), ("first", "4"), ("last", "2")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!(ch.vars.iter().all(|&v| v == 0), "inverted range writes nothing");
+    }
+
+    #[test]
+    fn var_range_set_last_beyond_bank_is_clamped_safely() {
+        // A `last` past the bank maximum must not panic: out-of-range indices are
+        // skipped by assign_var, in-range ones are set.
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "3"), ("first", "58"), ("last", "100")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch); // must not panic despite last=100 > NUM_VARS-1
+        assert_eq!(ch.vars[58], 3);
+        assert_eq!(ch.vars[NUM_VARS - 1], 3, "top valid index set");
+    }
+
+    #[test]
+    fn var_range_set_both_value_and_fvalue_set_both_banks() {
+        // A single VarRangeSet carrying BOTH `value` and `fvalue` sets the int AND
+        // float banks over the shared first/last range.
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "7"), ("fvalue", "1.5"), ("first", "0"), ("last", "1")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[0], 7);
+        assert_eq!(ch.vars[1], 7);
+        assert!((ch.fvars[0] - 1.5).abs() < 1e-6);
+        assert!((ch.fvars[1] - 1.5).abs() < 1e-6);
+        assert_eq!(ch.vars[2], 0, "above range untouched (int)");
+        assert!((ch.fvars[2] - 0.0).abs() < 1e-6, "above range untouched (float)");
+    }
+
+    // ---- AC1: StateTypeSet ignores a fully invalid token ----
+
+    #[test]
+    fn state_type_set_invalid_token_leaves_category_unchanged() {
+        // An unrecognized statetype token (e.g. "Z") yields None from from_token, so
+        // the category is left unchanged rather than reset or panicking.
+        let c = ctrl(
+            0,
+            "StateTypeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("statetype", "Z"), ("physics", "?")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.state_type = StateType::Air;
+        ch.physics = Physics::Air;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_type, StateType::Air, "invalid statetype token left unchanged");
+        assert_eq!(ch.physics, Physics::Air, "invalid physics token left unchanged");
+    }
+
+    #[test]
+    fn state_type_set_lowercase_token_is_accepted() {
+        // Letter tokens are matched case-insensitively (from_token trims + ignores
+        // case): a lowercase `c` sets crouching.
+        let c = ctrl(0, "StateTypeSet", &[], &[(1, &["1"])], None, &[("statetype", "c")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.state_type = StateType::Standing;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_type, StateType::Crouching, "lowercase token accepted");
+    }
+
+    // ---- AC1: ChangeAnim elem param edge cases (zero / negative clamp) ----
+
+    #[test]
+    fn change_anim_elem_zero_and_negative_clamp_to_first_element() {
+        // elem is one-based; saturating_sub(1).max(0) clamps `0` and negatives to
+        // the first element (zero-based 0) rather than producing a negative index.
+        for elem_src in ["0", "-5"] {
+            let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5"), ("elem", elem_src)]);
+            let lc = loaded(vec![stand_n(0, vec![c])], {
+                let mut air = tiny_air(0, &[5]);
+                add_action(&mut air, 5, &[10, 10]);
+                air
+            });
+            let mut ch = Character::new();
+            ch.state_no = 0;
+            ch.anim = 0;
+            lc.tick(&mut ch);
+            assert_eq!(ch.anim, 5);
+            assert_eq!(ch.anim_elem, 0, "elem={elem_src} clamped to first element");
+        }
+    }
+
+    // ---- AC1: Turn with default persistent flips every tick within one entry ---
+
+    #[test]
+    fn turn_default_persistent_flips_every_tick() {
+        // With no persistent param (default 1), Turn flips facing on EVERY tick of
+        // the same state entry: right -> left -> right over two ticks.
+        let c = ctrl(0, "Turn", &[], &[(1, &["1"])], None, &[]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.facing = Facing::Right;
+        lc.tick(&mut ch);
+        assert_eq!(ch.facing, Facing::Left, "tick 1 flips right -> left");
+        lc.tick(&mut ch);
+        assert_eq!(ch.facing, Facing::Right, "tick 2 flips left -> right");
+    }
+
+    // ---- AC3: PosSet/PosAdd are independent of per-tick physics ----
+
+    #[test]
+    fn pos_controllers_are_not_disturbed_by_physics() {
+        // Physics acts on velocity, never position. A PosSet under stand physics
+        // leaves the set position intact while friction only scales velocity.
+        let pset = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "100"), ("y", "-20")]);
+        let st = state(0, Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![pset]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::Stand;
+        ch.pos = Vec2::new(1.0, 1.0);
+        ch.vel = Vec2::new(10.0, 0.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.x - 100.0).abs() < 1e-6, "position set, physics did not move it");
+        assert!((ch.pos.y - (-20.0)).abs() < 1e-6);
+        // Velocity, by contrast, was scaled by stand friction this tick.
+        let f = CharacterConstants::default().movement.stand_friction;
+        assert!((ch.vel.x - 10.0 * f).abs() < 1e-6);
+    }
+
+    // ---- AC1: new controllers are also reachable from a special state ----
+
+    #[test]
+    fn pos_add_fires_from_special_state_minus2() {
+        // The new controllers honor the special-state pass too: a PosAdd in [-2]
+        // moves the entity before the current state's controllers run.
+        let s_neg2 = ctrl(-2, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "5")]);
+        let lc = loaded(
+            vec![stand_n(-2, vec![s_neg2]), stand_n(0, vec![])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.pos = Vec2::<f32>::ZERO;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "special-state PosAdd fired");
+        assert!((ch.pos.x - 5.0).abs() < 1e-6);
+    }
+
+    // ---- AC1: dispatch through the real CNS parser (lowercased keys/types) ----
+
+    #[test]
+    fn new_controllers_dispatch_from_real_cns_text() {
+        // Parse a statedef whose controllers are the 5.4 set through the real CNS
+        // parser (which lowercases keys), compile, and verify each applies. This
+        // proves the dispatch works against parser output, not just hand-built
+        // controllers with already-lowercased keys.
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\nanim = 0\n\
+             [State 0, anim]\ntype = ChangeAnim\ntrigger1 = Time = 0\nvalue = 5\n\
+             [State 0, pos]\ntype = PosAdd\ntrigger1 = Time = 0\nx = 3\ny = -2\n\
+             [State 0, var]\ntype = VarSet\ntrigger1 = Time = 0\nvar(4) = 9\n\
+             [State 0, turn]\ntype = Turn\ntrigger1 = Time = 0\npersistent = 0\n\
+             [State 0, stype]\ntype = StateTypeSet\ntrigger1 = Time = 0\nmovetype = A\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], {
+            let mut air = tiny_air(0, &[5]);
+            add_action(&mut air, 5, &[10, 10]);
+            air
+        });
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.facing = Facing::Right;
+        ch.pos = Vec2::<f32>::ZERO;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 5, "all five 5.4 controllers fired");
+        assert_eq!(ch.anim, 5, "ChangeAnim");
+        assert!((ch.pos.x - 3.0).abs() < 1e-6, "PosAdd x");
+        assert!((ch.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y");
+        assert_eq!(ch.vars[4], 9, "VarSet var(4)");
+        assert_eq!(ch.facing, Facing::Left, "Turn");
+        assert_eq!(ch.move_type, MoveType::Attack, "StateTypeSet movetype");
+    }
+
+    // ---- AC1: PlaySnd via real CNS text (the `value = g, i` pair form) ----
+
+    #[test]
+    fn play_snd_pair_value_from_cns_is_noop_stub() {
+        // The canonical PlaySnd form `value = group, index` parses through the CNS
+        // parser; the stub must dispatch, log, and leave all state untouched.
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, snd]\ntype = PlaySnd\ntrigger1 = 1\nvalue = S1, 0\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.life = 1000;
+        let before_vars = ch.vars;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
+        assert_eq!(ch.life, 1000, "PlaySnd stub mutates nothing");
+        assert_eq!(ch.vars, before_vars);
     }
 }

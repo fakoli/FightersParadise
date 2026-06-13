@@ -614,7 +614,14 @@ pub struct Character {
 
     // ---- Executor bookkeeping ---------------------------------------------
     /// Per-state-entry firing counts used by the executor to enforce the
-    /// `persistent` universal parameter, keyed by `(state_no, controller_index)`.
+    /// `persistent` universal parameter, keyed by
+    /// `(owning_state_number, controller_index)`.
+    ///
+    /// The key's first component is the controller's *owning* state number (the
+    /// `N` in `[State N, label]`), **not** the live `state_no`: while a special
+    /// state (`-3`/`-2`/`-1`) runs, `state_no` is still the current numbered
+    /// state, so keying by it would make a special-state controller and a
+    /// current-state controller that share an index collide on one count.
     ///
     /// Each entry counts how many times a controller has *qualified* (its gating
     /// passed) since the current state was entered. The executor consults and

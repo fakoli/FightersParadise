@@ -585,12 +585,12 @@ fn read_velocity_group(ini: &DefFile, vel: &mut VelocityConstants) {
         // explicit jump.up is authored.
         vel.jump_up = v.y;
     }
-    // An explicit `jump.up` (a bare upward y-velocity on some characters)
+    // An explicit `jump.up` (an upward jump velocity on some characters)
     // overrides the jump.neu-derived value.
-    if let Some(v) = ini.get("Velocity", "jump.up").and_then(parse_vec2) {
-        // `jump.up` is conventionally a single (y) value; treat the first parsed
-        // component as the upward speed.
-        vel.jump_up = v.x;
+    if let Some(raw) = ini.get("Velocity", "jump.up") {
+        if let Some(up) = parse_jump_up(raw) {
+            vel.jump_up = up;
+        }
     }
 }
 
@@ -616,6 +616,29 @@ fn parse_vec2(raw: &str) -> Option<Vec2<f32>> {
     let x = parts.next().and_then(|p| p.parse::<f32>().ok())?;
     let y = parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(0.0);
     Some(Vec2::new(x, y))
+}
+
+/// Parses the upward jump speed from a `jump.up` value.
+///
+/// MUGEN's `jump.up` is the velocity applied to an up-held jump. It is most
+/// commonly authored as a 2-component `x, y` pair (e.g. `jump.up = 0, -9.5`),
+/// where the upward speed is the **y** component (y is negative = upward); the
+/// x component is the horizontal drift. When only a single component is present
+/// (a bare upward speed), that lone value is the upward speed.
+///
+/// Reading the y component where present is load-bearing: a previous version
+/// read the first (x) component, so `jump.up = 0, -9.5` silently stored `0`
+/// instead of `-9.5`. Returns `None` when no component parses (the caller keeps
+/// the existing, `jump.neu`-derived value).
+fn parse_jump_up(raw: &str) -> Option<f32> {
+    let mut parts = raw.split(',').map(str::trim);
+    let first = parts.next().and_then(|p| p.parse::<f32>().ok());
+    match parts.next().and_then(|p| p.parse::<f32>().ok()) {
+        // Two-component `x, y` form: the upward speed is the y component.
+        Some(y) => Some(y),
+        // Single-component form: the lone value is the upward speed.
+        None => first,
+    }
 }
 
 #[cfg(test)]
@@ -1464,6 +1487,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // ---- 5.3 review fix (4): jump.up honors the 2-component `x, y` form ----
+
+    #[test]
+    fn load_constants_jump_up_reads_y_of_two_component_form() {
+        // Regression: `jump.up = 0, -9.5` must store -9.5 (the y component), not 0
+        // (the x component). A previous version read the first component and
+        // silently stored 0, killing the jump.
+        let dir = scratch_dir("consts_jumpup_pair");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\njump.neu = 0, -8.4\njump.up = 0, -9.5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert!(
+            (consts.velocity.jump_up - (-9.5)).abs() < 1e-6,
+            "2-component jump.up stores the y component (-9.5), got {}",
+            consts.velocity.jump_up
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_jump_up_scalar_and_pair_and_garbage() {
+        // Single-component form: the lone value is the upward speed.
+        assert_eq!(parse_jump_up("-9.5"), Some(-9.5));
+        // Two-component `x, y` form: the y component is the upward speed.
+        assert_eq!(parse_jump_up("0, -9.5"), Some(-9.5));
+        assert_eq!(parse_jump_up(" 1.0 , -7.0 "), Some(-7.0));
+        // Fully malformed → None (caller keeps the jump.neu-derived default).
+        assert_eq!(parse_jump_up("nope"), None);
+        // Valid x but malformed y → falls back to the single (x) value.
+        assert_eq!(parse_jump_up("3, bad"), Some(3.0));
+    }
+
     // ---- AC2: [Movement] group: gravity + friction ----
 
     #[test]
@@ -1560,6 +1620,84 @@ mod tests {
         assert!((m.yaccel - 0.44).abs() < 1e-6);
         assert!((m.stand_friction - 0.85).abs() < 1e-6);
         assert!((m.crouch_friction - 0.82).abs() < 1e-6);
+    }
+
+    // =====================================================================
+    // Proctor (task 5.4 Part B fix #4): jump.up 2-component handling +
+    // velocity-override edge cases, layered on top of Forge's loader tests.
+    // =====================================================================
+
+    #[test]
+    fn parse_jump_up_two_component_does_not_return_x() {
+        // Regression guard for the exact bug fixed: the x component of a
+        // 2-component jump.up must NEVER be what is returned. Use a distinctive
+        // nonzero x so a regression that reads x is unambiguous.
+        assert_eq!(parse_jump_up("7.5, -9.5"), Some(-9.5));
+        assert_ne!(parse_jump_up("7.5, -9.5"), Some(7.5), "must not return the x component");
+    }
+
+    #[test]
+    fn parse_jump_up_empty_and_comma_only_are_none() {
+        // Fully degenerate inputs from messy content yield None (caller keeps the
+        // jump.neu-derived default), never a panic.
+        assert_eq!(parse_jump_up(""), None);
+        assert_eq!(parse_jump_up(","), None);
+        // Leading-comma (empty/unparseable x) but a VALID y: the y component is
+        // still recovered as the upward speed. This documents that the y-read is
+        // the load-bearing component — a malformed x does not discard a good y.
+        assert_eq!(parse_jump_up(", -9.5"), Some(-9.5));
+    }
+
+    #[test]
+    fn parse_jump_up_leading_dot_float() {
+        // KFM-style leading-dot floats parse in both components.
+        assert_eq!(parse_jump_up(".5"), Some(0.5));
+        assert_eq!(parse_jump_up("0, -.5"), Some(-0.5));
+    }
+
+    #[test]
+    fn jump_up_two_component_zero_x_stores_y_through_loader() {
+        // The headline case from the task: `jump.up = 0, -9.5` must store -9.5
+        // (the y), not 0 (the x), end-to-end through load_constants.
+        let dir = scratch_dir("consts_jumpup_zero_x");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\njump.up = 0, -9.5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert!(
+            (consts.velocity.jump_up - (-9.5)).abs() < 1e-6,
+            "jump.up = 0, -9.5 must store -9.5, got {}",
+            consts.velocity.jump_up
+        );
+        assert!(consts.velocity.jump_up.abs() > 1e-6, "must not be silently 0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn velocity_overrides_honor_two_component_form() {
+        // The other [Velocity] overrides (walk.fwd/back, run.fwd, jump.neu) use
+        // parse_vec2, which reads both components. A 2-component value stores both
+        // x and y rather than dropping y.
+        let dir = scratch_dir("consts_vel_pairs");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Velocity]\nwalk.fwd = 2.4, 0.1\nrun.fwd = 4.6, -0.2\njump.neu = 0.3, -8.4\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let v = load_constants(&parsed, &def, &["chr.cns".to_string()]).velocity;
+        assert!((v.walk_fwd.x - 2.4).abs() < 1e-6 && (v.walk_fwd.y - 0.1).abs() < 1e-6);
+        assert!((v.run_fwd.x - 4.6).abs() < 1e-6 && (v.run_fwd.y - (-0.2)).abs() < 1e-6);
+        // jump.neu pair stored; jump.up derived from its y (no explicit jump.up).
+        assert!((v.jump_neu.x - 0.3).abs() < 1e-6 && (v.jump_neu.y - (-8.4)).abs() < 1e-6);
+        assert!((v.jump_up - (-8.4)).abs() < 1e-6, "jump.up derived from jump.neu.y");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- AC5: real KFM constants read end-to-end (gated on test-assets) ----
