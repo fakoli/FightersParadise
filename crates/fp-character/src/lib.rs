@@ -895,6 +895,41 @@ impl EvalContext for Character {
             };
         }
 
+        // Liveness. `alive` is true while the character has any life left. The
+        // stock `common1.cns` stand state gates a `ChangeState` to the death
+        // state (5050) on `trigger1 = !alive`; without this arm `alive` would
+        // hit the unknown-trigger default of `0`, making `!alive` evaluate true
+        // and dropping a full-life KFM into the death state on tick 1. This is
+        // trivially correct from the `Life` we already model.
+        if name.eq_ignore_ascii_case("alive") {
+            return Value::from(self.life > 0);
+        }
+
+        // ---- Deferred triggers (documented, not silently wrong) -------------
+        //
+        // The following standard triggers appear in the stock `kfm.cns` /
+        // `common1.cns` but genuinely require engine context this crate does not
+        // yet model. They are intentionally NOT special-cased here: each falls
+        // through to the unknown-trigger default of `0` below, which is the same
+        // value MUGEN would report when the corresponding state is absent, so
+        // the common states do not actively misfire on them today. They are
+        // listed here so the omission is explicit rather than accidental.
+        //
+        // * Get-hit state (Phase 6): `HitOver`, `HitShakeOver`, `HitFall`,
+        //   `CanRecover`, `InGuardDist`, `MoveContact`, `MoveHit`,
+        //   `MoveGuarded`. These read the active `HitDef`/get-hit record, which
+        //   `Character` does not carry yet. `GetHitVar(...)` is likewise
+        //   deferred and handled (also defaulting) in `trigger_str`.
+        // * Round / match state (engine, Phase 5+): `RoundState`, `RoundNo`,
+        //   `RoundsExisted`, `MatchOver`, `GameTime`. These live on the round
+        //   coordinator (`fp-engine`), not on a single `Character`.
+        // * Cross-entity geometry (Phase 7 redirection): `P2BodyDist`,
+        //   `P2Dist`, `FrontEdgeBodyDist`, `BackEdgeBodyDist`, `BackEdgeDist`.
+        //   These need the opponent and stage, reached via `redirect` (which is
+        //   currently single-entity / `None`).
+        // * Animation table queries: `SelfAnimExist`. Needs the loaded `.air`
+        //   action set, which the executor owns rather than `Character`.
+
         // Unknown trigger → safe default, never a panic.
         Value::DEFAULT
     }
@@ -1009,6 +1044,58 @@ mod tests {
         assert_eq!(ev("PowerMax = 3000", &ch), Value::Int(1));
         // Ctrl is boolean → int 1.
         assert_eq!(ev("Ctrl", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn alive_tracks_life() {
+        let mut ch = sample();
+
+        // Full life: alive is 1 and `!alive` is 0, both via the typed path and
+        // through a parsed expression (case-insensitive trigger name).
+        ch.life = ch.life_max;
+        assert_eq!(ch.trigger("alive", &[]), Value::Int(1));
+        assert_eq!(ch.trigger("ALIVE", &[]), Value::Int(1));
+        assert_eq!(ev("alive", &ch), Value::Int(1));
+        assert_eq!(ev("!alive", &ch), Value::Int(0));
+
+        // Any positive life still counts as alive.
+        ch.life = 1;
+        assert_eq!(ev("alive", &ch), Value::Int(1));
+        assert_eq!(ev("!alive", &ch), Value::Int(0));
+
+        // Zero life: alive flips to 0 and `!alive` (the common1.cns death gate)
+        // becomes true.
+        ch.life = 0;
+        assert_eq!(ch.trigger("alive", &[]), Value::Int(0));
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+        assert_eq!(ev("!alive", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn deferred_triggers_stay_at_safe_default() {
+        // Triggers documented as deferred (need get-hit / round / cross-entity
+        // context not yet modeled) must still resolve to the safe default of 0,
+        // never panic. This pins the documented behavior so a future
+        // implementation is a deliberate change, not an accidental one.
+        let ch = sample();
+        for t in [
+            "HitOver",
+            "HitShakeOver",
+            "HitFall",
+            "CanRecover",
+            "InGuardDist",
+            "MoveContact",
+            "RoundState",
+            "GameTime",
+            "MatchOver",
+            "SelfAnimExist",
+        ] {
+            assert_eq!(
+                ch.trigger(t, &[]),
+                Value::DEFAULT,
+                "deferred trigger {t} should default to 0"
+            );
+        }
     }
 
     #[test]
@@ -1653,5 +1740,271 @@ mod tests {
                 value
             );
         }
+    }
+
+    // =====================================================================
+    // Proctor (task 5.6b): `alive` trigger + common-state trigger audit.
+    // These layer MUGEN-semantics edge cases and the real-content death-gate
+    // scenario on top of Forge's `alive_tracks_life` /
+    // `deferred_triggers_stay_at_safe_default` tests. Grouped by the task's
+    // acceptance criteria.
+    // =====================================================================
+
+    // ---- AC1: `alive` resolves to Life>0, placed before the unknown fallthrough.
+
+    #[test]
+    fn alive_is_zero_for_overkill_negative_life() {
+        // MUGEN can drive Life below zero on an overkill hit before clamping.
+        // `alive` is `Life > 0`, so any non-positive Life (including negative)
+        // must read 0 — never the unknown-trigger default leaking through as a
+        // surprising 1, and never a panic on the signed value.
+        let mut ch = sample();
+        ch.life = -250;
+        assert_eq!(ch.trigger("alive", &[]), Value::Int(0));
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+        assert_eq!(ev("!alive", &ch), Value::Int(1));
+        // The exact boundary: Life == 0 is dead, Life == 1 is alive.
+        ch.life = 0;
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+        ch.life = 1;
+        assert_eq!(ev("alive", &ch), Value::Int(1));
+        // Extreme negative value still reads dead, no overflow/panic.
+        ch.life = i32::MIN;
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn alive_is_int_typed_and_case_insensitive() {
+        // `alive` is a boolean-coded trigger → the int 1/0 variant (never float),
+        // so it threads through `!`, `&&`, and integer comparison cleanly.
+        let mut ch = sample();
+        ch.life = ch.life_max;
+        for spelling in ["alive", "Alive", "ALIVE", "aLiVe"] {
+            assert_eq!(
+                ch.trigger(spelling, &[]),
+                Value::Int(1),
+                "`{spelling}` should resolve case-insensitively to 1"
+            );
+            assert!(
+                ch.trigger(spelling, &[]).is_int(),
+                "`{spelling}` must be int-typed, not float"
+            );
+        }
+        // Through the parser/evaluator with varied casing.
+        assert_eq!(ev("Alive", &ch), Value::Int(1));
+        assert_eq!(ev("!ALIVE", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn alive_ignores_spurious_arguments() {
+        // `alive` is argument-less in MUGEN. The arm matches on name alone, so a
+        // (malformed) parenthesized call still resolves from Life rather than
+        // panicking — defends the "never panic" invariant on odd content.
+        let mut ch = sample();
+        ch.life = 500;
+        assert_eq!(ch.trigger("alive", &[Value::Int(7)]), Value::Int(1));
+        ch.life = 0;
+        assert_eq!(ch.trigger("alive", &[Value::Int(7)]), Value::Int(0));
+    }
+
+    #[test]
+    fn alive_unaffected_by_lifemax() {
+        // Liveness is about *current* Life crossing zero, independent of LifeMax.
+        // A character with a tiny max but positive life is alive; draining to 0
+        // makes it dead regardless of max.
+        let mut ch = Character::new();
+        ch.life_max = 1;
+        ch.life = 1;
+        assert_eq!(ev("alive", &ch), Value::Int(1));
+        ch.life = 0;
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+        // Large max, full life: still alive.
+        ch.life_max = 9999;
+        ch.life = 9999;
+        assert_eq!(ev("alive", &ch), Value::Int(1));
+    }
+
+    // ---- AC1: the real common1.cns death-gate scenario (the task's motivation).
+
+    #[test]
+    fn common1_death_gate_does_not_fire_at_full_life() {
+        // common1.cns `[State 0, 4] ;Are you dead?` is a ChangeState to the death
+        // state (5050) gated on `trigger1 = !alive`. Before 5.6b, `alive` hit the
+        // unknown-trigger default 0, so `!alive` was always TRUE and a full-life
+        // KFM dropped into the death state on tick 1. With `alive` implemented the
+        // gate must be FALSE at full life and only TRUE once Life reaches 0.
+        let mut ch = Character::new(); // new() => full life, alive
+        ch.state_no = 0;
+        ch.state_time = 1;
+        // The death-gate trigger expression, verbatim from the stock state.
+        let death_gate = "!alive";
+        assert_eq!(
+            ev(death_gate, &ch),
+            Value::Int(0),
+            "full-life KFM must NOT satisfy the !alive death gate"
+        );
+        // Drive life to zero: now (and only now) the gate fires → ChangeState 5050.
+        ch.life = 0;
+        assert_eq!(
+            ev(death_gate, &ch),
+            Value::Int(1),
+            "a KO'd KFM must satisfy the !alive death gate"
+        );
+    }
+
+    #[test]
+    fn common1_alive_guard_forms_evaluate_both_ways() {
+        // common1.cns also gates *recovery* states on `triggerall = alive` and
+        // `trigger1 = alive`. The positive form must mirror the negative one: true
+        // at positive life, false at zero. (Pins both polarities used in stock
+        // content so a regression in either direction is caught.)
+        let mut ch = Character::new();
+        ch.life = 300;
+        assert_eq!(ev("alive", &ch), Value::Int(1)); // recovery allowed
+        assert_eq!(ev("!alive", &ch), Value::Int(0)); // death gate closed
+        ch.life = 0;
+        assert_eq!(ev("alive", &ch), Value::Int(0)); // recovery blocked
+        assert_eq!(ev("!alive", &ch), Value::Int(1)); // death gate open
+    }
+
+    // ---- AC2: the deferred-trigger audit is pinned against the *actual* names
+    // that appear in test-assets/kfm/{kfm,common1}.cns. Each must still default
+    // to 0 (so common states do not misfire on them) and never panic. This makes
+    // a future implementation of any of them a deliberate, test-breaking change.
+
+    #[test]
+    fn audited_deferred_triggers_all_default_to_zero() {
+        let ch = sample();
+        // Names harvested from the trigger lines of the stock CNS files that the
+        // EvalContext deliberately does not resolve yet (get-hit / round / match
+        // / cross-entity geometry / anim-table queries). Includes case variants
+        // to confirm the default holds regardless of spelling.
+        let deferred = [
+            // Get-hit state (Phase 6).
+            "HitOver", "hitover", "HitShakeOver", "HitFall", "CanRecover",
+            "InGuardDist", "MoveContact", "MoveHit", "MoveGuarded",
+            // Round / match state (engine, Phase 5+).
+            "RoundState", "roundstate", "RoundNo", "RoundsExisted", "MatchOver",
+            "GameTime",
+            // Cross-entity geometry (Phase 7 redirection).
+            "P2BodyDist", "P2Dist", "FrontEdgeBodyDist", "BackEdgeBodyDist",
+            "BackEdgeDist",
+            // Animation-table query (executor owns the .air set).
+            "SelfAnimExist",
+        ];
+        for t in deferred {
+            let v = ch.trigger(t, &[]);
+            assert_eq!(v, Value::DEFAULT, "deferred trigger `{t}` must default to 0");
+            // Value::DEFAULT is documented as Value::Int(0); pin that contract so
+            // a comparison against literal 0 in stock content still holds.
+            assert_eq!(v, Value::Int(0), "deferred trigger `{t}` default must be int 0");
+        }
+        // With representative args (these are functions in real content, e.g.
+        // SelfAnimExist(44), P2BodyDist), the deferred path must still default,
+        // not panic.
+        assert_eq!(ch.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
+        assert_eq!(ch.trigger("P2BodyDist", &[Value::Int(0)]), Value::Int(0));
+    }
+
+    #[test]
+    fn alive_is_not_in_the_deferred_set() {
+        // Guard against a regression that would re-defer `alive`: unlike the
+        // audited deferred names, `alive` must NOT collapse to the unknown
+        // default at full life. (If someone removes the `alive` arm, this fails
+        // even though the generic default still returns Value::Int(0).)
+        let ch = Character::new(); // full life
+        assert_eq!(ch.trigger("alive", &[]), Value::Int(1));
+        assert_ne!(
+            ch.trigger("alive", &[]),
+            ch.trigger("ThisTriggerDoesNotExist", &[]),
+            "alive must resolve to a real value, not the unknown-trigger default"
+        );
+    }
+
+    // ---- AC3: already-supported triggers are unchanged; nothing panics.
+
+    #[test]
+    fn alive_arm_does_not_shadow_other_triggers() {
+        // Adding the `alive` arm must not perturb neighbouring resolutions. Spot
+        // check a spread of previously-supported triggers still answer correctly
+        // on the same character whose `alive` we also read.
+        let mut ch = sample();
+        ch.life = 0; // dead, to make alive=0 distinctly observable
+        assert_eq!(ev("alive", &ch), Value::Int(0));
+        // Unrelated triggers keep their values regardless of liveness.
+        assert_eq!(ev("StateNo = 200", &ch), Value::Int(1));
+        assert_eq!(ev("Anim = 200", &ch), Value::Int(1));
+        assert_eq!(ev("Vel X = 2.5", &ch), Value::Int(1));
+        assert_eq!(ev("LifeMax = 1000", &ch), Value::Int(1));
+        assert_eq!(ev("Power = 500", &ch), Value::Int(1));
+    }
+
+    // ---- AC4 / AC5: real-content fixture for the `!alive` death gate, gated to
+    // skip cleanly when test-assets/ is absent.
+
+    #[test]
+    fn real_common1_death_gate_trigger_when_present() {
+        // Reads the stock common1.cns and extracts the `!alive` death-gate trigger
+        // expression(s) verbatim, then asserts the implemented `alive` makes the
+        // gate behave correctly: closed (0) for a full-life KFM, open (1) when KO.
+        // SKIPS cleanly when the asset is absent so the suite stays green in a
+        // checkout without test-assets.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-assets/kfm/common1.cns");
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return, // asset absent → skip, not a failure
+        };
+
+        // Collect the right-hand side of every `trigger... = ...alive...` line.
+        let alive_exprs: Vec<String> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower.starts_with("trigger") && lower.contains("alive")
+            })
+            .filter_map(|l| l.split_once('=').map(|(_, rhs)| rhs.trim().to_string()))
+            .collect();
+
+        // The stock file is known to gate on `alive` (recovery) and `!alive`
+        // (death). If neither appears the fixture is unexpectedly shaped; assert
+        // we found at least one so the test cannot silently pass on a stripped
+        // file that still exists.
+        assert!(
+            !alive_exprs.is_empty(),
+            "common1.cns present but contains no `alive`-gated triggers"
+        );
+
+        let alive = Character::new(); // full life
+        let mut dead = Character::new();
+        dead.life = 0;
+
+        let mut saw_negated = false;
+        let mut saw_plain = false;
+        for raw in &alive_exprs {
+            // Only evaluate expressions that are *exactly* an alive guard
+            // (`alive` or `!alive`), case-insensitively. Other lines that merely
+            // contain the substring (none expected in stock KFM, but be safe) are
+            // skipped so the assertions stay meaningful.
+            let norm = raw.to_ascii_lowercase();
+            let norm = norm.split(';').next().unwrap_or("").trim(); // strip comments
+            match norm {
+                "!alive" => {
+                    saw_negated = true;
+                    assert_eq!(ev(raw, &alive), Value::Int(0), "`{raw}` false at full life");
+                    assert_eq!(ev(raw, &dead), Value::Int(1), "`{raw}` true when KO");
+                }
+                "alive" => {
+                    saw_plain = true;
+                    assert_eq!(ev(raw, &alive), Value::Int(1), "`{raw}` true at full life");
+                    assert_eq!(ev(raw, &dead), Value::Int(0), "`{raw}` false when KO");
+                }
+                _ => {}
+            }
+        }
+        // Stock common1.cns has both polarities; require we exercised the death
+        // gate at minimum (the task's core scenario).
+        assert!(saw_negated, "expected a `!alive` death gate in common1.cns");
+        assert!(saw_plain, "expected an `alive` recovery guard in common1.cns");
     }
 }
