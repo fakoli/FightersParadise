@@ -234,6 +234,12 @@ fn trigger_key(name: &str, args: &[Value]) -> String {
     key
 }
 
+/// Renders `(name, member)` into a stable, case-insensitive lookup key for the
+/// member-keyed trigger path (`GetHitVar(member)`, task 4.11 item a).
+fn member_key(name: &str, member: &str) -> String {
+    format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+}
+
 /// A deterministic in-memory [`EvalContext`] for evaluating curated triggers.
 ///
 /// Anything not explicitly seeded resolves to the safe default
@@ -242,6 +248,9 @@ fn trigger_key(name: &str, args: &[Value]) -> String {
 #[derive(Default)]
 struct Ctx {
     triggers: HashMap<String, Value>,
+    /// Member-keyed trigger values (`GetHitVar(member)`), keyed on the rendered
+    /// `(lowercased name, lowercased member)` string (task 4.11, item a).
+    member_triggers: HashMap<String, Value>,
     // `Redirect` is `Hash + Eq` but not `Ord`, so the target map must be a
     // `HashMap`, not a `BTreeMap`.
     redirects: HashMap<Redirect, Box<Ctx>>,
@@ -262,6 +271,13 @@ impl Ctx {
         self
     }
 
+    /// Seeds a member-keyed trigger value (`GetHitVar(member)`, task 4.11 item a).
+    fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
+        self.member_triggers
+            .insert(member_key(name, member), value);
+        self
+    }
+
     /// Seeds a redirection target.
     fn with_redirect(mut self, target: Redirect, ctx: Ctx) -> Self {
         self.redirects.insert(target, Box::new(ctx));
@@ -279,6 +295,13 @@ impl EvalContext for Ctx {
     fn trigger(&self, name: &str, args: &[Value]) -> Value {
         self.triggers
             .get(&trigger_key(name, args))
+            .copied()
+            .unwrap_or(Value::DEFAULT)
+    }
+
+    fn trigger_str(&self, name: &str, key: &str) -> Value {
+        self.member_triggers
+            .get(&member_key(name, key))
             .copied()
             .unwrap_or(Value::DEFAULT)
     }
@@ -936,16 +959,219 @@ fn gap_forms_end_to_end_against_mock_cover_all_four_acceptance_criteria() {
     let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(-1));
     assert_eq!(run("AnimElem = 2, >= 0", &ctx), Value::Int(0));
 
-    // AC3: dotted member arg (`GetHitVar(fall.yvel)`), passed by nested-trigger
-    // value: seed fall.yvel→7, GetHitVar(7)→42.
+    // AC3: member-keyed GetHitVar (`GetHitVar(fall.yvel)`) passes the member NAME
+    // through the string seam (task 4.11 item a): seed member "fall.yvel"→42.
+    // Distinct member names give distinct values — the property the old
+    // value-passing path could not provide.
     let ctx = Ctx::new()
-        .with_trigger("fall.yvel", &[], Value::Int(7))
-        .with_trigger("GetHitVar", &[Value::Int(7)], Value::Int(42));
+        .with_member_trigger("GetHitVar", "fall.yvel", Value::Int(42))
+        .with_member_trigger("GetHitVar", "xveladd", Value::Int(7));
     assert_eq!(run("GetHitVar(fall.yvel)", &ctx), Value::Int(42));
+    assert_eq!(run("GetHitVar(xveladd)", &ctx), Value::Int(7));
 
     // AC4: command = "x" string equality through the command seam.
     let ctx = Ctx::new().with_command("x");
     assert_eq!(run("command = \"x\"", &ctx), Value::Int(1));
     let ctx = Ctx::new().with_command("y");
     assert_eq!(run("command = \"x\"", &ctx), Value::Int(0));
+}
+
+// =============================================================================
+// Proctor (task 4.11) — end-to-end coverage of the three VM-correctness
+// follow-ups, both asset-independent (always runs) and real-fixture-gated.
+//
+//   (a) GetHitVar member-arg STRING key — distinct member names → distinct
+//       values, proving the name (not a collapsed numeric value) reaches the
+//       context.
+//   (b) TimeMod / AnimElemNo are NOT the AnimElemTime comparison-tail family —
+//       a `<name> = N, op M` for either degrades to a recoverable ParseError,
+//       so it can never be evaluated with the wrong semantics.
+//   (c) AnimElem tail binds the secondary operand at relational precedence, so a
+//       trailing `&& …` / `|| …` is a separate conjunct, asserted semantically
+//       (not just by tree shape).
+// =============================================================================
+
+#[test]
+fn task_4_11_three_followups_end_to_end_asset_independent() {
+    // ---- (a) member-arg string key: distinct members → distinct values ----
+    let ctx = Ctx::new()
+        .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
+        .with_member_trigger("GetHitVar", "xveladd", Value::Int(7))
+        .with_member_trigger("GetHitVar", "animtype", Value::Int(2));
+    assert_eq!(run("GetHitVar(fall.yvel)", &ctx), Value::Float(-4.5));
+    assert_eq!(run("GetHitVar(xveladd)", &ctx), Value::Int(7));
+    assert_eq!(run("GetHitVar(animtype)", &ctx), Value::Int(2));
+    // The member NAME, not a value, is the key: an unseeded member is the safe 0.
+    assert_eq!(run("GetHitVar(nosuchfield)", &ctx), Value::Int(0));
+    // It composes in a real-shape comparison (a HitDef-style guard).
+    assert_eq!(run("GetHitVar(fall.yvel) < 0", &ctx), Value::Int(1));
+
+    // ---- (b) TimeMod / AnimElemNo comma-tail degrade to a recoverable error ----
+    for src in [
+        "TimeMod = 2, >= 0",
+        "timemod = 4, 1",
+        "AnimElemNo = 2, >= 0",
+        "ANIMELEMNO = 3, 1",
+    ] {
+        let _ = tokenize(src); // never panics
+        let err = parse_str(src).expect_err(
+            "TimeMod/AnimElemNo comma-tail is NOT the AnimElem family; must be a ParseError",
+        );
+        assert!(
+            matches!(err, ParseError::UnexpectedToken { .. }),
+            "{src:?} must degrade cleanly, got {err:?}"
+        );
+    }
+    // Their bare equalities still evaluate as ordinary trigger comparisons.
+    let ctx = Ctx::new().with_trigger("TimeMod", &[], Value::Int(2));
+    assert_eq!(run("TimeMod = 2", &ctx), Value::Int(1));
+    let ctx = Ctx::new().with_trigger("AnimElemNo", &[], Value::Int(3));
+    assert_eq!(run("AnimElemNo = 3", &ctx), Value::Int(1));
+
+    // ---- (c) AnimElem tail does not swallow a trailing && / || ----
+    // Tail TRUE (reached, time 0) but the second conjunct FALSE (Time not > 0):
+    // a swallowed `&&` would not produce this separable result.
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("Time", &[], Value::Int(0));
+    assert_eq!(run("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(0));
+    // Both true → 1.
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("Time", &[], Value::Int(5));
+    assert_eq!(run("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(1));
+    // `||`: tail FALSE (time 0 not > 5) but Time>0 TRUE → 1.
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("Time", &[], Value::Int(5));
+    assert_eq!(run("AnimElem = 2, > 5 || Time > 0", &ctx), Value::Int(1));
+    // The operand still absorbs additive: `, >= 1 + 1` compares against 2.
+    let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(2));
+    assert_eq!(run("AnimElem = 2, >= 1 + 1", &ctx), Value::Int(1));
+
+    // Parenthesized / left-side tail forms degrade cleanly (no silent wrong tree).
+    for src in [
+        "(AnimElem = 2, >= 0)",
+        "(AnimElem = 2, >= 0) && Time > 0",
+        "Time > 0 && AnimElem = 2, >= 0",
+    ] {
+        assert!(
+            matches!(parse_str(src), Err(ParseError::UnexpectedToken { .. })),
+            "{src:?} should cleanly degrade to a recoverable parse error"
+        );
+    }
+}
+
+#[test]
+fn task_4_11_real_fixture_member_and_tail_forms_eval_without_panic() {
+    let Some(dir) = kfm_assets_dir() else {
+        eprintln!(
+            "skipping task_4_11_real_fixture_member_and_tail_forms_eval_without_panic: test-assets/ absent"
+        );
+        return;
+    };
+
+    // Seed the AnimElemTime reads behind the real AnimElem tail forms, plus the
+    // GetHitVar members KFM references, so the harvested gap lines compute a
+    // concrete value rather than only "not panicking".
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("AnimElemTime", &[Value::Int(3)], Value::Int(0))
+        .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.0))
+        .with_member_trigger("GetHitVar", "xveladd", Value::Float(2.5))
+        .with_member_trigger("GetHitVar", "yaccel", Value::Float(0.5));
+
+    let mut tail_seen = 0usize;
+    let mut member_seen = 0usize;
+    let mut evaluated = 0usize;
+
+    for fname in ["kfm.cns", "common1.cns"] {
+        let text = std::fs::read_to_string(dir.join(fname)).expect("read fixture");
+        for rhs in harvest_trigger_rhs(&text) {
+            let lower = rhs.to_ascii_lowercase();
+
+            // AnimElem comma-tail form (item c): an animelem-family `= N ,` shape
+            // that is NOT a range RHS and NOT a parenthesized call.
+            let is_tail = lower.contains("animelem")
+                && lower.contains('=')
+                && lower.contains(',')
+                && !lower.contains('[')
+                && !lower.contains('(');
+            // GetHitVar member form (item a): a dotted-or-bare member argument.
+            let is_member = lower.contains("gethitvar(");
+
+            if is_tail {
+                tail_seen += 1;
+            }
+            if is_member {
+                member_seen += 1;
+            }
+
+            // The never-crash contract spans tokenize -> parse -> eval. A parse
+            // error here is the recoverable kind (some value-set RHS are not whole
+            // expressions); only assert eval on what parses.
+            let _ = tokenize(&rhs);
+            if let Ok(ast) = parse_str(&rhs) {
+                let v = eval(&ast, &ctx);
+                match v {
+                    Value::Int(_) => {}
+                    Value::Float(f) => assert!(
+                        f.is_finite() || f.is_nan(),
+                        "eval of real 4.11 RHS {rhs:?} produced a non-representable float"
+                    ),
+                }
+                evaluated += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "task 4.11 real-fixture: animelem-tail={tail_seen} gethitvar-member={member_seen} \
+         (evaluated {evaluated} parseable RHS)"
+    );
+    // KFM uses both the AnimElem comma-tail and dotted GetHitVar member forms; if
+    // they vanished, this test is no longer exercising item (a)/(c) on real data.
+    assert!(tail_seen >= 1, "expected AnimElem comma-tail forms in fixtures, saw {tail_seen}");
+    assert!(member_seen >= 1, "expected GetHitVar member forms in fixtures, saw {member_seen}");
+    assert!(evaluated > 50, "expected many parseable RHS, evaluated {evaluated}");
+}
+
+#[test]
+fn task_4_11_real_fixture_clean_parse_rate_is_100_percent() {
+    // AC4: the cns_integration clean-parse rate must stay 100% (812/812) after the
+    // 4.11 changes. The aggregate `all_real_triggers_lex_and_parse_without_panic`
+    // asserts a 98% floor + no unexpected failures; this pins the exact 100% rate
+    // and the expected total so a regression in either the parser OR the fixtures
+    // is caught precisely.
+    let Some(dir) = kfm_assets_dir() else {
+        eprintln!("skipping task_4_11_real_fixture_clean_parse_rate_is_100_percent: test-assets/ absent");
+        return;
+    };
+
+    let triggers = load_all_triggers(&dir);
+    let total = triggers.len();
+    let mut parsed = 0usize;
+    let mut failures: Vec<(&RawTrigger, ParseError)> = Vec::new();
+    for t in &triggers {
+        let _ = tokenize(&t.expr); // never panics
+        match parse_str(&t.expr) {
+            Ok(_) => parsed += 1,
+            Err(e) => failures.push((t, e)),
+        }
+    }
+
+    if !failures.is_empty() {
+        eprintln!("clean-parse failures ({}):", failures.len());
+        for (t, e) in &failures {
+            eprintln!("  {}: {:?} -> {e}", t.origin, t.expr);
+        }
+    }
+    assert_eq!(
+        parsed, total,
+        "clean-parse rate must be 100% ({parsed}/{total}); 4.11 must not drop any real trigger"
+    );
+    // Provenance for the documented 812/812 figure: these particular fixtures
+    // yield 812 triggers. Pin it so a fixture swap that changes the count is a
+    // conscious update, not a silent drift of the acceptance figure.
+    assert_eq!(total, 812, "expected 812 real triggers across kfm.cns + common1.cns, got {total}");
 }

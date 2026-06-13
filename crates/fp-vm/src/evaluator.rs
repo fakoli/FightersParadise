@@ -88,8 +88,12 @@
 //! - **`AnimElem = N, op M`** — the two-parameter element-time comparison
 //!   ([`Expr::AnimElemTail`]) evaluates to
 //!   "element `N` reached **and** `AnimElemTime(N) op M`".
-//! - **Dotted call arguments** — `GetHitVar(fall.yvel)` lexes the dotted member
-//!   as one identifier, which the trigger resolver receives as the argument key.
+//! - **Member-keyed triggers** — `GetHitVar(member)` selects a hit field *by
+//!   name* (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`). The member is a bare
+//!   identifier (a dotted member like `fall.yvel` lexes as one identifier); the
+//!   evaluator passes that name verbatim through
+//!   [`EvalContext::trigger_str`] rather than collapsing it to a number, so the
+//!   context identifies which field was requested (task 4.11, item a).
 //! - **`command = "name"`** — string-equality routes through
 //!   [`EvalContext::command_active`] (a boolean string-keyed seam) instead of a
 //!   numeric read, so the comparison actually fires when the command is active.
@@ -841,27 +845,55 @@ fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
         // `random(lo, hi)` (inclusive integer range) through the entity-owned RNG
         // seam (§11). With no args it is [0,999].
         "random" => eval_random(args, ctx),
-        // ---- Otherwise: a parameterized trigger ----
-        _ => {
-            // Evaluate the arguments left-to-right into Values for the lookup.
-            // A string argument has no numeric Value; the two real-content
-            // string-arg shapes are encoded so the context can still
-            // distinguish them (task 4.10):
-            //   * an axis word (`Vel Y` → Str("Y")) maps to its axis code
-            //     X=0 / Y=1 / Z=2 (see `axis_arg_code`);
-            //   * any other string argument (e.g. `GetHitVar(...)` uses an
-            //     Ident, not a Str, so this is rare) maps to the safe default 0.
-            let mut evaluated = Vec::with_capacity(args.len());
-            for a in args {
-                let v = match a {
-                    Expr::Str(s) => Value::Int(axis_arg_code(s)),
-                    other => eval_inner(other, ctx).into_value(),
-                };
-                evaluated.push(v);
+        // ---- Member-keyed triggers: argument is a named field, not a number ----
+        // `GetHitVar(member)` selects a hit field BY NAME (`GetHitVar(fall.yvel)`,
+        // `GetHitVar(xveladd)`). The member is a bare identifier; routing it
+        // through the numeric `trigger` path would lose which field was asked for
+        // (a `Value` has no string variant). So when the sole argument is a bare
+        // identifier we pass the member NAME verbatim through the string-keyed
+        // `trigger_str` seam (task 4.11, item a). Any non-ident argument (a rare
+        // numeric/computed form) falls through to the ordinary numeric path
+        // below.
+        _ if is_member_keyed_trigger(&lname) => {
+            if let [Expr::Ident(member)] = args {
+                Eval::from_value(ctx.trigger_str(name, member))
+            } else {
+                eval_numeric_trigger(name, args, ctx)
             }
-            Eval::from_value(ctx.trigger(name, &evaluated))
         }
+        // ---- Otherwise: a parameterized trigger ----
+        _ => eval_numeric_trigger(name, args, ctx),
     }
+}
+
+/// Returns whether `lname` (already lowercased) is a **member-keyed** trigger:
+/// one whose argument is a named field rather than a number, so a bare-identifier
+/// argument is routed through [`EvalContext::trigger_str`] instead of the numeric
+/// [`EvalContext::trigger`] path (task 4.11, item a).
+///
+/// Currently this is exactly `GetHitVar`, the one real-content trigger whose
+/// argument (`fall.yvel`, `xveladd`, `animtype`, …) is an arbitrary field label.
+fn is_member_keyed_trigger(lname: &str) -> bool {
+    lname == "gethitvar"
+}
+
+/// Evaluates a parameterized trigger via the numeric [`EvalContext::trigger`]
+/// path: arguments are evaluated left-to-right into [`Value`]s for the lookup.
+///
+/// A string argument has no numeric [`Value`]; the real-content string-arg shape
+/// is the axis word (`Vel Y` → `Str("Y")`), which maps to its axis code
+/// `X=0` / `Y=1` / `Z=2` (see [`axis_arg_code`]). Any other string maps to the
+/// safe default `0`.
+fn eval_numeric_trigger(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
+    let mut evaluated = Vec::with_capacity(args.len());
+    for a in args {
+        let v = match a {
+            Expr::Str(s) => Value::Int(axis_arg_code(s)),
+            other => eval_inner(other, ctx).into_value(),
+        };
+        evaluated.push(v);
+    }
+    Eval::from_value(ctx.trigger(name, &evaluated))
 }
 
 /// Implements `random` / `random(lo, hi)` via the entity-owned RNG seam (§11).
@@ -952,11 +984,18 @@ mod tests {
         key
     }
 
+    /// Renders `(name, member)` into a stable, case-insensitive lookup key for
+    /// the member-keyed trigger path (`GetHitVar(member)`).
+    fn member_key(name: &str, member: &str) -> String {
+        format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+    }
+
     /// An in-memory [`EvalContext`] for evaluator tests, with a deterministic RNG
     /// seam so `random` is reproducible.
     #[derive(Default)]
     struct MockContext {
         triggers: HashMap<String, Value>,
+        member_triggers: HashMap<String, Value>,
         vars: HashMap<i32, i32>,
         fvars: HashMap<i32, f32>,
         sysvars: HashMap<i32, i32>,
@@ -970,6 +1009,11 @@ mod tests {
         }
         fn with_trigger(mut self, name: &str, args: &[Value], value: Value) -> Self {
             self.triggers.insert(trigger_key(name, args), value);
+            self
+        }
+        fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
+            self.member_triggers
+                .insert(member_key(name, member), value);
             self
         }
         fn with_var(mut self, index: i32, value: i32) -> Self {
@@ -998,6 +1042,12 @@ mod tests {
         fn trigger(&self, name: &str, args: &[Value]) -> Value {
             self.triggers
                 .get(&trigger_key(name, args))
+                .copied()
+                .unwrap_or(Value::DEFAULT)
+        }
+        fn trigger_str(&self, name: &str, key: &str) -> Value {
+            self.member_triggers
+                .get(&member_key(name, key))
                 .copied()
                 .unwrap_or(Value::DEFAULT)
         }
@@ -2679,21 +2729,61 @@ mod tests {
         assert_eq!(ev("AnimElem = 3, -1", &ctx), Value::Int(0));
     }
 
-    // ---- Gap 3: dotted member names in call args ----
+    // ---- Item (a): member-keyed GetHitVar passes the member NAME as the key ----
 
     #[test]
-    fn dotted_call_arg_passes_through_to_trigger() {
-        // `GetHitVar(fall.yvel)` — the dotted name is the argument key. The mock
-        // keys on the rendered (name, args); a string-keyed arg is not numeric, so
-        // here we register the trigger by its 0-arg key would be wrong. Instead the
-        // evaluator evaluates `fall.yvel` as an Ident: an unknown ident → 0, so the
-        // arg becomes Int(0). Pin that the lookup happens with the evaluated arg.
+    fn gethitvar_member_arg_passes_name_through_string_seam() {
+        // `GetHitVar(member)` must route through `trigger_str` with the member
+        // NAME, not evaluate the member as a nested trigger and pass its value
+        // (task 4.11, item a). A context that keys on the member name returns the
+        // field's value; distinct member names give distinct values.
         let ctx = MockContext::new()
-            .with_trigger("gethitvar", &[Value::Int(0)], Value::Int(42));
-        // `fall.yvel` is an unknown trigger → 0, so the arg is Int(0).
-        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx), Value::Int(42));
-        // It also never panics and yields a concrete value when nothing matches.
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
+            .with_member_trigger("GetHitVar", "xveladd", Value::Int(7));
+        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx), Value::Float(-4.5));
+        assert_eq!(ev("GetHitVar(xveladd)", &ctx), Value::Int(7));
+        // An unknown member → safe default 0, never a panic.
+        assert_eq!(ev("GetHitVar(nosuchfield)", &ctx), Value::Int(0));
         assert_eq!(ev("GetHitVar(xveladd)", &MockContext::new()), Value::Int(0));
+    }
+
+    #[test]
+    fn gethitvar_does_not_evaluate_member_as_nested_trigger() {
+        // The lossy "evaluate the member ident as a nested trigger, pass its
+        // value" path is GONE: seeding the member name as an ordinary numeric
+        // trigger must NOT affect the GetHitVar read (the member is a string key,
+        // not a value). Here `fall.yvel` is seeded as a numeric trigger AND as the
+        // GetHitVar 0-arg key that the old behavior would have hit — neither must
+        // be consulted; only the member-keyed seam is.
+        let ctx = MockContext::new()
+            .with_trigger("fall.yvel", &[], Value::Int(7))
+            .with_trigger("gethitvar", &[Value::Int(7)], Value::Int(99))
+            .with_trigger("gethitvar", &[Value::Int(0)], Value::Int(123))
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Int(55));
+        // Only the member-keyed value is returned — not 99 (old: member→7→arg) nor
+        // 123 (old: unknown member→0→arg).
+        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx), Value::Int(55));
+    }
+
+    #[test]
+    fn gethitvar_multi_segment_member_routes_through_string_seam() {
+        // A three-segment dotted member is one identifier; it routes through the
+        // string seam by its full name (task 4.11, item a).
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.envshake.time", Value::Int(5));
+        assert_eq!(ev("GetHitVar(fall.envshake.time)", &ctx), Value::Int(5));
+    }
+
+    #[test]
+    fn gethitvar_through_redirect_uses_target_member_seam() {
+        // `enemy, GetHitVar(fall.yvel)` reads the member from the REDIRECTED
+        // context's member seam, never the local one.
+        let enemy = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-9.0));
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
+            .with_redirect(Redirect::Enemy, enemy);
+        assert_eq!(ev("enemy, GetHitVar(fall.yvel)", &ctx), Value::Float(-9.0));
     }
 
     // ---- Gap 4: `command = "name"` string equality ----
@@ -2804,10 +2894,11 @@ mod tests {
 
     #[test]
     fn animelem_tail_family_members_all_resolve_via_animelemtime() {
-        // Every family member lowers to a read of AnimElemTime(N); the trigger
-        // name on the AST is diagnostic only. Confirm AnimElemTime / TimeMod /
-        // AnimElemNo heads all compute the same conjunction against the same seed.
-        for head in ["AnimElem", "AnimElemTime", "AnimElemNo", "TimeMod"] {
+        // Both comparison-tail family members lower to a read of AnimElemTime(N);
+        // the trigger name on the AST is diagnostic only. After task 4.11 item
+        // (b) the family is exactly AnimElem + AnimElemTime (TimeMod / AnimElemNo
+        // are no longer mis-folded into this form — see the parser tests).
+        for head in ["AnimElem", "AnimElemTime"] {
             let ctx = MockContext::new()
                 .with_trigger("animelemtime", &[Value::Int(4)], Value::Int(3));
             let src = format!("{head} = 4, >= 0");
@@ -2868,34 +2959,42 @@ mod tests {
         assert_eq!(ev("AnimElem = 2, > 0", &ctx), Value::Int(0));
     }
 
-    // ---- Gap 3: dotted member arg — nested-trigger value-passing semantics ----
+    // ---- Item (a): member arg passes the member NAME through the string seam ----
 
     #[test]
-    fn dotted_arg_is_evaluated_as_nested_trigger_then_passed_by_value() {
-        // IMPORTANT semantic note (reported behavior): a dotted member arg like
-        // `fall.yvel` is NOT passed to GetHitVar as the string key "fall.yvel".
-        // The lexer makes it one Ident, and the evaluator evaluates that Ident as
-        // a nested trigger (`trigger("fall.yvel", &[])`), then passes its *value*
-        // as GetHitVar's argument. So a context can answer GetHitVar by first
-        // resolving the member ident. Here: seed fall.yvel → 7, and GetHitVar
-        // keyed on arg 7 → 99.
+    fn member_arg_routes_by_name_not_by_nested_trigger_value() {
+        // Task 4.11 item (a): `GetHitVar(fall.yvel)` passes the member NAME
+        // ("fall.yvel") through `trigger_str` — it does NOT evaluate `fall.yvel`
+        // as a nested numeric trigger and pass the resulting value. To prove the
+        // old lossy path is gone, seed `fall.yvel` as a numeric trigger (the old
+        // behavior would resolve it to 7 and look up GetHitVar(7)); the result
+        // must come from the member seam instead.
         let ctx = MockContext::new()
             .with_trigger("fall.yvel", &[], Value::Int(7))
-            .with_trigger("gethitvar", &[Value::Int(7)], Value::Int(99));
-        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx), Value::Int(99));
-        // With fall.yvel unseeded it is 0, so GetHitVar is looked up with arg 0.
-        let ctx2 = MockContext::new()
-            .with_trigger("gethitvar", &[Value::Int(0)], Value::Int(123));
-        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx2), Value::Int(123));
+            .with_trigger("gethitvar", &[Value::Int(7)], Value::Int(99))
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5));
+        assert_eq!(ev("GetHitVar(fall.yvel)", &ctx), Value::Float(-4.5));
     }
 
     #[test]
-    fn dotted_arg_multi_segment_member_evaluates_without_panic() {
-        // A three-segment member is one nested-trigger ident; unknown → 0, so the
-        // outer call reads with arg 0. Never panics.
+    fn member_arg_distinct_names_distinct_values() {
+        // Distinct member names yield distinct values through the string seam —
+        // the property a numeric value-passing path could never provide.
         let ctx = MockContext::new()
-            .with_trigger("gethitvar", &[Value::Int(0)], Value::Int(5));
+            .with_member_trigger("GetHitVar", "animtype", Value::Int(2))
+            .with_member_trigger("GetHitVar", "groundtype", Value::Int(1));
+        assert_eq!(ev("GetHitVar(animtype)", &ctx), Value::Int(2));
+        assert_eq!(ev("GetHitVar(groundtype)", &ctx), Value::Int(1));
+    }
+
+    #[test]
+    fn member_arg_multi_segment_member_routes_by_name() {
+        // A three-segment member is one identifier; it routes by its full name.
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.envshake.time", Value::Int(5));
         assert_eq!(ev("GetHitVar(fall.envshake.time)", &ctx), Value::Int(5));
+        // Unknown member → safe default, never a panic.
+        assert_eq!(ev("GetHitVar(fall.envshake.time)", &MockContext::new()), Value::Int(0));
     }
 
     // ---- Gap 4: command string equality — OR chains, chained edge, case ----
@@ -2967,5 +3066,225 @@ mod tests {
         }
         assert_eq!(ev("command = \"x\"", &TriggerOnly), Value::Int(0));
         assert_eq!(ev("command != \"x\"", &TriggerOnly), Value::Int(1));
+    }
+
+    // =====================================================================
+    // Proctor (task 4.11) — focused hardening of the three correctness
+    // follow-ups, exercised end-to-end through parse->eval where the existing
+    // suite only pinned the parse tree or a single eval case. Grouped by item.
+    // =====================================================================
+
+    // ---- Item (a): GetHitVar / member-arg STRING key — eval-path edges ----
+
+    #[test]
+    fn gethitvar_trigger_name_is_case_insensitive_through_eval() {
+        // The member-keyed dispatch keys on the lowercased trigger name, so any
+        // casing of `GetHitVar` must route through the string seam (item a). The
+        // member name itself is forwarded verbatim and matched per the context's
+        // own (case-insensitive) table.
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5));
+        for src in ["GetHitVar(fall.yvel)", "gethitvar(fall.yvel)", "GETHITVAR(fall.yvel)", "GetHitVar(FALL.YVEL)"] {
+            assert_eq!(ev(src, &ctx), Value::Float(-4.5), "{src}");
+        }
+    }
+
+    #[test]
+    fn gethitvar_non_ident_arg_falls_through_to_numeric_path() {
+        // The member seam only fires for a SINGLE BARE-IDENTIFIER argument. A
+        // computed / numeric argument (`GetHitVar(1+1)`, `GetHitVar(var(0))`) is
+        // not a member name, so it falls through to the ordinary numeric
+        // `trigger` path with the EVALUATED arg — it must NOT touch `trigger_str`.
+        // Seed both seams; only the numeric one must be consulted.
+        let ctx = MockContext::new()
+            .with_var(0, 2)
+            .with_trigger("GetHitVar", &[Value::Int(2)], Value::Int(70))
+            .with_member_trigger("GetHitVar", "2", Value::Int(999)); // must NOT be hit
+        // `GetHitVar(1+1)` → arg evaluates to 2 → numeric trigger("GetHitVar",[2]).
+        assert_eq!(ev("GetHitVar(1+1)", &ctx), Value::Int(70));
+        // `GetHitVar(var(0))` → var(0)=2 → same numeric lookup.
+        assert_eq!(ev("GetHitVar(var(0))", &ctx), Value::Int(70));
+    }
+
+    #[test]
+    fn gethitvar_zero_and_multi_arg_forms_use_numeric_path() {
+        // Only the single-bare-ident shape is member-keyed. A zero-arg or
+        // multi-arg call is not, so it routes numerically and never panics.
+        let ctx = MockContext::new()
+            .with_trigger("GetHitVar", &[], Value::Int(11))
+            .with_trigger("GetHitVar", &[Value::Int(1), Value::Int(2)], Value::Int(22));
+        // Build the AST forms directly (the surface syntax is unusual but legal).
+        let zero = Expr::Call { name: "GetHitVar".into(), args: vec![] };
+        assert_eq!(eval(&zero, &ctx), Value::Int(11));
+        let two = Expr::Call {
+            name: "GetHitVar".into(),
+            args: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        assert_eq!(eval(&two, &ctx), Value::Int(22));
+    }
+
+    #[test]
+    fn gethitvar_member_value_type_is_preserved_through_eval() {
+        // The member seam returns whatever Value the field holds; an int field
+        // stays int, a float field stays float — proving no lossy int-collapse.
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "animtype", Value::Int(2))
+            .with_member_trigger("GetHitVar", "yvel", Value::Float(-6.25));
+        let int_v = ev("GetHitVar(animtype)", &ctx);
+        assert_eq!(int_v, Value::Int(2));
+        assert!(int_v.is_int());
+        let flt_v = ev("GetHitVar(yvel)", &ctx);
+        assert_eq!(flt_v, Value::Float(-6.25));
+        assert!(flt_v.is_float());
+    }
+
+    #[test]
+    fn gethitvar_member_composes_in_arithmetic_and_comparison() {
+        // The member read is an ordinary atom in a larger expression: it composes
+        // in arithmetic (with float promotion) and comparisons, end to end.
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.0));
+        assert_eq!(ev("GetHitVar(fall.yvel) + 1.0", &ctx), Value::Float(-3.0));
+        assert_eq!(ev("GetHitVar(fall.yvel) < 0", &ctx), Value::Int(1));
+        assert_eq!(ev("GetHitVar(fall.yvel) > 0", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn gethitvar_default_trigger_str_yields_zero_not_panic() {
+        // A context that does NOT override `trigger_str` inherits the trait
+        // default (every member → 0). The eval path must use it and never panic.
+        struct NoHitVars;
+        impl EvalContext for NoHitVars {
+            fn trigger(&self, _n: &str, _a: &[Value]) -> Value {
+                // Even if `trigger` would return nonzero, the member path must use
+                // `trigger_str` (default 0), proving the routing, not this value.
+                Value::Int(42)
+            }
+        }
+        assert_eq!(ev("GetHitVar(fall.yvel)", &NoHitVars), Value::Int(0));
+        // And as a condition it never fires.
+        assert_eq!(ev("GetHitVar(fall.yvel) || 0", &NoHitVars), Value::Int(0));
+    }
+
+    // ---- Item (b): TimeMod / AnimElemNo are NOT AnimElemTime semantics ----
+
+    #[test]
+    fn timemod_bare_equality_evaluates_as_ordinary_trigger_not_animelemtime() {
+        // `TimeMod = 2` (no comma tail) is a plain equality on the `TimeMod`
+        // trigger read — it must NOT be lowered through AnimElemTime. Seed the
+        // `TimeMod` trigger and an AnimElemTime that the WRONG (old) path would
+        // have hit; only the ordinary `TimeMod` read may be consulted.
+        let ctx = MockContext::new()
+            .with_trigger("TimeMod", &[], Value::Int(2))
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0)); // decoy
+        assert_eq!(ev("TimeMod = 2", &ctx), Value::Int(1));
+        let ctx = MockContext::new().with_trigger("TimeMod", &[], Value::Int(5));
+        assert_eq!(ev("TimeMod = 2", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn animelemno_bare_equality_evaluates_as_ordinary_trigger() {
+        // `AnimElemNo = 3` is an ordinary equality on the `AnimElemNo` read, not a
+        // tail form. (Real MUGEN `AnimElemNo` is the parameterized `AnimElemNo(t)`;
+        // either way it is not the comparison-tail family — item b.)
+        let ctx = MockContext::new().with_trigger("AnimElemNo", &[], Value::Int(3));
+        assert_eq!(ev("AnimElemNo = 3", &ctx), Value::Int(1));
+        assert_eq!(ev("AnimElemNo = 9", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn timemod_comma_tail_is_recoverable_error_not_wrong_eval() {
+        // The crux of item (b): `TimeMod = 2, op M` must NOT fold into an
+        // AnimElemTail (which would give it AnimElemTime semantics). It is a
+        // recoverable parse error, so it can never be evaluated with the wrong
+        // meaning. Confirm via the public parse API (eval is unreachable for it).
+        for src in ["TimeMod = 2, >= 0", "timemod = 4, 1", "AnimElemNo = 2, >= 0"] {
+            let err = parse_str(src).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnexpectedToken { .. }),
+                "{src:?} must degrade to a recoverable error, got {err:?}"
+            );
+        }
+    }
+
+    // ---- Item (c): AnimElem tail binds at relational precedence (eval-path) ----
+
+    #[test]
+    fn animelem_tail_trailing_and_is_separate_conjunct_at_eval() {
+        // Item (c), end-to-end: `AnimElem = 2, >= 0 && Time > 0` is
+        // `(tail) && (Time>0)`, NOT a tail whose operand swallowed `0 && Time>0`.
+        // Wire the tail to be TRUE and Time to make the second conjunct FALSE; the
+        // AND must then be 0. If the `&&` had been swallowed into the operand the
+        // result would differ, so this distinguishes the trees semantically.
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0)) // reached, time 0
+            .with_trigger("Time", &[], Value::Int(0)); // Time > 0 is FALSE
+        assert_eq!(ev("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(0));
+
+        // Now make BOTH conjuncts true → 1.
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0))
+            .with_trigger("Time", &[], Value::Int(5));
+        assert_eq!(ev("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(1));
+
+        // Tail FALSE, second conjunct TRUE → 0 (the && short-circuits on the tail).
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(-1)) // not reached
+            .with_trigger("Time", &[], Value::Int(5));
+        assert_eq!(ev("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn animelem_tail_trailing_or_is_separate_disjunct_at_eval() {
+        // The `||` variant: `AnimElem = 2, > 5 || Time > 0`. Tail FALSE (time 0 is
+        // not > 5) but Time>0 TRUE → the OR is 1, proving the disjunct is NOT
+        // swallowed into the tail operand.
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0))
+            .with_trigger("Time", &[], Value::Int(5));
+        assert_eq!(ev("AnimElem = 2, > 5 || Time > 0", &ctx), Value::Int(1));
+        // Both false → 0.
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0))
+            .with_trigger("Time", &[], Value::Int(0));
+        assert_eq!(ev("AnimElem = 2, > 5 || Time > 0", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn animelem_tail_operand_additive_is_absorbed_at_eval() {
+        // The operand DOES absorb additive (`+ -`): `AnimElem = 2, >= 1 + 1`
+        // compares element-time against 2. With time 2 it holds; with time 1 it
+        // does not — proving `1 + 1` is the single operand `2`.
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(2));
+        assert_eq!(ev("AnimElem = 2, >= 1 + 1", &ctx), Value::Int(1));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(1));
+        assert_eq!(ev("AnimElem = 2, >= 1 + 1", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn animelem_tail_trailing_relational_binds_tail_as_left_operand() {
+        // A trailing relational (`= 1`) also binds the folded tail, not the
+        // operand: `AnimElem = 2, >= 0 = 1` is `(tail) = 1`. The tail is 1 when
+        // reached, so `(1) = 1` → 1; flip the tail to 0 and `(0) = 1` → 0.
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0));
+        assert_eq!(ev("AnimElem = 2, >= 0 = 1", &ctx), Value::Int(1));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(-1));
+        assert_eq!(ev("AnimElem = 2, >= 0 = 1", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn animelem_tail_real_combo_shape_evaluates_correctly() {
+        // A realistic combined shape mixing the tail with a parenthesized guard:
+        // `(AnimElem = 2, >= 0) && Time > 0`. The parenthesized tail does NOT fold
+        // (documented degrade), so this specific paren form is a parse error —
+        // pin it, and confirm the UN-parenthesized equivalent evaluates correctly.
+        assert!(matches!(
+            parse_str("(AnimElem = 2, >= 0) && Time > 0"),
+            Err(ParseError::UnexpectedToken { .. })
+        ));
+        let ctx = MockContext::new()
+            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0))
+            .with_trigger("Time", &[], Value::Int(3));
+        assert_eq!(ev("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(1));
     }
 }

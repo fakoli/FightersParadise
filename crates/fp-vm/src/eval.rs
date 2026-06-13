@@ -56,14 +56,21 @@
 //! redirections **never panic**: they yield `Value::Int(0)` (or `None` for a
 //! redirect), matching the spec's safe-default contract.
 //!
-//! ## String-keyed queries (`command = "name"`)
+//! ## String-keyed queries (`command = "name"`, `GetHitVar(member)`)
 //!
-//! Most triggers are numeric, but MUGEN's `command` trigger is compared against
-//! a quoted *command name* (`command = "fwd"`). Because the right-hand side is a
-//! string with no numeric [`Value`], the evaluator routes `command = "name"`
-//! (in either operand order) through [`EvalContext::command_active`], a boolean
-//! string-keyed seam, rather than the numeric [`EvalContext::trigger`] path. See
-//! that method and [task 4.10's evaluator notes](crate::evaluator) for details.
+//! Most triggers are numeric, but two MUGEN forms are keyed by a *name*, not a
+//! number, and [`Value`] has no string variant — so each gets its own seam:
+//!
+//! - **`command = "name"`** — the `command` trigger is compared against a quoted
+//!   *command name* (`command = "fwd"`). The evaluator routes `command = "name"`
+//!   (in either operand order) through [`EvalContext::command_active`], a boolean
+//!   string-keyed seam, rather than the numeric [`EvalContext::trigger`] path.
+//! - **`GetHitVar(member)`** — `GetHitVar` selects a hit field *by name*
+//!   (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`). The member name is an
+//!   arbitrary label, so the evaluator routes the call through
+//!   [`EvalContext::trigger_str`], passing the member name verbatim as the key
+//!   rather than collapsing it to a number. See that method and [task 4.11's
+//!   evaluator notes](crate::evaluator) for details.
 //!
 //! [kb]: ../../../docs/knowledge-base/07-evaluator-semantics.md
 
@@ -359,6 +366,10 @@ impl fmt::Display for Redirect {
 ///   through [`trigger`](EvalContext::trigger) (`"var"` / `"fvar"` / `"sysvar"`)
 ///   so a context that only overrides `trigger` still works; a concrete entity
 ///   may override them to read its variable arrays directly.
+/// - [`trigger_str`](EvalContext::trigger_str) is the **member-keyed** path for
+///   triggers whose argument is a named field rather than a number — currently
+///   `GetHitVar(member)`. The member name is passed through verbatim so the
+///   context can identify *which* hit field was requested (see that method).
 pub trait EvalContext {
     /// Reads a trigger or state value by (case-insensitive) name, given its
     /// already-evaluated arguments.
@@ -371,6 +382,46 @@ pub trait EvalContext {
     /// Returns [`Value::DEFAULT`] (`0`) for any unrecognized name or invalid
     /// argument — it must never panic.
     fn trigger(&self, name: &str, args: &[Value]) -> Value;
+
+    /// Reads a trigger whose argument is a **named field key** rather than a
+    /// numeric value, given the (case-insensitive) trigger name and the
+    /// (case-preserved) member key.
+    ///
+    /// ## Why a separate, string-keyed path exists
+    ///
+    /// A handful of MUGEN triggers are parameterized by a *named field*, not a
+    /// number. The canonical case is `GetHitVar`: `GetHitVar(fall.yvel)`,
+    /// `GetHitVar(xveladd)`, `GetHitVar(animtype)` each select a distinct field
+    /// of the most-recent hit, identified **by name**. The field name is an
+    /// arbitrary label (`fall.yvel`, `xveladd`, `fall.envshake.time`), not an
+    /// index, so it cannot be carried through the numeric
+    /// [`trigger`](EvalContext::trigger) path: [`Value`] has no string variant,
+    /// so collapsing the member to a number would lose *which* field was asked
+    /// for. This method is the seam that preserves the member name end-to-end.
+    ///
+    /// The evaluator routes a member-arg call — a call whose single argument is a
+    /// bare identifier, for the recognized member-keyed trigger names (currently
+    /// `GetHitVar`) — here, passing the identifier verbatim as `key`. All other
+    /// calls keep using the numeric [`trigger`](EvalContext::trigger) path with
+    /// evaluated [`Value`] arguments.
+    ///
+    /// ## Contract
+    ///
+    /// Like every method here it is infallible: an unrecognized trigger name or
+    /// member key returns [`Value::DEFAULT`] (`0`), never a panic. The trigger
+    /// name should be matched case-insensitively (MUGEN is case-insensitive);
+    /// MUGEN's `GetHitVar` field names are conventionally compared
+    /// case-insensitively too, so an implementation should use
+    /// [`str::eq_ignore_ascii_case`] against its field table.
+    ///
+    /// The default implementation returns [`Value::DEFAULT`] for every key, so a
+    /// context that does not model hit vars reports `0` for every member read. A
+    /// concrete entity (task Phase 5, `fp-character`) overrides this to read its
+    /// `GetHitVar` field table.
+    fn trigger_str(&self, name: &str, key: &str) -> Value {
+        let _ = (name, key);
+        Value::DEFAULT
+    }
 
     /// Reads integer variable `var(index)`.
     ///
@@ -604,6 +655,13 @@ mod tests {
         key
     }
 
+    /// Renders `(name, member)` into a stable, case-insensitive lookup key for
+    /// the member-keyed trigger path (`GetHitVar(member)`). Both the trigger name
+    /// and the member are lowercased so the lookup is case-insensitive.
+    fn member_key(name: &str, member: &str) -> String {
+        format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+    }
+
     /// A simple in-memory [`EvalContext`] backed by lookup tables, for
     /// deterministic evaluation tests.
     ///
@@ -616,6 +674,9 @@ mod tests {
     struct MockContext {
         /// Trigger values keyed by the rendered (name, args) string.
         triggers: HashMap<String, Value>,
+        /// Member-keyed trigger values (e.g. `GetHitVar(member)`), keyed by the
+        /// rendered `(lowercased name, lowercased member)` string.
+        member_triggers: HashMap<String, Value>,
         /// Integer variable bank (`var(i)`).
         vars: HashMap<i32, i32>,
         /// Float variable bank (`fvar(i)`).
@@ -634,6 +695,14 @@ mod tests {
         /// Registers a trigger value under the given name + args.
         fn with_trigger(mut self, name: &str, args: &[Value], value: Value) -> Self {
             self.triggers.insert(trigger_key(name, args), value);
+            self
+        }
+
+        /// Registers a member-keyed trigger value (e.g. `GetHitVar(member)`),
+        /// keyed case-insensitively on both the trigger name and the member.
+        fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
+            self.member_triggers
+                .insert(member_key(name, member), value);
             self
         }
 
@@ -662,6 +731,13 @@ mod tests {
         fn trigger(&self, name: &str, args: &[Value]) -> Value {
             self.triggers
                 .get(&trigger_key(name, args))
+                .copied()
+                .unwrap_or(Value::DEFAULT)
+        }
+
+        fn trigger_str(&self, name: &str, key: &str) -> Value {
+            self.member_triggers
+                .get(&member_key(name, key))
                 .copied()
                 .unwrap_or(Value::DEFAULT)
         }
@@ -725,6 +801,39 @@ mod tests {
         assert_eq!(ctx.trigger("AnimElemTime", &[Value::Int(3)]), Value::Int(-1));
         // Different arg → not found → default.
         assert_eq!(ctx.trigger("AnimElemTime", &[Value::Int(9)]), Value::Int(0));
+    }
+
+    #[test]
+    fn mock_trigger_str_distinguishes_member_names() {
+        // The member-keyed seam (`GetHitVar(member)`) must return distinct values
+        // for distinct member NAMES — that is the whole point of the string key
+        // (the member name cannot be recovered from a numeric Value).
+        let ctx = MockContext::new()
+            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
+            .with_member_trigger("GetHitVar", "xveladd", Value::Int(7))
+            .with_member_trigger("GetHitVar", "animtype", Value::Int(2));
+        assert_eq!(ctx.trigger_str("GetHitVar", "fall.yvel"), Value::Float(-4.5));
+        assert_eq!(ctx.trigger_str("GetHitVar", "xveladd"), Value::Int(7));
+        assert_eq!(ctx.trigger_str("GetHitVar", "animtype"), Value::Int(2));
+        // Case-insensitive on both name and member.
+        assert_eq!(ctx.trigger_str("gethitvar", "FALL.YVEL"), Value::Float(-4.5));
+        // Unknown member → safe default 0, never a panic.
+        assert_eq!(ctx.trigger_str("GetHitVar", "nosuchfield"), Value::DEFAULT);
+    }
+
+    #[test]
+    fn default_trigger_str_is_safe_default() {
+        // A context that does not model hit vars inherits the default
+        // `trigger_str`, returning 0 for every member key (never a panic).
+        struct TriggerOnly;
+        impl EvalContext for TriggerOnly {
+            fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+                Value::Int(1)
+            }
+        }
+        let ctx = TriggerOnly;
+        assert_eq!(ctx.trigger_str("GetHitVar", "fall.yvel"), Value::DEFAULT);
+        assert_eq!(ctx.trigger_str("GetHitVar", ""), Value::DEFAULT);
     }
 
     #[test]

@@ -285,8 +285,9 @@ pub enum Expr {
     /// [`Expr::Binary`] equality — this variant is produced *only* when the
     /// comma tail is present.
     AnimElemTail {
-        /// The trigger name as written (case preserved): `AnimElem`,
-        /// `AnimElemTime`, `TimeMod`, etc.
+        /// The trigger name as written (case preserved): `AnimElem` or
+        /// `AnimElemTime` — the two members of the `AnimElem` family that accept
+        /// the `= N, op M` comparison tail.
         name: String,
         /// The element number `N` (the right-hand side of the leading `= N`).
         element: Box<Expr>,
@@ -480,6 +481,15 @@ fn binary_binding_power(kind: &TokenKind) -> Option<(u8, BinaryOp)> {
     Some(pair)
 }
 
+/// The binding power of the relational operators (`= == != < <= > >=`), level 4
+/// in the precedence table. The secondary operand `M` of an `AnimElem = N, op M`
+/// tail is parsed as a relational *right-hand side*, i.e. at `RELATIONAL_BP + 1`,
+/// so it binds additive (`+ -`) and tighter but stops before relational, bitwise,
+/// `&&`, and `||` — preventing a trailing `&& …` / `|| …` from being swallowed
+/// into the operand (task 4.11, item c). Kept in sync with the level-4 entries in
+/// [`binary_binding_power`].
+const RELATIONAL_BP: u8 = 4;
+
 /// Maps a relational-operator token to its [`BinaryOp`], or [`None`] if the
 /// token is not a comparison operator. Used to read the optional operator in the
 /// `AnimElem = N, op M` comma-tail form (task 4.10, gap 2).
@@ -498,10 +508,29 @@ fn relational_op(kind: &TokenKind) -> Option<BinaryOp> {
 /// Returns whether `name` (matched case-insensitively) is a member of the
 /// `AnimElem` trigger family that accepts the two-parameter
 /// `= N, op M` comparison tail (task 4.10, gap 2).
+///
+/// ## Membership (task 4.11, item b)
+///
+/// Only `AnimElem` and `AnimElemTime` use the `= N, op M` comparison-tail form,
+/// which the evaluator lowers to "element `N` reached **and** `AnimElemTime(N)
+/// op M`". `TimeMod` and `AnimElemNo` were previously (wrongly) admitted here:
+///
+/// - **`TimeMod`** means `(Time % A) op B` — a modulo-of-time test entirely
+///   unrelated to element time. Folding it into the AnimElem tail gave it
+///   AnimElemTime semantics, which is simply incorrect.
+/// - **`AnimElemNo`** is the function-form `AnimElemNo(time)` (the element number
+///   at a time offset), not a comparison-tail trigger at all.
+///
+/// Neither is part of the comparison-tail family, so both are excluded here.
+/// They consequently degrade to recoverable parse errors (a trailing comma with
+/// no fold → [`ParseError::UnexpectedToken`]) rather than parsing into a node
+/// with the wrong meaning. Implementing their distinct semantics is left to a
+/// future task; the real KFM fixtures use neither in comma-tail form, so the
+/// clean-parse rate is unaffected.
 fn is_animelem_family(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "animelem" | "animelemtime" | "animelemno" | "timemod"
+        "animelem" | "animelemtime"
     )
 }
 
@@ -656,9 +685,17 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let mut lhs = self.parse_prefix()?;
+        let lhs = self.parse_prefix()?;
+        self.fold_binary_ops(lhs, min_bp)
+    }
 
-        // Left-fold binary operators with binding power >= min_bp.
+    /// Left-folds binary operators with binding power `>= min_bp` onto an
+    /// already-parsed `lhs` (precedence climbing). This is the operator loop of
+    /// [`parse_expr`], factored out so the `AnimElem` comma-tail fold can resume
+    /// the loop with the folded tail as its left operand — letting a trailing
+    /// `&& …` / `|| …` bind the tail correctly instead of being stranded
+    /// (task 4.11, item c).
+    fn fold_binary_ops(&mut self, mut lhs: Expr, min_bp: u8) -> Result<Expr, ParseError> {
         while let Some(tok) = self.peek() {
             let Some((bp, op)) = binary_binding_power(&tok.kind) else {
                 break;
@@ -783,8 +820,8 @@ impl<'a> Parser<'a> {
     ///
     /// The current token must be the top-level `,`. The supplied `expr` must be
     /// an equality `Binary { op: Eq, lhs, rhs }` whose `lhs` names a member of
-    /// the `AnimElem` trigger family (`AnimElem`, `AnimElemTime`, `TimeMod`,
-    /// `AnimElemNo`); the `rhs` is the element number `N`. On a match this
+    /// the `AnimElem` comparison-tail family (`AnimElem` or `AnimElemTime`; see
+    /// [`is_animelem_family`]); the `rhs` is the element number `N`. On a match this
     /// consumes the comma and the tail (`[op] M`, where an omitted operator
     /// defaults to `=`) and returns the folded node. On any non-match it returns
     /// `Ok(None)` **without consuming** the comma, so the caller's
@@ -836,7 +873,11 @@ impl<'a> Parser<'a> {
             self.advance();
         }
 
-        // The secondary operand `M` is a full expression.
+        // The secondary operand `M` binds as a relational *right-hand side*, NOT
+        // a full expression: parse at `RELATIONAL_BP + 1` so it absorbs additive
+        // (`+ -`) and tighter operators but STOPS before relational, bitwise,
+        // `&&`, and `||`. This prevents `AnimElem = 2, >= 0 && Time > 0` from
+        // greedily swallowing `&& Time > 0` into the operand (task 4.11, item c).
         if self.is_at_end() {
             return Err(ParseError::UnexpectedEof {
                 expected: "a comparison operand after the AnimElem tail operator".to_string(),
@@ -845,14 +886,22 @@ impl<'a> Parser<'a> {
         // Guard against an immediate second comma (`AnimElem = 2,,`) producing a
         // confusing error: parse_expr will report the comma as unexpected.
         let _ = comma_col;
-        let operand = self.parse_expr(0)?;
+        let operand = self.parse_expr(RELATIONAL_BP + 1)?;
 
-        Ok(Some(Expr::AnimElemTail {
+        let tail = Expr::AnimElemTail {
             name: name.clone(),
             element: rhs.clone(),
             op,
             operand: Box::new(operand),
-        }))
+        };
+
+        // Resume the binary left-fold with the tail as the left operand, so a
+        // trailing `&& …` / `|| …` binds the whole tail correctly:
+        // `AnimElem = 2, >= 0 && Time > 0` parses as `(AnimElem tail) && (Time>0)`,
+        // not by absorbing the `&&` into the operand (task 4.11, item c). With no
+        // trailing operator this is a no-op and returns the bare tail.
+        let folded = self.fold_binary_ops(tail, 0)?;
+        Ok(Some(folded))
     }
 
     /// Scans an `(id)` redirect index starting at `open` (which must index the
@@ -2953,7 +3002,10 @@ mod tests {
     #[test]
     fn animelem_tail_all_family_members_parse() {
         // Every family member named in `is_animelem_family` accepts the tail.
-        for name in ["AnimElem", "AnimElemTime", "AnimElemNo", "TimeMod"] {
+        // After task 4.11 item (b) the family is exactly AnimElem + AnimElemTime;
+        // TimeMod / AnimElemNo are NOT comparison-tail triggers (see the next
+        // test, which pins that they now degrade to a recoverable error).
+        for name in ["AnimElem", "AnimElemTime"] {
             let src = format!("{name} = 2, >= 0");
             let ast = parse_str(&src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
             match ast {
@@ -2965,6 +3017,30 @@ mod tests {
                 }
                 other => panic!("{src:?} should fold to AnimElemTail, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn timemod_and_animelemno_are_not_comparison_tail_triggers() {
+        // Task 4.11 item (b): `TimeMod` (`(Time % A) op B`) and `AnimElemNo`
+        // (function-form `AnimElemNo(time)`) are NOT part of the AnimElem
+        // comparison-tail family. A `<name> = N, op M` shape for either must NOT
+        // fold into an AnimElemTail with (wrong) AnimElemTime semantics; instead
+        // the trailing comma is stranded and surfaces as a recoverable
+        // trailing-token error — never a panic, never a silently-wrong tree.
+        for name in ["TimeMod", "AnimElemNo"] {
+            let src = format!("{name} = 2, >= 0");
+            let err = parse_str(&src).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnexpectedToken { .. }),
+                "{src:?} should degrade to a recoverable error, got {err:?}"
+            );
+            // The bare `<name> = N` equality (no comma tail) still parses as an
+            // ordinary equality — only the comma-tail fold is withdrawn.
+            assert_eq!(
+                parse_str(&format!("{name} = 2")).unwrap(),
+                bin(BinaryOp::Eq, ident(name), int(2)),
+            );
         }
     }
 
@@ -2999,45 +3075,74 @@ mod tests {
     }
 
     #[test]
-    fn animelem_tail_fold_is_top_level_only_documented_limitation() {
-        // KNOWN LIMITATION (reported to Forge): the `= N, op M` fold is attempted
-        // ONLY at the very top of the parse, when the comma is the immediate next
-        // token after the full expression AND that full expression is exactly a
-        // `<family> = N` equality. Consequences, all pinned here so a future change
-        // is a conscious one:
-        //
-        //  (a) A standalone line folds correctly (the real-content shape — all four
-        //      kfm.cns occurrences are standalone `trigger1 = AnimElem = N, ...`).
+    fn animelem_tail_does_not_swallow_trailing_logical_operator() {
+        // Task 4.11 item (c): the secondary operand `M` binds at RELATIONAL
+        // precedence, so a trailing `&& …` / `|| …` is NOT swallowed into the
+        // operand. `AnimElem = 2, >= 0 && Time > 0` must parse as
+        // `(AnimElem tail) && (Time > 0)` — the tail's operand is just `0`.
+        match parse_str("AnimElem = 2, >= 0 && Time > 0").unwrap() {
+            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+                // LHS is the folded tail with operand `0` (NOT `0 && …`).
+                match *lhs {
+                    Expr::AnimElemTail { op, ref operand, .. } => {
+                        assert_eq!(op, BinaryOp::Ge);
+                        assert_eq!(**operand, int(0), "operand must be just `0`");
+                    }
+                    other => panic!("LHS should be the AnimElemTail, got {other:?}"),
+                }
+                // RHS is the trailing `Time > 0`.
+                assert_eq!(*rhs, bin(BinaryOp::Gt, ident("Time"), int(0)));
+            }
+            other => panic!("expected `(tail) && (Time > 0)`, got {other:?}"),
+        }
+
+        // The `||` variant binds the same way.
+        match parse_str("AnimElem = 2, >= 0 || Time > 0").unwrap() {
+            Expr::Binary { op: BinaryOp::Or, lhs, rhs } => {
+                assert!(matches!(*lhs, Expr::AnimElemTail { .. }));
+                assert_eq!(*rhs, bin(BinaryOp::Gt, ident("Time"), int(0)));
+            }
+            other => panic!("expected `(tail) || (Time > 0)`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_operand_absorbs_additive_but_not_relational() {
+        // The operand binds additive (`+ -`) and tighter (so an arithmetic
+        // secondary like `, >= N + 1` works) but stops before a following
+        // relational/`&&`. `AnimElem = 2, >= 1 + 1` → operand is `1 + 1`.
+        match parse_str("AnimElem = 2, >= 1 + 1").unwrap() {
+            Expr::AnimElemTail { ref operand, .. } => {
+                assert_eq!(**operand, bin(BinaryOp::Add, int(1), int(1)));
+            }
+            other => panic!("expected AnimElemTail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_standalone_and_degenerate_cases() {
+        // (a) A standalone line folds correctly — the real-content shape (all
+        //     kfm.cns occurrences are standalone `trigger1 = AnimElem = N, …`).
         assert!(matches!(
             parse_str("AnimElem = 2, >= 0"),
             Ok(Expr::AnimElemTail { .. })
         ));
-        //  (b) A *parenthesized* tail does NOT fold: inside `(...)` the comma is
-        //      read as a range separator and the `op` after it is a stray token.
-        //      Recoverable error, never a panic.
+        // (b) A *parenthesized* tail cleanly DEGRADES (it does not fold): inside
+        //     `(...)` the comma is read as a range separator and the trailing `op`
+        //     is a stray token → recoverable error, never a panic, never a
+        //     silently-wrong tree.
         assert!(matches!(
             parse_str("(AnimElem = 2, >= 0)"),
             Err(ParseError::UnexpectedToken { .. })
         ));
-        //  (c) When the family equality is buried inside a larger boolean on its
-        //      LEFT, the comma is stranded and surfaces as a trailing-token error.
+        // (c) When the family equality is buried inside a larger boolean on its
+        //     LEFT, the top-level expr is the `&&`, not a bare `<family> = N`
+        //     equality, so the fold declines and the stranded comma surfaces as a
+        //     recoverable trailing-token error (clean degrade, no wrong tree).
         assert!(matches!(
             parse_str("Time > 0 && AnimElem = 2, >= 0"),
             Err(ParseError::UnexpectedToken { .. })
         ));
-        //  (d) When it is on the LEFT of the line, the tail operand greedily
-        //      absorbs the trailing boolean (`>= 0 && Time > 0` becomes the
-        //      operand). It still parses to an AnimElemTail (no panic), but the
-        //      operand is the whole `0 && ...` — a mis-binding to be aware of.
-        match parse_str("AnimElem = 2, >= 0 && Time > 0").unwrap() {
-            Expr::AnimElemTail { operand, .. } => {
-                assert!(
-                    matches!(*operand, Expr::Binary { op: BinaryOp::And, .. }),
-                    "operand greedily absorbs the && tail: {operand:?}"
-                );
-            }
-            other => panic!("expected AnimElemTail, got {other:?}"),
-        }
     }
 
     // ---- Gap 3: dotted member args — multi-dot, composition ----
@@ -3127,6 +3232,199 @@ mod tests {
         assert_eq!(
             parse_str("command = \"\"").unwrap(),
             bin(BinaryOp::Eq, ident("command"), str_lit(""))
+        );
+    }
+
+    // =====================================================================
+    // Proctor (task 4.11) — parser binding-edge hardening for the three
+    // correctness follow-ups. These pin AST shapes the existing suite left
+    // implicit: the tail operand stopping before EVERY non-additive class,
+    // case-insensitive TimeMod/AnimElemNo exclusion, and the left-side strand.
+    // =====================================================================
+
+    // ---- Item (c): tail operand stops before each non-additive operator class ----
+
+    #[test]
+    fn animelem_tail_operand_does_not_swallow_trailing_relational() {
+        // A trailing relational (`= 1`) must bind the folded TAIL as its left
+        // operand, not be absorbed into the tail's secondary operand. So
+        // `AnimElem = 2, >= 0 = 1` is `(tail{op:Ge, operand:0}) = 1`.
+        match parse_str("AnimElem = 2, >= 0 = 1").unwrap() {
+            Expr::Binary { op: BinaryOp::Eq, lhs, rhs } => {
+                match *lhs {
+                    Expr::AnimElemTail { op, ref operand, .. } => {
+                        assert_eq!(op, BinaryOp::Ge);
+                        assert_eq!(**operand, int(0), "operand must be just `0`, not `0 = 1`");
+                    }
+                    other => panic!("LHS should be AnimElemTail, got {other:?}"),
+                }
+                assert_eq!(*rhs, int(1));
+            }
+            other => panic!("expected `(tail) = 1`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_operand_does_not_swallow_trailing_bitwise() {
+        // A trailing bitwise (`| 1`) also binds the folded tail, since bitwise sits
+        // BELOW relational in MUGEN precedence: `AnimElem = 2, >= 0 | 1` is
+        // `(tail) | 1` — the operand is just `0`.
+        match parse_str("AnimElem = 2, >= 0 | 1").unwrap() {
+            Expr::Binary { op: BinaryOp::BitOr, lhs, rhs } => {
+                assert!(matches!(*lhs, Expr::AnimElemTail { ref operand, .. } if **operand == int(0)));
+                assert_eq!(*rhs, int(1));
+            }
+            other => panic!("expected `(tail) | 1`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_operand_does_not_swallow_chained_logical() {
+        // A chain `&& a || b` binds the whole tail at the outermost (lowest-prec)
+        // operator: `AnimElem = 2, >= 0 && a || b` is `((tail && a) || b)`, with
+        // the tail's operand still just `0`.
+        match parse_str("AnimElem = 2, >= 0 && a || b").unwrap() {
+            Expr::Binary { op: BinaryOp::Or, lhs, rhs } => {
+                match *lhs {
+                    Expr::Binary { op: BinaryOp::And, lhs: inner_l, rhs: inner_r } => {
+                        assert!(matches!(*inner_l, Expr::AnimElemTail { ref operand, .. } if **operand == int(0)));
+                        assert_eq!(*inner_r, ident("a"));
+                    }
+                    other => panic!("LHS should be `tail && a`, got {other:?}"),
+                }
+                assert_eq!(*rhs, ident("b"));
+            }
+            other => panic!("expected `(tail && a) || b`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_omitted_op_operand_stops_at_logical() {
+        // The omitted-operator (defaults to `=`) shape binds the trailing `&&`
+        // the same way: `AnimElem = 2, 1 && Time` is `(tail{op:Eq,operand:1}) && Time`.
+        match parse_str("AnimElem = 2, 1 && Time").unwrap() {
+            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+                match *lhs {
+                    Expr::AnimElemTail { op, ref operand, .. } => {
+                        assert_eq!(op, BinaryOp::Eq);
+                        assert_eq!(**operand, int(1));
+                    }
+                    other => panic!("LHS should be the omitted-op tail, got {other:?}"),
+                }
+                assert_eq!(*rhs, ident("Time"));
+            }
+            other => panic!("expected `(tail) && Time`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_operand_absorbs_subtraction_and_multiplication() {
+        // The operand absorbs the full additive+multiplicative band (everything
+        // ABOVE relational): `AnimElem = 2, >= 1 + 2 * 3` → operand `1 + (2*3)`.
+        match parse_str("AnimElem = 2, >= 1 + 2 * 3").unwrap() {
+            Expr::AnimElemTail { ref operand, op, .. } => {
+                assert_eq!(op, BinaryOp::Ge);
+                assert_eq!(
+                    **operand,
+                    bin(BinaryOp::Add, int(1), bin(BinaryOp::Mul, int(2), int(3)))
+                );
+            }
+            other => panic!("expected AnimElemTail with arithmetic operand, got {other:?}"),
+        }
+    }
+
+    // ---- Item (c): parenthesized and left-side cases degrade cleanly ----
+
+    #[test]
+    fn animelem_tail_left_side_equality_strands_comma_cleanly() {
+        // When the family equality is on the LEFT of a larger boolean, the
+        // top-level expr is the `&&`/`||`, not a bare `<family> = N`, so the fold
+        // declines and the stranded comma is a recoverable trailing-token error.
+        for src in [
+            "Time > 0 && AnimElem = 2, >= 0",
+            "1 || AnimElem = 2, >= 0",
+            "AnimElem = 2 && AnimElem = 3, >= 0",
+        ] {
+            let err = parse_str(src).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnexpectedToken { .. }),
+                "{src:?} should cleanly degrade, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn animelem_tail_parenthesized_does_not_fold() {
+        // Inside parens the comma is a range separator; the trailing `op` strands.
+        // Both the bare-paren and the in-expression-paren forms degrade cleanly.
+        for src in ["(AnimElem = 2, >= 0)", "(AnimElem = 2, >= 0) && Time"] {
+            assert!(
+                matches!(parse_str(src), Err(ParseError::UnexpectedToken { .. })),
+                "{src:?} should be a recoverable error"
+            );
+        }
+    }
+
+    // ---- Item (b): TimeMod / AnimElemNo are NOT comparison-tail (case-insensitive) ----
+
+    #[test]
+    fn timemod_animelemno_excluded_from_family_all_casings() {
+        // The family exclusion is case-insensitive: every casing of TimeMod /
+        // AnimElemNo with a comma tail must degrade, never fold.
+        for src in [
+            "TimeMod = 2, >= 0",
+            "timemod = 2, >= 0",
+            "TIMEMOD = 2, 1",
+            "AnimElemNo = 2, >= 0",
+            "animelemno = 2, 1",
+            "ANIMELEMNO = 5, < 3",
+        ] {
+            let err = parse_str(src).unwrap_err();
+            assert!(
+                matches!(err, ParseError::UnexpectedToken { .. }),
+                "{src:?} must not fold into an AnimElemTail, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timemod_animelemno_bare_equality_is_ordinary_binary() {
+        // Without a comma tail, both are plain equalities (and the parameterized
+        // `AnimElemNo(t)` is an ordinary call) — only the comma-tail fold is gone.
+        assert_eq!(
+            parse_str("TimeMod = 2").unwrap(),
+            bin(BinaryOp::Eq, ident("TimeMod"), int(2))
+        );
+        assert_eq!(
+            parse_str("AnimElemNo = 3").unwrap(),
+            bin(BinaryOp::Eq, ident("AnimElemNo"), int(3))
+        );
+        assert_eq!(
+            parse_str("AnimElemNo(5)").unwrap(),
+            call("AnimElemNo", vec![int(5)])
+        );
+    }
+
+    // ---- Item (a): GetHitVar dotted member vs. numeric arg parse shapes ----
+
+    #[test]
+    fn gethitvar_numeric_and_computed_args_parse_as_plain_calls() {
+        // A bare-ident arg is a member (routed to the string seam by the
+        // evaluator); a numeric / computed arg is an ordinary call argument. The
+        // PARSER produces a plain Call for both — the member/numeric split is an
+        // evaluator concern — but the arg subtrees differ, which is what lets the
+        // evaluator distinguish them.
+        assert_eq!(
+            parse_str("GetHitVar(fall.yvel)").unwrap(),
+            call("GetHitVar", vec![ident("fall.yvel")])
+        );
+        assert_eq!(
+            parse_str("GetHitVar(0)").unwrap(),
+            call("GetHitVar", vec![int(0)])
+        );
+        assert_eq!(
+            parse_str("GetHitVar(1 + 1)").unwrap(),
+            call("GetHitVar", vec![bin(BinaryOp::Add, int(1), int(1))])
         );
     }
 }
