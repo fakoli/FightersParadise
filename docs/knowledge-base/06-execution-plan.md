@@ -127,7 +127,11 @@ finalized fp-vm `EvalContext`. **Phase 4 is complete** (4.1–4.6, 4.8, 4.10, 4.
 | 5.2 | DONE | **Character loader** (.def → ready Character) | `fp-character` | ✅ `LoadedCharacter::load` — parses .def, loads+merges SFF/AIR/CNS(+stcommon)/CMD/SND, reads `[Data]` constants, compiles all exprs via fp-vm (bad→const-0+warn). Real `kfm.def` loads end-to-end (gated). 5.1 AnimElemTime sentinel fixed; tracing used. 844 tests. Commit `e8b9775`. SHOULD_FIX: `[Size]/[Velocity]/[Movement]` constants → **5.3**; merge-order/I-O-dedup/cmd-snd-error nits → CB16-18. | 5.1 |
 | 5.3 | DONE | **State-machine executor** (+ full constants) | `fp-character` | ✅ `Character::tick()` — `-3/-2/-1/current` order; triggerall+group gating w/ **CB6 contiguity**; persistent/ignorehitpause; state entry + ChangeState; anim advance from AIR; statedef physics (S/C friction, A gravity). Dispatch: ChangeState/VelSet/VelAdd/CtrlSet/Null. Constants `[Size]/[Velocity]/[Movement]` loaded (5.2 overclaim fixed). Gated KFM 30-frame tick. 912 tests. Commit `eba6d70`. SHOULD_FIX → 5.4. | 5.1, 5.2 |
 | 5.4 | DONE | **Core state controllers** (+ 5.3 fixes) | `fp-character` | ✅ ChangeAnim(2), PosSet/Add, VarSet/Add/VarRangeSet (all banks), StateTypeSet, Turn, PlaySnd-stub — data-driven. All 4 5.3 fixes landed (jump.up 2-comp, fire_counts keying, exit-clause, prev_state test). 177 fp-character / 960 workspace tests. Commit `3173af0`. SHOULD_FIX (StateTypeSet expr-token test, VarRangeSet doc reword, ignorehitpause clarity) → CB19-21. | 5.3 |
-| 5.5 | DOING | **fp-app integration** (KFM moves from CNS) | `fp-app`+`fp-character` | Load KFM via `LoadedCharacter` (incl. **merging the `.cmd` file's `[Statedef -1]`** command→state handler — the CMD parser skips statedefs, so without this input can't drive transitions); each frame feed fp-input commands into the Character's `CommandSource`, call `Character::tick()`, render the current anim element at the entity pos/facing; **retire the hardcoded SM**. Headless test: synthetic input drives CNS transitions (e.g. forward→walk state 20). Visual `cargo run` flagged for the user. | 5.4 |
+| 5.5 | DONE | **fp-app integration** (KFM moves from CNS) | `fp-app`+`fp-character` | ✅ **PHASE 5 DONE** — fp-app loads KFM, feeds input→commands, ticks the CNS state machine, renders the current AIR frame; hardcoded SM removed; loader merges `.cmd` `[Statedef -1]`. Headless test (runs): hold-Forward→walk state 20→stand. 979 tests; clippy clean. Commit `ccebde1`. **Band-aids** (inject walk bridge, drop `alive`, strip `$`/`>`) mask engine gaps → **5.6**. | 5.4 |
+| 5.6 | SPLIT | **Engine-gap fixes** (faithful KFM) — split into 5.6a/b/c | — | Original combined task BLOCKED (workflow's single-crate scope-guard boxed the agent in fp-input). Re-split per crate (each fits the workflow + is more reviewable). **Loop policy learned: workflow tasks = ONE crate; multi-crate work must be split (or use a direct agent for genuinely atomic cross-crate changes).** | 5.5 |
+| 5.6a | DONE | fp-input `$`/`>` command symbols | `fp-input` | ✅ `$` (direction-detect) + `>` (strict) in compile_command/CommandMatcher; `/$F` (holdfwd) compiles + matches when forward held (incl. diagonals). +16 tests. 1061 workspace tests. | 5.5 |
+| 5.6b | DOING | `alive` trigger (+ common-state trigger audit) | `fp-character` | Add `alive` => Life>0 to EvalContext (currently defaults 0 → `!alive` true → common stand state ChangeStates to death 5050; the fp-app band-aid masks this). Audit other trivially-missing common-state triggers. Tested. | 5.5 |
+| 5.6c | TODO | Remove fp-app band-aids (faithful KFM walk) | `fp-app` | Now that fp-input ($/>) + fp-character (alive) are fixed, delete `normalize_command`/`drop_unevaluable_alive_controllers`/`inject_default_movement` + call sites; KFM walks from its OWN merged CNS/CMD bridge. Strengthen the headless test (vel.x>0 in state 20) and ensure it passes WITHOUT band-aids. | 5.6a, 5.6b |
 
 ### Phase 6 — `fp-combat`  *(expand when reached)*
 HitDef application; Clsn1×Clsn2 overlap; priority/trade; damage; guard; p1/p2 state-takeover;
@@ -204,6 +208,12 @@ parallelizable once the core exists. Deps: Phase 7.
   the engine's safe-default; reword for doc honesty. *(added 5.4 iter)*
 - **CB21** `executor.rs` `ignorehitpause` is compiled+stored but not read in dispatch (deferred to
   hitpause); add a visible reference/note at the dispatch site. *(added 5.4 iter)*
+- **CB22** fp-app `drop_unevaluable_alive_controllers` matches `alive` by substring (`contains`);
+  use a word-boundary/token check. *(superseded once 5.6 adds the `alive` trigger)*
+- **CB23** fp-app `inject_default_movement` walk-bridge detection compares ChangeState value source
+  to `"20"` literally; would mis-skip on `20.0`/`16+4`. *(superseded once 5.6 removes the injection)*
+- **CB24** fp-app headless walk test asserts `pos.x >= x_before` (a stationary char passes too);
+  strengthen to `vel.x > 0` / strictly advancing while in state 20. *(added 5.5 iter)*
 
 ---
 

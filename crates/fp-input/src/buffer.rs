@@ -1,7 +1,8 @@
 //! Input ring buffer for frame history.
 //!
-//! Stores the last [`BUFFER_SIZE`] frames of input so that the command matcher
-//! can scan backward through recent history to detect special-move sequences.
+//! Stores the last `BUFFER_SIZE` (60) frames of input so that the command
+//! matcher can scan backward through recent history to detect special-move
+//! sequences.
 
 use crate::state::InputState;
 
@@ -125,6 +126,89 @@ mod tests {
         }
         assert_eq!(buf.len(), 60);
         // Frame 60 ago is out of range (valid range is 0..59)
+        assert!(buf.get(60).is_none());
+    }
+
+    // -- Proctor: additional buffer-layer coverage ------------------------
+
+    #[test]
+    fn empty_buffer_invariants() {
+        let buf = InputBuffer::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        // Any get on an empty buffer is None, never a panic or stale default.
+        assert!(buf.get(0).is_none());
+        assert!(buf.get(1).is_none());
+        assert!(buf.get(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn default_matches_new() {
+        // `Default` must produce the same empty buffer as `new()`.
+        let buf = InputBuffer::default();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        assert!(buf.get(0).is_none());
+    }
+
+    #[test]
+    fn single_push_boundary() {
+        let mut buf = InputBuffer::new();
+        let mut s = InputState::default();
+        s.set_button(Button::C, true);
+        buf.push(s);
+
+        assert!(!buf.is_empty());
+        assert_eq!(buf.len(), 1);
+        // Offset 0 is the only valid frame; offset 1 is one-past-the-end.
+        assert!(buf.get(0).unwrap().button(Button::C));
+        assert!(buf.get(1).is_none());
+    }
+
+    #[test]
+    fn ordering_is_lifo_by_offset() {
+        // Frame N pushed last must be at offset 0; ordering must be strictly
+        // most-recent-first as the matcher relies on this for backward scans.
+        let mut buf = InputBuffer::new();
+        // Encode a distinct, recognizable payload per frame via Start button on
+        // even frames only.
+        for i in 0..5u8 {
+            let mut s = InputState::default();
+            s.set_button(Button::Start, i % 2 == 0);
+            buf.push(s);
+        }
+        // Pushed i = 0,1,2,3,4. Most recent (offset 0) is i=4 (even => Start).
+        assert!(buf.get(0).unwrap().button(Button::Start)); // i=4
+        assert!(!buf.get(1).unwrap().button(Button::Start)); // i=3
+        assert!(buf.get(2).unwrap().button(Button::Start)); // i=2
+        assert!(!buf.get(3).unwrap().button(Button::Start)); // i=1
+        assert!(buf.get(4).unwrap().button(Button::Start)); // i=0
+    }
+
+    #[test]
+    fn exact_capacity_then_overflow_evicts_oldest() {
+        let mut buf = InputBuffer::new();
+        // Push exactly 60: oldest (i=0) is reachable at offset 59.
+        for i in 0..60u32 {
+            let s = InputState {
+                direction: Direction {
+                    up: i == 0, // mark only the very first frame
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            buf.push(s);
+        }
+        assert_eq!(buf.len(), 60);
+        assert!(buf.get(59).unwrap().direction.up, "oldest frame still i=0");
+
+        // One more push evicts i=0; the frame at offset 59 is now i=1 (no up).
+        buf.push(InputState::default());
+        assert_eq!(buf.len(), 60, "len saturates at capacity");
+        assert!(
+            !buf.get(59).unwrap().direction.up,
+            "oldest frame i=0 must have been evicted"
+        );
         assert!(buf.get(60).is_none());
     }
 }

@@ -147,6 +147,36 @@ pub fn dir_matches(logical: &LogicalDirection, token: DirToken) -> bool {
     }
 }
 
+/// Checks if a [`LogicalDirection`] matches a [`DirToken`] in *direction-detect*
+/// mode (the MUGEN `$` prefix).
+///
+/// Unlike [`dir_matches`], direction-detect does **not** require an exact match
+/// of the whole stick. It only requires that the token's component axis (or
+/// axes) be held, ignoring whatever else is pressed — except the directly
+/// opposing axis, which must not be held. This is what makes `$F` (and the
+/// `holdfwd` command built from `/$F`) fire while the player holds Forward at
+/// *any* vertical angle (F, UF, or DF), the way MUGEN does.
+///
+/// Concretely:
+/// - `$F` is satisfied by F, UF, or DF (forward held, back not held).
+/// - `$B` is satisfied by B, UB, or DB (back held, forward not held).
+/// - `$U` is satisfied by U, UF, or UB (up held, down not held).
+/// - `$D` is satisfied by D, DF, or DB (down held, up not held).
+/// - Diagonals require both component axes held, with neither opposing axis
+///   held (e.g. `$UF` needs up and forward, but not down or back).
+pub fn dir_matches_detect(logical: &LogicalDirection, token: DirToken) -> bool {
+    match token {
+        DirToken::U => logical.up && !logical.down,
+        DirToken::D => logical.down && !logical.up,
+        DirToken::F => logical.forward && !logical.back,
+        DirToken::B => logical.back && !logical.forward,
+        DirToken::UF => logical.up && logical.forward && !logical.down && !logical.back,
+        DirToken::UB => logical.up && logical.back && !logical.down && !logical.forward,
+        DirToken::DF => logical.down && logical.forward && !logical.up && !logical.back,
+        DirToken::DB => logical.down && logical.back && !logical.up && !logical.forward,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +245,214 @@ mod tests {
         assert!(dir_matches(&logical, DirToken::DF));
         assert!(!dir_matches(&logical, DirToken::D));
         assert!(!dir_matches(&logical, DirToken::F));
+    }
+
+    #[test]
+    fn dir_matches_detect_axis_held() {
+        // `$F` (direction-detect forward) fires on F, UF and DF, but not back.
+        let fwd = LogicalDirection {
+            forward: true,
+            ..Default::default()
+        };
+        let up_fwd = LogicalDirection {
+            forward: true,
+            up: true,
+            ..Default::default()
+        };
+        let down_fwd = LogicalDirection {
+            forward: true,
+            down: true,
+            ..Default::default()
+        };
+        let back = LogicalDirection {
+            back: true,
+            ..Default::default()
+        };
+        assert!(dir_matches_detect(&fwd, DirToken::F));
+        assert!(dir_matches_detect(&up_fwd, DirToken::F));
+        assert!(dir_matches_detect(&down_fwd, DirToken::F));
+        assert!(!dir_matches_detect(&back, DirToken::F));
+
+        // Plain (non-detect) cardinal `F` rejects the diagonals.
+        assert!(!dir_matches(&up_fwd, DirToken::F));
+        assert!(!dir_matches(&down_fwd, DirToken::F));
+    }
+
+    #[test]
+    fn dir_matches_detect_opposing_axis_excluded() {
+        // Both forward and back held simultaneously is ambiguous: neither
+        // `$F` nor `$B` should fire.
+        let both = LogicalDirection {
+            forward: true,
+            back: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&both, DirToken::F));
+        assert!(!dir_matches_detect(&both, DirToken::B));
+    }
+
+    // -- Proctor: additional state-layer coverage -------------------------
+
+    #[test]
+    fn logical_direction_facing_left_back_mapping() {
+        // Facing LEFT: hardware right is Back, hardware left is Forward.
+        // This is the mirror of the facing-right case and underpins
+        // facing-relative command matching on side switch.
+        let dir = Direction {
+            right: true,
+            ..Default::default()
+        };
+        let logical = logical_direction(&dir, false);
+        assert!(!logical.forward, "hardware right is Back when facing left");
+        assert!(logical.back, "hardware right is Back when facing left");
+    }
+
+    #[test]
+    fn logical_direction_preserves_vertical_axes() {
+        // Up/Down are facing-independent; they must pass through unchanged
+        // regardless of facing.
+        let dir = Direction {
+            up: true,
+            down: true,
+            ..Default::default()
+        };
+        for facing_right in [true, false] {
+            let logical = logical_direction(&dir, facing_right);
+            assert!(logical.up);
+            assert!(logical.down);
+        }
+    }
+
+    #[test]
+    fn dir_matches_cardinal_requires_pure_axis() {
+        // MUGEN cardinal (non-detect) F requires *no other* axis held: UF must
+        // not satisfy plain F. (This is precisely why holdfwd uses `$F`, not F.)
+        let up_fwd = LogicalDirection {
+            forward: true,
+            up: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches(&up_fwd, DirToken::F));
+        assert!(!dir_matches(&up_fwd, DirToken::U));
+        // ...but the diagonal token UF accepts it.
+        assert!(dir_matches(&up_fwd, DirToken::UF));
+    }
+
+    #[test]
+    fn dir_matches_detect_all_cardinals() {
+        // Exhaustive: every cardinal `$` token fires on its own axis and on
+        // both adjacent diagonals, and is rejected by the opposite cardinal.
+        let cases = [
+            (DirToken::U, ("up",)),
+            (DirToken::D, ("down",)),
+            (DirToken::F, ("forward",)),
+            (DirToken::B, ("back",)),
+        ];
+        for (token, _) in cases {
+            // Build the pure-axis direction for this token.
+            let mut pure = LogicalDirection::default();
+            match token {
+                DirToken::U => pure.up = true,
+                DirToken::D => pure.down = true,
+                DirToken::F => pure.forward = true,
+                DirToken::B => pure.back = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                dir_matches_detect(&pure, token),
+                "{token:?} must fire on its pure axis"
+            );
+        }
+        // Opposite-cardinal rejection.
+        let up = LogicalDirection {
+            up: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&up, DirToken::D));
+        let fwd = LogicalDirection {
+            forward: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&fwd, DirToken::B));
+    }
+
+    #[test]
+    fn dir_matches_detect_diagonal_needs_both_axes() {
+        // `$DF` (detect down-forward) requires BOTH down and forward, and must
+        // reject either component alone or any opposing axis.
+        let df = LogicalDirection {
+            down: true,
+            forward: true,
+            ..Default::default()
+        };
+        assert!(dir_matches_detect(&df, DirToken::DF));
+
+        let only_down = LogicalDirection {
+            down: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&only_down, DirToken::DF));
+
+        let only_fwd = LogicalDirection {
+            forward: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&only_fwd, DirToken::DF));
+
+        // Opposing vertical axis held => reject.
+        let df_plus_up = LogicalDirection {
+            down: true,
+            forward: true,
+            up: true,
+            ..Default::default()
+        };
+        assert!(!dir_matches_detect(&df_plus_up, DirToken::DF));
+    }
+
+    #[test]
+    fn dir_matches_detect_neutral_matches_nothing() {
+        // A neutral stick satisfies no direction-detect token. (Critical: a
+        // hold-only holdfwd `/$F` with time=1 must NOT fire on neutral.)
+        let neutral = LogicalDirection::default();
+        for token in [
+            DirToken::U,
+            DirToken::D,
+            DirToken::F,
+            DirToken::B,
+            DirToken::UF,
+            DirToken::UB,
+            DirToken::DF,
+            DirToken::DB,
+        ] {
+            assert!(
+                !dir_matches_detect(&neutral, token),
+                "neutral must not satisfy {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn button_discriminants_are_unique_indices() {
+        // The InputState::buttons array is indexed by `Button as usize`; verify
+        // every variant maps to a distinct in-range slot so set/get never alias.
+        let all = [
+            Button::A,
+            Button::B,
+            Button::C,
+            Button::X,
+            Button::Y,
+            Button::Z,
+            Button::Start,
+        ];
+        let mut state = InputState::default();
+        for (i, &btn) in all.iter().enumerate() {
+            assert_eq!(btn as usize, i, "{btn:?} index drifted");
+            assert!((btn as usize) < BUTTON_COUNT);
+            state.set_button(btn, true);
+        }
+        // All seven independently set, none aliased.
+        for &btn in &all {
+            assert!(state.button(btn), "{btn:?} got clobbered (aliasing)");
+        }
     }
 }
