@@ -1,7 +1,7 @@
 //! SFF v2 sprite decompression routines.
 //!
-//! Implements the RLE8 decompression algorithm used by most SFF v2 sprite data.
-//! RLE5, LZ5, and PNG-based formats are stubbed with error returns.
+//! Implements the RLE8, RLE5, and LZ5 decompression algorithms used by SFF v2
+//! sprite data. PNG-based formats return an unsupported-format error.
 
 use fp_core::{FpError, FpResult};
 
@@ -51,7 +51,7 @@ pub fn decompress_rle8(data: &[u8]) -> FpResult<Vec<u8>> {
             i += 1;
 
             let actual_len = run_len.min(decompressed_size - output.len());
-            output.extend(std::iter::repeat(color).take(actual_len));
+            output.extend(std::iter::repeat_n(color, actual_len));
         }
     }
 
@@ -70,15 +70,27 @@ pub fn decompress_rle8(data: &[u8]) -> FpResult<Vec<u8>> {
 
 /// Decompresses RLE5-encoded sprite data.
 ///
-/// RLE5 encodes 5-bit palette indices (0–31). Each byte is split:
-/// - Lower 5 bits: color index
-/// - Upper 3 bits: flags (0 = run-length mode, 1–7 = literal count)
+/// RLE5 is MUGEN's two-level run encoder. The first 4 bytes are a little-endian
+/// `u32` giving the decompressed size; the codec stream follows.
 ///
-/// In run-length mode (flags == 0), the next byte gives the repeat count.
-/// In literal mode (flags == N where N in 1..=7), the color is output once,
-/// then N-1 additional bytes are read and their lower 5 bits output.
+/// The stream is a sequence of *packets*. Each packet begins with a header:
+/// - a **run-length** byte `rl` (full 8 bits),
+/// - a **data-length** byte whose low 7 bits (`dl`) count how many *additional*
+///   colour segments follow, and whose high bit flags whether an explicit colour
+///   byte is present,
+/// - if that flag is set, an explicit **colour** byte (a full 8 bits).
 ///
-/// The first 4 bytes are a little-endian u32 giving the decompressed size.
+/// The packet then emits the header colour (0 when the flag was clear) `rl + 1`
+/// times, followed by `dl` further segments. Each segment is a single byte that
+/// packs the colour in its low 5 bits and `run_length - 1` in its high 3 bits,
+/// so it emits `(byte >> 5) + 1` copies of `byte & 0x1f`.
+///
+/// This mirrors the reference Elecbyte / Ikemen GO `Rle5Decode`. The reference
+/// drives the inner loop with counters that fall *below zero* as sentinels
+/// (`rl < 0` ⇒ pull the next segment; `dl < 0` ⇒ end the packet), so the port
+/// uses signed `i32` counters. All indexing is bounds-checked and the read head
+/// saturates at the final byte, so malformed input yields a best-effort,
+/// zero-padded buffer rather than panicking (never-crash).
 pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
     if data.len() < 4 {
         return Err(FpError::parse(
@@ -90,55 +102,86 @@ pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
     let decompressed_size =
         u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
-    let mut output = Vec::with_capacity(decompressed_size);
-    let mut i = 4;
+    // A single SFF sprite is at most a few megapixels; reject absurd sizes from a
+    // corrupt prefix rather than attempting a multi-gigabyte allocation (never-crash).
+    const MAX_RLE5_OUTPUT: usize = 64 * 1024 * 1024;
+    if decompressed_size > MAX_RLE5_OUTPUT {
+        return Err(FpError::parse(
+            "SFF",
+            format!("RLE5 declared size {decompressed_size} exceeds sane limit ({MAX_RLE5_OUTPUT})"),
+        ));
+    }
 
-    while i < data.len() && output.len() < decompressed_size {
-        let d = data[i];
-        i += 1;
+    // The compressed stream begins after the 4-byte size prefix.
+    let rle = &data[4..];
+    let mut p = vec![0u8; decompressed_size];
 
-        let color_index = d & 0x1F;
-        let flags = (d >> 5) & 0x07;
+    if rle.is_empty() || decompressed_size == 0 {
+        return Ok(p);
+    }
 
-        if flags == 0 {
-            // Run-length mode: next byte is the repeat count
-            if i >= data.len() {
-                return Err(FpError::parse(
-                    "SFF",
-                    "RLE5 unexpected end of data during run-length read",
-                ));
+    // Saturating advance: like the reference decoder, `i` never moves past the
+    // final byte, so a truncated stream re-reads the last byte rather than
+    // overrunning — the output-size bound (`j < decompressed_size`) still
+    // terminates the loop because every outer packet writes at least one byte.
+    let next = |i: &mut usize| {
+        if *i < rle.len() - 1 {
+            *i += 1;
+        }
+    };
+
+    let mut i = 0usize; // read head into `rle`
+    let mut j = 0usize; // write head into `p`
+
+    while j < decompressed_size {
+        // Packet header: 8-bit run length, then a data byte whose low 7 bits are
+        // the count of *additional* colour segments and whose high bit flags an
+        // explicit colour byte.
+        let mut rl = rle[i] as i32;
+        next(&mut i);
+
+        let mut dl = (rle[i] & 0x7f) as i32;
+        let mut c = 0u8;
+        if rle[i] >> 7 != 0 {
+            next(&mut i);
+            c = rle[i];
+        }
+        next(&mut i);
+
+        // Emit the header colour `rl + 1` times, then `dl` further segments. The
+        // negative-going `rl`/`dl` counters mirror the reference exactly: when
+        // `rl` falls below zero we pull the next segment's colour (low 5 bits)
+        // and run length (high 3 bits); when `dl` falls below zero the packet is
+        // done. Because the first write always lands (the outer guard ensures
+        // `j < decompressed_size` on entry), the write head always advances.
+        loop {
+            if j < decompressed_size {
+                p[j] = c;
+                j += 1;
             }
-            let rle_count = data[i] as usize;
-            i += 1;
-
-            let actual_len = rle_count.min(decompressed_size - output.len());
-            output.extend(std::iter::repeat(color_index).take(actual_len));
-        } else {
-            // Literal mode: output the color, then flags-1 more literals
-            if output.len() < decompressed_size {
-                output.push(color_index);
-            }
-            for _ in 1..flags {
-                if i >= data.len() || output.len() >= decompressed_size {
+            rl -= 1;
+            if rl < 0 {
+                dl -= 1;
+                if dl < 0 {
                     break;
                 }
-                output.push(data[i] & 0x1F);
-                i += 1;
+                c = rle[i] & 0x1f;
+                rl = (rle[i] >> 5) as i32;
+                next(&mut i);
             }
         }
     }
 
-    // Pad with zeros if we didn't reach the expected size
-    if output.len() < decompressed_size {
+    if j < decompressed_size {
         tracing::warn!(
             expected = decompressed_size,
-            actual = output.len(),
+            actual = j,
             "RLE5 decompressed data shorter than expected, padding with zeros"
         );
-        output.resize(decompressed_size, 0);
+        // `p` is already zero-initialized to `decompressed_size`.
     }
 
-    Ok(output)
+    Ok(p)
 }
 
 /// Decompresses LZ5-encoded sprite data.
@@ -298,48 +341,64 @@ mod tests {
     }
 
     // ---- RLE5 tests ----
+    //
+    // These exercise the *real* MUGEN RLE5 codec (Elecbyte / Ikemen GO
+    // `Rle5Decode`), not the synthetic "5-bit colour + 3-bit flag" scheme the
+    // previous tests asserted. A packet is: an 8-bit run-length byte `rl`, a
+    // data byte (low 7 bits = count of additional segments `dl`, high bit =
+    // "explicit colour follows"), an optional full-byte colour, then `dl`
+    // segment bytes (`(b >> 5) + 1` copies of `b & 0x1f`). The header colour is
+    // emitted `rl + 1` times. Each sequence below is hand-traced in its comments.
 
     #[test]
-    fn rle5_run_length_mode() {
-        // Decompressed size = 5
-        // Byte: color=3, flags=0 -> run mode, next byte=5 -> output 3 five times
+    fn rle5_single_run_explicit_color() {
+        // size = 5. One packet, no extra segments, explicit colour 7.
+        //   rl byte   = 0x04            -> rl = 4  (emit colour rl+1 = 5 times)
+        //   data byte = 0x80            -> dl = 0, high bit set -> colour follows
+        //   colour    = 0x07            -> c = 7
+        //   inner: write 7 five times (rl: 4,3,2,1,0 then -1); dl-- = -1 -> stop.
         let data = [
-            5, 0, 0, 0, // decompressed size = 5
-            0x03,       // lower 5 bits = 3, upper 3 bits = 0 (run mode)
-            5,          // repeat count = 5
+            5, 0, 0, 0, //
+            0x04,       // rl = 4
+            0x80,       // dl = 0, explicit-colour flag set
+            0x07,       // colour = 7
         ];
         let result = decompress_rle5(&data).unwrap();
-        assert_eq!(result, vec![3, 3, 3, 3, 3]);
+        assert_eq!(result, vec![7, 7, 7, 7, 7]);
     }
 
     #[test]
-    fn rle5_literal_mode() {
-        // Decompressed size = 3
-        // Byte: color=1, flags=3 -> output color 1, then read 2 more literal bytes
+    fn rle5_implicit_zero_color_run() {
+        // size = 5. No explicit-colour flag -> header colour defaults to 0.
+        //   rl byte   = 0x04 -> rl = 4 (emit 0 five times)
+        //   data byte = 0x00 -> dl = 0, flag clear -> c stays 0
         let data = [
-            3, 0, 0, 0, // decompressed size = 3
-            0x61,       // flags=3 (0b011 << 5 = 0x60), color=1 (0x01) -> 0x61
-            0x42,       // lower 5 bits = 2 (flags ignored for subsequent)
-            0x63,       // lower 5 bits = 3
+            5, 0, 0, 0, //
+            0x04,       // rl = 4
+            0x00,       // dl = 0, no explicit colour -> colour 0
         ];
         let result = decompress_rle5(&data).unwrap();
-        assert_eq!(result, vec![1, 2, 3]);
+        assert_eq!(result, vec![0, 0, 0, 0, 0]);
     }
 
     #[test]
-    fn rle5_mixed() {
-        // Decompressed size = 7
-        // First: literal mode flags=2, color=5 -> output 5, then read 1 more (color=10)
-        // Second: run mode, color=7, count=5 -> output 7 five times
+    fn rle5_multi_segment_packet() {
+        // size = 6. One packet: header colour once, then two extra segments.
+        //   rl byte   = 0x00 -> rl = 0  (emit header colour rl+1 = 1 time)
+        //   data byte = 0x82 -> dl = 2, explicit-colour flag set
+        //   colour    = 0x05 -> c = 5   -> emit [5]
+        //   segment 1 = 0x23 -> colour 0x23&0x1f = 3, run (0x23>>5)+1 = 2 -> [3,3]
+        //   segment 2 = 0x47 -> colour 0x47&0x1f = 7, run (0x47>>5)+1 = 3 -> [7,7,7]
         let data = [
-            7, 0, 0, 0,
-            0x45,       // flags=2 (0b010 << 5 = 0x40), color=5 -> 0x45
-            0x0A,       // literal: lower 5 bits = 10
-            0x07,       // flags=0, color=7 -> run mode
-            5,          // repeat count = 5
+            6, 0, 0, 0, //
+            0x00,       // rl = 0
+            0x82,       // dl = 2, explicit-colour flag set
+            0x05,       // header colour = 5
+            0x23,       // segment: colour 3, run 2
+            0x47,       // segment: colour 7, run 3
         ];
         let result = decompress_rle5(&data).unwrap();
-        assert_eq!(result, vec![5, 10, 7, 7, 7, 7, 7]);
+        assert_eq!(result, vec![5, 3, 3, 7, 7, 7]);
     }
 
     #[test]
@@ -357,14 +416,60 @@ mod tests {
     }
 
     #[test]
-    fn rle5_truncated_run() {
-        // Run mode but no repeat-count byte follows
+    fn rle5_flag_clear_with_segments() {
+        // size = 4. Header data byte has the high bit CLEAR, so the header colour
+        // defaults to 0 and NO explicit colour byte is read; dl = 1 still pulls one
+        // segment.
+        //   rl byte = 0x00 -> rl = 0 (emit header colour 0 once) -> [0]
+        //   data    = 0x01 -> dl = 1, high bit clear -> colour 0, no colour byte
+        //   segment = 0x47 -> colour 7, run (0x47>>5)+1 = 3 -> [7,7,7]
+        let data = [4, 0, 0, 0, 0x00, 0x01, 0x47];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result, vec![0, 7, 7, 7]);
+    }
+
+    #[test]
+    fn rle5_multiple_packets() {
+        // size = 3. Packet 1: rl=1 -> emit colour 5 twice ([5,5]); Packet 2: rl=0 ->
+        // emit colour 9 once ([9]). Both set the explicit-colour flag (0x80).
         let data = [
-            5, 0, 0, 0,
-            0x03, // flags=0 (run mode), color=3, but no count byte
+            3, 0, 0, 0, //
+            0x01, 0x80, 0x05, // packet 1 -> [5, 5]
+            0x00, 0x80, 0x09, // packet 2 -> [9]
         ];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result, vec![5, 5, 9]);
+    }
+
+    #[test]
+    fn rle5_rejects_absurd_size() {
+        // A corrupt 4-byte prefix declaring 0xFFFFFFFF (~4 GB) must be rejected
+        // before any allocation rather than aborting the process on OOM
+        // (never-crash). At least one codec byte follows so the size check, not the
+        // too-short guard, is what fires.
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0x00];
         let err = decompress_rle5(&data).unwrap_err();
-        assert!(err.to_string().contains("unexpected end"));
+        assert!(err.to_string().contains("exceeds sane limit"));
+    }
+
+    #[test]
+    fn rle5_truncated_stream_pads_without_panicking() {
+        // Declares 8 output bytes but supplies only one packet's header. The
+        // decoder must terminate (never-crash) and zero-pad to the declared size.
+        //   rl byte = 0x02 -> rl = 2 (emit colour 3 times)
+        //   data    = 0x80 -> dl = 0, explicit-colour flag set
+        //   colour  = 0x09 -> c = 9  -> emit [9,9,9]
+        // The read head then saturates on the last byte; remaining packets write
+        // zero-derived padding until the 8-byte buffer is full.
+        let data = [
+            8, 0, 0, 0, //
+            0x02,       // rl = 2
+            0x80,       // dl = 0, explicit-colour flag set
+            0x09,       // colour = 9
+        ];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result.len(), 8, "output must match declared size");
+        assert_eq!(&result[0..3], &[9, 9, 9], "real pixels preserved");
     }
 
     // ---- LZ5 tests ----
