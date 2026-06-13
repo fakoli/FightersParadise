@@ -124,8 +124,8 @@ finalized fp-vm `EvalContext`. **Phase 4 is complete** (4.1–4.6, 4.8, 4.10, 4.
 | ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
 |----|--------|------|----------|--------------------|------|
 | 5.1 | DONE | **Character entity struct + `EvalContext` impl** | `fp-character` | ✅ `Character` struct (pos/vel, facing, life/power, ctrl, statetype/movetype/physics enums, anim+elem+time, state-no/prev/time, var/fvar/sysvar banks, constants) + `impl EvalContext` resolving standard KFM triggers (incl. letter-coded `StateType=A`) + `CommandSource` seam; 33 tests evaluate real parsed triggers through fp-vm. Critic SHOULD_FIX → **folded into 5.2**: `AnimElemTime` must return a NEGATIVE sentinel for not-reached elements (VM tail-guard contract; currently 0 → every element reads "reached"); + use/remove the `tracing` dep. | 4.11 |
-| 5.2 | DOING | **Character loader** (.def → ready Character) | `fp-character` | Resolve a `.def` (Info/Files), load SFF/AIR/CNS(+`stcommon` common1.cns)/CMD/SND via fp-formats, read constants, compile every CNS trigger + controller-param expr via fp-vm at load (bad-expr→const-0 + warn), store states ready to run. Loads real KFM (gated). **+ folds 5.1 SHOULD_FIX**: AnimElemTime negative sentinel for not-reached elements; use/remove `tracing`. | 5.1 |
-| 5.3 | TODO | **State-machine executor** | `fp-character` | Per-tick `-3→-2→-1→current` processing; trigger gating (triggerall AND + trigger-group OR, **CB6 contiguity**); `persistent`/`ignorehitpause`; state transitions; AnimElem/time advance. | 5.1, 5.2 |
+| 5.2 | DONE | **Character loader** (.def → ready Character) | `fp-character` | ✅ `LoadedCharacter::load` — parses .def, loads+merges SFF/AIR/CNS(+stcommon)/CMD/SND, reads `[Data]` constants, compiles all exprs via fp-vm (bad→const-0+warn). Real `kfm.def` loads end-to-end (gated). 5.1 AnimElemTime sentinel fixed; tracing used. 844 tests. Commit `e8b9775`. SHOULD_FIX: `[Size]/[Velocity]/[Movement]` constants → **5.3**; merge-order/I-O-dedup/cmd-snd-error nits → CB16-18. | 5.1 |
+| 5.3 | DOING | **State-machine executor** (+ full constants) | `fp-character` | Per-tick `-3→-2→-1→current`; trigger gating (triggerall AND + group OR, **CB6 contiguity**); `persistent`/`ignorehitpause`; state transitions; AnimElem/time advance; apply statedef `physics` (gravity/friction from constants). **+ expand `CharacterConstants` to load `[Size]/[Velocity]/[Movement]`** (gravity, yaccel, walk/jump/run vels, size.ground.front/back) — fixes the 5.2 doc overclaim. | 5.1, 5.2 |
 | 5.4 | TODO | **Core state controllers** | `fp-character` | Movement/control subset for KFM basic states: ChangeState, VelSet/VelAdd, ChangeAnim, CtrlSet, PosSet/PosAdd, VarSet/VarAdd/VarRangeSet, StateTypeSet, Turn, Null (+ PlaySnd stub). | 5.3 |
 | 5.5 | TODO | **fp-app integration** (retire hardcoded SM) | `fp-app`+`fp-character` | Drive the playable character from KFM's own CNS via fp-character; walk/jump/crouch/turn from `kfm.cns`, not hardcoded constants. The "character moves from its own files" demo. | 5.4 |
 
@@ -191,6 +191,13 @@ parallelizable once the core exists. Deps: Phase 7.
   token-aware/anchored matching so a real parser regression can't slip past. *(added 4.6 iter, minor)*
 - **CB15** `push.rs` `resolve_push` doctest opens with a dangling/self-contradicting comment; clean
   it up. *(added P6.2 iter, cosmetic)*
+- **CB16** `loader.rs` CNS merge order: confirm `cns` vs `st*` precedence on a same-state-number
+  collision against the engine ref; add a synthetic test pinning the winner; document the order.
+  *(added 5.2 iter)*
+- **CB17** `loader.rs` `load_constants` re-reads/re-parses the cns file (once as CNS, once as DEF) —
+  dedup the I/O on the load path. *(added 5.2 iter, perf)*
+- **CB18** `loader.rs` `load_optional` can't distinguish "file missing" from "file present but
+  corrupt" for cmd/snd; differentiate in the warn message. *(added 5.2 iter, minor)*
 
 ---
 

@@ -24,7 +24,13 @@
 //! 4. Read the character constants from the CNS `[Data]`/`[Size]`/`[Velocity]`/
 //!    `[Movement]` groups (these live in the same text file as the statedefs,
 //!    but the [`CnsFile`] parser intentionally drops non-state sections, so they
-//!    are re-read with the generic INI parser).
+//!    are re-read with the generic INI parser). `[Data]` supplies
+//!    `life`/`power`/`attack`/`defence`; `[Size]` supplies
+//!    `ground.front`/`ground.back`/`height`; `[Velocity]` supplies
+//!    `walk.fwd`/`walk.back`/`run.fwd`/`jump.neu`(+`jump.up`); `[Movement]`
+//!    supplies `yaccel`/`stand.friction`/`crouch.friction`. Every other key in
+//!    those groups is not read yet. The first candidate file with a `[Data]`
+//!    group is the constants source.
 //! 5. **Compile** every trigger expression (`triggerall` + each numbered trigger
 //!    group condition) and every controller parameter via
 //!    [`fp_vm::parse_str`] at load time, storing the compiled
@@ -51,7 +57,9 @@ use fp_formats::snd::SndFile;
 use fp_formats::sff::SffFile;
 use fp_vm::Expr;
 
-use crate::CharacterConstants;
+use fp_core::Vec2;
+
+use crate::{CharacterConstants, MovementConstants, SizeConstants, VelocityConstants};
 
 /// A trigger expression compiled at load time.
 ///
@@ -132,6 +140,14 @@ pub struct CompiledController {
     pub triggerall: Vec<CompiledExpr>,
     /// Compiled numbered trigger groups, in the parser's first-seen order.
     pub triggers: Vec<CompiledTriggerGroup>,
+    /// Compiled `persistent` universal parameter, if present. `1` (the MUGEN
+    /// default) re-fires every qualifying tick, `0` fires once per state entry,
+    /// `n` fires every `n`th qualifying tick. See the executor for the applied
+    /// semantics.
+    pub persistent: Option<CompiledExpr>,
+    /// Compiled `ignorehitpause` universal parameter, if present. Wired through
+    /// for task 5.3 (there is no hitpause yet); the executor stores the flag.
+    pub ignorehitpause: Option<CompiledExpr>,
     /// Compiled controller-specific parameters, keyed by the lowercased
     /// parameter name. Each value's expression is the parsed parameter
     /// expression (const-`0` on failure).
@@ -141,7 +157,7 @@ pub struct CompiledController {
 impl CompiledController {
     /// Compiles a parsed [`StateController`] into a [`CompiledController`],
     /// compiling every trigger condition and every parameter expression.
-    fn from_parsed(ctrl: &StateController) -> Self {
+    pub(crate) fn from_parsed(ctrl: &StateController) -> Self {
         let triggerall = ctrl
             .triggerall
             .iter()
@@ -169,6 +185,8 @@ impl CompiledController {
             controller_type: ctrl.controller_type.clone(),
             triggerall,
             triggers,
+            persistent: ctrl.persistent.as_deref().map(CompiledExpr::compile),
+            ignorehitpause: ctrl.ignorehitpause.as_deref().map(CompiledExpr::compile),
             params,
         }
     }
@@ -202,7 +220,7 @@ pub struct CompiledState {
 
 impl CompiledState {
     /// Compiles a parsed [`Statedef`] into a [`CompiledState`].
-    fn from_parsed(def: &Statedef) -> Self {
+    pub(crate) fn from_parsed(def: &Statedef) -> Self {
         Self {
             number: def.number,
             state_type: def.state_type.clone(),
@@ -463,10 +481,12 @@ fn parse_localcoord(value: Option<&str>) -> (i32, i32) {
 /// `[Movement]` groups of the constants file.
 ///
 /// MUGEN keeps these groups in the `cns` file (which is also a state file). The
-/// [`CnsFile`] parser drops non-state sections, so the
-/// file is re-read with the generic INI parser. Each candidate file is tried in
-/// order; the first that yields a `[Data]` group is used. Missing or malformed
-/// values fall back to the [`CharacterConstants::default`] for that field.
+/// [`CnsFile`] parser drops non-state sections, so the file is re-read with the
+/// generic INI parser. Each candidate file is tried in order; the first that
+/// yields a `[Data]` group is used and all four groups are read from it.
+/// Missing or malformed values fall back to the
+/// [`CharacterConstants::default`] for that field — a bad value never fails the
+/// load.
 fn load_constants(def: &DefFile, def_path: &Path, state_refs: &[String]) -> CharacterConstants {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(cns_ref) = def.get("Files", "cns") {
@@ -489,32 +509,113 @@ fn load_constants(def: &DefFile, def_path: &Path, state_refs: &[String]) -> Char
         if !ini.sections.contains_key("data") {
             continue;
         }
-        if let Some(v) = ini.get_parsed::<i32>("Data", "life") {
-            consts.life_max = v;
-        }
-        if let Some(v) = ini.get_parsed::<i32>("Data", "attack") {
-            consts.attack = v;
-        }
-        if let Some(v) = ini.get_parsed::<i32>("Data", "defence") {
-            consts.defence = v;
-        }
-        // `power` lives in [Data] as `power` on some characters; KFM omits it and
-        // MUGEN defaults to 3000. Honor an explicit value when present.
-        if let Some(v) = ini.get_parsed::<i32>("Data", "power") {
-            consts.power_max = v;
-        }
+        read_data_group(&ini, &mut consts);
+        read_size_group(&ini, &mut consts.size);
+        read_velocity_group(&ini, &mut consts.velocity);
+        read_movement_group(&ini, &mut consts.movement);
         tracing::info!(
-            "read constants from {}: life={} attack={} defence={} power={}",
+            "read constants from {}: life={} attack={} defence={} power={}; \
+             size(front={},back={},h={}) walk.fwd={} yaccel={}",
             path.display(),
             consts.life_max,
             consts.attack,
             consts.defence,
             consts.power_max,
+            consts.size.ground_front,
+            consts.size.ground_back,
+            consts.size.height,
+            consts.velocity.walk_fwd.x,
+            consts.movement.yaccel,
         );
         return consts;
     }
     tracing::warn!("no [Data] constants group found; using MUGEN defaults");
     consts
+}
+
+/// Reads the `[Data]` group into `consts`, leaving each field at its prior value
+/// when absent or malformed.
+fn read_data_group(ini: &DefFile, consts: &mut CharacterConstants) {
+    if let Some(v) = ini.get_parsed::<i32>("Data", "life") {
+        consts.life_max = v;
+    }
+    if let Some(v) = ini.get_parsed::<i32>("Data", "attack") {
+        consts.attack = v;
+    }
+    if let Some(v) = ini.get_parsed::<i32>("Data", "defence") {
+        consts.defence = v;
+    }
+    // `power` lives in [Data] as `power` on some characters; KFM omits it and
+    // MUGEN defaults to 3000. Honor an explicit value when present.
+    if let Some(v) = ini.get_parsed::<i32>("Data", "power") {
+        consts.power_max = v;
+    }
+}
+
+/// Reads the `[Size]` group: player widths and height. Missing/malformed fields
+/// keep their default.
+fn read_size_group(ini: &DefFile, size: &mut SizeConstants) {
+    if let Some(v) = ini.get_parsed::<i32>("Size", "ground.front") {
+        size.ground_front = v;
+    }
+    if let Some(v) = ini.get_parsed::<i32>("Size", "ground.back") {
+        size.ground_back = v;
+    }
+    if let Some(v) = ini.get_parsed::<i32>("Size", "height") {
+        size.height = v;
+    }
+}
+
+/// Reads the `[Velocity]` group: walk and jump velocities. Each entry may be a
+/// bare scalar (x only, y defaults to `0`) or an `x, y` pair; missing/malformed
+/// fields keep their default.
+fn read_velocity_group(ini: &DefFile, vel: &mut VelocityConstants) {
+    if let Some(v) = ini.get("Velocity", "walk.fwd").and_then(parse_vec2) {
+        vel.walk_fwd = v;
+    }
+    if let Some(v) = ini.get("Velocity", "walk.back").and_then(parse_vec2) {
+        vel.walk_back = v;
+    }
+    if let Some(v) = ini.get("Velocity", "run.fwd").and_then(parse_vec2) {
+        vel.run_fwd = v;
+    }
+    if let Some(v) = ini.get("Velocity", "jump.neu").and_then(parse_vec2) {
+        vel.jump_neu = v;
+        // MUGEN derives the upward jump speed from jump.neu's y unless an
+        // explicit jump.up is authored.
+        vel.jump_up = v.y;
+    }
+    // An explicit `jump.up` (a bare upward y-velocity on some characters)
+    // overrides the jump.neu-derived value.
+    if let Some(v) = ini.get("Velocity", "jump.up").and_then(parse_vec2) {
+        // `jump.up` is conventionally a single (y) value; treat the first parsed
+        // component as the upward speed.
+        vel.jump_up = v.x;
+    }
+}
+
+/// Reads the `[Movement]` group: gravity and friction. Missing/malformed fields
+/// keep their default.
+fn read_movement_group(ini: &DefFile, mv: &mut MovementConstants) {
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "yaccel") {
+        mv.yaccel = v;
+    }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "stand.friction") {
+        mv.stand_friction = v;
+    }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "crouch.friction") {
+        mv.crouch_friction = v;
+    }
+}
+
+/// Parses a velocity entry that is either a bare scalar (`"2.4"` → `(2.4, 0)`)
+/// or an `x, y` pair (`"0,-8.4"` → `(0, -8.4)`). Returns `None` when the first
+/// component is not a valid float (a fully malformed value keeps the default).
+fn parse_vec2(raw: &str) -> Option<Vec2<f32>> {
+    let mut parts = raw.split(',').map(str::trim);
+    let x = parts.next().and_then(|p| p.parse::<f32>().ok())?;
+    let y = parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(0.0);
+    Some(Vec2::new(x, y))
 }
 
 #[cfg(test)]
@@ -1272,5 +1373,224 @@ mod tests {
         assert_eq!(loaded.state_count(), loaded.states.len());
         assert!(loaded.state_count() >= 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // Proctor (task 5.3 Part B): [Size]/[Velocity]/[Movement] constant-group
+    // expansion. Forge added the fields and the reader functions; these tests
+    // exercise them through load_constants (the loader's real entry point) plus
+    // the parse_vec2 helper directly, all synthetic and on-disk-free where
+    // possible.
+    // =====================================================================
+
+    // ---- AC2: [Size] group is read into SizeConstants ----
+
+    #[test]
+    fn load_constants_reads_size_group() {
+        let dir = scratch_dir("consts_size");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Size]\nground.front = 22\nground.back = 18\nheight = 70\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(consts.size.ground_front, 22);
+        assert_eq!(consts.size.ground_back, 18);
+        assert_eq!(consts.size.height, 70);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_size_partial_keeps_defaults() {
+        // Only ground.front is authored; the other [Size] fields keep defaults.
+        let dir = scratch_dir("consts_size_partial");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Size]\nground.front = 30\n");
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let d = SizeConstants::default();
+        assert_eq!(consts.size.ground_front, 30);
+        assert_eq!(consts.size.ground_back, d.ground_back);
+        assert_eq!(consts.size.height, d.height);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- AC2: [Velocity] group, including scalar vs pair and jump.up override --
+
+    #[test]
+    fn load_constants_reads_velocity_group() {
+        let dir = scratch_dir("consts_velocity");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Velocity]\nwalk.fwd = 2.4\nwalk.back = -2.2\nrun.fwd = 4.6, 0\njump.neu = 0, -8.4\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let v = consts.velocity;
+        // Scalar walk.fwd → (2.4, 0).
+        assert!((v.walk_fwd.x - 2.4).abs() < 1e-6);
+        assert!((v.walk_fwd.y - 0.0).abs() < 1e-6);
+        assert!((v.walk_back.x - (-2.2)).abs() < 1e-6);
+        // Pair run.fwd → (4.6, 0).
+        assert!((v.run_fwd.x - 4.6).abs() < 1e-6);
+        // jump.neu pair, and jump.up DERIVED from jump.neu.y when no explicit one.
+        assert!((v.jump_neu.y - (-8.4)).abs() < 1e-6);
+        assert!((v.jump_up - (-8.4)).abs() < 1e-6, "jump.up derived from jump.neu.y");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_explicit_jump_up_overrides_jump_neu() {
+        // An explicit jump.up overrides the jump.neu-derived value (its first
+        // parsed component is the upward speed).
+        let dir = scratch_dir("consts_jumpup");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\njump.neu = 0, -8.4\njump.up = -9.5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        // jump.neu.y is still -8.4, but jump.up is the explicit -9.5.
+        assert!((consts.velocity.jump_neu.y - (-8.4)).abs() < 1e-6);
+        assert!((consts.velocity.jump_up - (-9.5)).abs() < 1e-6, "explicit jump.up wins");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- AC2: [Movement] group: gravity + friction ----
+
+    #[test]
+    fn load_constants_reads_movement_group() {
+        let dir = scratch_dir("consts_movement");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        // KFM-style leading-dot floats (.44) must parse.
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Movement]\nyaccel = .44\nstand.friction = .85\ncrouch.friction = .82\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert!((consts.movement.yaccel - 0.44).abs() < 1e-6);
+        assert!((consts.movement.stand_friction - 0.85).abs() < 1e-6);
+        assert!((consts.movement.crouch_friction - 0.82).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_movement_malformed_keeps_default() {
+        let dir = scratch_dir("consts_movement_bad");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        // yaccel non-numeric → keeps default; stand.friction valid → read.
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nyaccel = fast\nstand.friction = 0.5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let d = MovementConstants::default();
+        assert!((consts.movement.yaccel - d.yaccel).abs() < 1e-6, "bad yaccel keeps default");
+        assert!((consts.movement.stand_friction - 0.5).abs() < 1e-6, "valid sibling still read");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_all_four_groups_together() {
+        // A single .cns carrying all four groups is read in one pass.
+        let dir = scratch_dir("consts_all_groups");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1100\nattack = 95\n\
+             [Size]\nground.front = 17\nheight = 65\n\
+             [Velocity]\nwalk.fwd = 2.5\n\
+             [Movement]\nyaccel = .5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(consts.life_max, 1100);
+        assert_eq!(consts.attack, 95);
+        assert_eq!(consts.size.ground_front, 17);
+        assert_eq!(consts.size.height, 65);
+        assert!((consts.velocity.walk_fwd.x - 2.5).abs() < 1e-6);
+        assert!((consts.movement.yaccel - 0.5).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- AC2: parse_vec2 helper: scalar, pair, garbage, leading-dot ----
+
+    #[test]
+    fn parse_vec2_scalar_pair_and_garbage() {
+        assert_eq!(parse_vec2("2.4"), Some(Vec2::new(2.4, 0.0)));
+        assert_eq!(parse_vec2("0, -8.4"), Some(Vec2::new(0.0, -8.4)));
+        assert_eq!(parse_vec2(" 4.6 , 0 "), Some(Vec2::new(4.6, 0.0)));
+        // Leading-dot float (KFM style).
+        assert_eq!(parse_vec2(".44"), Some(Vec2::new(0.44, 0.0)));
+        // Non-numeric first component → None (caller keeps default).
+        assert_eq!(parse_vec2("fast"), None);
+        // Non-numeric second component → y defaults to 0.
+        assert_eq!(parse_vec2("3, nope"), Some(Vec2::new(3.0, 0.0)));
+    }
+
+    // ---- AC2: defaults match KFM's authored baseline values ----
+
+    #[test]
+    fn constant_group_defaults_are_kfm_baseline() {
+        // The documented per-field defaults are KFM's values; assert them so a
+        // future change to a default is caught and the docs stay honest.
+        let s = SizeConstants::default();
+        assert_eq!((s.ground_front, s.ground_back, s.height), (16, 15, 60));
+        let v = VelocityConstants::default();
+        assert!((v.walk_fwd.x - 2.4).abs() < 1e-6);
+        assert!((v.walk_back.x - (-2.2)).abs() < 1e-6);
+        assert!((v.run_fwd.x - 4.6).abs() < 1e-6);
+        assert!((v.jump_neu.y - (-8.4)).abs() < 1e-6);
+        assert!((v.jump_up - (-8.4)).abs() < 1e-6);
+        let m = MovementConstants::default();
+        assert!((m.yaccel - 0.44).abs() < 1e-6);
+        assert!((m.stand_friction - 0.85).abs() < 1e-6);
+        assert!((m.crouch_friction - 0.82).abs() < 1e-6);
+    }
+
+    // ---- AC5: real KFM constants read end-to-end (gated on test-assets) ----
+
+    #[test]
+    fn real_kfm_constants_all_groups() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        let c = &loaded.constants;
+        // [Size]
+        assert_eq!(c.size.ground_front, 16);
+        assert_eq!(c.size.ground_back, 15);
+        assert_eq!(c.size.height, 60);
+        // [Velocity]
+        assert!((c.velocity.walk_fwd.x - 2.4).abs() < 1e-4);
+        assert!((c.velocity.walk_back.x - (-2.2)).abs() < 1e-4);
+        assert!((c.velocity.run_fwd.x - 4.6).abs() < 1e-4);
+        assert!((c.velocity.jump_neu.y - (-8.4)).abs() < 1e-4);
+        // [Movement]
+        assert!((c.movement.yaccel - 0.44).abs() < 1e-4);
+        assert!((c.movement.stand_friction - 0.85).abs() < 1e-4);
+        assert!((c.movement.crouch_friction - 0.82).abs() < 1e-4);
     }
 }

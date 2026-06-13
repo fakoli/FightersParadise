@@ -21,15 +21,30 @@
 //! [`LoadedCharacter`]: it parses the `.def`, resolves and loads the referenced
 //! SFF/AIR/CNS(+`stcommon`)/CMD/SND files relative to the `.def` directory,
 //! reads the character constants from the CNS `[Data]`/`[Size]`/`[Velocity]`/
-//! `[Movement]` groups, merges the CNS state files in MUGEN order (`stcommon`
-//! last, fill-missing only), and **compiles every trigger and controller
-//! parameter expression** via [`fp_vm::parse_str`] at load time. A bad
-//! expression compiles to a const-`0` [`fp_vm::Expr`] with a `tracing::warn!`;
-//! missing optional files are warn-logged and skipped. See the [`loader`] module.
+//! `[Movement]` groups (task 5.3 expands this beyond 5.2's `[Data]`-only read to
+//! the modeled `[Size]`/`[Velocity]`/`[Movement]` fields — see
+//! [`CharacterConstants`]), merges the CNS state files in MUGEN order
+//! (`stcommon` last, fill-missing only), and **compiles every trigger and
+//! controller parameter expression** via [`fp_vm::parse_str`] at load time. A
+//! bad expression compiles to a const-`0` [`fp_vm::Expr`] with a
+//! `tracing::warn!`; missing optional files are warn-logged and skipped. See the
+//! [`loader`] module.
 //!
-//! Out of scope here (later tasks): the per-tick state-machine executor that
-//! runs controllers and mutates this state (task 5.3), real get-hit state
-//! (Phase 6), and multi-entity redirection (Phase 7).
+//! ## Running the state machine (task 5.3)
+//!
+//! [`Character::tick`] advances a live [`Character`] one 60Hz tick against its
+//! [`LoadedCharacter`]: it processes the special states (`-3`, `-2`, `-1`) then
+//! the current state in MUGEN order, gates each controller on its
+//! `triggerall` (AND) and numbered trigger groups (OR, with the [CB6 contiguity
+//! rule](executor)), honors `persistent`/`ignorehitpause`, performs state entry
+//! and `ChangeState` transitions, applies the statedef `physics`
+//! (friction/gravity), and advances the animation cursor from the AIR frame
+//! durations. See the [`executor`] module.
+//!
+//! Out of scope here (later tasks): the full ~100-controller dispatch set (task
+//! 5.4 — this task wires only `ChangeState`/`VelSet`/`VelAdd`/`CtrlSet`/`Null`),
+//! `fp-app` integration (task 5.5), real get-hit state (Phase 6), and
+//! multi-entity redirection (Phase 7).
 //!
 //! ## Trigger resolution model
 //!
@@ -53,8 +68,10 @@
 
 #![warn(missing_docs)]
 
+pub mod executor;
 pub mod loader;
 
+pub use executor::TickReport;
 pub use loader::{
     CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup, LoadedCharacter,
 };
@@ -129,6 +146,28 @@ impl StateType {
             StateType::Unchanged => CODE_U,
         }
     }
+
+    /// Parses a `Statedef` `type` token (`S`/`C`/`A`/`L`/`U`), case-insensitively.
+    ///
+    /// Returns `None` for an unrecognized token; the caller keeps the previous
+    /// value (MUGEN treats an absent/invalid `type` as "unchanged").
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("S") {
+            Some(StateType::Standing)
+        } else if t.eq_ignore_ascii_case("C") {
+            Some(StateType::Crouching)
+        } else if t.eq_ignore_ascii_case("A") {
+            Some(StateType::Air)
+        } else if t.eq_ignore_ascii_case("L") {
+            Some(StateType::Lying)
+        } else if t.eq_ignore_ascii_case("U") {
+            Some(StateType::Unchanged)
+        } else {
+            None
+        }
+    }
 }
 
 /// The character's action category (`Statedef` `movetype`): attacking, idle,
@@ -159,6 +198,24 @@ impl MoveType {
             MoveType::Idle => CODE_I,
             MoveType::BeingHit => CODE_H,
             MoveType::Unchanged => CODE_U,
+        }
+    }
+
+    /// Parses a `Statedef` `movetype` token (`A`/`I`/`H`/`U`),
+    /// case-insensitively. Returns `None` for an unrecognized token.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("A") {
+            Some(MoveType::Attack)
+        } else if t.eq_ignore_ascii_case("I") {
+            Some(MoveType::Idle)
+        } else if t.eq_ignore_ascii_case("H") {
+            Some(MoveType::BeingHit)
+        } else if t.eq_ignore_ascii_case("U") {
+            Some(MoveType::Unchanged)
+        } else {
+            None
         }
     }
 }
@@ -194,6 +251,26 @@ impl Physics {
             Physics::Air => CODE_A,
             Physics::None => CODE_N,
             Physics::Unchanged => CODE_U,
+        }
+    }
+
+    /// Parses a `Statedef` `physics` token (`S`/`C`/`A`/`N`/`U`),
+    /// case-insensitively. Returns `None` for an unrecognized token.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("S") {
+            Some(Physics::Stand)
+        } else if t.eq_ignore_ascii_case("C") {
+            Some(Physics::Crouch)
+        } else if t.eq_ignore_ascii_case("A") {
+            Some(Physics::Air)
+        } else if t.eq_ignore_ascii_case("N") {
+            Some(Physics::None)
+        } else if t.eq_ignore_ascii_case("U") {
+            Some(Physics::Unchanged)
+        } else {
+            None
         }
     }
 }
@@ -238,13 +315,17 @@ const AXIS_Y: i32 = 1;
 /// the tail from spuriously firing. `-1` is the conventional MUGEN value.
 const ANIM_ELEM_NOT_REACHED: i32 = -1;
 
-/// Static, per-character constants (the `.cns` `[Data]`/`[Size]`/`[Velocity]`
-/// groups and friends).
+/// Static, per-character constants read from the `.cns`
+/// `[Data]`/`[Size]`/`[Velocity]`/`[Movement]` groups.
 ///
-/// These are authored values loaded once from the character's `.cns` and read
-/// by triggers like `Const(...)`. Task 5.1 ships only the handful needed to
-/// initialize live state (`life`/`power` maxima); the loader (task 5.2) will
-/// populate the rest. Unknown/unmodeled constants resolve to the safe default.
+/// These are authored values loaded once from the character's `.cns`. Task 5.1
+/// shipped only the `[Data]` maxima needed to initialize live state; task 5.3
+/// expands this to the [`Size`](CharacterConstants::size),
+/// [`Velocity`](CharacterConstants::velocity), and
+/// [`Movement`](CharacterConstants::movement) groups the executor needs
+/// (player widths, walk/jump velocities, gravity and friction). Every field has
+/// a safe MUGEN-style default; unknown/unmodeled constants resolve to the safe
+/// default rather than failing the load.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharacterConstants {
     /// Maximum life (`[Data] life`). Defaults to MUGEN's `1000`.
@@ -257,6 +338,12 @@ pub struct CharacterConstants {
     /// Starting defence scaling (`[Data] defence`), as a percentage. Defaults
     /// to `100`.
     pub defence: i32,
+    /// `[Size]` group: player dimensions.
+    pub size: SizeConstants,
+    /// `[Velocity]` group: walk and jump velocities.
+    pub velocity: VelocityConstants,
+    /// `[Movement]` group: gravity and friction coefficients.
+    pub movement: MovementConstants,
 }
 
 impl Default for CharacterConstants {
@@ -266,6 +353,99 @@ impl Default for CharacterConstants {
             power_max: 3000,
             attack: 100,
             defence: 100,
+            size: SizeConstants::default(),
+            velocity: VelocityConstants::default(),
+            movement: MovementConstants::default(),
+        }
+    }
+}
+
+/// The `[Size]` constant group: the character's collision/positioning
+/// dimensions.
+///
+/// Only the fields the executor and physics need are modeled here (player
+/// widths and height); the remaining `[Size]` keys (`xscale`, `head.pos`, …)
+/// are not read yet. Each defaults to KFM's value, MUGEN's de-facto baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizeConstants {
+    /// `ground.front` — player half-width forward, on the ground (pixels).
+    pub ground_front: i32,
+    /// `ground.back` — player half-width backward, on the ground (pixels).
+    pub ground_back: i32,
+    /// `height` — player height, used for jump-over checks (pixels).
+    pub height: i32,
+}
+
+impl Default for SizeConstants {
+    fn default() -> Self {
+        // KFM's authored values (the MUGEN baseline character).
+        Self {
+            ground_front: 16,
+            ground_back: 15,
+            height: 60,
+        }
+    }
+}
+
+/// The `[Velocity]` constant group: authored walk and jump velocities, in
+/// pixels/tick.
+///
+/// Velocities are stored as `(x, y)` pairs. Forward velocities assume facing
+/// right; the executor mirrors them by [`Facing::sign`]. Only the fields needed
+/// for basic locomotion are modeled (walk forward/back, run forward, neutral
+/// and up jump); the air-recover velocities and run-jump pairs are not read yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityConstants {
+    /// `walk.fwd` — forward walking velocity `(x, y)`. MUGEN authors this as a
+    /// bare x value; `y` is `0`.
+    pub walk_fwd: Vec2<f32>,
+    /// `walk.back` — backward walking velocity `(x, y)` (x is negative).
+    pub walk_back: Vec2<f32>,
+    /// `run.fwd` — forward running velocity `(x, y)`.
+    pub run_fwd: Vec2<f32>,
+    /// `jump.neu` — neutral jump velocity `(x, y)` (y is negative = upward).
+    pub jump_neu: Vec2<f32>,
+    /// `jump.up` y-velocity — the upward jump speed. MUGEN derives jump y from
+    /// `jump.neu.y`; when an explicit `jump.up` is absent this mirrors
+    /// `jump_neu.y`.
+    pub jump_up: f32,
+}
+
+impl Default for VelocityConstants {
+    fn default() -> Self {
+        // KFM's authored values.
+        Self {
+            walk_fwd: Vec2::new(2.4, 0.0),
+            walk_back: Vec2::new(-2.2, 0.0),
+            run_fwd: Vec2::new(4.6, 0.0),
+            jump_neu: Vec2::new(0.0, -8.4),
+            jump_up: -8.4,
+        }
+    }
+}
+
+/// The `[Movement]` constant group: gravity and friction.
+///
+/// `yaccel` is the per-tick downward acceleration applied by air physics
+/// (`Physics::Air`). `stand.friction`/`crouch.friction` are the multiplicative
+/// coefficients applied to x-velocity each tick by stand/crouch physics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MovementConstants {
+    /// `yaccel` — downward acceleration in pixels/tick² (gravity).
+    pub yaccel: f32,
+    /// `stand.friction` — x-velocity multiplier per tick while standing.
+    pub stand_friction: f32,
+    /// `crouch.friction` — x-velocity multiplier per tick while crouching.
+    pub crouch_friction: f32,
+}
+
+impl Default for MovementConstants {
+    fn default() -> Self {
+        // KFM's authored values.
+        Self {
+            yaccel: 0.44,
+            stand_friction: 0.85,
+            crouch_friction: 0.82,
         }
     }
 }
@@ -431,6 +611,17 @@ pub struct Character {
     ///
     /// Defaults to [`NoCommands`]; the executor swaps in `fp-input`'s recognizer.
     pub commands: Box<dyn CommandSource>,
+
+    // ---- Executor bookkeeping ---------------------------------------------
+    /// Per-state-entry firing counts used by the executor to enforce the
+    /// `persistent` universal parameter, keyed by `(state_no, controller_index)`.
+    ///
+    /// Each entry counts how many times a controller has *qualified* (its gating
+    /// passed) since the current state was entered. The executor consults and
+    /// updates it in [`Character::tick`]; it is cleared on every state entry. It
+    /// is part of the public struct only because the entity is struct-based (no
+    /// hidden state), but callers other than the executor should not touch it.
+    pub fire_counts: std::collections::HashMap<(i32, usize), i32>,
 }
 
 impl Default for Character {
@@ -461,6 +652,7 @@ impl Default for Character {
             sysfvars: [0.0; NUM_SYSFVARS],
             constants,
             commands: Box::new(NoCommands),
+            fire_counts: std::collections::HashMap::new(),
         }
     }
 }
@@ -913,6 +1105,7 @@ mod tests {
             power_max: 5000,
             attack: 110,
             defence: 90,
+            ..CharacterConstants::default()
         };
         let ch = Character::with_constants(consts);
         assert_eq!(ev("LifeMax = 1200", &ch), Value::Int(1));
