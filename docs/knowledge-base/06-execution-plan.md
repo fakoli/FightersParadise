@@ -111,18 +111,29 @@ Status keys: `TODO` · `DOING` · `DONE` · `BLOCKED`. Tasks run top-down; respe
 | 4.6 | DONE | **Integration:** kfm.cns → lex/parse/eval (keystone validation) | `fp-vm`/tests | ✅ `tests/cns_integration.rs` — **812 real triggers, 733 parse cleanly (90.3%), 0 panics**; curated triggers evaluate correctly. Critic **PASS**. Surfaced 4 real gaps (NOT `:=`) → task **4.10**. | 4.4, 4.5, 4.8, 0.3 |
 | 4.7 | TODO | *(perf, optional)* AST → **bytecode** + stack VM | `fp-vm` | Compile AST to bytecode; stack interpreter matches tree-walk results on the test corpus; micro-bench recorded. | 4.4 |
 | 4.10 | DONE | **Real-content trigger support** | `fp-vm` | ✅ kfm.cns clean-parse **90.3%→100% (812/812)**. Axis-suffix triggers (`Vel Y`/`Pos X`), `AnimElem=N,op M`, dotted call args, **`command="x"` string-eq** (via `EvalContext::command_active` — moves fire now). 685 workspace tests. Commit `145ed85`. Critic SHOULD_FIX → 4.11. | 4.6 |
-| 4.11 | DOING | **VM correctness follow-ups** (4.10 review) | `fp-vm` | (a) `GetHitVar(member)` must pass the member NAME as key — extend `EvalContext` with a string-keyed accessor (`Value` has no String variant); finalizes the trait **before Phase 5 implements it**. (b) `TimeMod`/`AnimElemNo` wrongly folded into AnimElem family (silently wrong; a test pins it) → handle correctly or drop from family. (c) `AnimElem=N,op M` tail greedily swallows trailing `&&` → bind at relational precedence. Remove tests pinning wrong behavior. | 4.10 |
+| 4.11 | DONE | **VM correctness follow-ups** (4.10 review) | `fp-vm` | ✅ Critic **PASS, no should-fix**. (a) `EvalContext::trigger_str` member-key seam (GetHitVar passes name, not value); (b) TimeMod/AnimElemNo dropped from AnimElem family (safe degrade); (c) AnimElem tail at relational precedence (no `&&`-swallow). 721 workspace tests. Commit `8b66c87`. | 4.10 |
 | 4.8 | DONE | **Redirection** parsing + eval | `fp-vm` | ✅ `Expr::Redirected`; parser lookahead binds redirect looser than all ops + nests (`enemy, helper(1), x`); evaluator `eval_redirect` via `EvalContext::redirect` (missing→0). **CB8 resolved**: `enemy(n>0)`→`EnemyNear(n)` (lowered + documented). +31 tests. Critic **PASS** (doc/warn nits → CB12). | 4.2, 4.4 |
 | 4.9 | TODO | **`:=` assignment** parsing + eval | `fp-vm` | Add `Expr` + parser + eval for in-expression assignment `var(x):=y` / `fvar(x):=y` (returns the stored value per [07](07-evaluator-semantics.md)); evaluator needs a mutable context hook. Deferred by 4.2. | 4.2, 4.4 |
 
-### Phase 5 — `fp-character` (data-driven state machine)  *(expand when reached)*
-Character struct; `-3→-2→-1→current` per-tick execution; `persistent`/`ignorehitpause`; core state
-controllers (ChangeState, VelSet/Add, ChangeAnim, VarSet, PlaySnd, CtrlSet, PosAdd, …); **retire the
-hardcoded SM in `fp-app`**. Deps: Phase 4.
+### Phase 5 — `fp-character` (data-driven state machine)  *(the demo-able milestone)*
+
+Replaces `fp-app`'s hardcoded movement with a character driven entirely by its own CNS. Built on the
+finalized fp-vm `EvalContext`. **Phase 4 is complete** (4.1–4.6, 4.8, 4.10, 4.11; 4.7 bytecode + 4.9
+`:=` remain optional/deferred).
+
+| ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
+|----|--------|------|----------|--------------------|------|
+| 5.1 | DONE | **Character entity struct + `EvalContext` impl** | `fp-character` | ✅ `Character` struct (pos/vel, facing, life/power, ctrl, statetype/movetype/physics enums, anim+elem+time, state-no/prev/time, var/fvar/sysvar banks, constants) + `impl EvalContext` resolving standard KFM triggers (incl. letter-coded `StateType=A`) + `CommandSource` seam; 33 tests evaluate real parsed triggers through fp-vm. Critic SHOULD_FIX → **folded into 5.2**: `AnimElemTime` must return a NEGATIVE sentinel for not-reached elements (VM tail-guard contract; currently 0 → every element reads "reached"); + use/remove the `tracing` dep. | 4.11 |
+| 5.2 | TODO | **Character loader** (.def → ready Character) | `fp-character` | Resolve a `.def` (Info/Files), load SFF/AIR/CNS(+`stcommon` common1.cns)/CMD/SND via fp-formats, compile every CNS trigger expr via fp-vm at load (bad-expr→const-0 + warn), store states ready to run. Loads real KFM (gated). | 5.1 |
+| 5.3 | TODO | **State-machine executor** | `fp-character` | Per-tick `-3→-2→-1→current` processing; trigger gating (triggerall AND + trigger-group OR, **CB6 contiguity**); `persistent`/`ignorehitpause`; state transitions; AnimElem/time advance. | 5.1, 5.2 |
+| 5.4 | TODO | **Core state controllers** | `fp-character` | Movement/control subset for KFM basic states: ChangeState, VelSet/VelAdd, ChangeAnim, CtrlSet, PosSet/PosAdd, VarSet/VarAdd/VarRangeSet, StateTypeSet, Turn, Null (+ PlaySnd stub). | 5.3 |
+| 5.5 | TODO | **fp-app integration** (retire hardcoded SM) | `fp-app`+`fp-character` | Drive the playable character from KFM's own CNS via fp-character; walk/jump/crouch/turn from `kfm.cns`, not hardcoded constants. The "character moves from its own files" demo. | 5.4 |
 
 ### Phase 6 — `fp-combat`  *(expand when reached)*
 HitDef application; Clsn1×Clsn2 overlap; priority/trade; damage; guard; p1/p2 state-takeover;
-GetHitVars; juggle. Needs AABB in `fp-physics` + char-vs-char push. Deps: Phase 5.
+GetHitVars; juggle. Deps: Phase 5.
+- Physics prep already done: **P6.1** ✅ AABB (`collision.rs`), **P6.2** ✅ player-push + bound-clamp
+  (`push.rs`). Both Critic-reviewed (P6.2 cosmetic doctest nit → CB15).
 
 ### Phase 7 — `fp-engine` (round flow)  *(expand when reached)*
 Move loop out of `fp-app`; P1/P2 coordination; round states (intro→fight→KO→win); timer; win
@@ -176,6 +187,10 @@ parallelizable once the core exists. Deps: Phase 7.
   `tracing::warn!` for parity with `saturate_i64_to_i32`. *(added 4.8 iter)*
 - **CB13** `snd.rs` `recovers_partial_on_truncated_entry` test rewires the chain via a fragile
   linear-scan for `old_len`; rebuild the truncated fixture deterministically. *(added S8.1 iter)*
+- **CB14** `cns_integration.rs` known-unsupported guard uses substring matching; tighten to
+  token-aware/anchored matching so a real parser regression can't slip past. *(added 4.6 iter, minor)*
+- **CB15** `push.rs` `resolve_push` doctest opens with a dangling/self-contradicting comment; clean
+  it up. *(added P6.2 iter, cosmetic)*
 
 ---
 
