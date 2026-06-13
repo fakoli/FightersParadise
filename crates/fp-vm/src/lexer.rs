@@ -372,10 +372,39 @@ fn lex_number(chars: &[char], start: usize) -> (TokenKind, usize) {
 /// Identifiers begin with a letter or `_` and continue with letters, digits, or
 /// `_`. The original casing is preserved; case-insensitive matching (MUGEN
 /// trigger names are case-insensitive) is left to the parser/evaluator.
+///
+/// ## Dotted member names (task 4.10, gap 3)
+///
+/// MUGEN's `GetHitVar` accessor uses *dotted* member keys for some of its hit
+/// variables — `GetHitVar(fall.yvel)`, `GetHitVar(fall.envshake.time)`. To let
+/// these flow through as a single argument key, a `.` that immediately follows
+/// an identifier **and** is immediately followed by another identifier character
+/// (letter or `_`) is folded into the same `Ident` token: `fall.yvel` lexes as
+/// one `Ident("fall.yvel")`, not `Ident("fall")` `.` `Ident("yvel")`. The dot is
+/// only consumed when it is sandwiched between identifier characters, so a lone
+/// trailing dot, or a dot before a digit, is left alone — a numeric literal such
+/// as `5.x` is still lexed by [`lex_number`] (the leading digit routes there
+/// first) and a bare `.` remains [`TokenKind::Unknown`].
 fn lex_ident(chars: &[char], start: usize) -> (TokenKind, usize) {
     let mut i = start;
-    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-        i += 1;
+    loop {
+        // Run of normal identifier characters.
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        // A dotted member continues the identifier only when the dot is
+        // immediately followed by another identifier-start character. This is
+        // what makes `fall.yvel` one token while leaving `fall.` (trailing dot)
+        // and `fall.5` (dot-then-digit) split for the parser to handle.
+        if i < chars.len() && chars[i] == '.' {
+            if let Some(next) = chars.get(i + 1) {
+                if next.is_alphabetic() || *next == '_' {
+                    i += 1; // consume the '.'
+                    continue;
+                }
+            }
+        }
+        break;
     }
     let text: String = chars[start..i].iter().collect();
     (TokenKind::Ident(text), i)
@@ -1003,6 +1032,48 @@ mod tests {
     }
 
     #[test]
+    fn dotted_member_name_is_one_ident() {
+        // Task 4.10 gap 3: `gethitvar(fall.yvel)` — the dotted member name is a
+        // single Ident so it can be passed through as one argument key.
+        assert_eq!(
+            kinds("gethitvar(fall.yvel)"),
+            vec![
+                TokenKind::Ident("gethitvar".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("fall.yvel".into()),
+                TokenKind::RParen,
+            ]
+        );
+        // A multi-dot member (`fall.envshake.time`) folds entirely too.
+        assert_eq!(
+            kinds("fall.envshake.time"),
+            vec![TokenKind::Ident("fall.envshake.time".into())]
+        );
+    }
+
+    #[test]
+    fn dot_not_between_idents_is_not_folded() {
+        // A trailing dot after an identifier is NOT consumed into it (no
+        // following identifier char): `fall.` is `Ident("fall")` then Unknown('.').
+        assert_eq!(
+            kinds("fall."),
+            vec![TokenKind::Ident("fall".into()), TokenKind::Unknown('.')]
+        );
+        // A dot before a digit is not folded: `x.5` is Ident, then Float(0.5)
+        // (the lexer routes `.5` to the number path).
+        assert_eq!(
+            kinds("x.5"),
+            vec![TokenKind::Ident("x".into()), TokenKind::Float(0.5)]
+        );
+        // A numeric literal with a fractional part is unaffected (digit-led →
+        // lex_number, never lex_ident): `5.x` stays Float then Ident.
+        assert_eq!(
+            kinds("5.x"),
+            vec![TokenKind::Float(5.0), TokenKind::Ident("x".into())]
+        );
+    }
+
+    #[test]
     fn cond_function_with_nested_arithmetic() {
         // `cond(var(0) > 0, life - 10, life)` — nested calls + arithmetic.
         let ks = kinds("cond(var(0) > 0, life - 10, life)");
@@ -1083,5 +1154,74 @@ mod tests {
             checked > 0,
             "fixture present but no trigger lines were parsed"
         );
+    }
+
+    // =====================================================================
+    // Proctor (task 4.10) — additional dotted-identifier lexer edge cases.
+    // Gap 3 folds `ident(.ident)*` into one Ident token; these pin the
+    // boundary conditions the existing tests do not, so a future lexer change
+    // that over- or under-folds is caught.
+    // =====================================================================
+
+    #[test]
+    fn dotted_ident_underscore_and_digit_members_fold() {
+        // A member name may contain digits and underscores after its first
+        // letter — `fall.envshake.time` already covered; here a mixed member.
+        assert_eq!(
+            kinds("get.var_2.x"),
+            vec![TokenKind::Ident("get.var_2.x".into())]
+        );
+        // An underscore-led member segment is an identifier-start char, so it
+        // folds: `a._b` is one ident.
+        assert_eq!(kinds("a._b"), vec![TokenKind::Ident("a._b".into())]);
+    }
+
+    #[test]
+    fn dotted_ident_does_not_swallow_following_operator_or_paren() {
+        // The fold stops at the first non-identifier char, so an operator or
+        // delimiter right after a dotted member stays its own token.
+        assert_eq!(
+            kinds("fall.yvel = 0"),
+            vec![
+                TokenKind::Ident("fall.yvel".into()),
+                TokenKind::Eq,
+                TokenKind::Int(0),
+            ]
+        );
+        assert_eq!(
+            kinds("gethitvar(fall.yvel)+1"),
+            vec![
+                TokenKind::Ident("gethitvar".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("fall.yvel".into()),
+                TokenKind::RParen,
+                TokenKind::Plus,
+                TokenKind::Int(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_dot_in_ident_is_not_folded_across_empty_segment() {
+        // `a..b` — the first dot is followed by another dot (not an
+        // identifier-start char), so it is NOT folded into `a`. The lexer
+        // emits `Ident("a")` then handles the dots without panicking. The exact
+        // remainder is not load-bearing; the contract is "never crash" and that
+        // the leading ident does not absorb a `..`.
+        let ks = kinds("a..b");
+        assert_eq!(ks.first(), Some(&TokenKind::Ident("a".into())));
+        // ...and the trailing `b` survives as its own ident somewhere after.
+        assert!(
+            ks.iter().any(|k| matches!(k, TokenKind::Ident(s) if s == "b")),
+            "trailing member should remain a separate ident: {ks:?}"
+        );
+    }
+
+    #[test]
+    fn dotted_member_after_digit_in_name_still_folds() {
+        // The member-continuation rule only requires the char after the dot to
+        // be a letter/underscore; the char before may be a digit (idents may
+        // contain digits): `p2.x` folds (`2` precedes the dot, `x` follows).
+        assert_eq!(kinds("p2.x"), vec![TokenKind::Ident("p2.x".into())]);
     }
 }

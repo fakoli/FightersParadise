@@ -213,6 +213,24 @@ pub enum Expr {
     ///
     /// The callee name is stored as written (case preserved); case-insensitive
     /// matching is left to the evaluator.
+    ///
+    /// ## Axis-suffixed component triggers (task 4.10, gap 1)
+    ///
+    /// MUGEN writes several vector triggers with a trailing, space-separated
+    /// *axis word* — `Vel Y`, `Pos X`, `P2Dist X`, `P2BodyDist X`,
+    /// `ScreenPos Y`, … — selecting one component of a 2-D (occasionally 3-D)
+    /// quantity. There is no operator between the two words; they are two
+    /// adjacent identifiers in the token stream. The parser lowers this form to
+    /// a single-argument `Call` whose **argument is the axis as a string
+    /// literal**: `Vel Y` becomes `Call { name: "Vel", args: [Str("Y")] }`,
+    /// `P2BodyDist X` becomes `Call { name: "P2BodyDist", args: [Str("X")] }`.
+    /// The axis word is normalized to an upper-case single letter (`"X"` /
+    /// `"Y"` / `"Z"`). This reuses the ordinary `Call` →
+    /// [`EvalContext::trigger`](crate::eval::EvalContext::trigger) path: the
+    /// evaluator passes the axis through as the (string) argument, so a context
+    /// answers `Vel Y` by reading `trigger("Vel", &[Value from "Y"])`. A bare,
+    /// non-suffixed `Vel` (no following axis word) still parses as a plain
+    /// [`Expr::Ident`].
     Call {
         /// The function / trigger name.
         name: String,
@@ -248,6 +266,36 @@ pub enum Expr {
         target: Redirect,
         /// The sub-expression to evaluate in the redirected context.
         expr: Box<Expr>,
+    },
+    /// The two-parameter *element-time comparison* form of the `AnimElem` /
+    /// `AnimElemTime` trigger family (task 4.10, gap 2), written
+    /// `AnimElem = N, op M` — for example `AnimElem = 2, >= 0` or the shorthand
+    /// `AnimElem = 2, 1` (an omitted operator means `=`).
+    ///
+    /// MUGEN reads this as **"the animation has reached element `N`, *and* the
+    /// time relative to that element satisfies `op M`"**. It is therefore the
+    /// conjunction of two checks: the element has been reached
+    /// (`AnimElemTime(N) >= 0`) **and** the secondary comparison
+    /// (`AnimElemTime(N) op M`). The evaluator computes exactly that against
+    /// [`EvalContext::trigger`](crate::eval::EvalContext::trigger) with the
+    /// trigger name `"AnimElemTime"` and the (evaluated) element number as the
+    /// argument; see [the evaluator](crate::evaluator) for the precise lowering.
+    ///
+    /// The bare `AnimElem = N` form (no comma tail) keeps parsing as an ordinary
+    /// [`Expr::Binary`] equality — this variant is produced *only* when the
+    /// comma tail is present.
+    AnimElemTail {
+        /// The trigger name as written (case preserved): `AnimElem`,
+        /// `AnimElemTime`, `TimeMod`, etc.
+        name: String,
+        /// The element number `N` (the right-hand side of the leading `= N`).
+        element: Box<Expr>,
+        /// The comparison operator applied to the element time. An omitted
+        /// operator in the source (`AnimElem = 2, 1`) defaults to
+        /// [`BinaryOp::Eq`].
+        op: BinaryOp,
+        /// The secondary operand `M` the element time is compared against.
+        operand: Box<Expr>,
     },
 }
 
@@ -347,7 +395,16 @@ pub fn parse(tokens: &[Token]) -> Result<Expr, ParseError> {
     if p.is_at_end() {
         return Err(ParseError::Empty);
     }
-    let expr = p.parse_expr(0)?;
+    let mut expr = p.parse_expr(0)?;
+    // The `AnimElem = N, op M` two-parameter comparison form (task 4.10, gap 2)
+    // leaves a top-level `,` after the leading `= N` equality. Try to fold it
+    // into an `AnimElemTail`; a non-matching shape leaves `expr` and the comma
+    // untouched, so the trailing-token check below still rejects a stray comma.
+    if p.peek().map(|t| &t.kind) == Some(&TokenKind::Comma) {
+        if let Some(folded) = p.try_fold_animelem_tail(&expr)? {
+            expr = folded;
+        }
+    }
     // Reject trailing tokens (e.g. `1 2` or `(a) b`).
     if let Some(tok) = p.peek() {
         return Err(ParseError::UnexpectedToken {
@@ -421,6 +478,31 @@ fn binary_binding_power(kind: &TokenKind) -> Option<(u8, BinaryOp)> {
         _ => return None,
     };
     Some(pair)
+}
+
+/// Maps a relational-operator token to its [`BinaryOp`], or [`None`] if the
+/// token is not a comparison operator. Used to read the optional operator in the
+/// `AnimElem = N, op M` comma-tail form (task 4.10, gap 2).
+fn relational_op(kind: &TokenKind) -> Option<BinaryOp> {
+    Some(match kind {
+        TokenKind::Eq | TokenKind::EqEq => BinaryOp::Eq,
+        TokenKind::NotEq => BinaryOp::Ne,
+        TokenKind::Lt => BinaryOp::Lt,
+        TokenKind::Le => BinaryOp::Le,
+        TokenKind::Gt => BinaryOp::Gt,
+        TokenKind::Ge => BinaryOp::Ge,
+        _ => return None,
+    })
+}
+
+/// Returns whether `name` (matched case-insensitively) is a member of the
+/// `AnimElem` trigger family that accepts the two-parameter
+/// `= N, op M` comparison tail (task 4.10, gap 2).
+fn is_animelem_family(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "animelem" | "animelemtime" | "animelemno" | "timemod"
+    )
 }
 
 // Note on the two highest precedence levels: unary prefixes conceptually sit at
@@ -675,6 +757,104 @@ impl<'a> Parser<'a> {
         self.tokens.get(idx).map(|t| &t.kind)
     }
 
+    /// If the current token is a bare axis word (`X` / `Y` / `Z`,
+    /// case-insensitive), returns it normalized to an upper-case single-letter
+    /// string; otherwise [`None`]. Used to fold a space-separated component
+    /// trigger (`Vel Y`, `Pos X`) into a one-argument call (task 4.10, gap 1).
+    ///
+    /// The token is **not** consumed — the caller decides whether to commit. The
+    /// match is exact (`x`, `y`, `z`), so a trigger or identifier that merely
+    /// starts with one of those letters (`yaccel`, `xvel`) is never mistaken for
+    /// an axis word.
+    fn peek_axis_word(&self) -> Option<String> {
+        let TokenKind::Ident(word) = &self.peek()?.kind else {
+            return None;
+        };
+        match word.as_str() {
+            "x" | "X" => Some("X".to_string()),
+            "y" | "Y" => Some("Y".to_string()),
+            "z" | "Z" => Some("Z".to_string()),
+            _ => None,
+        }
+    }
+
+    /// Tries to fold an already-parsed `<AnimElem-family> = N` equality plus a
+    /// trailing `, [op] M` into an [`Expr::AnimElemTail`] (task 4.10, gap 2).
+    ///
+    /// The current token must be the top-level `,`. The supplied `expr` must be
+    /// an equality `Binary { op: Eq, lhs, rhs }` whose `lhs` names a member of
+    /// the `AnimElem` trigger family (`AnimElem`, `AnimElemTime`, `TimeMod`,
+    /// `AnimElemNo`); the `rhs` is the element number `N`. On a match this
+    /// consumes the comma and the tail (`[op] M`, where an omitted operator
+    /// defaults to `=`) and returns the folded node. On any non-match it returns
+    /// `Ok(None)` **without consuming** the comma, so the caller's
+    /// trailing-token check still rejects an unrelated stray comma (e.g.
+    /// `foo, bar`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ParseError`] only when the comma *was* consumed (the shape
+    /// matched) but the tail is malformed — e.g. `AnimElem = 2,` with nothing
+    /// after the comma. That keeps the never-panic / recoverable-error contract.
+    fn try_fold_animelem_tail(&mut self, expr: &Expr) -> Result<Option<Expr>, ParseError> {
+        // The leading clause must be `<family-trigger> = N`.
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        let Expr::Ident(name) = lhs.as_ref() else {
+            return Ok(None);
+        };
+        if !is_animelem_family(name) {
+            return Ok(None);
+        }
+
+        // Commit: consume the top-level comma.
+        let comma_col = self.peek().map_or(0, |t| t.column);
+        self.advance();
+
+        // Optional comparison operator; an omitted operator means `=`.
+        let op = match self.peek().map(|t| &t.kind) {
+            Some(kind) => relational_op(kind).unwrap_or(BinaryOp::Eq),
+            None => {
+                return Err(ParseError::UnexpectedEof {
+                    expected: "a comparison operand after `,` in the AnimElem tail".to_string(),
+                });
+            }
+        };
+        // Consume the operator token if one was actually present.
+        if self
+            .peek()
+            .map(|t| &t.kind)
+            .and_then(relational_op)
+            .is_some()
+        {
+            self.advance();
+        }
+
+        // The secondary operand `M` is a full expression.
+        if self.is_at_end() {
+            return Err(ParseError::UnexpectedEof {
+                expected: "a comparison operand after the AnimElem tail operator".to_string(),
+            });
+        }
+        // Guard against an immediate second comma (`AnimElem = 2,,`) producing a
+        // confusing error: parse_expr will report the comma as unexpected.
+        let _ = comma_col;
+        let operand = self.parse_expr(0)?;
+
+        Ok(Some(Expr::AnimElemTail {
+            name: name.clone(),
+            element: rhs.clone(),
+            op,
+            operand: Box::new(operand),
+        }))
+    }
+
     /// Scans an `(id)` redirect index starting at `open` (which must index the
     /// `(`), returning the integer value and the position just past the `)`.
     ///
@@ -769,6 +949,18 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Call {
                         name: name.clone(),
                         args,
+                    })
+                } else if let Some(axis) = self.peek_axis_word() {
+                    // Axis-suffixed component trigger (task 4.10, gap 1):
+                    // `Vel Y`, `Pos X`, `P2BodyDist X`, `ScreenPos Y`, … — a
+                    // trigger name followed by a bare axis word. Lower it to a
+                    // call carrying the axis as a string argument, so it reuses
+                    // the ordinary `Call` → `trigger` path; see `Expr::Call`'s
+                    // axis-suffix note.
+                    self.advance(); // consume the axis word
+                    Ok(Expr::Call {
+                        name: name.clone(),
+                        args: vec![Expr::Str(axis)],
                     })
                 } else {
                     Ok(Expr::Ident(name.clone()))
@@ -2039,12 +2231,55 @@ mod tests {
     }
 
     #[test]
-    fn top_level_comma_leaves_trailing_tokens() {
-        // `AnimElem = 3, -1` (real kfm.cns line 1703) is MUGEN's two-parameter
-        // AnimElem syntax, not a single expression. The parser consumes
-        // `AnimElem = 3` and reports the `,` as a trailing unexpected token.
-        let err = parse_str("AnimElem = 3, -1").unwrap_err();
+    fn top_level_comma_on_non_animelem_leaves_trailing_tokens() {
+        // A top-level comma that is NOT the `AnimElem = N, op M` tail is still a
+        // trailing-token error: `Time = 3, -1` is not a two-parameter trigger, so
+        // the parser consumes `Time = 3` and reports the `,` as unexpected.
+        let err = parse_str("Time = 3, -1").unwrap_err();
         assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+        // Likewise a bare value with a trailing comma (`5, 6`) is an error.
+        let err = parse_str("5, 6").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn animelem_two_parameter_tail_parses() {
+        // Task 4.10 gap 2: `AnimElem = 3, -1` (real kfm.cns line 1703) is MUGEN's
+        // two-parameter AnimElem syntax, folded into an AnimElemTail node.
+        assert_eq!(
+            parse_str("AnimElem = 3, -1").unwrap(),
+            Expr::AnimElemTail {
+                name: "AnimElem".into(),
+                element: Box::new(int(3)),
+                op: BinaryOp::Eq, // omitted operator defaults to `=`
+                operand: Box::new(un(UnaryOp::Neg, int(1))),
+            }
+        );
+        // With an explicit operator (kfm.cns line 3200): `AnimElem = 2, >= 0`.
+        assert_eq!(
+            parse_str("AnimElem = 2, >= 0").unwrap(),
+            Expr::AnimElemTail {
+                name: "AnimElem".into(),
+                element: Box::new(int(2)),
+                op: BinaryOp::Ge,
+                operand: Box::new(int(0)),
+            }
+        );
+        // The whole family + case-insensitive name matching.
+        assert_eq!(
+            parse_str("animelemtime = 5, <= 3").unwrap(),
+            Expr::AnimElemTail {
+                name: "animelemtime".into(),
+                element: Box::new(int(5)),
+                op: BinaryOp::Le,
+                operand: Box::new(int(3)),
+            }
+        );
+        // A malformed tail (nothing after the comma) is a recoverable error.
+        assert!(matches!(
+            parse_str("AnimElem = 2,").unwrap_err(),
+            ParseError::UnexpectedEof { .. }
+        ));
     }
 
     #[test]
@@ -2053,6 +2288,82 @@ mod tests {
         // with an operator and cannot parse as an expression; must be Err.
         let err = parse_str(">= 0").unwrap_err();
         assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn axis_suffixed_component_triggers_parse_as_calls() {
+        // Task 4.10 gap 1: `Vel Y`, `Pos X`, … fold to a one-arg call with the
+        // axis as an upper-cased string literal argument.
+        assert_eq!(parse_str("Vel Y").unwrap(), call("Vel", vec![Expr::Str("Y".into())]));
+        assert_eq!(parse_str("Pos X").unwrap(), call("Pos", vec![Expr::Str("X".into())]));
+        // Case-insensitive axis word, normalized to upper-case.
+        assert_eq!(parse_str("Pos y").unwrap(), call("Pos", vec![Expr::Str("Y".into())]));
+        assert_eq!(parse_str("Vel x").unwrap(), call("Vel", vec![Expr::Str("X".into())]));
+        // Multi-word trigger names (P2Dist, P2BodyDist, ScreenPos).
+        assert_eq!(
+            parse_str("P2BodyDist X").unwrap(),
+            call("P2BodyDist", vec![Expr::Str("X".into())])
+        );
+        assert_eq!(
+            parse_str("ScreenPos Y").unwrap(),
+            call("ScreenPos", vec![Expr::Str("Y".into())])
+        );
+        // The Z axis is accepted too.
+        assert_eq!(parse_str("Pos Z").unwrap(), call("Pos", vec![Expr::Str("Z".into())]));
+    }
+
+    #[test]
+    fn axis_suffix_participates_in_comparisons_and_redirects() {
+        // The folded call is an ordinary atom, so it composes with operators...
+        assert_eq!(
+            parse_str("Vel Y > 0").unwrap(),
+            bin(BinaryOp::Gt, call("Vel", vec![Expr::Str("Y".into())]), int(0))
+        );
+        assert_eq!(
+            parse_str("(Vel y > 0) && (Pos y >= 0)").unwrap(),
+            bin(
+                BinaryOp::And,
+                bin(BinaryOp::Gt, call("Vel", vec![Expr::Str("Y".into())]), int(0)),
+                bin(BinaryOp::Ge, call("Pos", vec![Expr::Str("Y".into())]), int(0)),
+            )
+        );
+        // ...and through a redirect: `enemy, P2BodyDist X` (a real KFM shape).
+        assert_eq!(
+            parse_str("enemy, P2BodyDist X").unwrap(),
+            redirected(Redirect::Enemy, call("P2BodyDist", vec![Expr::Str("X".into())]))
+        );
+    }
+
+    #[test]
+    fn non_axis_trailing_ident_is_not_folded() {
+        // A non-axis word after an ident is NOT an axis suffix; two adjacent
+        // idents stay a (recoverable) trailing-token error.
+        let err = parse_str("Vel W").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+        // A bare trigger that merely starts with an axis letter is unaffected: a
+        // standalone `Y` is just an ident; `yaccel` is an ident.
+        assert_eq!(parse_str("yaccel").unwrap(), ident("yaccel"));
+        // `Vel` with no following axis word stays a bare ident.
+        assert_eq!(parse_str("Vel").unwrap(), ident("Vel"));
+    }
+
+    #[test]
+    fn dotted_member_in_call_arg_parses() {
+        // Task 4.10 gap 3: `GetHitVar(fall.yvel)` — the dotted member name is one
+        // ident token, passed through as the single call argument.
+        assert_eq!(
+            parse_str("GetHitVar(fall.yvel)").unwrap(),
+            call("GetHitVar", vec![ident("fall.yvel")])
+        );
+        assert_eq!(
+            parse_str("GetHitVar(xveladd)").unwrap(),
+            call("GetHitVar", vec![ident("xveladd")])
+        );
+        // It composes in a comparison: `GetHitVar(fall.yvel) = 0` (common1.cns).
+        assert_eq!(
+            parse_str("GetHitVar(fall.yvel) = 0").unwrap(),
+            bin(BinaryOp::Eq, call("GetHitVar", vec![ident("fall.yvel")]), int(0))
+        );
     }
 
     #[test]
@@ -2520,5 +2831,302 @@ mod tests {
         // Debug is non-empty and names the variant.
         let dbg = format!("{a:?}");
         assert!(dbg.contains("Redirected"), "{dbg}");
+    }
+
+    // =====================================================================
+    // Proctor (task 4.10) — additional parser edge cases & error paths for
+    // the four real-content gaps. These complement Forge's happy-path parse
+    // tests with the boundary, negative, and error-recovery cases.
+    // =====================================================================
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::Str(s.into())
+    }
+
+    // ---- Gap 1: axis suffix — boundaries & non-folding cases ----
+
+    #[test]
+    fn axis_suffix_does_not_fold_after_a_call() {
+        // The axis fold only applies to a bare `Ident` followed by an axis word.
+        // A *call* `var(0)` followed by `Y` is two atoms, not an axis form — it
+        // must stay a (recoverable) trailing-token error, never silently fold.
+        let err = parse_str("var(0) Y").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn axis_suffix_does_not_consume_a_following_paren_call() {
+        // `Vel Y(0)` — `Vel` folds with axis `Y`, but the trailing `(0)` is then a
+        // leftover token (the folded Call is complete). Recoverable error, not a
+        // panic, and not a silent two-arg call.
+        let err = parse_str("Vel Y(0)").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn axis_word_alone_is_a_bare_ident_not_an_axis() {
+        // A standalone axis letter is just a trigger/ident; folding requires a
+        // *preceding* trigger name.
+        assert_eq!(parse_str("X").unwrap(), ident("X"));
+        assert_eq!(parse_str("Y").unwrap(), ident("Y"));
+        assert_eq!(parse_str("Z").unwrap(), ident("Z"));
+    }
+
+    #[test]
+    fn axis_suffix_only_consumes_one_axis_word() {
+        // `Pos X Y` — `Pos` folds with the first axis word `X`; the second `Y` is a
+        // leftover trailing token (recoverable error). Confirms the fold is
+        // single-shot, not greedy.
+        let err = parse_str("Pos X Y").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn axis_suffix_lowercase_trigger_name_still_folds() {
+        // Real common1.cns writes the trigger name in lower case too (`vel x`).
+        // Case is preserved on the NAME (matching is the evaluator's job) but the
+        // axis is normalized to upper-case.
+        assert_eq!(parse_str("vel x").unwrap(), call("vel", vec![str_lit("X")]));
+        assert_eq!(parse_str("pos y").unwrap(), call("pos", vec![str_lit("Y")]));
+    }
+
+    #[test]
+    fn axis_suffix_composes_with_arithmetic_and_unary() {
+        // The folded call is an ordinary atom: it participates in arithmetic and
+        // under a unary prefix exactly like any other primary.
+        assert_eq!(
+            parse_str("Pos Y + 10").unwrap(),
+            bin(BinaryOp::Add, call("Pos", vec![str_lit("Y")]), int(10))
+        );
+        assert_eq!(
+            parse_str("-Vel Y").unwrap(),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(call("Vel", vec![str_lit("Y")])),
+            }
+        );
+    }
+
+    // ---- Gap 2: AnimElem comma tail — error paths & family coverage ----
+
+    #[test]
+    fn animelem_tail_missing_operand_after_comma_is_eof_error() {
+        // `AnimElem = 2,` — the comma matched the family shape and was consumed,
+        // but nothing follows. This must be a recoverable EOF error, not a panic.
+        let err = parse_str("AnimElem = 2,").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn animelem_tail_double_comma_is_recoverable_error() {
+        // `AnimElem = 2,,` — comma consumed, then a stray comma where an operand
+        // is required. Recoverable token error, never a panic.
+        let err = parse_str("AnimElem = 2,,").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::UnexpectedToken { .. } | ParseError::UnexpectedEof { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn non_family_trigger_with_comma_tail_does_not_fold() {
+        // The comma tail only folds for the AnimElem family. `Time = 2, >= 0` is
+        // NOT a family trigger, so the comma is left unconsumed and surfaces as a
+        // trailing-token error — it must NOT be silently swallowed into an
+        // AnimElemTail.
+        let err = parse_str("Time = 2, >= 0").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn animelem_tail_requires_equality_head_not_other_comparison() {
+        // The fold only fires when the head is an *equality* (`= N`). A `>=` head
+        // is a different comparison; the comma after it is a stray trailing token,
+        // not a tail. `AnimElem >= 2, 0` must error, not fold.
+        let err = parse_str("AnimElem >= 2, 0").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn animelem_tail_all_family_members_parse() {
+        // Every family member named in `is_animelem_family` accepts the tail.
+        for name in ["AnimElem", "AnimElemTime", "AnimElemNo", "TimeMod"] {
+            let src = format!("{name} = 2, >= 0");
+            let ast = parse_str(&src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            match ast {
+                Expr::AnimElemTail {
+                    name: n, op, ..
+                } => {
+                    assert!(n.eq_ignore_ascii_case(name), "name preserved: {n}");
+                    assert_eq!(op, BinaryOp::Ge);
+                }
+                other => panic!("{src:?} should fold to AnimElemTail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn animelem_tail_omitted_operator_defaults_to_eq() {
+        // `AnimElem = 2, 1` — no operator in the tail means `=`.
+        match parse_str("AnimElem = 2, 1").unwrap() {
+            Expr::AnimElemTail { op, element, operand, .. } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_eq!(*element, int(2));
+                assert_eq!(*operand, int(1));
+            }
+            other => panic!("expected AnimElemTail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_real_kfm_negative_operand() {
+        // Verbatim kfm.cns line 1703: `AnimElem = 3, -1` — operand is a negated
+        // literal; the omitted op defaults to `=`.
+        match parse_str("AnimElem = 3, -1").unwrap() {
+            Expr::AnimElemTail { op, element, operand, .. } => {
+                assert_eq!(op, BinaryOp::Eq);
+                assert_eq!(*element, int(3));
+                assert_eq!(
+                    *operand,
+                    Expr::Unary { op: UnaryOp::Neg, operand: Box::new(int(1)) }
+                );
+            }
+            other => panic!("expected AnimElemTail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn animelem_tail_fold_is_top_level_only_documented_limitation() {
+        // KNOWN LIMITATION (reported to Forge): the `= N, op M` fold is attempted
+        // ONLY at the very top of the parse, when the comma is the immediate next
+        // token after the full expression AND that full expression is exactly a
+        // `<family> = N` equality. Consequences, all pinned here so a future change
+        // is a conscious one:
+        //
+        //  (a) A standalone line folds correctly (the real-content shape — all four
+        //      kfm.cns occurrences are standalone `trigger1 = AnimElem = N, ...`).
+        assert!(matches!(
+            parse_str("AnimElem = 2, >= 0"),
+            Ok(Expr::AnimElemTail { .. })
+        ));
+        //  (b) A *parenthesized* tail does NOT fold: inside `(...)` the comma is
+        //      read as a range separator and the `op` after it is a stray token.
+        //      Recoverable error, never a panic.
+        assert!(matches!(
+            parse_str("(AnimElem = 2, >= 0)"),
+            Err(ParseError::UnexpectedToken { .. })
+        ));
+        //  (c) When the family equality is buried inside a larger boolean on its
+        //      LEFT, the comma is stranded and surfaces as a trailing-token error.
+        assert!(matches!(
+            parse_str("Time > 0 && AnimElem = 2, >= 0"),
+            Err(ParseError::UnexpectedToken { .. })
+        ));
+        //  (d) When it is on the LEFT of the line, the tail operand greedily
+        //      absorbs the trailing boolean (`>= 0 && Time > 0` becomes the
+        //      operand). It still parses to an AnimElemTail (no panic), but the
+        //      operand is the whole `0 && ...` — a mis-binding to be aware of.
+        match parse_str("AnimElem = 2, >= 0 && Time > 0").unwrap() {
+            Expr::AnimElemTail { operand, .. } => {
+                assert!(
+                    matches!(*operand, Expr::Binary { op: BinaryOp::And, .. }),
+                    "operand greedily absorbs the && tail: {operand:?}"
+                );
+            }
+            other => panic!("expected AnimElemTail, got {other:?}"),
+        }
+    }
+
+    // ---- Gap 3: dotted member args — multi-dot, composition ----
+
+    #[test]
+    fn dotted_multi_segment_member_arg_parses() {
+        // `GetHitVar(fall.envshake.time)` — a three-segment dotted member is one
+        // ident argument.
+        assert_eq!(
+            parse_str("GetHitVar(fall.envshake.time)").unwrap(),
+            call("GetHitVar", vec![ident("fall.envshake.time")])
+        );
+    }
+
+    #[test]
+    fn dotted_member_arg_through_redirect_parses() {
+        // `enemy, GetHitVar(fall.yvel)` — dotted arg survives inside a redirect.
+        assert_eq!(
+            parse_str("enemy, GetHitVar(fall.yvel)").unwrap(),
+            redirected(Redirect::Enemy, call("GetHitVar", vec![ident("fall.yvel")]))
+        );
+    }
+
+    #[test]
+    fn dotted_member_arg_with_arithmetic_parses() {
+        // `GetHitVar(fall.yvel) + 1` — the dotted-arg call composes in arithmetic.
+        assert_eq!(
+            parse_str("GetHitVar(fall.yvel) + 1").unwrap(),
+            bin(BinaryOp::Add, call("GetHitVar", vec![ident("fall.yvel")]), int(1))
+        );
+    }
+
+    // ---- Gap 4: command = "string" — parse shape & chained forms ----
+
+    #[test]
+    fn command_string_equality_parses_in_both_orders() {
+        // The parser is order-agnostic; the evaluator recognizes either operand
+        // order. Confirm both parse to the obvious Binary shape.
+        assert_eq!(
+            parse_str("command = \"x\"").unwrap(),
+            bin(BinaryOp::Eq, ident("command"), str_lit("x"))
+        );
+        assert_eq!(
+            parse_str("\"x\" = command").unwrap(),
+            bin(BinaryOp::Eq, str_lit("x"), ident("command"))
+        );
+        assert_eq!(
+            parse_str("command != \"x\"").unwrap(),
+            bin(BinaryOp::Ne, ident("command"), str_lit("x"))
+        );
+    }
+
+    #[test]
+    fn command_string_or_chain_parses() {
+        // Real kfm.cns shape: `Command = "a" || Command = "b"`.
+        assert_eq!(
+            parse_str("Command = \"a\" || Command = \"b\"").unwrap(),
+            bin(
+                BinaryOp::Or,
+                bin(BinaryOp::Eq, ident("Command"), str_lit("a")),
+                bin(BinaryOp::Eq, ident("Command"), str_lit("b")),
+            )
+        );
+    }
+
+    #[test]
+    fn chained_var_eq_command_eq_string_is_left_associative() {
+        // Real kfm.cns shape `var(2) = command = "holdfwd"` (a VarSet value, not a
+        // trigger condition). `=` is left-associative, so this parses as
+        // `(var(2) = command) = "holdfwd"` — the OUTER lhs is a Binary, NOT a bare
+        // `command` ident, which is why the evaluator does NOT route it through the
+        // command seam (documented in the evaluator tests). Pin the parse shape.
+        assert_eq!(
+            parse_str("var(2) = command = \"holdfwd\"").unwrap(),
+            bin(
+                BinaryOp::Eq,
+                bin(BinaryOp::Eq, call("var", vec![int(2)]), ident("command")),
+                str_lit("holdfwd"),
+            )
+        );
+    }
+
+    #[test]
+    fn empty_string_literal_compare_parses() {
+        // A degenerate but well-formed `command = ""` must parse (the lexer yields
+        // an empty Str), never panic.
+        assert_eq!(
+            parse_str("command = \"\"").unwrap(),
+            bin(BinaryOp::Eq, ident("command"), str_lit(""))
+        );
     }
 }

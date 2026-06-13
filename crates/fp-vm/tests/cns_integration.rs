@@ -105,44 +105,25 @@ fn load_all_triggers(dir: &Path) -> Vec<RawTrigger> {
 /// syntactic form. A clean-parse failure is only acceptable if the offending
 /// expression contains one of these; anything else is a genuine regression.
 ///
-/// What these correspond to in the real fixtures (see the analysis in the
-/// test below):
+/// Task 4.10 closed the four real-content gaps the 4.6 keystone surfaced —
+/// axis-suffixed component triggers (`Vel Y`, `Pos X`, `P2BodyDist X`,
+/// `ScreenPos Y`), the `AnimElem = N, op M` comparison tail,
+/// dotted call arguments (`GetHitVar(fall.yvel)`), and `command = "name"`
+/// string equality — so **none of those forms is unsupported any more**. The
+/// only remaining deferred form is:
 ///
-/// - `vel `, `pos `, `p2dist `, `p2bodydist ` — MUGEN's *space-separated
-///   component* triggers (`Vel Y`, `Pos Y`, `P2Dist X`, …). The current parser
-///   does not yet treat the trailing `X`/`Y` axis word as part of the trigger.
-/// - `gethitvar(` — the `GetHitVar(fall.yvel)` form uses a *dotted* member name
-///   inside the call arguments, which the lexer/parser do not yet accept.
-/// - `,` after a comparison — the extended `AnimElem = N, op M` comparison form
-///   (e.g. `AnimElem = 2, >= 0`) is not yet supported.
 /// - `:=` — variable assignment inside an expression, explicitly deferred to
 ///   task 4.9. (Not present in these particular fixtures, but listed so the
 ///   guard stays correct once assignment-bearing content is added.)
-const KNOWN_UNSUPPORTED_SUBSTR: &[&str] = &[
-    "vel ",
-    "pos ",
-    "p2dist ",
-    "p2bodydist ",
-    "gethitvar(",
-    ":=",
-];
+const KNOWN_UNSUPPORTED_SUBSTR: &[&str] = &[":="];
 
 /// Returns `true` if `expr` (matched case-insensitively) contains a known
-/// unsupported form, or if it is one of the trailing-comma comparison forms.
+/// unsupported form. After task 4.10 this is just the deferred `:=` assignment
+/// operator; the previously-listed axis / dotted / comma-tail / command forms
+/// now all parse.
 fn is_known_unsupported(expr: &str) -> bool {
     let lower = expr.to_ascii_lowercase();
-    if KNOWN_UNSUPPORTED_SUBSTR.iter().any(|s| lower.contains(s)) {
-        return true;
-    }
-    // The extended `AnimElem = N, op M` comparison form: a top-level comparison
-    // followed by a comma. We detect it structurally enough for the guard: the
-    // expression contains a comparison operator and a comma but is not a
-    // call/range (those legitimately use commas). The real offenders all start
-    // with `animelem` and contain `,` after an `=`.
-    if lower.starts_with("animelem") && lower.contains(',') {
-        return true;
-    }
-    false
+    KNOWN_UNSUPPORTED_SUBSTR.iter().any(|s| lower.contains(s))
 }
 
 // =============================================================================
@@ -206,10 +187,12 @@ fn all_real_triggers_lex_and_parse_without_panic() {
         }
     }
 
-    // (2) A large majority must parse cleanly.
+    // (2) The vast majority must parse cleanly. Task 4.10 closed the four
+    // real-content gaps the 4.6 keystone surfaced, lifting the rate from ~90.3%
+    // to ~100% on these fixtures, so the floor is now 98%.
     assert!(
-        rate >= 85.0,
-        "clean-parse rate {rate:.1}% fell below the 85% floor ({parsed}/{total})"
+        rate >= 98.0,
+        "clean-parse rate {rate:.1}% fell below the 98% floor ({parsed}/{total})"
     );
 
     // (2 cont.) Every failure must be attributable to a known-unsupported form;
@@ -262,6 +245,10 @@ struct Ctx {
     // `Redirect` is `Hash + Eq` but not `Ord`, so the target map must be a
     // `HashMap`, not a `BTreeMap`.
     redirects: HashMap<Redirect, Box<Ctx>>,
+    /// Command names that are "active" this tick, for `command = "name"`
+    /// string-equality (task 4.10, gap 4). Stored lowercased for
+    /// case-insensitive matching.
+    active_commands: Vec<String>,
 }
 
 impl Ctx {
@@ -280,6 +267,12 @@ impl Ctx {
         self.redirects.insert(target, Box::new(ctx));
         self
     }
+
+    /// Marks a command name as active for `command = "name"` queries.
+    fn with_command(mut self, name: &str) -> Self {
+        self.active_commands.push(name.to_ascii_lowercase());
+        self
+    }
 }
 
 impl EvalContext for Ctx {
@@ -294,6 +287,12 @@ impl EvalContext for Ctx {
         self.redirects
             .get(&target)
             .map(|boxed| boxed.as_ref() as &dyn EvalContext)
+    }
+
+    fn command_active(&self, name: &str) -> bool {
+        self.active_commands
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(name))
     }
 }
 
@@ -384,17 +383,24 @@ fn curated_real_kfm_triggers_evaluate_to_expected_values() {
     );
 
     // 9. A command-string compare: `command = "x"`. (kfm.cns) — KFM's special
-    //    intro uses `command = "x"`-style detection. NOTE: string-equality
-    //    semantics for `command = "..."` are NOT yet implemented in the
-    //    evaluator (the `Str` RHS evaluates to bottom), so this currently always
-    //    yields 0. We assert the never-crash contract (a concrete Value, here
-    //    Int(0)) and flag the gap; see the test return notes.
-    let ctx = Ctx::new().with_trigger("command", &[], Value::Int(1));
+    //    intro and many moves fire on `command = "name"` detection. Task 4.10
+    //    wired string-equality through the `command_active` seam, so this now
+    //    evaluates the command buffer rather than collapsing to 0.
+    //    When the named command IS active, the compare fires (1)...
+    let ctx = Ctx::new().with_command("x");
     assert_eq!(
         run("command = \"x\"", &ctx),
-        Value::Int(0),
-        "command-string compare is not yet wired (Str RHS -> bottom -> 0); never panics"
+        Value::Int(1),
+        "command = \"x\" must fire when command x is active (task 4.10)"
     );
+    //    ...and when it is NOT active it is 0 (never panics).
+    let ctx = Ctx::new().with_command("y");
+    assert_eq!(run("command = \"x\"", &ctx), Value::Int(0));
+    // Reversed operand order and `!=` also work end-to-end.
+    let ctx = Ctx::new().with_command("recovery");
+    assert_eq!(run("\"recovery\" = command", &ctx), Value::Int(1));
+    assert_eq!(run("command != \"recovery\"", &ctx), Value::Int(0));
+    assert_eq!(run("command != \"holdback\"", &ctx), Value::Int(1));
 
     // 10. A REDIRECTION evaluated end-to-end. KFM's own trigger conditions do
     //     not use a `root,`-prefixed redirect, so this is a representative
@@ -522,26 +528,60 @@ fn deferred_assignment_form_is_a_recoverable_parse_error() {
 }
 
 #[test]
-fn space_separated_component_triggers_surface_as_parse_errors() {
-    // MUGEN's `Vel Y` / `Pos X` / `P2Dist X` axis-word forms are a known gap:
-    // the trailing axis word is an unexpected token after a complete `Ident`.
-    for src in ["Vel Y", "Pos X", "P2Dist X", "P2BodyDist X"] {
+fn space_separated_component_triggers_now_parse_and_evaluate() {
+    // Task 4.10 gap 1: MUGEN's `Vel Y` / `Pos X` / `P2Dist X` / `P2BodyDist X`
+    // axis-word forms now PARSE (folded to a one-arg call carrying the axis) and
+    // EVALUATE through the trigger seam with the axis code (X=0, Y=1, Z=2).
+    for src in ["Vel Y", "Pos X", "P2Dist X", "P2BodyDist X", "ScreenPos Y"] {
         let _ = tokenize(src);
-        let err = parse_str(src)
-            .expect_err("space-separated component trigger is a known-unsupported form");
-        assert!(
-            matches!(err, ParseError::UnexpectedToken { .. }),
-            "{src:?} should be an UnexpectedToken (trailing axis word), got {err:?}"
-        );
+        parse_str(src).unwrap_or_else(|e| panic!("{src:?} should now parse: {e}"));
     }
-    // Crucially, these are exactly what the asset test's guard whitelists, so
-    // keep the guard honest: it must classify them as known-unsupported.
+    // Evaluate one: `Vel Y` reads trigger("Vel", &[Int(1)]).
+    let ctx = Ctx::new().with_trigger("Vel", &[Value::Int(1)], Value::Float(-3.0));
+    assert_eq!(run("Vel Y", &ctx), Value::Float(-3.0));
+    // X and Y are distinguishable (the int-code encoding): only Y registered.
+    assert_eq!(run("Vel X", &ctx), Value::Int(0));
+    // A real KFM comparison: `Vel Y > 0`.
+    let ctx = Ctx::new().with_trigger("Vel", &[Value::Int(1)], Value::Float(2.0));
+    assert_eq!(run("Vel Y > 0", &ctx), Value::Int(1));
+
+    // None of these is "known-unsupported" any more (the guard must not
+    // whitelist a form that now parses — that would mask a future regression).
     for src in ["vel y", "pos x", "p2dist x", "p2bodydist x"] {
         assert!(
-            is_known_unsupported(src),
-            "guard must recognize {src:?} as a known-unsupported form"
+            !is_known_unsupported(src),
+            "guard must NOT whitelist {src:?}: it parses now (task 4.10)"
         );
     }
+}
+
+#[test]
+fn animelem_comma_tail_and_dotted_args_now_parse() {
+    // Task 4.10 gaps 2 & 3: the `AnimElem = N, op M` tail and dotted call args
+    // both parse now (previously known-unsupported). Confirm parse + concrete
+    // eval, and that the guard no longer whitelists them.
+    for src in [
+        "AnimElem = 2, >= 0",
+        "AnimElem = 3, -1",
+        "GetHitVar(fall.yvel)",
+        "GetHitVar(xveladd)",
+    ] {
+        let ast = parse_str(src).unwrap_or_else(|e| panic!("{src:?} should now parse: {e}"));
+        // Evaluating against an empty context yields a concrete Value, no panic.
+        let v = eval(&ast, &EmptyCtx);
+        assert!(matches!(v, Value::Int(_) | Value::Float(_)), "{src:?} -> {v:?}");
+        assert!(
+            !is_known_unsupported(src),
+            "guard must NOT whitelist {src:?}: it parses now (task 4.10)"
+        );
+    }
+
+    // AnimElem tail semantics end-to-end: element reached (time 0) AND `>= 0`.
+    let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0));
+    assert_eq!(run("AnimElem = 2, >= 0", &ctx), Value::Int(1));
+    // Not reached (negative element time) → false.
+    let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(-1));
+    assert_eq!(run("AnimElem = 2, >= 0", &ctx), Value::Int(0));
 }
 
 #[test]
@@ -612,10 +652,14 @@ fn mugen_bottom_and_unknown_trigger_never_fires() {
     let ctx = EmptyCtx; // every trigger -> 0
     assert_eq!(run("SomeUnknownTrigger", &ctx), Value::Int(0));
     assert_eq!(run("SomeUnknownTrigger = 5", &ctx), Value::Int(0));
-    // A string literal RHS evaluates to bottom -> the comparison is 0 (never
-    // fires) rather than panicking. This is the documented current gap for
-    // `command = "x"` and friends.
+    // `command = "name"` now routes through the `command_active` seam (task
+    // 4.10). EmptyCtx's default `command_active` returns false, so no command is
+    // active here and the compare is 0 — it never fires, and never panics. (A
+    // context that reports the command active yields 1; see the curated test.)
     assert_eq!(run("command = \"fwd\"", &ctx), Value::Int(0));
+    // A NON-command `trigger = "string"` still collapses to bottom -> 0 (the
+    // documented behavior for string compares outside the `command` seam).
+    assert_eq!(run("anim = \"fwd\"", &ctx), Value::Int(0));
     // ln of a non-positive value is bottom -> 0 (never fires), no panic.
     assert_eq!(run("ln(0) > 0", &ctx), Value::Int(0));
     // A bare bottom-y string used as a condition is false.
@@ -718,4 +762,190 @@ fn additional_curated_real_shape_triggers_evaluate() {
     let ctx = Ctx::new().with_trigger("var", &[Value::Int(5)], Value::Int(2));
     assert_eq!(run("var(5) = 2", &ctx), Value::Int(1));
     assert_eq!(run("var(5) != 2", &ctx), Value::Int(0));
+}
+
+// =============================================================================
+// Proctor (task 4.10) — REAL-FIXTURE gate exercising every closed gap.
+//
+// The asset-gated test above proves the aggregate parse rate; this one harvests
+// the *specific* gap-form trigger lines out of the production CNS and drives each
+// through parse->eval, asserting (a) no panic, (b) a concrete Value, and (c) that
+// all four gap categories were actually present and exercised. Gated on
+// `test-assets/` so the default asset-less checkout stays green.
+// =============================================================================
+
+/// Pulls the raw right-hand sides of `triggerN = ...` / `triggerall = ...` /
+/// `varset`-style lines straight out of a CNS file's text. This is a lighter
+/// harvest than the structured `collect_triggers` above — it keeps the verbatim
+/// RHS string so the curated gap-shape matching below sees exactly what the
+/// author wrote (including the `command = "x"` value-set lines).
+fn harvest_trigger_rhs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        // trigger / triggerall lines carry expressions; also catch `value = ...`
+        // and `var(n) = ...` value-sets, which is where `command = "x"` lives.
+        let is_trigger = lower.starts_with("trigger");
+        let is_value = lower.starts_with("value") || lower.starts_with("var(");
+        if !(is_trigger || is_value) {
+            continue;
+        }
+        let Some((_, rhs)) = line.split_once('=') else {
+            continue;
+        };
+        // Strip a trailing `;` comment.
+        let rhs = rhs.split(';').next().unwrap_or(rhs).trim();
+        if !rhs.is_empty() {
+            out.push(rhs.to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn real_fixture_gap_forms_parse_and_eval_without_panic() {
+    let Some(dir) = kfm_assets_dir() else {
+        eprintln!("skipping real_fixture_gap_forms_parse_and_eval_without_panic: test-assets/ absent");
+        return;
+    };
+
+    // A generous context so most reads resolve to something; anything unseeded
+    // still defaults safely to 0. We seed the axis/command shapes we assert on.
+    let ctx = Ctx::new()
+        .with_command("x")
+        .with_command("a")
+        .with_command("holdfwd")
+        .with_command("recovery")
+        .with_trigger("Vel", &[Value::Int(1)], Value::Float(-4.0)) // Vel Y
+        .with_trigger("Vel", &[Value::Int(0)], Value::Float(2.0)) // Vel X
+        .with_trigger("Pos", &[Value::Int(1)], Value::Float(-10.0)) // Pos Y
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("AnimElemTime", &[Value::Int(3)], Value::Int(0));
+
+    let mut axis_seen = 0usize;
+    let mut tail_seen = 0usize;
+    let mut dotted_seen = 0usize;
+    let mut command_seen = 0usize;
+    let mut evaluated = 0usize;
+
+    for fname in ["kfm.cns", "common1.cns"] {
+        let text = std::fs::read_to_string(dir.join(fname)).expect("read fixture");
+        for rhs in harvest_trigger_rhs(&text) {
+            let lower = rhs.to_ascii_lowercase();
+
+            // Categorize the gap forms so we can assert each was present.
+            // Axis-suffixed component trigger: `<word> <X|Y|Z>` (whole-word axis).
+            let has_axis = regex_like_axis(&lower);
+            // AnimElem comma tail: an animelem-family `= N ,` shape.
+            let has_tail = lower.contains("animelem")
+                && lower.contains('=')
+                && lower.contains(',')
+                && !lower.contains('[') // exclude range RHS like `anim = [a,b]`
+                && !lower.contains('(');
+            // Dotted member arg.
+            let has_dotted = lower.contains("gethitvar(") && rhs.contains('.');
+            // command = "str".
+            let has_command = lower.contains("command") && rhs.contains('"');
+
+            if has_axis {
+                axis_seen += 1;
+            }
+            if has_tail {
+                tail_seen += 1;
+            }
+            if has_dotted {
+                dotted_seen += 1;
+            }
+            if has_command {
+                command_seen += 1;
+            }
+
+            // Every harvested RHS must tokenize + (for the gap shapes) eval without
+            // panic. Some value-set RHS are not standalone expressions (e.g.
+            // multi-comma controller params), so only assert eval on those that
+            // parse — the contract is "never panic", and a parse error here is the
+            // recoverable kind.
+            let _ = tokenize(&rhs);
+            if let Ok(ast) = parse_str(&rhs) {
+                let v = eval(&ast, &ctx);
+                match v {
+                    Value::Int(_) => {}
+                    Value::Float(f) => assert!(
+                        f.is_finite() || f.is_nan(),
+                        "eval of real gap RHS {rhs:?} produced a non-representable float"
+                    ),
+                }
+                evaluated += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "real-fixture gap forms: axis={axis_seen} tail={tail_seen} dotted={dotted_seen} \
+         command={command_seen} (evaluated {evaluated} parseable RHS)"
+    );
+
+    // Each gap category must actually be present in the production content, or
+    // this test is not exercising what it claims. (Grounded in grep counts:
+    // axis ~80, tail 4, dotted 3, command ~49 across the two files.)
+    assert!(axis_seen >= 10, "expected axis-suffixed forms in fixtures, saw {axis_seen}");
+    assert!(tail_seen >= 1, "expected AnimElem comma-tail forms, saw {tail_seen}");
+    assert!(dotted_seen >= 1, "expected dotted GetHitVar args, saw {dotted_seen}");
+    assert!(command_seen >= 1, "expected command string compares, saw {command_seen}");
+    assert!(evaluated > 50, "expected many parseable gap RHS, evaluated {evaluated}");
+}
+
+/// Whole-word detection of an axis-suffixed component trigger inside a lowercased
+/// RHS: a known vector trigger name immediately followed (separated only by
+/// spaces) by a lone axis word `x`/`y`/`z`. Avoids a regex dependency.
+fn regex_like_axis(lower: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "vel", "pos", "p2dist", "p2bodydist", "p1bodydist", "screenpos",
+        "backedgedist", "frontedgedist", "parentdist", "rootdist",
+    ];
+    // Tokenize on non-alphanumeric, then look for [name, axis] adjacency.
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for pair in words.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if NAMES.contains(&a) && matches!(b, "x" | "y" | "z") {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn gap_forms_end_to_end_against_mock_cover_all_four_acceptance_criteria() {
+    // A single asset-independent test that drives ONE representative real-shape
+    // expression per gap through parse->eval, asserting the MUGEN-correct result.
+    // This guarantees each acceptance criterion is exercised on every
+    // `cargo test`, with or without fixtures.
+
+    // AC1: axis-suffixed component trigger (`Vel Y` → Y=1).
+    let ctx = Ctx::new().with_trigger("Vel", &[Value::Int(1)], Value::Float(-3.0));
+    assert_eq!(run("Vel Y", &ctx), Value::Float(-3.0));
+    assert_eq!(run("Vel Y < 0", &ctx), Value::Int(1));
+
+    // AC2: AnimElem comma tail (`AnimElem = 2, >= 0` → reached AND secondary).
+    let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0));
+    assert_eq!(run("AnimElem = 2, >= 0", &ctx), Value::Int(1));
+    let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(-1));
+    assert_eq!(run("AnimElem = 2, >= 0", &ctx), Value::Int(0));
+
+    // AC3: dotted member arg (`GetHitVar(fall.yvel)`), passed by nested-trigger
+    // value: seed fall.yvel→7, GetHitVar(7)→42.
+    let ctx = Ctx::new()
+        .with_trigger("fall.yvel", &[], Value::Int(7))
+        .with_trigger("GetHitVar", &[Value::Int(7)], Value::Int(42));
+    assert_eq!(run("GetHitVar(fall.yvel)", &ctx), Value::Int(42));
+
+    // AC4: command = "x" string equality through the command seam.
+    let ctx = Ctx::new().with_command("x");
+    assert_eq!(run("command = \"x\"", &ctx), Value::Int(1));
+    let ctx = Ctx::new().with_command("y");
+    assert_eq!(run("command = \"x\"", &ctx), Value::Int(0));
 }

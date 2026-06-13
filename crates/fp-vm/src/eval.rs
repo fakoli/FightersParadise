@@ -56,6 +56,15 @@
 //! redirections **never panic**: they yield `Value::Int(0)` (or `None` for a
 //! redirect), matching the spec's safe-default contract.
 //!
+//! ## String-keyed queries (`command = "name"`)
+//!
+//! Most triggers are numeric, but MUGEN's `command` trigger is compared against
+//! a quoted *command name* (`command = "fwd"`). Because the right-hand side is a
+//! string with no numeric [`Value`], the evaluator routes `command = "name"`
+//! (in either operand order) through [`EvalContext::command_active`], a boolean
+//! string-keyed seam, rather than the numeric [`EvalContext::trigger`] path. See
+//! that method and [task 4.10's evaluator notes](crate::evaluator) for details.
+//!
 //! [kb]: ../../../docs/knowledge-base/07-evaluator-semantics.md
 
 use std::fmt;
@@ -405,6 +414,33 @@ pub trait EvalContext {
     fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
         let _ = target;
         None
+    }
+
+    /// Answers a string-keyed query: whether the named *command* (or, more
+    /// generally, the named string-valued condition) is currently active.
+    ///
+    /// This is the seam for MUGEN's `command = "name"` trigger (task 4.10, gap
+    /// 4). MUGEN's `command` trigger is special: it is compared against a quoted
+    /// *command name* (`command = "fwd"`, `command = "x"`), and the comparison is
+    /// true iff that named command fired this tick. Because the right-hand side
+    /// is a string — which has no numeric [`Value`] — the evaluator cannot model
+    /// it as an ordinary numeric trigger read; instead, when it sees
+    /// `command = "name"` (in either operand order) it calls this method with the
+    /// (case-sensitively-preserved) command name and yields int `1`/`0`.
+    ///
+    /// The default implementation returns `false` for every name, so a context
+    /// that does not model commands (a leaf entity, the test doubles) reports no
+    /// command as active — i.e. `command = "x"` evaluates to `0` rather than
+    /// firing. A concrete entity overrides this to consult its command buffer.
+    /// Like every other method here it is infallible and must never panic.
+    ///
+    /// Names are MUGEN command labels; matching is left to the implementation
+    /// (MUGEN command names are conventionally compared case-insensitively, so an
+    /// implementation should use [`str::eq_ignore_ascii_case`] against its
+    /// command table).
+    fn command_active(&self, name: &str) -> bool {
+        let _ = name;
+        false
     }
 
     /// Draws one deterministic pseudo-random value for the `random` trigger.
