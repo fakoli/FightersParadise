@@ -20,7 +20,10 @@
 //! 3. **Merge** all CNS state files in MUGEN order: a statedef defined in an
 //!    earlier file is never overridden by a later one, and `stcommon` is loaded
 //!    **last**, filling in only the common states not already defined by the
-//!    character.
+//!    character. The `.cmd` file is then parsed as a CNS state file too and its
+//!    statedefs (the command->state bridge, `[Statedef -1]`) are **merged in,
+//!    supplementing** existing states — appending their controllers rather than
+//!    dropping them — so input can drive state transitions (task 5.5 part A).
 //! 4. Read the character constants from the CNS `[Data]`/`[Size]`/`[Velocity]`/
 //!    `[Movement]` groups (these live in the same text file as the statedefs,
 //!    but the [`CnsFile`] parser intentionally drops non-state sections, so they
@@ -352,6 +355,27 @@ impl LoadedCharacter {
             );
         }
 
+        // ---- CMD statedefs: the command->state bridge -----------------------
+        // MUGEN puts the input->state transitions (`[Statedef -1]` with
+        // `[State -1, ...] type=ChangeState triggerall=command="..."`) in the
+        // `.cmd` FILE, not the `.cns`. The CMD parser only reads `[Command]`
+        // blocks and drops statedefs, so without this step input could never
+        // drive a state transition. Run the CNS statedef parser over the `.cmd`
+        // path and merge its statedefs into the graph. Unlike the fill-missing
+        // CNS merge, CMD statedefs *supplement* an existing statedef: their
+        // controllers are appended to a state already in the graph (e.g. a
+        // `[Statedef -1]` that does not otherwise exist), rather than dropped.
+        if let Some(cmd_ref) = def.get("Files", "cmd") {
+            let cmd_ref = cmd_ref.trim();
+            if !cmd_ref.is_empty() {
+                merge_cmd_statedefs(
+                    &mut states,
+                    &DefFile::resolve_path(def_path, cmd_ref),
+                    cmd_ref,
+                );
+            }
+        }
+
         if states.is_empty() {
             return Err(FpError::not_found(
                 "state",
@@ -455,6 +479,53 @@ fn merge_cns(states: &mut HashMap<i32, CompiledState>, path: &Path, rel: &str) {
     tracing::info!(
         "merged {added} new states from {rel} ({} statedefs in file)",
         cns.statedefs.len()
+    );
+}
+
+/// Parses the `.cmd` file as a CNS state file and merges its statedefs into
+/// `states`, *supplementing* rather than replacing.
+///
+/// This is the command->state bridge: MUGEN's `[Statedef -1]` (the
+/// `command="..."` → `ChangeState` rules) lives in the `.cmd` file. Each parsed
+/// statedef's controllers are **appended** to a state already present in the
+/// graph (so a `[State -1, ...]` ChangeState joins any existing `-1` controllers
+/// without losing them); a statedef not yet present is inserted wholesale. The
+/// supplement-not-override behavior is what distinguishes this from the
+/// first-wins [`merge_cns`]: a `[Statedef -1]` rarely exists before the CMD merge,
+/// and even when it does (some characters split it across files) its rules must
+/// all run, not just the first file's.
+///
+/// A missing or unparsable `.cmd` file is warn-logged and skipped — never fatal.
+fn merge_cmd_statedefs(states: &mut HashMap<i32, CompiledState>, path: &Path, rel: &str) {
+    let cns = match CnsFile::load(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("CMD statedef merge for {rel} ({}) skipped: {e}", path.display());
+            return;
+        }
+    };
+    let mut appended = 0usize;
+    let mut inserted = 0usize;
+    for def in &cns.statedefs {
+        let compiled = CompiledState::from_parsed(def);
+        match states.entry(def.number) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                // Supplement: append the CMD statedef's controllers to the
+                // existing state. CMD statedefs (notably `-1`) carry only
+                // controllers; their header entry fields are not meaningful, so
+                // we keep the existing header and extend the controller list.
+                appended += compiled.controllers.len();
+                slot.get_mut().controllers.extend(compiled.controllers);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                inserted += 1;
+                slot.insert(compiled);
+            }
+        }
+    }
+    tracing::info!(
+        "merged CMD statedefs from {rel}: {inserted} new state(s), \
+         {appended} controller(s) appended to existing states"
     );
 }
 
@@ -801,6 +872,86 @@ mod tests {
             })
         });
         assert!(any_compiled, "at least one real trigger should compile");
+    }
+
+    #[test]
+    fn real_fixture_kfm_merges_cmd_statedef_minus_one() {
+        // PART A: the command->state bridge. KFM keeps its `[Statedef -1]`
+        // (command="..." → ChangeState) in kfm.cmd, which the CMD parser drops.
+        // The loader must run the CNS statedef parser over the .cmd path and
+        // merge those statedefs into the graph, so input can drive transitions.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+
+        // A non-empty [Statedef -1] must now exist (it comes only from kfm.cmd).
+        let minus_one = loaded
+            .state(-1)
+            .expect("kfm.cmd [Statedef -1] should be merged into the graph");
+        assert!(
+            !minus_one.controllers.is_empty(),
+            "merged [Statedef -1] must carry controllers"
+        );
+
+        // At least one controller must be a ChangeState gated on a command="..."
+        // trigger (the input->state rules). Confirm both the controller type and
+        // a compiled command trigger are present.
+        let has_command_changestate = minus_one.controllers.iter().any(|c| {
+            let is_change_state = c
+                .controller_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"));
+            let gated_on_command = c
+                .triggerall
+                .iter()
+                .chain(c.triggers.iter().flat_map(|g| g.conditions.iter()))
+                .any(|e| e.source.to_ascii_lowercase().contains("command"));
+            is_change_state && gated_on_command
+        });
+        assert!(
+            has_command_changestate,
+            "[Statedef -1] should contain a ChangeState gated on command=..."
+        );
+    }
+
+    #[test]
+    fn merge_cmd_statedefs_appends_to_existing_state() {
+        // The CMD merge supplements (appends controllers) rather than overriding,
+        // so a `[Statedef -1]` split across the .cns and .cmd keeps both rules.
+        let dir = scratch_dir("cmd_merge_append");
+        // Pretend a state -1 already exists from a cns (one controller)…
+        let pre = write_file(&dir, "pre.cns", "[Statedef -1]\n[State -1, a]\ntype = Null\ntrigger1 = 1\n");
+        // …and the .cmd adds another (a command-gated ChangeState).
+        let cmd = write_file(
+            &dir,
+            "chr.cmd",
+            "[Statedef -1]\n[State -1, walk]\ntype = ChangeState\n\
+             triggerall = command = \"holdfwd\"\ntrigger1 = ctrl\nvalue = 20\n",
+        );
+
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        merge_cns(&mut states, &pre, "pre.cns");
+        merge_cmd_statedefs(&mut states, &cmd, "chr.cmd");
+
+        let s = states.get(&-1).expect("state -1 present");
+        // Both controllers survive: the original Null and the appended ChangeState.
+        assert_eq!(s.controllers.len(), 2, "CMD controllers append, not replace");
+        assert!(s
+            .controllers
+            .iter()
+            .any(|c| c.controller_type.as_deref() == Some("ChangeState")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_cmd_statedefs_missing_file_is_skipped() {
+        // A missing .cmd must be warn-skipped, never fatal.
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        merge_cmd_statedefs(&mut states, Path::new("/nonexistent/none.cmd"), "none.cmd");
+        assert!(states.is_empty());
     }
 
     #[test]
