@@ -273,18 +273,27 @@ mod tests {
         let total = tdata_offset as usize + tdata_length as usize;
         let mut buf = vec![0u8; total];
 
-        // --- Header ---
+        // --- Header (real MUGEN 1.0 SFF v2 layout) ---
+        // Offsets 16..36 are five reserved u32s (left zeroed). The directory
+        // fields begin at offset 36 and store COUNTS, not byte-lengths, for the
+        // sprite/palette tables — mirroring `header::make_test_header`.
         buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
         buf[12] = 0; buf[13] = 0; buf[14] = 1; buf[15] = 2; // version 2.1.0.0
-        buf[28..32].copy_from_slice(&1u32.to_le_bytes()); // num_groups
-        buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // num_sprites
+        // sprite_offset @36
         buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
-        buf[40..44].copy_from_slice(&28u32.to_le_bytes()); // sprite_length
+        // num_sprites @40 (count, not byte length)
+        buf[40..44].copy_from_slice(&1u32.to_le_bytes());
+        // palette_offset @44
         buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
-        buf[48..52].copy_from_slice(&16u32.to_le_bytes()); // palette_length
+        // num_palettes @48 (count, not byte length)
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes());
+        // ldata_offset @52
         buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
+        // ldata_length @56
         buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
+        // tdata_offset @60
         buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());
+        // tdata_length @64
         buf[64..68].copy_from_slice(&tdata_length.to_le_bytes());
 
         // --- Sprite sub-header at offset 512 ---
