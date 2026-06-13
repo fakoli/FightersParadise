@@ -5,7 +5,7 @@
 //! data blocks within the file.
 
 use fp_core::{FpError, FpResult};
-use nom::bytes::complete::{tag, take};
+use nom::bytes::complete::tag;
 use nom::number::complete::{le_u32, le_u8};
 
 /// The expected file signature at the start of every SFF file.
@@ -47,10 +47,38 @@ pub struct SffHeader {
     pub tdata_length: u32,
 }
 
+/// Byte size of a single sprite sub-header (used to derive the block length).
+const SPRITE_SUBHEADER_SIZE: u32 = 28;
+
+/// Byte size of a single palette sub-header (used to derive the block length).
+const PALETTE_SUBHEADER_SIZE: u32 = 16;
+
 /// Parses an SFF v2 file header from raw bytes.
 ///
-/// Expects at least 512 bytes of input. Validates the signature and
-/// version major byte.
+/// Expects at least 512 bytes of input. Validates the signature and version
+/// major byte.
+///
+/// ## Real-world layout note
+///
+/// The header layout follows the *actual* MUGEN 1.0 SFF v2 format produced by
+/// the official tools (and Ikemen), which differs from some older third-party
+/// write-ups. After the 12-byte signature and 4 version bytes there are five
+/// reserved `u32`s (offsets 16..36), then the directory fields begin at offset
+/// 36 and store **counts**, not byte-lengths, for the sprite/palette tables:
+///
+/// | Offset | Field |
+/// |--------|-------|
+/// | 36 | first sprite sub-header offset |
+/// | 40 | number of sprites |
+/// | 44 | first palette sub-header offset |
+/// | 48 | number of palettes |
+/// | 52 | LData offset |
+/// | 56 | LData length |
+/// | 60 | TData offset |
+/// | 64 | TData length |
+///
+/// The block *lengths* (`sprite_length`, `palette_length`) are derived from the
+/// counts so the rest of the crate can keep working in byte terms.
 pub fn parse_header(input: &[u8]) -> FpResult<SffHeader> {
     if input.len() < HEADER_SIZE {
         return Err(FpError::parse(
@@ -77,7 +105,7 @@ pub fn parse_header(input: &[u8]) -> FpResult<SffHeader> {
     let (rest, version_minor1) = le_u8(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
         FpError::parse("SFF", "failed to read version minor1")
     })?;
-    let (rest, version_major) = le_u8(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
+    let (_rest, version_major) = le_u8(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
         FpError::parse("SFF", "failed to read version major")
     })?;
 
@@ -88,57 +116,35 @@ pub fn parse_header(input: &[u8]) -> FpResult<SffHeader> {
         ));
     }
 
-    // Reserved: 3 x u32 (12 bytes)
-    let (rest, _) = take(12u8)(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read reserved fields")
-    })?;
+    // Read directory fields by absolute offset (see the layout table above).
+    // `read_u32` is bounds-safe because we already checked `input.len() >= 512`.
+    let read_u32 = |off: usize| -> FpResult<u32> {
+        let (_, v) = le_u32::<_, nom::error::Error<&[u8]>>(&input[off..])
+            .map_err(|_| FpError::parse("SFF", format!("failed to read u32 at offset {off}")))?;
+        Ok(v)
+    };
 
-    // num_groups, num_sprites
-    let (rest, num_groups) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read num_groups")
-    })?;
-    let (rest, num_sprites) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read num_sprites")
-    })?;
+    let sprite_offset = read_u32(36)?;
+    let num_sprites = read_u32(40)?;
+    let palette_offset = read_u32(44)?;
+    let num_palettes = read_u32(48)?;
+    let ldata_offset = read_u32(52)?;
+    let ldata_length = read_u32(56)?;
+    let tdata_offset = read_u32(60)?;
+    let tdata_length = read_u32(64)?;
 
-    // Sprite sub-header offset and length
-    let (rest, sprite_offset) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read sprite_offset")
-    })?;
-    let (rest, sprite_length) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read sprite_length")
-    })?;
-
-    // Palette sub-header offset and length
-    let (rest, palette_offset) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read palette_offset")
-    })?;
-    let (rest, palette_length) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read palette_length")
-    })?;
-
-    // LData offset and length
-    let (rest, ldata_offset) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read ldata_offset")
-    })?;
-    let (rest, ldata_length) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read ldata_length")
-    })?;
-
-    // TData offset and length
-    let (rest, tdata_offset) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read tdata_offset")
-    })?;
-    let (_rest, tdata_length) = le_u32(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "failed to read tdata_length")
-    })?;
+    // Derive block byte-lengths from the counts.
+    let sprite_length = num_sprites.saturating_mul(SPRITE_SUBHEADER_SIZE);
+    let palette_length = num_palettes.saturating_mul(PALETTE_SUBHEADER_SIZE);
 
     Ok(SffHeader {
         version_major,
         version_minor1,
         version_minor2,
         version_minor3,
-        num_groups,
+        // The real SFF v2 header has no dedicated group-count field at this
+        // position; groups are implied by the sprite entries themselves.
+        num_groups: 0,
         num_sprites,
         sprite_offset,
         sprite_length,
@@ -168,28 +174,27 @@ mod tests {
         buf[14] = 1; // minor1
         buf[15] = 2; // major
 
-        // Reserved (16..28): zeros
+        // Reserved (16..36): zeros — real SFF v2 has five reserved u32s here.
 
-        // num_groups at offset 28
-        buf[28..32].copy_from_slice(&num_groups.to_le_bytes());
-        // num_sprites at offset 32
-        buf[32..36].copy_from_slice(&num_sprites.to_le_bytes());
-        // sprite_offset at offset 36
+        // The `num_groups` parameter doubles as the palette count for the test.
+        let num_palettes = num_groups;
+
+        // Directory fields, real MUGEN 1.0 layout (counts, not byte lengths):
+        // sprite_offset @36
         buf[36..40].copy_from_slice(&512u32.to_le_bytes());
-        // sprite_length at offset 40
-        buf[40..44].copy_from_slice(&(num_sprites * 28).to_le_bytes());
-        // palette_offset at offset 44
-        let pal_off = 512 + num_sprites * 28;
-        buf[44..48].copy_from_slice(&pal_off.to_le_bytes());
-        // palette_length at offset 48
-        buf[48..52].copy_from_slice(&16u32.to_le_bytes());
-        // ldata_offset at offset 52
+        // num_sprites @40
+        buf[40..44].copy_from_slice(&num_sprites.to_le_bytes());
+        // palette_offset @44
+        buf[44..48].copy_from_slice(&(512 + num_sprites * 28).to_le_bytes());
+        // num_palettes @48
+        buf[48..52].copy_from_slice(&num_palettes.to_le_bytes());
+        // ldata_offset @52
         buf[52..56].copy_from_slice(&1024u32.to_le_bytes());
-        // ldata_length at offset 56
+        // ldata_length @56
         buf[56..60].copy_from_slice(&768u32.to_le_bytes());
-        // tdata_offset at offset 60
+        // tdata_offset @60
         buf[60..64].copy_from_slice(&2048u32.to_le_bytes());
-        // tdata_length at offset 64
+        // tdata_length @64
         buf[64..68].copy_from_slice(&256u32.to_le_bytes());
 
         buf
@@ -197,15 +202,16 @@ mod tests {
 
     #[test]
     fn parse_valid_header() {
+        // num_sprites = 10, num_palettes = 3
         let data = make_test_header(10, 3);
         let header = parse_header(&data).unwrap();
 
         assert_eq!(header.version_major, 2);
         assert_eq!(header.version_minor1, 1);
         assert_eq!(header.num_sprites, 10);
-        assert_eq!(header.num_groups, 3);
         assert_eq!(header.sprite_offset, 512);
-        assert_eq!(header.sprite_length, 280); // 10 * 28
+        assert_eq!(header.sprite_length, 280); // 10 * 28, derived from count
+        assert_eq!(header.palette_length, 48); // 3 * 16, derived from count
         assert_eq!(header.ldata_offset, 1024);
         assert_eq!(header.ldata_length, 768);
         assert_eq!(header.tdata_offset, 2048);
