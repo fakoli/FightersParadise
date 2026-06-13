@@ -33,16 +33,23 @@ SFF (Sprite File Format) v2 is a binary container for 256-color indexed sprites.
 | 13 | 1 | u8 | Version minor2 |
 | 14 | 1 | u8 | Version minor1 |
 | 15 | 1 | u8 | Version major (hi) = 2 |
-| 28 | 4 | u32 | Number of groups |
-| 32 | 4 | u32 | Number of sprites |
-| 36 | 4 | u32 | Sprite sub-header offset |
-| 40 | 4 | u32 | Sprite sub-header block length |
-| 44 | 4 | u32 | Palette sub-header offset |
-| 48 | 4 | u32 | Palette sub-header block length |
+| 16 | 4 | u32 | Reserved (low compat version) |
+| 20 | 16 | bytes | Reserved |
+| 36 | 4 | u32 | Sprite node-list offset |
+| 40 | 4 | u32 | Number of sprites |
+| 44 | 4 | u32 | Palette node-list offset |
+| 48 | 4 | u32 | Number of palettes |
 | 52 | 4 | u32 | LData offset |
 | 56 | 4 | u32 | LData length |
 | 60 | 4 | u32 | TData offset |
 | 64 | 4 | u32 | TData length |
+
+> **Correction (2026-06-13, task 0.3):** An earlier version of this table placed the sprite/palette
+> **counts** at offsets 28/32 and labeled 40/48 as "block length". That was wrong — real MUGEN 1.0
+> files (e.g. `kfm.sff`) store the **counts** at offsets **40** (sprites) and **48** (palettes), with
+> the node-list **offsets** at 36/44. The old layout made the parser read 0 sprites from genuine
+> files while all synthetic tests (which encoded the same wrong layout) passed. The implementation in
+> `crates/fp-formats/src/sff/header.rs` reads these by absolute offset and is the source of truth.
 
 ## Sprite Sub-Header (28 bytes)
 
