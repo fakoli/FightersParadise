@@ -9,10 +9,22 @@
 //! - Y < 0 is airborne (above ground)
 //! - Gravity is a positive value that pulls Y toward 0
 //! - Horizontal X uses standard left-negative, right-positive
+//!
+//! # Collision detection
+//!
+//! AABB collision for MUGEN Clsn boxes lives in the [`collision`] module and is
+//! re-exported here: [`Clsn`], [`Facing`], [`rects_overlap`], [`place_clsn`],
+//! [`any_overlap`], and [`any_clsn_overlap`].
 
 #![warn(missing_docs)]
 
 use fp_core::Vec2;
+
+pub mod collision;
+
+pub use collision::{
+    any_clsn_overlap, any_overlap, place_clsn, rects_overlap, Clsn, Facing,
+};
 
 /// Default gravity acceleration matching MUGEN's standard value.
 ///

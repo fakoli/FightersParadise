@@ -24,30 +24,52 @@ mod compression;
 mod header;
 mod palette;
 mod sprite;
+mod v1;
 
 pub use compression::{decompress_rle5, decompress_rle8, decompress_lz5, decompress_png};
 pub use header::SffHeader;
 pub use palette::{SffPalette, PALETTE_RGBA_SIZE};
 pub use sprite::{SffSprite, SpriteFormat};
+pub use v1::{decode_pcx_8bit, SffV1Header};
 
 use fp_core::{FpError, FpResult};
 use std::path::Path;
 
-/// A fully loaded SFF v2 file.
+/// Which SFF container format a loaded file uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SffVersion {
+    /// SFF v1 — inline PCX images (MUGEN 2002 / WinMUGEN era).
+    V1,
+    /// SFF v2 — LData/TData blocks with RLE/LZ5/PNG sprites (MUGEN 1.0+).
+    V2,
+}
+
+/// A fully loaded SFF file (v1 or v2).
 ///
 /// Contains the parsed header, all sprite and palette sub-headers, and the raw
 /// data blocks needed to decompress sprite pixels and resolve palette colors.
+/// For SFF v1 the sprites are inline PCX images stored in the single backing
+/// buffer; for SFF v2 they live in the LData/TData blocks.
 #[derive(Debug)]
 pub struct SffFile {
+    /// Which container format this file uses.
+    pub version: SffVersion,
     /// The parsed file header.
+    ///
+    /// For SFF v1 the version fields are populated and the v2-specific block
+    /// offsets are left zeroed (v1 has no LData/TData blocks).
     pub header: SffHeader,
     /// All sprite sub-headers, in file order.
     pub sprites: Vec<SffSprite>,
     /// All palette sub-headers, in file order.
+    ///
+    /// SFF v1 stores per-sprite palettes inline with each PCX image and does not
+    /// expose a separate palette table here, so this is empty for v1 files.
     pub palettes: Vec<SffPalette>,
     /// Raw literal data block (LData) — uncompressed palette and sprite data.
+    /// For SFF v1 this holds the entire file (sprites are inline PCX images).
     ldata: Vec<u8>,
-    /// Raw translate data block (TData) — compressed sprite data.
+    /// Raw translate data block (TData) — compressed sprite data (SFF v2 only).
     tdata: Vec<u8>,
 }
 
@@ -62,8 +84,56 @@ impl SffFile {
         Self::from_bytes(&data)
     }
 
-    /// Parses an SFF v2 file from raw bytes already in memory.
+    /// Parses an SFF file (v1 or v2) from raw bytes already in memory.
+    ///
+    /// The container version is detected from the header's major-version byte:
+    /// v1 files take the inline-PCX path, v2 files the LData/TData path.
     pub fn from_bytes(data: &[u8]) -> FpResult<Self> {
+        match detect_version(data)? {
+            SffVersion::V1 => Self::from_bytes_v1(data),
+            SffVersion::V2 => Self::from_bytes_v2(data),
+        }
+    }
+
+    /// Parses an SFF v1 file (inline PCX images) from raw bytes.
+    fn from_bytes_v1(data: &[u8]) -> FpResult<Self> {
+        let v1_header = v1::parse_v1_header(data)?;
+        let sprites = v1::parse_v1_sprites(data, &v1_header)?;
+
+        // Synthesize an `SffHeader` so the public `header` field stays valid.
+        // SFF v1 has no separate LData/TData blocks, so those offsets are zero.
+        let header = SffHeader {
+            version_major: 1,
+            version_minor1: 0,
+            version_minor2: 0,
+            version_minor3: 0,
+            num_groups: v1_header.num_groups,
+            num_sprites: v1_header.num_images,
+            sprite_offset: v1_header.first_subheader_offset,
+            sprite_length: 0,
+            palette_offset: 0,
+            palette_length: 0,
+            ldata_offset: 0,
+            ldata_length: data.len() as u32,
+            tdata_offset: 0,
+            tdata_length: 0,
+        };
+
+        tracing::info!("SFF v1: loaded {} sprites", sprites.len());
+
+        Ok(Self {
+            version: SffVersion::V1,
+            header,
+            sprites,
+            palettes: Vec::new(),
+            // The whole file is the backing buffer; sprite offsets are absolute.
+            ldata: data.to_vec(),
+            tdata: Vec::new(),
+        })
+    }
+
+    /// Parses an SFF v2 file from raw bytes already in memory.
+    fn from_bytes_v2(data: &[u8]) -> FpResult<Self> {
         let file_header = header::parse_header(data)?;
 
         // Parse sprite sub-headers
@@ -135,6 +205,7 @@ impl SffFile {
         };
 
         Ok(Self {
+            version: SffVersion::V2,
             header: file_header,
             sprites,
             palettes,
@@ -161,6 +232,12 @@ impl SffFile {
         let sprite = self.sprites.get(index).ok_or_else(|| {
             FpError::not_found("sprite", format!("index {index}"))
         })?;
+
+        // SFF v1 stores each sprite as an inline PCX image inside the backing
+        // buffer (`ldata` holds the whole file). Decode that directly.
+        if self.version == SffVersion::V1 {
+            return self.decode_sprite_v1(index, sprite);
+        }
 
         // Follow link if this sprite doesn't have its own data
         let data_sprite = if sprite.linked_index as usize != index && sprite.data_length == 0 {
@@ -211,6 +288,39 @@ impl SffFile {
         }
     }
 
+    /// Decodes a single SFF v1 sprite (inline 8-bit PCX image).
+    ///
+    /// Linked sprites (zero data length) resolve through `linked_index` to the
+    /// referenced sprite's PCX data.
+    fn decode_sprite_v1(&self, index: usize, sprite: &SffSprite) -> FpResult<Vec<u8>> {
+        // Resolve links: a zero-length sprite reuses an earlier sprite's pixels.
+        let data_sprite = if sprite.data_length == 0 {
+            let linked = sprite.linked_index as usize;
+            self.sprites.get(linked).ok_or_else(|| {
+                FpError::parse(
+                    "SFF",
+                    format!("v1 sprite {index} links to non-existent sprite {linked}"),
+                )
+            })?
+        } else {
+            sprite
+        };
+
+        let start = data_sprite.data_offset as usize;
+        let end = start + data_sprite.data_length as usize;
+        if end > self.ldata.len() {
+            return Err(FpError::parse(
+                "SFF",
+                format!(
+                    "v1 sprite data [{start}..{end}] out of range for file ({} bytes)",
+                    self.ldata.len()
+                ),
+            ));
+        }
+
+        v1::decode_pcx_8bit(&self.ldata[start..end])
+    }
+
     /// Returns the RGBA palette data for the palette at the given index.
     ///
     /// Follows linked palettes if necessary. The returned array is 1024 bytes
@@ -249,6 +359,36 @@ impl SffFile {
     }
 }
 
+/// The `ElecbyteSpr\0` signature shared by both SFF v1 and v2 files.
+const SFF_SIGNATURE: &[u8; 12] = b"ElecbyteSpr\0";
+
+/// Detects whether `data` is an SFF v1 or v2 file.
+///
+/// Both formats begin with the same 12-byte signature followed by four version
+/// bytes; the high-order byte (offset 15) is `1` for v1 and `2` for v2.
+fn detect_version(data: &[u8]) -> FpResult<SffVersion> {
+    if data.len() < 16 {
+        return Err(FpError::parse(
+            "SFF",
+            format!("file too small for SFF header: {} bytes (need 16)", data.len()),
+        ));
+    }
+    if &data[0..12] != SFF_SIGNATURE.as_slice() {
+        return Err(FpError::parse(
+            "SFF",
+            "invalid file signature (expected 'ElecbyteSpr\\0')",
+        ));
+    }
+    match data[15] {
+        1 => Ok(SffVersion::V1),
+        2 => Ok(SffVersion::V2),
+        other => Err(FpError::parse(
+            "SFF",
+            format!("unsupported SFF version {other} (expected 1 or 2)"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,15 +413,14 @@ mod tests {
         let total = tdata_offset as usize + tdata_length as usize;
         let mut buf = vec![0u8; total];
 
-        // --- Header ---
+        // --- Header (real MUGEN 1.0 SFF v2 layout) ---
         buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
         buf[12] = 0; buf[13] = 0; buf[14] = 1; buf[15] = 2; // version 2.1.0.0
-        buf[28..32].copy_from_slice(&1u32.to_le_bytes()); // num_groups
-        buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // num_sprites
+        // Reserved u32s at 16..36 stay zero.
         buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
-        buf[40..44].copy_from_slice(&28u32.to_le_bytes()); // sprite_length
+        buf[40..44].copy_from_slice(&1u32.to_le_bytes()); // num_sprites = 1
         buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
-        buf[48..52].copy_from_slice(&16u32.to_le_bytes()); // palette_length
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // num_palettes = 1
         buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
         buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
         buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());

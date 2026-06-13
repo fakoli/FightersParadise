@@ -9,3 +9,10 @@ license.workspace = true
 fp-core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+# Dev-only: the keystone integration test (tests/cns_integration.rs) drives the
+# expression VM end-to-end over real MUGEN CNS content parsed by fp-formats.
+# This is a one-way edge (fp-formats does NOT depend on fp-vm), so it introduces
+# no dependency cycle, and being dev-only it never ships in the fp-vm library.
+[dev-dependencies]
+fp-formats = { path = "../fp-formats" }

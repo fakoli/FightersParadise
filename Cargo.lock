@@ -324,6 +324,7 @@ name = "fp-vm"
 version = "0.1.0"
 dependencies = [
  "fp-core",
+ "fp-formats",
  "thiserror 2.0.18",
  "tracing",
 ]

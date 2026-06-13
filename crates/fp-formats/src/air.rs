@@ -85,12 +85,19 @@ impl AirFile {
     }
 
     /// Parses an AIR file from a string.
+    ///
+    /// Tolerates a leading UTF-8 BOM (real MUGEN `.air` files are commonly saved
+    /// UTF-8-with-BOM) and CRLF line endings.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> FpResult<Self> {
         let mut actions = HashMap::new();
         let mut current_action: Option<ActionBuilder> = None;
 
+        // Strip a leading UTF-8 BOM if present so the first line parses cleanly.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
         for raw_line in text.lines() {
+            // `lines()` already strips the trailing `\r` of CRLF endings.
             let line = strip_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
@@ -597,5 +604,16 @@ Clsn1: 1
         let frame = &air.action(0).unwrap().frames[0];
         assert_eq!(frame.offset.x, -5);
         assert_eq!(frame.offset.y, 10);
+    }
+
+    #[test]
+    fn leading_bom_and_crlf_tolerated() {
+        // Real MUGEN `.air` files are UTF-8-with-BOM and CRLF-terminated, and
+        // the BOM can land directly on a `[Begin Action]` header.
+        let air_text = "\u{feff}[Begin Action 0]\r\n0,0, 0,0, 7\r\n0,1, 0,0, 7\r\n";
+        let air = AirFile::from_str(air_text).unwrap();
+        let action = air.action(0).expect("action 0 must parse despite BOM/CRLF");
+        assert_eq!(action.frames.len(), 2);
+        assert_eq!(action.frames[0].ticks, 7);
     }
 }

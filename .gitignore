@@ -21,5 +21,9 @@
 *.snd
 *.fnt
 
+# Local-only sample MUGEN content for parser/integration testing
+# (third-party assets, e.g. Elecbyte KFM CC BY-NC — never shipped)
+/test-assets/
+
 # OS
 Thumbs.db
