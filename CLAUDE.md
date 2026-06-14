@@ -189,6 +189,8 @@ Authoritative project docs live in `docs/`; research/planning docs in `docs/know
 - [docs/known-issues.md](docs/known-issues.md) — ranked fidelity gaps (mirrors the faithfulness audit).
 - [docs/roadmap.md](docs/roadmap.md) — what's planned next.
 - [docs/development.md](docs/development.md) — build/test/lint, worktree + clean-room rules.
+- [docs/handoffs/](docs/handoffs/) — dated session-handoff notes; the **newest is the current pickup
+  point** (see "Session handoffs" below).
 - [docs/format-specs/sff-v2.md](docs/format-specs/sff-v2.md) — SFF v2 binary layout.
 - [docs/knowledge-base/](docs/knowledge-base/) — MUGEN research (01-03), roadmap (05), execution plan
   (06, live ledger), evaluator semantics (07), faithfulness audit (08). Note: doc 04 (codebase review)
@@ -198,3 +200,21 @@ Authoritative project docs live in `docs/`; research/planning docs in `docs/know
 > macOS-filesystem caveat: the filesystem here is **case-insensitive**, so do **not** create
 > `docs/ARCHITECTURE.md` alongside the existing `docs/architecture.md` (they are the same file). New docs
 > belong under `docs/`, not at the repo root.
+
+## Session handoffs
+
+Cross-session / cross-workstation continuity lives in [`docs/handoffs/`](docs/handoffs/) — dated,
+**version-controlled** notes named `YYYY-MM-DD-<slug>.md`. They are committed on purpose so any
+workstation (or a fresh session with no memory of the conversation) can resume from where the last one
+stopped.
+
+- **Starting a session:** read the **most recent** file in `docs/handoffs/` first. It carries the
+  current `main`/PR state, what the last session changed, where the audit "P" fixes stand, and the
+  recommended next actions — orient from it before doing anything else.
+- **Ending a substantial session, or whenever asked for a handoff:** write a **new** dated file
+  capturing (1) repo state — `main` tip, active branch, open PRs (verify with `git`/`gh`, don't guess);
+  (2) what this session changed; (3) where work stopped + the next concrete steps; (4) invariants/gotchas
+  to not relearn. Make it **self-contained** — a cold session must be able to act on it alone. Commit it
+  (typically onto the active branch/PR).
+- Newest = source of truth. Keep them factual and skimmable; don't delete older ones — they are the
+  project's running history.
