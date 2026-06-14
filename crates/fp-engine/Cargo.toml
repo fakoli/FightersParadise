@@ -10,12 +10,17 @@ fp-core.workspace = true
 fp-character.workspace = true
 fp-physics.workspace = true
 fp-input.workspace = true
+# Priority / trade clash arbitration (audit #20) reads `Priority` and calls the
+# pure `resolve_clash` / `detect_hit` primitives; `fp-formats` provides the AIR
+# frame model the clash probe pulls current-frame Clsn boxes from. Both already
+# arrive transitively (via `fp-character`), so promoting them to direct
+# dependencies only edits this crate's own manifest, not the root.
+fp-combat.workspace = true
+fp-formats.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 # Test-only: synthetic LoadedCharacter/HitDef construction for the headless
-# Match tests. Both crates already exist at the workspace level (fp-character
-# brings them transitively at runtime); declaring them here only edits this
-# crate's own manifest, not the root.
+# Match tests. (Both are also direct dependencies above for the clash probe.)
 fp-formats.workspace = true
 fp-combat.workspace = true
