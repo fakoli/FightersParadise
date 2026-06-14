@@ -32,8 +32,22 @@
 //!    `state_time`, then the new current state is processed in the same tick.
 //! 5. **Time & physics.** After controllers run, the statedef `physics` is
 //!    applied (stand/crouch friction on x-velocity, air gravity on y-velocity),
-//!    then time-in-state and the animation element/time advance from the AIR
-//!    action frame durations.
+//!    then the world position is integrated from velocity, then time-in-state
+//!    and the animation element/time advance from the AIR action frame
+//!    durations.
+//!
+//! ## Facing-relative velocity (MUGEN semantics)
+//!
+//! MUGEN state-controller velocities are **facing-relative**: `+x` is the
+//! direction the character faces. The engine integrates the *world* position as
+//! `pos.x += vel.x * facing_sign` (facing right `+1`, left `-1`); the Y axis is
+//! never mirrored. The stored `vel.x` is therefore kept facing-relative — it is
+//! never mirrored at `VelSet`/`VelAdd`, and the `Vel X` trigger returns the
+//! stored (facing-relative) value unchanged. Only the per-tick world-position
+//! integration applies the facing sign. `PosAdd` is likewise facing-relative
+//! (`pos.x += dx * facing_sign`), while `PosSet` and the `Pos X` trigger operate
+//! on the **absolute** stage position (no mirroring). See
+//! [`Character::integrate_position`].
 //!
 //! ## Controller dispatch
 //!
@@ -148,8 +162,12 @@ impl Character {
         // destination in the same tick (bounded by run_current_with_transitions).
         self.run_current_with_transitions(states, &mut report);
 
-        // ---- Per-tick physics, time, and animation advance -----------------
+        // ---- Per-tick physics, integration, time, and animation advance -----
+        // MUGEN order: controllers set velocity, then `physics` modifies it
+        // (friction/gravity), then the world position is integrated from the
+        // (facing-relative) velocity, then time/animation advance.
         self.apply_physics();
+        self.integrate_position();
         self.advance_time();
         self.advance_animation(air);
 
@@ -509,6 +527,12 @@ impl Character {
 
     /// `PosSet`: set the x/y position components from the `x`/`y` parameters. A
     /// missing component leaves that axis unchanged.
+    ///
+    /// `PosSet` operates on the **absolute** stage position: the `x` value is
+    /// taken as-is and is **not** mirrored by facing (matching the `Pos X`
+    /// trigger, which also reports the absolute stage position). Only
+    /// facing-relative motion (velocity integration and [`PosAdd`](Self::ctrl_pos_add))
+    /// applies the facing sign.
     fn ctrl_pos_set(&mut self, ctrl: &CompiledController) {
         if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
             self.pos.x = v.to_float();
@@ -520,9 +544,15 @@ impl Character {
 
     /// `PosAdd`: add to the x/y position components from the `x`/`y` parameters.
     /// A missing component adds nothing on that axis.
+    ///
+    /// `PosAdd` is **facing-relative on X** (MUGEN semantics): the `x` delta is
+    /// mirrored by the facing sign (`pos.x += dx * facing_sign`), so a positive
+    /// `x` always nudges the character *forward* regardless of which way it
+    /// faces. The Y delta is never mirrored. (Contrast [`PosSet`](Self::ctrl_pos_set),
+    /// which is absolute.)
     fn ctrl_pos_add(&mut self, ctrl: &CompiledController) {
         if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
-            self.pos.x += v.to_float();
+            self.pos.x += v.to_float() * self.facing.sign() as f32;
         }
         if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
             self.pos.y += v.to_float();
@@ -1016,6 +1046,21 @@ impl Character {
             Physics::Air => self.vel.y += mv.yaccel,
             Physics::None | Physics::Unchanged => {}
         }
+    }
+
+    /// Integrates the world position from the (facing-relative) velocity for this
+    /// tick: `world pos.x += vel.x * facing_sign`, `world pos.y += vel.y`.
+    ///
+    /// MUGEN state-controller velocities are **facing-relative** (`+x` = the way
+    /// the character faces), so the stored `vel.x` is mirrored by the facing sign
+    /// (`+1` right, `-1` left) only here, when advancing the absolute stage
+    /// position. The stored velocity itself is left untouched (the `Vel X`
+    /// trigger keeps returning the facing-relative value), and the Y axis is
+    /// never mirrored. A facing-right character with `vel.x = +V` moves `+x`; a
+    /// facing-left character with the *same* stored `vel.x = +V` moves `-x`.
+    fn integrate_position(&mut self) {
+        self.pos.x += self.vel.x * self.facing.sign() as f32;
+        self.pos.y += self.vel.y;
     }
 
     /// Advances time-in-state by one tick.
@@ -2998,15 +3043,144 @@ mod tests {
 
     #[test]
     fn pos_add_accumulates_both_axes() {
+        // Default facing is Right (sign +1), so PosAdd x adds as written.
         let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "2"), ("y", "-1")]);
         let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
+        ch.facing = Facing::Right;
         ch.pos = Vec2::new(10.0, 10.0);
         lc.tick(&mut ch);
         assert!((ch.pos.x - 12.0).abs() < 1e-6);
         assert!((ch.pos.y - 9.0).abs() < 1e-6);
+    }
+
+    // ---- 6.2c: facing-relative velocity / position integration --------------
+
+    #[test]
+    fn integration_facing_right_positive_vel_moves_plus_x() {
+        // A facing-RIGHT character with vel.x = +V advances toward +x. No
+        // controllers fire (empty state); Physics::None leaves velocity intact so
+        // the only motion is the world-position integration `pos.x += vel.x * +1`.
+        let lc = loaded(vec![stand_n(0, vec![])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.facing = Facing::Right;
+        ch.pos = Vec2::<f32>::ZERO;
+        ch.vel = Vec2::new(3.0, 0.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.x - 3.0).abs() < 1e-6, "facing right + vel.x=+3 -> +x; got {}", ch.pos.x);
+        // The stored velocity is unchanged (facing-relative, not mirrored).
+        assert!((ch.vel.x - 3.0).abs() < 1e-6, "stored vel.x stays facing-relative (+3)");
+    }
+
+    #[test]
+    fn integration_facing_left_same_positive_vel_moves_minus_x() {
+        // A facing-LEFT character with the SAME stored vel.x = +V advances toward
+        // -x: the integration mirrors the X by facing (`pos.x += vel.x * -1`),
+        // while the stored vel.x is left facing-relative (+V).
+        let lc = loaded(vec![stand_n(0, vec![])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.facing = Facing::Left;
+        ch.pos = Vec2::<f32>::ZERO;
+        ch.vel = Vec2::new(3.0, 0.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.x - (-3.0)).abs() < 1e-6, "facing left + vel.x=+3 -> -x; got {}", ch.pos.x);
+        // Stored velocity is still +3 (facing-relative), NOT mirrored to -3.
+        assert!((ch.vel.x - 3.0).abs() < 1e-6, "stored vel.x stays facing-relative (+3) when facing left");
+    }
+
+    #[test]
+    fn integration_y_is_never_mirrored_by_facing() {
+        // The Y axis is integrated as-is regardless of facing.
+        let lc = loaded(vec![stand_n(0, vec![])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.facing = Facing::Left;
+        ch.pos = Vec2::<f32>::ZERO;
+        ch.vel = Vec2::new(0.0, -4.0);
+        lc.tick(&mut ch);
+        assert!((ch.pos.y - (-4.0)).abs() < 1e-6, "y integrated unmirrored even facing left");
+        assert!((ch.pos.x - 0.0).abs() < 1e-6, "no x velocity -> no x motion");
+    }
+
+    #[test]
+    fn vel_x_trigger_is_facing_relative_for_both_facings() {
+        // The `Vel X` trigger returns the STORED (facing-relative) velocity for
+        // both facings — it is never mirrored. This is what common1.cns relies on:
+        // `vel x > 0` selects the walk-forward anim regardless of facing.
+        let mut right = Character::new();
+        right.facing = Facing::Right;
+        right.vel = Vec2::new(2.4, 0.0);
+        let mut left = Character::new();
+        left.facing = Facing::Left;
+        left.vel = Vec2::new(2.4, 0.0);
+        // X axis is encoded as 0 (see Character::axis_component).
+        let vx_right = EvalContext::trigger(&right, "Vel", &[Value::Int(0)]).to_float();
+        let vx_left = EvalContext::trigger(&left, "Vel", &[Value::Int(0)]).to_float();
+        assert!((vx_right - 2.4).abs() < 1e-6, "facing right Vel X = +2.4");
+        assert!(
+            (vx_left - 2.4).abs() < 1e-6,
+            "facing left Vel X stays facing-relative (+2.4), not mirrored; got {vx_left}"
+        );
+    }
+
+    #[test]
+    fn pos_x_trigger_is_absolute_for_both_facings() {
+        // The `Pos X` trigger reports the ABSOLUTE stage position, never mirrored
+        // by facing. A facing-left character at stage x = 50 reads Pos X = 50.
+        let mut left = Character::new();
+        left.facing = Facing::Left;
+        left.pos = Vec2::new(50.0, 0.0);
+        let px = EvalContext::trigger(&left, "Pos", &[Value::Int(0)]).to_float();
+        assert!((px - 50.0).abs() < 1e-6, "Pos X is absolute stage position; got {px}");
+    }
+
+    #[test]
+    fn pos_add_is_facing_relative_on_x() {
+        // PosAdd x is mirrored by facing: facing right, x=+5 -> +5; facing left,
+        // the SAME x=+5 -> -5 (forward in both cases). Physics::None + zero vel so
+        // the integration adds nothing and we observe PosAdd in isolation.
+        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "5"), ("y", "2")]);
+        let lc = loaded(vec![stand_n(0, vec![add.clone()])], tiny_air(0, &[5]));
+        let mut right = Character::new();
+        right.state_no = 0;
+        right.physics = Physics::None;
+        right.facing = Facing::Right;
+        right.pos = Vec2::<f32>::ZERO;
+        lc.tick(&mut right);
+        assert!((right.pos.x - 5.0).abs() < 1e-6, "facing right PosAdd x=+5 -> +5");
+        assert!((right.pos.y - 2.0).abs() < 1e-6, "PosAdd y is never mirrored");
+
+        let lc2 = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
+        let mut left = Character::new();
+        left.state_no = 0;
+        left.physics = Physics::None;
+        left.facing = Facing::Left;
+        left.pos = Vec2::<f32>::ZERO;
+        lc2.tick(&mut left);
+        assert!((left.pos.x - (-5.0)).abs() < 1e-6, "facing left PosAdd x=+5 -> -5 (forward)");
+        assert!((left.pos.y - 2.0).abs() < 1e-6, "PosAdd y unmirrored facing left");
+    }
+
+    #[test]
+    fn pos_set_is_absolute_not_facing_relative() {
+        // PosSet writes the absolute stage x regardless of facing.
+        let set = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "7"), ("y", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
+        let mut left = Character::new();
+        left.state_no = 0;
+        left.physics = Physics::None;
+        left.facing = Facing::Left;
+        left.pos = Vec2::new(100.0, 100.0);
+        lc.tick(&mut left);
+        assert!((left.pos.x - 7.0).abs() < 1e-6, "PosSet x is absolute (7), not mirrored; got {}", left.pos.x);
+        assert!((left.pos.y - 1.0).abs() < 1e-6);
     }
 
     // ---- 5.4 AC: VarSet / VarAdd across int/float/sys banks ----
@@ -3607,21 +3781,33 @@ mod tests {
 
     #[test]
     fn pos_controllers_are_not_disturbed_by_physics() {
-        // Physics acts on velocity, never position. A PosSet under stand physics
-        // leaves the set position intact while friction only scales velocity.
+        // The `physics` (friction) step acts on VELOCITY only — it never touches
+        // position directly. `PosSet` writes the ABSOLUTE stage position. The
+        // per-tick world integration then advances position by the
+        // (post-friction, facing-relative) velocity. Facing right, the integrated
+        // x delta is the friction-scaled velocity (no mirror), so:
+        //   pos.x = 100 (PosSet) + 10 * stand_friction * (+1)
         let pset = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "100"), ("y", "-20")]);
         let st = state(0, Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![pset]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::Stand;
+        ch.facing = Facing::Right;
         ch.pos = Vec2::new(1.0, 1.0);
         ch.vel = Vec2::new(10.0, 0.0);
         lc.tick(&mut ch);
-        assert!((ch.pos.x - 100.0).abs() < 1e-6, "position set, physics did not move it");
+        let f = CharacterConstants::default().movement.stand_friction;
+        // PosSet wrote the absolute x, then integration added the friction-scaled
+        // velocity (facing right => no mirror). y has zero velocity, so PosSet's
+        // -20 is intact.
+        assert!(
+            (ch.pos.x - (100.0 + 10.0 * f)).abs() < 1e-6,
+            "PosSet (absolute) + facing-relative integration of friction-scaled vel; got {}",
+            ch.pos.x
+        );
         assert!((ch.pos.y - (-20.0)).abs() < 1e-6);
         // Velocity, by contrast, was scaled by stand friction this tick.
-        let f = CharacterConstants::default().movement.stand_friction;
         assert!((ch.vel.x - 10.0 * f).abs() < 1e-6);
     }
 

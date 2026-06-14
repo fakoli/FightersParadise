@@ -216,14 +216,15 @@ impl CnsCharacter {
         let active = snapshot_active_commands(&self.matcher, &self.command_defs);
         self.entity.set_command_source(Box::new(active));
 
-        // 4. Step the CNS state machine one tick.
+        // 4. Step the CNS state machine one tick. The executor now owns world
+        //    position integration from velocity, applying the facing sign to X
+        //    (`pos.x += vel.x * facing_sign`, task 6.2c) so a left-facing
+        //    character walks the correct way. The app must NOT integrate again.
         let _ = self.entity.tick(&self.loaded);
 
-        // 5. Integrate position from velocity (the executor sets velocity via
-        //    CNS controllers/physics; the app owns world integration). Clamp to
-        //    the ground plane (y = 0) so the character never sinks.
-        self.entity.pos.x += self.entity.vel.x;
-        self.entity.pos.y += self.entity.vel.y;
+        // 5. Clamp to the stage ground plane (y = 0) so the character never
+        //    sinks. The ground plane is a stage concern, so it stays here rather
+        //    than in the character executor.
         if self.entity.pos.y > 0.0 {
             self.entity.pos.y = 0.0;
             if self.entity.vel.y > 0.0 {
@@ -379,23 +380,22 @@ fn make_ctrl(
 /// character gets it for free, exactly as MUGEN does), at which point this shim
 /// can be deleted.
 ///
-/// # Second gap: walk velocity (`const(...)` evaluator)
+/// # Walk velocity is now fully engine-driven (no app-side repair)
 ///
-/// Entering state 20 is not enough to *walk*: KFM's `[Statedef 20]` sets motion
-/// with `VelSet x = const(velocity.walk.fwd.x)`. The authored value IS loaded
-/// (`loaded.constants.velocity.walk_fwd.x == 2.4`), but fp-character's
-/// `EvalContext::trigger_str` does not yet resolve the `const(<member>)`
-/// named-constant function — it returns `0` for every member except `GetHitVar`.
-/// So the VelSet evaluates to `0` and the character enters state 20 without
-/// moving. This bridge therefore also drives the walk velocity directly from the
-/// character's OWN authored `[Velocity]` constants (so the values are faithful,
-/// not hardcoded), mirrored by `facing` so forward is always toward the screen
-/// direction the character faces.
+/// Entering state 20 *and walking* now works end-to-end with no app-side repair:
+/// KFM's `[Statedef 20]` sets motion with `VelSet x = const(velocity.walk.fwd.x)`,
+/// `const(<member>)` resolves the authored magnitude (2.4) in fp-character (5.6e),
+/// and the executor integrates the world position **facing-relative**
+/// (`pos.x += vel.x * facing_sign`, task 6.2c). The stored velocity stays
+/// facing-relative (matching the `Vel X` trigger that common1.cns's walk-anim
+/// selectors rely on), so KFM walks the correct direction for BOTH facings
+/// without rewriting the walk-state `VelSet`. The previous CB26 walk-velocity
+/// facing repair (which rewrote state-20 `VelSet x` to `{walk_fwd_x} * facing`)
+/// was therefore removed in 6.2c.
 ///
-/// TODO(5.6d / fp-character): (1) move the stand<->walk (and crouch/jump) engine
-/// built-in command->state transitions into the executor's special-state
-/// handling, and (2) make `const(<member>)` resolve `velocity.walk.fwd.x` etc.
-/// against the loaded constants; then remove this app-side shim entirely.
+/// TODO(fp-character): move the stand<->walk (and crouch/jump) engine built-in
+/// command->state transitions into the executor's special-state handling so every
+/// character gets them for free, then remove this remaining app-side bridge (CB25).
 ///
 /// The bridge is appended to `[Statedef -1]` (the per-tick command->state state),
 /// gated on the standard `holdfwd`/`holdback` commands the data file defines, so
@@ -418,13 +418,6 @@ fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
         tracing::info!("character authors its own walk bridge; skipping engine built-in");
         return;
     }
-
-    // Walk speeds from the character's own [Velocity] constants. const() now
-    // resolves the magnitude (5.6e), but the executor does not yet apply velocity
-    // facing-relative, so we still mirror by facing here. TODO(6.2c): move facing
-    // mirroring into the executor's VelSet and drop this repair (CB26).
-    let walk_fwd_x = loaded.constants.velocity.walk_fwd.x;
-    let walk_back_x = loaded.constants.velocity.walk_back.x;
 
     let stand_to_walk = make_ctrl(
         -1,
@@ -453,30 +446,7 @@ fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
         minus_one.controllers.push(walk_to_stand);
     }
 
-    // Mirror the walk state's VelSet x by facing (the const() magnitude is authored
-    // facing-right; the executor does not yet apply velocity facing-relative — TODO
-    // 6.2c, after which this repair is removed, CB26).
-    if let Some(walk) = loaded.states.get_mut(&STATE_WALK) {
-        for c in &mut walk.controllers {
-            let is_velset = c
-                .controller_type
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("VelSet"));
-            if !is_velset {
-                continue;
-            }
-            if let Some(x) = c.params.get_mut("x") {
-                let src = x.raw().to_ascii_lowercase();
-                if src.contains("const") && src.contains("walk.fwd") {
-                    *x = fp_character::CompiledParam::compile(&format!("{walk_fwd_x} * facing"));
-                } else if src.contains("const") && src.contains("walk.back") {
-                    *x = fp_character::CompiledParam::compile(&format!("{walk_back_x} * facing"));
-                }
-            }
-        }
-    }
-
-    tracing::info!("injected engine built-in stand<->walk bridge + walk-velocity facing repair");
+    tracing::info!("injected engine built-in stand<->walk command->state bridge");
 }
 
 /// Builds an empty `[Statedef n]` (no entry params, no controllers).
@@ -1485,8 +1455,17 @@ mod tests {
     #[test]
     fn headless_facing_left_hold_left_advances_forward_to_negative_x() {
         // Positive companion: facing Left, holding screen-Left is FORWARD. With
-        // walking now functional (5.6c), the character must strictly advance in
-        // the facing (forward = -x) direction, mirroring the facing-right walk.
+        // walking now functional (5.6c) and the executor integrating position
+        // facing-relative (6.2c), the character must strictly advance in the
+        // facing (forward = -x) direction, mirroring the facing-right walk.
+        //
+        // 6.2c semantics: the STORED velocity is FACING-RELATIVE — walk-forward is
+        // `const(velocity.walk.fwd.x)` = +2.4 for BOTH facings (this is exactly
+        // what common1.cns's `vel x > 0` walk-anim selector relies on). The facing
+        // sign is applied only when integrating world position
+        // (`pos.x += vel.x * facing_sign`), so facing left the SAME +2.4 velocity
+        // produces -x motion. We therefore assert the facing-relative velocity is
+        // strictly positive (forward) AND the world position advances toward -x.
         let Some(mut pc) = load_kfm_pc() else { return };
         pc.entity.facing = fp_character::Facing::Left;
         // Reach walk state first.
@@ -1503,13 +1482,16 @@ mod tests {
         let mut saw_forward_vel = false;
         for _ in 0..5 {
             pc.tick(hold_left());
-            if pc.entity.state_no == STATE_WALK && pc.entity.vel.x < 0.0 {
+            // Facing-relative walk-forward velocity is positive for both facings.
+            if pc.entity.state_no == STATE_WALK && pc.entity.vel.x > 0.0 {
                 saw_forward_vel = true;
             }
         }
         assert!(
             saw_forward_vel,
-            "facing left, walk velocity must be strictly negative (forward = -x)"
+            "facing left, walk-forward velocity is FACING-RELATIVE and must be \
+             strictly positive (+walk.fwd.x); the facing sign is applied at \
+             integration, not to the stored velocity"
         );
         assert!(
             pc.entity.pos.x < x_before,
