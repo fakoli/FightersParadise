@@ -148,6 +148,22 @@ impl EvalEnv<'_> {
 /// the cap is hit, degrading safely rather than hanging.
 const MAX_TRANSITIONS_PER_TICK: u32 = 512;
 
+/// World Y coordinate of the floor (ground plane) a grounded player stands on.
+///
+/// MUGEN's world Y axis increases **downward** and the floor is `Y = 0`:
+/// negative Y is *above* the ground (airborne), positive Y would be *below* the
+/// floor, which a player is never allowed to reach. After integrating velocity
+/// each tick the executor clamps `pos.y` to this value
+/// ([`Character::integrate_position`]) so a falling character settles on the
+/// ground instead of sinking, letting the data-driven land transition in
+/// `common1` (air [Statedef 50] checks `Vel Y > 0 && Pos Y >= 0` to
+/// `ChangeState` to the Jump Land state 52) fire and complete the
+/// jump → land → stand loop.
+///
+/// Kept as a named constant so a future per-stage floor / `zoffset` can override
+/// it without hunting for a magic literal.
+const GROUND_Y: f32 = 0.0;
+
 /// A request to play one sound, emitted by a `PlaySnd` controller during a tick.
 ///
 /// `fp-character` is a *pure simulation* crate: it never touches the audio
@@ -1932,7 +1948,8 @@ impl Character {
     }
 
     /// Integrates the world position from the (facing-relative) velocity for this
-    /// tick: `world pos.x += vel.x * facing_sign`, `world pos.y += vel.y`.
+    /// tick: `world pos.x += vel.x * facing_sign`, `world pos.y += vel.y`, then
+    /// clamps `pos.y` to the ground plane ([`GROUND_Y`]).
     ///
     /// MUGEN state-controller velocities are **facing-relative** (`+x` = the way
     /// the character faces), so the stored `vel.x` is mirrored by the facing sign
@@ -1941,9 +1958,23 @@ impl Character {
     /// trigger keeps returning the facing-relative value), and the Y axis is
     /// never mirrored. A facing-right character with `vel.x = +V` moves `+x`; a
     /// facing-left character with the *same* stored `vel.x = +V` moves `-x`.
+    ///
+    /// **Ground clamp.** Y increases downward and the floor is [`GROUND_Y`]
+    /// (`0`); positive Y is below the floor, which a player may never reach. After
+    /// integrating, `pos.y` is held at `min(pos.y, GROUND_Y)` every tick so a
+    /// falling character (positive `vel.y`) settles *on* the ground instead of
+    /// sinking. Crucially only the **position** is clamped — `vel.y` is left
+    /// untouched so `common1`'s land transition (air [Statedef 50]:
+    /// `Vel Y > 0 && Pos Y >= 0` → `ChangeState` 52) still observes the downward
+    /// velocity on the landing frame and Jump Land (state 52) gets to run its own
+    /// `VelSet`/`PosSet` to settle. Upward motion (negative Y) is unaffected by
+    /// `min(_, 0)`, and a grounded character already at `GROUND_Y` is unchanged.
     fn integrate_position(&mut self) {
         self.pos.x += self.vel.x * self.facing.sign() as f32;
         self.pos.y += self.vel.y;
+        // Hold at the floor: clamp position only, never velocity, so the
+        // data-driven land trigger still sees `Vel Y > 0` on the landing frame.
+        self.pos.y = self.pos.y.min(GROUND_Y);
     }
 
     /// Advances time-in-state by one tick.
@@ -2639,6 +2670,281 @@ mod tests {
         lcn.tick(&mut ch2);
         assert!((ch2.vel.x - 2.0).abs() < 1e-6);
         assert!((ch2.vel.y - 3.0).abs() < 1e-6);
+    }
+
+    // ---- A.P15: ground-plane Y clamp (falling characters land) -------------
+
+    /// A falling character (downward = positive `vel.y`) integrates toward the
+    /// floor and is clamped at [`GROUND_Y`] (`0`): `pos.y` never goes positive
+    /// (below the floor), no matter how many ticks pass, and — critically — the
+    /// clamp leaves `vel.y` untouched so the land trigger can still observe the
+    /// downward velocity on the landing frame.
+    #[test]
+    fn falling_character_clamps_at_ground_and_vel_y_preserved() {
+        // Physics::None so gravity does not alter vel.y: this isolates the
+        // position clamp. Start above the floor (negative Y) with downward vel.
+        let st = stand_n(0, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.pos = Vec2::new(0.0, -3.0); // 3 units above the floor
+        ch.vel = Vec2::new(0.0, 2.0); // falling (downward)
+
+        // Tick once: pos.y = -3 + 2 = -1, still airborne, not yet clamped.
+        lc.tick(&mut ch);
+        assert!((ch.pos.y - (-1.0)).abs() < 1e-6, "still airborne, got {}", ch.pos.y);
+        assert!((ch.vel.y - 2.0).abs() < 1e-6, "vel.y untouched by integration");
+
+        // Tick again: pos.y would integrate to -1 + 2 = +1 (below floor); the
+        // clamp must hold it AT the floor (0), and must NOT modify vel.y.
+        lc.tick(&mut ch);
+        assert!((ch.pos.y - GROUND_Y).abs() < 1e-6, "clamped to floor, got {}", ch.pos.y);
+        assert!(ch.pos.y <= GROUND_Y, "pos.y never positive (below floor)");
+        assert!((ch.vel.y - 2.0).abs() < 1e-6, "clamp must NOT touch vel.y (land-trigger timing)");
+
+        // Keep ticking with the same downward velocity: it stays pinned at 0.
+        for _ in 0..10 {
+            lc.tick(&mut ch);
+            assert!(ch.pos.y <= GROUND_Y, "stays at/above floor, got {}", ch.pos.y);
+        }
+        assert!((ch.pos.y - GROUND_Y).abs() < 1e-6, "settled exactly at the floor");
+    }
+
+    /// Upward motion (negative Y, above the floor) is unaffected by the
+    /// `min(_, GROUND_Y)` clamp, and a grounded character already at the floor
+    /// with zero vertical velocity stays put.
+    #[test]
+    fn upward_motion_unaffected_and_grounded_unchanged() {
+        let st = stand_n(0, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+
+        // Rising character: pos.y goes more negative, never touched by the clamp.
+        let mut up = Character::new();
+        up.state_no = 0;
+        up.physics = Physics::None;
+        up.pos = Vec2::new(0.0, 0.0);
+        up.vel = Vec2::new(0.0, -5.0); // upward
+        lc.tick(&mut up);
+        assert!((up.pos.y - (-5.0)).abs() < 1e-6, "upward motion passes through clamp");
+
+        // Grounded character at the floor, no vertical velocity: stays at 0.
+        let mut grounded = Character::new();
+        grounded.state_no = 0;
+        grounded.physics = Physics::None;
+        grounded.pos = Vec2::new(0.0, GROUND_Y);
+        grounded.vel = Vec2::new(0.0, 0.0);
+        lc.tick(&mut grounded);
+        assert!((grounded.pos.y - GROUND_Y).abs() < 1e-6, "grounded char unmoved by min(_,0)");
+    }
+
+    /// Gated real-KFM integration test (skips silently when the
+    /// `test-assets/kfm` fixture is absent), in two parts:
+    ///
+    /// **Part A — the jump arc lands via the clamp.** Enter the jump-up air
+    /// state 50 with the P4 jump velocity (negative y = upward, from
+    /// `velocity.jump.up`) under air physics, exactly as Statedef 40's
+    /// `AnimTime=0` VelSet → ChangeState 50 leaves the character. Gravity
+    /// (`yaccel`) pulls it back down and the ground clamp must settle `pos.y`
+    /// **exactly at the floor** (`GROUND_Y`) without ever sinking below it —
+    /// the headline behavior this task adds (before the clamp the character sank
+    /// forever).
+    ///
+    /// **Part B — common1's data land transition completes the loop.** Drive the
+    /// air-fall state 5040, whose `[State 5040, 6]` carries common1's land rule
+    /// (`Vel Y > 0 && Pos Y >= 0` → ChangeState 52). With a downward velocity
+    /// and air physics, the clamp lands the character at `Pos Y = 0`, the land
+    /// trigger fires (it can only fire because the clamp leaves `vel.y > 0`
+    /// intact at the landing frame), and common1 carries the character into the
+    /// grounded Jump Land state 52 (`type=S`, which then settles velocity and
+    /// proceeds to Stand 0). This proves the falling → land → grounded loop the
+    /// task targets.
+    #[test]
+    fn real_kfm_jump_lands_and_common1_land_transition_completes() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+
+        // ---- Part A: the jump arc returns to the floor and is clamped there --
+        let mut jumper = Character::with_constants(lc.constants);
+        jumper.facing = Facing::Right;
+        jumper.pos = Vec2::new(0.0, GROUND_Y);
+        jumper.change_state(&lc.states, 50); // air jump-up (sets type/physics=A)
+        jumper.vel = Vec2::new(0.0, lc.constants.velocity.jump_up);
+        assert!(jumper.vel.y < 0.0, "jump y must be upward (negative), got {}", jumper.vel.y);
+
+        let mut peaked_airborne = false;
+        let mut returned_to_ground = false;
+        for _ in 0..240 {
+            let _ = jumper.tick(&lc, None, StageView::default());
+            // The character must NEVER sink below the floor (the bug this fixes).
+            assert!(
+                jumper.pos.y <= GROUND_Y + 1e-4,
+                "character must never sink below the floor, got pos.y = {}",
+                jumper.pos.y
+            );
+            if jumper.pos.y < -1.0 {
+                peaked_airborne = true; // genuinely left the ground on the way up
+            }
+            if peaked_airborne && (jumper.pos.y - GROUND_Y).abs() < 1e-4 {
+                returned_to_ground = true;
+                break;
+            }
+        }
+        assert!(peaked_airborne, "the jump should lift the character off the floor");
+        assert!(
+            returned_to_ground,
+            "the falling character should settle back AT the floor (Pos Y = 0), \
+             not sink past it; ended at pos.y = {}",
+            jumper.pos.y
+        );
+
+        // ---- Part B: common1's `Vel Y > 0 && Pos Y >= 0` → 52 land transition -
+        // State 5040 (air-fall) carries the land rule in this common1 fixture.
+        let mut faller = Character::with_constants(lc.constants);
+        faller.facing = Facing::Right;
+        faller.pos = Vec2::new(0.0, -40.0); // start airborne, above the floor
+        faller.change_state(&lc.states, 5040);
+        faller.physics = Physics::Air; // gravity (yaccel) accelerates the fall
+        faller.vel = Vec2::new(0.0, 1.0); // already moving downward
+
+        let mut reached_land_state = false;
+        for _ in 0..240 {
+            let _ = faller.tick(&lc, None, StageView::default());
+            assert!(
+                faller.pos.y <= GROUND_Y + 1e-4,
+                "faller must never sink below the floor, got pos.y = {}",
+                faller.pos.y
+            );
+            // The data land transition carries the character into Jump Land (52),
+            // a grounded stand-type state, or onward to Stand (0).
+            if faller.state_no == 52 || faller.state_no == 0 {
+                reached_land_state = true;
+                break;
+            }
+        }
+        assert!(
+            reached_land_state,
+            "common1's `Vel Y > 0 && Pos Y >= 0` land transition should carry the \
+             landed character into a grounded state (52 Jump Land → Stand 0); \
+             ended in state {} at pos.y = {}",
+            faller.state_no, faller.pos.y
+        );
+        assert!(
+            (faller.pos.y - GROUND_Y).abs() < 1e-3,
+            "after landing, pos.y is settled at the floor; got {}",
+            faller.pos.y
+        );
+    }
+
+    /// The floor constant is the world origin (`Y = 0`) — pinned so a future
+    /// stage `zoffset`/floor change is a deliberate, test-visible edit rather
+    /// than a silent magic-literal drift. Y increases downward, so the clamp
+    /// `min(pos.y, GROUND_Y)` keeps a player at or above this line.
+    #[test]
+    fn ground_y_constant_is_floor_zero() {
+        assert!((GROUND_Y - 0.0).abs() < f32::EPSILON, "floor is the world origin Y=0");
+    }
+
+    /// Synthetic full jump arc driven by **air gravity** (no real fixtures
+    /// required), proving AC2's "downward velocity integrates toward the floor
+    /// and is clamped at `GROUND_Y`" under the real physics path: `apply_physics`
+    /// adds `yaccel` to `vel.y` each tick, then `integrate_position` advances and
+    /// clamps. The character launches upward (negative `vel.y`), peaks, gravity
+    /// reverses it, and the clamp settles it **exactly** at the floor without
+    /// ever sinking below it.
+    #[test]
+    fn synthetic_gravity_fall_integrates_toward_floor_and_clamps() {
+        // Air state so `Physics::Air` adds gravity (yaccel) to vel.y each tick.
+        let air = state(
+            0,
+            Entry { st: Some("A"), ph: Some("A"), anim: Some("0"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(vec![air], tiny_air(0, &[5]));
+        let yaccel = CharacterConstants::default().movement.yaccel;
+        assert!(yaccel > 0.0, "downward gravity must be positive (Y increases downward)");
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::Air;
+        ch.pos = Vec2::new(0.0, GROUND_Y); // start on the floor
+        ch.vel = Vec2::new(0.0, -8.4); // launch upward (negative Y)
+
+        let mut peaked_airborne = false;
+        let mut settled = false;
+        let mut min_y = 0.0_f32; // most-negative (highest) point reached
+        for _ in 0..200 {
+            lc.tick(&mut ch);
+            // The defining behavior: the player is NEVER below the floor.
+            assert!(
+                ch.pos.y <= GROUND_Y + 1e-5,
+                "character must never sink below the floor, got pos.y = {}",
+                ch.pos.y
+            );
+            min_y = min_y.min(ch.pos.y);
+            if ch.pos.y < -1.0 {
+                peaked_airborne = true;
+            }
+            if peaked_airborne && (ch.pos.y - GROUND_Y).abs() < 1e-5 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(peaked_airborne, "gravity test should lift the character (min_y = {min_y})");
+        assert!(
+            settled,
+            "gravity should pull the falling character back to rest AT the floor, \
+             not sink past it; ended at pos.y = {}",
+            ch.pos.y
+        );
+        // vel.y is left for the state machine to settle: still positive (downward)
+        // at the landing frame — the clamp touched position only.
+        assert!(
+            ch.vel.y > 0.0,
+            "clamp leaves vel.y downward for the land trigger; got {}",
+            ch.vel.y
+        );
+    }
+
+    /// Boundary: a character arriving **exactly** on the floor (`pos.y == 0`)
+    /// with a downward velocity is held at the floor every tick, and the clamp
+    /// never nudges `pos.y` positive nor zeroes `vel.y`. This is the precise
+    /// landing-frame condition common1's land rule (`Vel Y > 0 && Pos Y >= 0`)
+    /// observes: position pinned at `0`, velocity still downward.
+    #[test]
+    fn landing_frame_at_floor_holds_position_and_keeps_vel_y() {
+        let st = stand_n(0, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None; // isolate the clamp from gravity
+        ch.pos = Vec2::new(0.0, GROUND_Y); // already exactly on the floor
+        ch.vel = Vec2::new(0.0, 3.0); // still moving downward at the landing frame
+
+        for _ in 0..5 {
+            lc.tick(&mut ch);
+            assert!(
+                (ch.pos.y - GROUND_Y).abs() < 1e-6,
+                "held exactly at the floor, got {}",
+                ch.pos.y
+            );
+            assert!(ch.pos.y <= GROUND_Y, "never below the floor");
+            assert!(
+                (ch.vel.y - 3.0).abs() < 1e-6,
+                "clamp must not zero vel.y (land trigger needs Vel Y > 0); got {}",
+                ch.vel.y
+            );
+        }
     }
 
     // ---- AC1: persistent semantics -----------------------------------------
@@ -5152,10 +5458,12 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
-        ch.pos = Vec2::new(1.0, 2.0);
+        // Y is negative (above the floor) so the per-tick ground clamp leaves it
+        // alone — this test is about PosSet's per-axis behavior, not the floor.
+        ch.pos = Vec2::new(1.0, -2.0);
         lc.tick(&mut ch);
         assert!((ch.pos.x - 50.0).abs() < 1e-6, "x set");
-        assert!((ch.pos.y - 2.0).abs() < 1e-6, "y left unchanged");
+        assert!((ch.pos.y - (-2.0)).abs() < 1e-6, "y left unchanged");
 
         let both = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "3"), ("y", "-4")]);
         let lc2 = loaded(vec![stand_n(0, vec![both])], tiny_air(0, &[5]));
@@ -5177,10 +5485,12 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         ch.facing = Facing::Right;
-        ch.pos = Vec2::new(10.0, 10.0);
+        // Negative (airborne) Y so the per-tick ground clamp does not interfere;
+        // this test exercises PosAdd accumulation on both axes.
+        ch.pos = Vec2::new(10.0, -10.0);
         lc.tick(&mut ch);
         assert!((ch.pos.x - 12.0).abs() < 1e-6);
-        assert!((ch.pos.y - 9.0).abs() < 1e-6);
+        assert!((ch.pos.y - (-11.0)).abs() < 1e-6);
     }
 
     // ---- 6.2c: facing-relative velocity / position integration --------------
@@ -5273,7 +5583,9 @@ mod tests {
         // PosAdd x is mirrored by facing: facing right, x=+5 -> +5; facing left,
         // the SAME x=+5 -> -5 (forward in both cases). Physics::None + zero vel so
         // the integration adds nothing and we observe PosAdd in isolation.
-        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "5"), ("y", "2")]);
+        // PosAdd y is negative (upward / above the floor) so the per-tick ground
+        // clamp leaves it untouched; this test is about facing-relative x.
+        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "5"), ("y", "-2")]);
         let lc = loaded(vec![stand_n(0, vec![add.clone()])], tiny_air(0, &[5]));
         let mut right = Character::new();
         right.state_no = 0;
@@ -5282,7 +5594,7 @@ mod tests {
         right.pos = Vec2::<f32>::ZERO;
         lc.tick(&mut right);
         assert!((right.pos.x - 5.0).abs() < 1e-6, "facing right PosAdd x=+5 -> +5");
-        assert!((right.pos.y - 2.0).abs() < 1e-6, "PosAdd y is never mirrored");
+        assert!((right.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y is never mirrored");
 
         let lc2 = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut left = Character::new();
@@ -5292,22 +5604,24 @@ mod tests {
         left.pos = Vec2::<f32>::ZERO;
         lc2.tick(&mut left);
         assert!((left.pos.x - (-5.0)).abs() < 1e-6, "facing left PosAdd x=+5 -> -5 (forward)");
-        assert!((left.pos.y - 2.0).abs() < 1e-6, "PosAdd y unmirrored facing left");
+        assert!((left.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y unmirrored facing left");
     }
 
     #[test]
     fn pos_set_is_absolute_not_facing_relative() {
         // PosSet writes the absolute stage x regardless of facing.
-        let set = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "7"), ("y", "1")]);
+        // Y is set above the floor (negative) so the ground clamp is a no-op here;
+        // this test verifies PosSet writes the absolute x irrespective of facing.
+        let set = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "7"), ("y", "-1")]);
         let lc = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
         let mut left = Character::new();
         left.state_no = 0;
         left.physics = Physics::None;
         left.facing = Facing::Left;
-        left.pos = Vec2::new(100.0, 100.0);
+        left.pos = Vec2::new(100.0, -100.0);
         lc.tick(&mut left);
         assert!((left.pos.x - 7.0).abs() < 1e-6, "PosSet x is absolute (7), not mirrored; got {}", left.pos.x);
-        assert!((left.pos.y - 1.0).abs() < 1e-6);
+        assert!((left.pos.y - (-1.0)).abs() < 1e-6);
     }
 
     // ---- 5.4 AC: VarSet / VarAdd across int/float/sys banks ----
