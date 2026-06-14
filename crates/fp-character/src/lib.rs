@@ -74,6 +74,10 @@ pub mod loader;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{SoundRequest, TickReport};
+// Re-export the combat sound reference so downstream crates (e.g. fp-engine) can
+// name the type of [`AttackResolution::hit_sound`] without taking a direct
+// dependency on fp-combat.
+pub use fp_combat::SoundId;
 pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
     LoadedCharacter,

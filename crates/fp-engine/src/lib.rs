@@ -339,11 +339,13 @@ pub struct Match {
     winner: Option<Winner>,
     /// Player 1's sound-play requests from the MOST RECENT [`Match::tick`].
     ///
-    /// Captured (cloned) from P1's per-tick [`fp_character::TickReport`] and
-    /// REPLACED every tick, so it always reflects only the latest tick's
-    /// `PlaySnd` controllers (never accumulating across ticks). Empty on a tick
-    /// with no `PlaySnd`. Read it via [`Match::p1_sound_requests`]; a downstream
-    /// audio player (fp-app + fp-audio) consumes it to perform playback.
+    /// Each tick this is first REPLACED with P1's per-tick
+    /// [`fp_character::TickReport`] `PlaySnd` requests, then the `HitDef`
+    /// hit/guard impact sound is APPENDED if P1's attack connected this tick — so
+    /// it never accumulates across ticks but does combine both sources within a
+    /// tick. Empty on a tick with no `PlaySnd` and no connecting attack. Read it
+    /// via [`Match::p1_sound_requests`]; a downstream audio player (fp-app +
+    /// fp-audio) consumes it to perform playback.
     p1_sound_requests: Vec<fp_character::SoundRequest>,
     /// Player 2's sound-play requests from the most recent [`Match::tick`].
     /// See [`Match::p1_sound_requests`] for the capture/replace semantics; read
@@ -428,21 +430,26 @@ impl Match {
         self.winner
     }
 
-    /// Player 1's sound-play requests emitted by `PlaySnd` controllers during
-    /// the MOST RECENT [`Match::tick`], in fire order.
+    /// Player 1's sound-play requests for the MOST RECENT [`Match::tick`], in
+    /// fire order.
     ///
-    /// The slice is REPLACED every tick (never accumulated), so it reflects only
-    /// the latest tick — empty whenever P1 ran no `PlaySnd` that tick. A
-    /// downstream audio player decodes each [`fp_character::SoundRequest`] from
-    /// the character's `.snd` and plays it; `fp-engine` itself produces no sound.
+    /// This holds, in order: the `PlaySnd` controllers P1 fired this tick,
+    /// followed by P1's `HitDef` hit/guard impact sound if its attack connected
+    /// this tick (channel 0, full volume). The slice is REPLACED every tick
+    /// (never accumulated across ticks), so it reflects only the latest tick —
+    /// empty whenever P1 emitted nothing. A downstream audio player decodes each
+    /// [`fp_character::SoundRequest`] from the character's `.snd` (or the
+    /// common/fight file when `common` is set) and plays it; `fp-engine` itself
+    /// produces no sound.
     #[must_use]
     pub fn p1_sound_requests(&self) -> &[fp_character::SoundRequest] {
         &self.p1_sound_requests
     }
 
-    /// Player 2's sound-play requests from the most recent [`Match::tick`], in
-    /// fire order. See [`Match::p1_sound_requests`] for the replace-each-tick
-    /// semantics.
+    /// Player 2's sound-play requests for the most recent [`Match::tick`], in
+    /// fire order (P2's `PlaySnd` controllers followed by its `HitDef` impact
+    /// sound on a connecting attack). See [`Match::p1_sound_requests`] for the
+    /// replace-each-tick semantics.
     #[must_use]
     pub fn p2_sound_requests(&self) -> &[fp_character::SoundRequest] {
         &self.p2_sound_requests
@@ -489,23 +496,38 @@ impl Match {
         //     from their loaded AIR and applies any resolved hit. Combat only
         //     happens during the live fight phase — a HitDef left active during
         //     the intro/KO/win phases must not connect.
+        //
+        //     On a connection, the attacker's `HitDef` hit/guard impact sound is
+        //     APPENDED (not replacing) to the ATTACKER's sound-request vec. This
+        //     runs AFTER step (2) moved this tick's `PlaySnd` requests into those
+        //     vecs, so the impact sound adds to the same frame's requests rather
+        //     than overwriting them. The hit sound plays on channel 0 (a fixed
+        //     hit channel) at full volume (volume_scale 100); `common` is carried
+        //     from the `SoundId` so a common-file hitsound (one authored with no
+        //     `S` prefix) resolves against the fight.snd downstream.
         if fighting {
             let p2_states = &self.p2.loaded.states;
-            let _ = resolve_attack(
+            let p1_attack = resolve_attack(
                 &mut self.p1.character,
                 &self.p1.loaded.air,
                 &mut self.p2.character,
                 &self.p2.loaded.air,
                 p2_states,
             );
+            if let Some(s) = p1_attack.and_then(|res| res.hit_sound) {
+                self.p1_sound_requests.push(hit_sound_request(s));
+            }
             let p1_states = &self.p1.loaded.states;
-            let _ = resolve_attack(
+            let p2_attack = resolve_attack(
                 &mut self.p2.character,
                 &self.p2.loaded.air,
                 &mut self.p1.character,
                 &self.p1.loaded.air,
                 p1_states,
             );
+            if let Some(s) = p2_attack.and_then(|res| res.hit_sound) {
+                self.p2_sound_requests.push(hit_sound_request(s));
+            }
         }
 
         // (4) Separate overlapping bodies, then clamp each to the stage.
@@ -788,6 +810,27 @@ fn facings_toward(ax: f32, bx: f32) -> (Facing, Facing) {
     }
 }
 
+/// Builds the [`fp_character::SoundRequest`] for a `HitDef` impact sound (the
+/// hit or guard sound chosen by [`fp_character::AttackResolution::hit_sound`]).
+///
+/// The impact sound plays on **channel 0** — a fixed channel reserved here for
+/// hit/guard impacts so a new hit interrupts the previous impact rather than
+/// stacking on the auto-allocated PlaySnd channels — at **full volume**
+/// (`volume_scale = 100`) and never loops. `group`/`sample`/`common` are carried
+/// straight from the [`fp_character::SoundId`], so a common-file hitsound (one
+/// authored with no `S` prefix) resolves against the fight.snd downstream, while
+/// an `S`-prefixed one stays on the character's own `.snd`.
+fn hit_sound_request(s: fp_character::SoundId) -> fp_character::SoundRequest {
+    fp_character::SoundRequest {
+        group: s.group,
+        sample: s.sample,
+        channel: 0,
+        volume_scale: 100,
+        looping: false,
+        common: s.common,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1109,151 @@ time = 1
             m.round_state()
         );
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    #[test]
+    fn connecting_attack_appends_hit_sound_to_attacker_requests() {
+        use fp_character::SoundId;
+        let hitsound = SoundId { group: 5, sample: 0, common: false };
+
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000; // survive so the round stays in Fight
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Arm a hitsound-carrying HitDef and pin the attacker on its punch frame.
+        let mut hd = sample_hitdef();
+        hd.resources.hitsound = Some(hitsound);
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(hd);
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.holding_back = false; // takes a clean hit
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the attack must connect");
+        // The attacker's (P1's) requests carry the HitDef hitsound on channel 0.
+        let req = m
+            .p1_sound_requests()
+            .iter()
+            .find(|r| r.group == hitsound.group && r.sample == hitsound.sample)
+            .expect("P1's hit sound must be present in its sound requests");
+        assert_eq!(req.channel, 0, "impact sound plays on the hit channel (0)");
+        assert_eq!(req.volume_scale, 100, "impact sound at full volume");
+        assert!(!req.looping);
+        assert!(!req.common, "the SoundId `common` flag propagates unchanged (own .snd here)");
+        // The defender (P2) did not emit the attacker's hit sound.
+        assert!(
+            !m.p2_sound_requests()
+                .iter()
+                .any(|r| r.group == hitsound.group && r.sample == hitsound.sample),
+            "the hit sound belongs to the attacker, not the defender"
+        );
+    }
+
+    #[test]
+    fn connecting_attack_without_hitsound_appends_nothing() {
+        // A HitDef with no hit/guard sound must NOT append a spurious (0,0) request
+        // when it connects — the `.and_then(|res| res.hit_sound)` guard is the whole
+        // correctness of that. Mirrors the hitsound test but leaves the sounds None.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        let mut hd = sample_hitdef();
+        hd.resources.hitsound = None; // explicit: no impact sound
+        hd.resources.guardsound = None;
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(hd);
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.holding_back = false;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the attack must connect");
+        assert!(
+            m.p1_sound_requests().is_empty(),
+            "a connecting attack with no HitDef sound appends no request"
+        );
+    }
+
+    #[test]
+    fn guarded_attack_appends_guard_sound_to_attacker_requests() {
+        use fp_character::SoundId;
+        let guardsound = SoundId { group: 6, sample: 1, common: true };
+
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        let mut hd = sample_hitdef();
+        hd.resources.guardsound = Some(guardsound);
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(hd);
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+
+        // The defender blocks by holding "back" (away from the attacker). P2 sits
+        // to P1's right and faces left, so "back" is the absolute RIGHT direction.
+        // Feed it through the real input pipeline so `feed_input` sets
+        // `holding_back` (which `tick` would otherwise overwrite from the input).
+        let p2_back = MatchInput {
+            right: true,
+            ..MatchInput::none()
+        };
+        m.tick(MatchInput::none(), p2_back);
+
+        // Guard, not a clean hit: only guard damage was dealt (sample_hitdef
+        // guard = 5), and the guard sound is appended to the attacker's requests.
+        assert_eq!(m.p2().life(), 1000 - 5, "guard damage, not hit damage");
+        let req = m
+            .p1_sound_requests()
+            .iter()
+            .find(|r| r.group == guardsound.group && r.sample == guardsound.sample)
+            .expect("P1's guard sound must be present on a blocked attack");
+        assert_eq!(req.channel, 0);
+        assert_eq!(req.volume_scale, 100);
+        assert!(req.common, "a common guard sound (the hitsound/guardsound default) resolves against fight.snd");
     }
 
     #[test]

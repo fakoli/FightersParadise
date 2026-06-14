@@ -438,28 +438,131 @@ impl Default for HitTimes {
     }
 }
 
-/// Resource id fields attached to a hit: spark, hit sound, guard sound.
+/// A MUGEN sound reference: a `(group, sample)` pair into a `.snd` file, plus a
+/// flag selecting which file.
 ///
-/// Each is a raw numeric id; a value of `-1` means "unset / none" by MUGEN convention.
-/// The `S`-prefix (use the character's own AIR/SND rather than the common set) is not
+/// MUGEN's `hitsound` / `guardsound` parameters are a `group, sample` pair (e.g.
+/// `hitsound = 5, 0` is sample `0` of group `5`), not a single id — the older
+/// single-`i32` model dropped the sample. For these HitDef parameters the sound
+/// comes from the **common / fight** sound file (`fight.snd`) **by default**; a
+/// leading `S` (case-insensitive) on the group token selects the **character's
+/// own** `.snd` instead. (This is the inverse of the `PlaySnd` controller, where
+/// the character's own file is the default and `F` selects the common file — see
+/// [03-engine-architecture.md §state-controllers]). That distinction is captured
+/// in [`common`](SoundId::common). This type is pure data and carries no playback
+/// logic — a downstream player (`fp-audio`) resolves and plays it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SoundId {
+    /// The sound *group* number (with any leading `S` flag already stripped and
+    /// reflected in [`common`](SoundId::common)).
+    pub group: i32,
+    /// The sound *sample* number within [`group`](SoundId::group). Defaults to `0`
+    /// when the authored value omits it (`hitsound = 5` ≡ `5, 0`).
+    pub sample: i32,
+    /// `true` (the default for `hitsound`/`guardsound`) when the sound comes from
+    /// the **common / fight** sound file (`fight.snd`); `false` when the group
+    /// token was `S`-prefixed, meaning the **character's own** `.snd`.
+    pub common: bool,
+}
+
+impl SoundId {
+    /// Parses a MUGEN `hitsound` / `guardsound` value into an optional [`SoundId`].
+    ///
+    /// The value is a comma list `group [, sample]`:
+    /// - The **group** token selects the **common / fight** sound file by default
+    ///   ([`common`](SoundId::common) `= true`); a leading `S`/`s` flag instead
+    ///   selects the **character's own** `.snd` (`common = false`) and is stripped
+    ///   before the integer is parsed. (Inverse of `PlaySnd`, where the default is
+    ///   the character's own file and `F` selects the common one.)
+    /// - The **sample** defaults to `0` when absent (`"5"` ≡ `"5, 0"`) or when the
+    ///   sample token cannot be parsed as an integer.
+    ///
+    /// Returns [`None`] (the MUGEN "no sound" sentinel) when the group is the
+    /// literal `-1`, or when the group token is empty / cannot be parsed as an
+    /// integer (garbage). Never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::SoundId;
+    ///
+    /// // No prefix → the common / fight sound file (the hitsound default).
+    /// assert_eq!(
+    ///     SoundId::parse("5, 0"),
+    ///     Some(SoundId { group: 5, sample: 0, common: true })
+    /// );
+    /// // Leading `S` → the character's own .snd.
+    /// assert_eq!(
+    ///     SoundId::parse("S5, 2"),
+    ///     Some(SoundId { group: 5, sample: 2, common: false })
+    /// );
+    /// // Sample defaults to 0 when omitted.
+    /// assert_eq!(
+    ///     SoundId::parse("7"),
+    ///     Some(SoundId { group: 7, sample: 0, common: true })
+    /// );
+    /// // The `-1` sentinel and garbage both mean "no sound".
+    /// assert_eq!(SoundId::parse("-1"), None);
+    /// assert_eq!(SoundId::parse("nope"), None);
+    /// ```
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split(',');
+        let group_tok = parts.next().unwrap_or("").trim();
+
+        // hitsound/guardsound default to the common/fight sound file; a leading
+        // `S`/`s` flag selects the character's own `.snd` instead.
+        let (common, group_digits) = match group_tok.strip_prefix(['S', 's']) {
+            Some(rest) => (false, rest.trim()),
+            None => (true, group_tok),
+        };
+
+        let group = group_digits.parse::<i32>().ok()?;
+        // `-1` is MUGEN's explicit "no sound" sentinel.
+        if group == -1 {
+            return None;
+        }
+
+        // Sample defaults to 0 when absent or unparseable.
+        let sample = parts
+            .next()
+            .map(str::trim)
+            .and_then(|t| t.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        Some(Self {
+            group,
+            sample,
+            common,
+        })
+    }
+}
+
+/// Resource fields attached to a hit: spark id, hit sound, guard sound.
+///
+/// `sparkno` is a raw numeric id (`-1` = none). The two sounds are
+/// [`SoundId`]s wrapped in [`Option`]: [`None`] is the MUGEN "no sound" sentinel
+/// (an authored `-1`, or an absent / unparseable value). The `S`-prefix on
+/// `sparkno` (use the character's own AIR rather than the common set) is not
 /// modelled here — it is resolved by the controller in task 6.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HitResources {
     /// `sparkno` — spark animation action id (`-1` = none).
     pub sparkno: i32,
-    /// `hitsound` — sound id played on a clean hit (`-1` = none).
-    pub hitsound: i32,
-    /// `guardsound` — sound id played when guarded (`-1` = none).
-    pub guardsound: i32,
+    /// `hitsound` — sound played on a clean hit (`None` = no sound).
+    pub hitsound: Option<SoundId>,
+    /// `guardsound` — sound played when the hit is guarded (`None` = no sound).
+    pub guardsound: Option<SoundId>,
 }
 
 impl Default for HitResources {
-    /// All ids default to `-1` (unset), matching MUGEN's "no resource" convention.
+    /// `sparkno` defaults to `-1` (unset); both sounds default to [`None`] (no
+    /// sound), matching MUGEN's "no resource" convention.
     fn default() -> Self {
         Self {
             sparkno: -1,
-            hitsound: -1,
-            guardsound: -1,
+            hitsound: None,
+            guardsound: None,
         }
     }
 }
@@ -1249,10 +1352,10 @@ mod tests {
         // ids: id 0 (unset), chainid -1 (chain-from-any sentinel).
         assert_eq!(hd.id, 0);
         assert_eq!(hd.chainid, -1);
-        // All three resource ids are -1 (none).
+        // Spark id is -1 (none); both sounds are None (no sound).
         assert_eq!(
             hd.resources,
-            HitResources { sparkno: -1, hitsound: -1, guardsound: -1 }
+            HitResources { sparkno: -1, hitsound: None, guardsound: None }
         );
         // priority is the MUGEN default (4, Hit).
         assert_eq!(hd.priority.kind, PriorityType::Hit);
@@ -1280,7 +1383,11 @@ mod tests {
             priority: Priority { value: 5, kind: PriorityType::Miss },
             id: 7,
             chainid: -1,
-            resources: HitResources { sparkno: 2, hitsound: 5, guardsound: 6 },
+            resources: HitResources {
+                sparkno: 2,
+                hitsound: Some(SoundId { group: 5, sample: 0, common: false }),
+                guardsound: Some(SoundId { group: 6, sample: 0, common: false }),
+            },
         };
         let copy = base; // Copy, not move.
         assert_eq!(base, copy); // original still usable -> proves Copy
@@ -2239,5 +2346,66 @@ mod tests {
         assert_eq!(out.damage, 12);
         assert_eq!(out.knockback, Vec2::new(4.0, 0.0));
         assert_eq!(out.gethit_state, 5000);
+    }
+
+    // ---- SoundId::parse (hitsound / guardsound faithful parsing) -------------
+
+    /// `group, sample` parses both components; no flag → the common/fight file
+    /// (the `hitsound`/`guardsound` default).
+    #[test]
+    fn sound_id_parse_group_and_sample() {
+        assert_eq!(
+            SoundId::parse("5, 0"),
+            Some(SoundId { group: 5, sample: 0, common: true })
+        );
+        assert_eq!(
+            SoundId::parse("5, 3"),
+            Some(SoundId { group: 5, sample: 3, common: true })
+        );
+    }
+
+    /// A leading `S`/`s` flag selects the character's own `.snd` (`common = false`)
+    /// and is stripped before the group integer is parsed.
+    #[test]
+    fn sound_id_parse_s_prefix_is_own() {
+        assert_eq!(
+            SoundId::parse("S5, 2"),
+            Some(SoundId { group: 5, sample: 2, common: false })
+        );
+        // Lower-case flag too.
+        assert_eq!(
+            SoundId::parse("s10, 1"),
+            Some(SoundId { group: 10, sample: 1, common: false })
+        );
+    }
+
+    /// The sample defaults to `0` when absent or unparseable; whitespace is
+    /// tolerated around both tokens.
+    #[test]
+    fn sound_id_parse_sample_defaults_to_zero() {
+        assert_eq!(
+            SoundId::parse("7"),
+            Some(SoundId { group: 7, sample: 0, common: true })
+        );
+        assert_eq!(
+            SoundId::parse("  9  "),
+            Some(SoundId { group: 9, sample: 0, common: true })
+        );
+        // Garbage sample → defaults to 0 (group still valid).
+        assert_eq!(
+            SoundId::parse("4, nope"),
+            Some(SoundId { group: 4, sample: 0, common: true })
+        );
+    }
+
+    /// `-1`, empty, and non-numeric groups all mean "no sound" ([`None`]).
+    #[test]
+    fn sound_id_parse_sentinel_and_garbage_are_none() {
+        assert_eq!(SoundId::parse("-1"), None);
+        assert_eq!(SoundId::parse("-1, 4"), None);
+        assert_eq!(SoundId::parse(""), None);
+        assert_eq!(SoundId::parse("nope"), None);
+        // A bare `S` flag with no digits → unparseable group → None.
+        assert_eq!(SoundId::parse("S"), None);
     }
 }

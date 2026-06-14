@@ -58,6 +58,11 @@ pub struct AttackResolution {
     pub attacker_hitpause: i32,
     /// Hit-pause ticks set on the defender (`pausetime.p2`).
     pub defender_hitpause: i32,
+    /// The attacker's `HitDef` sound to play for this connection: the `hitsound`
+    /// on a clean [`HitResult::Hit`], the `guardsound` on a [`HitResult::Guard`].
+    /// [`None`] when the relevant sound is unset on the `HitDef`. (A miss never
+    /// produces an [`AttackResolution`], so this is keyed off `result`.)
+    pub hit_sound: Option<fp_combat::SoundId>,
 }
 
 /// Performs one tick of attacker → defender combat: detect, resolve, and apply.
@@ -205,6 +210,14 @@ pub fn resolve_attack(
         attacker.move_connect.hit = true;
     }
 
+    // Pick the impact sound from the attacker's HitDef: the guardsound when the
+    // attack was guarded, the hitsound on a clean hit. Either may be `None`.
+    let hit_sound = if guarded {
+        hitdef.resources.guardsound
+    } else {
+        hitdef.resources.hitsound
+    };
+
     Some(AttackResolution {
         result: outcome.result,
         damage: outcome.damage,
@@ -212,6 +225,7 @@ pub fn resolve_attack(
         defender_state: outcome.gethit_state,
         attacker_hitpause: outcome.pausetime,
         defender_hitpause: outcome.shaketime,
+        hit_sound,
     })
 }
 
@@ -486,6 +500,48 @@ mod tests {
         assert!(a.move_connect.guarded);
         assert!(!a.move_connect.hit);
         assert!(a.move_connect.contact());
+    }
+
+    #[test]
+    fn resolution_carries_hitsound_on_hit_and_guardsound_on_guard() {
+        use fp_combat::SoundId;
+        let hitsound = SoundId { group: 5, sample: 0, common: false };
+        let guardsound = SoundId { group: 6, sample: 1, common: true };
+
+        // ---- Clean hit → resolution carries the hitsound. ----
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.resources.hitsound = Some(hitsound);
+            hd.resources.guardsound = Some(guardsound);
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("clean hit");
+        assert_eq!(res.result, HitResult::Hit);
+        assert_eq!(res.hit_sound, Some(hitsound), "clean hit uses the hitsound");
+
+        // ---- Guarded → resolution carries the guardsound. ----
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.resources.hitsound = Some(hitsound);
+            hd.resources.guardsound = Some(guardsound);
+        }
+        let (mut d, d_air) = make_defender();
+        d.holding_back = true; // guardflag MA admits a standing block
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guarded hit");
+        assert_eq!(res.result, HitResult::Guard);
+        assert_eq!(res.hit_sound, Some(guardsound), "a guard uses the guardsound");
+    }
+
+    #[test]
+    fn resolution_hit_sound_is_none_when_hitdef_has_no_sounds() {
+        // Default HitDef resources have no sounds; a clean hit carries None.
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("clean hit");
+        assert_eq!(res.result, HitResult::Hit);
+        assert_eq!(res.hit_sound, None, "no hitsound on the HitDef => None");
     }
 
     #[test]

@@ -959,18 +959,25 @@ impl Character {
             hd.ground_type = parse_hit_type(src);
         }
 
-        // Spark / sound ids. These may carry a leading `S` (use the character's
-        // own AIR/SND set rather than the common set). The `S` prefix is not
-        // modelled in `fp_combat::HitResources` yet, so we strip it and keep the
-        // numeric id; an absent / non-numeric id keeps the default (`-1`).
+        // Spark id. `sparkno` may carry a leading `S` (use the character's own
+        // AIR set rather than the common set). The `S` prefix is not modelled in
+        // `fp_combat::HitResources`, so we strip it and keep the numeric id; an
+        // absent / non-numeric id keeps the default (`-1`).
         if let Some(src) = raw_param(ctrl, "sparkno") {
             hd.resources.sparkno = parse_resource_id(src, hd.resources.sparkno);
         }
+        // Hit / guard sounds. These are a `group, sample` pair (the sample was
+        // dropped by the old single-`i32` model). Unlike `PlaySnd`, these default
+        // to the common / fight sound file; a leading `S`/`s` flag selects the
+        // character's own `.snd` instead. Parsing is owned by
+        // `fp_combat::SoundId::parse`; `-1`, empty, or garbage → `None` (no sound).
+        // When the param is present we always overwrite the default so an authored
+        // `-1` clears it to `None`.
         if let Some(src) = raw_param(ctrl, "hitsound") {
-            hd.resources.hitsound = parse_resource_id(src, hd.resources.hitsound);
+            hd.resources.hitsound = fp_combat::SoundId::parse(src);
         }
         if let Some(src) = raw_param(ctrl, "guardsound") {
-            hd.resources.guardsound = parse_resource_id(src, hd.resources.guardsound);
+            hd.resources.guardsound = fp_combat::SoundId::parse(src);
         }
 
         // ---- Numeric params (evaluated against self / the attacker) --------
@@ -4264,7 +4271,8 @@ mod tests {
                 ("fall", "1"),
                 ("priority", "5, Miss"),
                 ("sparkno", "S2"),
-                ("hitsound", "S5, 0"),
+                ("hitsound", "5, 0"),
+                ("guardsound", "S6, 1"),
             ],
         );
         let st = stand_n(200, vec![hitdef]);
@@ -4296,9 +4304,18 @@ mod tests {
         assert!(hd.fall);
         assert_eq!(hd.priority.value, 5);
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss);
-        // `S`-prefixed resource ids: prefix stripped, numeric id kept.
+        // `S`-prefixed sparkno: prefix stripped, numeric id kept.
         assert_eq!(hd.resources.sparkno, 2);
-        assert_eq!(hd.resources.hitsound, 5);
+        // `hitsound = 5, 0` (no prefix) → the common/fight sound file, group 5.
+        assert_eq!(
+            hd.resources.hitsound,
+            Some(fp_combat::SoundId { group: 5, sample: 0, common: true })
+        );
+        // `guardsound = S6, 1` → `S` prefix selects the character's own .snd.
+        assert_eq!(
+            hd.resources.guardsound,
+            Some(fp_combat::SoundId { group: 6, sample: 1, common: false })
+        );
     }
 
     /// Unspecified params fall back to `HitDef::default()`'s MUGEN sentinels.
