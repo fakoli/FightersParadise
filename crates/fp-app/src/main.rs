@@ -863,6 +863,87 @@ fn draw_player(
 }
 
 // ---------------------------------------------------------------------------
+// Clsn hitbox/hurtbox debug overlay (audit #34)
+// ---------------------------------------------------------------------------
+
+/// The screen anchor a fighter's character-local geometry hangs off: the
+/// screen-space pixel that its axis (`pos`) maps to. This is exactly the anchor
+/// [`draw_player`] uses for the sprite (X from [`world_to_screen_x`], Y from the
+/// ground plane plus the fighter's vertical offset), so boxes computed from it
+/// line up with the drawn sprite. `ground_y` is the same `win_h * 0.8` fraction
+/// used there.
+fn player_screen_anchor(pos: fp_core::Vec2<f32>, win_w: f32, win_h: f32) -> (f32, f32) {
+    let ground_y = win_h * 0.8;
+    (world_to_screen_x(pos.x, win_w), ground_y + pos.y)
+}
+
+/// Maps one character-local Clsn rect (Y-down, relative to the axis, as stored
+/// in an AIR frame) into a screen-space [`fp_render::DebugBox`] of the given
+/// color.
+///
+/// The transform mirrors `fp_physics::place_clsn`: the local X edges are
+/// reflected about the axis when facing left (`anchor_x + sign * local_x`) and Y
+/// is translated unchanged (`anchor_y + local_y`, Y down). `WORLD_TO_SCREEN`
+/// being `1.0`, world and screen pixels share a scale, so no extra X scaling is
+/// needed. The result is normalized to non-negative width/height.
+fn clsn_to_screen_box(
+    local: &fp_core::Rect,
+    anchor_x: f32,
+    anchor_y: f32,
+    facing: fp_character::Facing,
+    color: [f32; 4],
+) -> fp_render::DebugBox {
+    let sign = facing.sign() as f32;
+    // Reflect both local X edges; left/right may swap when facing left.
+    let lx0 = local.x;
+    let lx1 = local.right();
+    let sx0 = anchor_x + sign * lx0;
+    let sx1 = anchor_x + sign * lx1;
+    let (x, w) = if sx0 <= sx1 {
+        (sx0, sx1 - sx0)
+    } else {
+        (sx1, sx0 - sx1)
+    };
+    // Y is never mirrored by facing.
+    let y = anchor_y + local.y;
+    let h = local.h.abs();
+    fp_render::DebugBox { x, y, w, h, color }
+}
+
+/// Red (Clsn1 = attack box), MUGEN debug convention. RGBA in 0.0–1.0.
+const CLSN1_COLOR: [f32; 4] = [1.0, 0.25, 0.25, 1.0];
+/// Blue (Clsn2 = hurt/collision box), MUGEN debug convention. RGBA in 0.0–1.0.
+const CLSN2_COLOR: [f32; 4] = [0.3, 0.55, 1.0, 1.0];
+
+/// Draws one fighter's current-frame collision boxes when the debug overlay is
+/// on: every Clsn2 (hurtbox, blue) first, then every Clsn1 (attack box, red) on
+/// top so attack boxes read clearly where the two overlap. A missing frame draws
+/// nothing.
+fn draw_player_clsn(
+    frame: &mut fp_render::RenderFrame<'_>,
+    player: &Player,
+    win_w: f32,
+    win_h: f32,
+) {
+    let Some(anim_frame) = player_current_frame(player) else {
+        return;
+    };
+    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), win_w, win_h);
+    let facing = player.facing();
+
+    for hurt in &anim_frame.clsn2 {
+        frame.draw_debug_box(&clsn_to_screen_box(
+            hurt, anchor_x, anchor_y, facing, CLSN2_COLOR,
+        ));
+    }
+    for attack in &anim_frame.clsn1 {
+        frame.draw_debug_box(&clsn_to_screen_box(
+            attack, anchor_x, anchor_y, facing, CLSN1_COLOR,
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Legacy SFF+AIR animation viewer (demo path)
 // ---------------------------------------------------------------------------
 
@@ -1160,6 +1241,10 @@ fn run() -> fp_core::FpResult<()> {
     let mut previous = Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut running = true;
+    // Clsn hitbox/hurtbox debug overlay (audit #34), toggled with F1. Off by
+    // default; when on, both fighters' current-frame Clsn1 (red) and Clsn2
+    // (blue) boxes are drawn over the sprites in the two-player match mode.
+    let mut overlay_enabled = false;
 
     while running {
         // Poll events
@@ -1171,6 +1256,17 @@ fn run() -> fp_core::FpResult<()> {
                     ..
                 } => {
                     running = false;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F1),
+                    repeat: false,
+                    ..
+                } => {
+                    overlay_enabled = !overlay_enabled;
+                    tracing::info!(
+                        "Clsn debug overlay {}",
+                        if overlay_enabled { "ON" } else { "OFF" }
+                    );
                 }
                 Event::Window {
                     win_event: sdl2::event::WindowEvent::Resized(w, h),
@@ -1247,6 +1343,12 @@ fn run() -> fp_core::FpResult<()> {
                 // own per-character texture cache (populated above).
                 draw_player(&mut frame, &run.p1_render, run.m.p1(), win_w as f32, win_h as f32);
                 draw_player(&mut frame, &run.p2_render, run.m.p2(), win_w as f32, win_h as f32);
+                // Optional Clsn debug overlay (F1): both fighters' attack (red)
+                // and hurt (blue) boxes, drawn over the sprites but under the HUD.
+                if overlay_enabled {
+                    draw_player_clsn(&mut frame, run.m.p1(), win_w as f32, win_h as f32);
+                    draw_player_clsn(&mut frame, run.m.p2(), win_w as f32, win_h as f32);
+                }
                 // Minimal HUD on top: life bars + KO/round indicator.
                 hud.draw(&mut frame, win_w as f32, &run.m);
             }
@@ -3064,5 +3166,68 @@ mod tests {
         let left = world_to_screen_x(-30.0, win_w);
         let right = world_to_screen_x(30.0, win_w);
         assert!((center - left - (right - center)).abs() < 1e-4, "symmetric about center");
+    }
+
+    // --- Clsn debug overlay box-mapping math (audit #34) ---
+
+    #[test]
+    fn player_screen_anchor_matches_draw_player_mapping() {
+        // The overlay anchor must equal the (x, y) draw_player hangs the sprite
+        // off: X via world_to_screen_x, Y via the ground plane plus pos.y.
+        let win_w = 640.0;
+        let win_h = 480.0;
+        let pos = fp_core::Vec2::new(40.0, -30.0);
+        let (ax, ay) = player_screen_anchor(pos, win_w, win_h);
+        assert!((ax - world_to_screen_x(pos.x, win_w)).abs() < 1e-4);
+        assert!((ay - (win_h * 0.8 + pos.y)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clsn_to_screen_box_facing_right_translates_only() {
+        // A local box to the right of and above the axis, facing right: X/Y are
+        // just translated by the anchor; no mirroring.
+        let local = fp_core::Rect::new(10.0, -40.0, 20.0, 30.0); // x,y,w,h
+        let b = clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Right, CLSN1_COLOR);
+        assert!((b.x - 110.0).abs() < 1e-4, "x = anchor_x + local.x");
+        assert!((b.w - 20.0).abs() < 1e-4, "width preserved");
+        assert!((b.y - 160.0).abs() < 1e-4, "y = anchor_y + local.y (Y down)");
+        assert!((b.h - 30.0).abs() < 1e-4, "height preserved");
+        assert_eq!(b.color, CLSN1_COLOR);
+    }
+
+    #[test]
+    fn clsn_to_screen_box_facing_left_mirrors_x_only() {
+        // Same local box facing left: X is reflected about the anchor while Y is
+        // untouched, matching fp_physics::place_clsn. The left/right edges swap,
+        // but the result stays a non-negative-width rect.
+        let local = fp_core::Rect::new(10.0, -40.0, 20.0, 30.0);
+        let right =
+            clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Right, CLSN2_COLOR);
+        let left =
+            clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Left, CLSN2_COLOR);
+
+        // Facing left: edges run from anchor - local.right() to anchor - local.x.
+        assert!((left.x - 70.0).abs() < 1e-4, "left edge = anchor_x - local.right()");
+        assert!((left.w - 20.0).abs() < 1e-4, "width preserved under mirroring");
+        // Y is identical to the right-facing case (facing never affects Y).
+        assert!((left.y - right.y).abs() < 1e-4);
+        assert!((left.h - right.h).abs() < 1e-4);
+        // The mirrored box is the reflection of the right-facing box about the
+        // anchor X: their centers are equidistant from the anchor.
+        let rc = right.x + right.w / 2.0;
+        let lc = left.x + left.w / 2.0;
+        assert!(((100.0 - lc) - (rc - 100.0)).abs() < 1e-4, "symmetric about anchor");
+    }
+
+    #[test]
+    fn clsn_to_screen_box_axis_crossing_box_facing_left() {
+        // A box straddling the axis (negative left edge) still normalizes to a
+        // non-negative width after the left-facing mirror.
+        let local = fp_core::Rect::new(-15.0, -10.0, 30.0, 10.0); // spans x=-15..15
+        let b = clsn_to_screen_box(&local, 50.0, 0.0, fp_character::Facing::Left, CLSN1_COLOR);
+        assert!(b.w >= 0.0, "width is non-negative after mirroring");
+        assert!((b.w - 30.0).abs() < 1e-4, "width magnitude preserved");
+        // Mirrored edges: anchor - 15 .. anchor + 15 => 35..65, so x = 35.
+        assert!((b.x - 35.0).abs() < 1e-4);
     }
 }
