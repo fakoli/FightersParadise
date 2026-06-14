@@ -146,8 +146,8 @@ Built on the faithful VM (const/alive/commands resolved). Physics prep done: **P
 | 6.2 | DONE | **HitDef controller + GetHitVars + get-hit states** | `fp-character` | ✅ HitDef controller builds `active_hitdef` (string params raw, numeric via eval); `GetHitVars` + `trigger_str("gethitvar")` resolves the last 5.6b deferral; get-hit states 5000-5xxx documented runnable. 250 fp-character / 1195 workspace. Commit `bfc5a58`. SHOULD_FIX → 6.2b + CB27. | 6.1 |
 | 6.2b | DONE | **Multi-component param model** (loader) | `fp-character`(+fp-app) | ✅ `CompiledParam{components}` splits params on top-level commas; controllers read `eval_param_component`; no spurious warns; CB27 fixed. **Public-type change broke fp-app** (params type) → fp-app migrated to `CompiledParam` in the same (amended) commit. 1221 tests. Commit `ccc4908`. Removing the walk repair exposed the **facing-relative velocity** gap → 6.2c. | 6.2 |
 | 6.2c | DONE | **Facing-relative velocity** (executor) + drop walk repair | `fp-character`+`fp-app` | ✅ World-pos integration moved INTO the executor: `pos.x += vel.x * facing` (vel stays facing-relative; `Vel X` facing-relative, validated vs common1 walk anim-select; PosAdd facing-relative; PosSet/Pos X absolute). fp-app walk repair removed (**CB26 done**); CB25 bridge kept. KFM walks both facings from its own data. 1228 tests. Commit `127883e`. | 6.2b |
-| 6.3a | DOING | **Hit resolution logic** (pure) | `fp-combat` | Pure `resolve_hit(&HitDef, defender_stance, defender_guarding, defender_airborne) -> HitOutcome{ result: Hit/Guard/Miss, damage, set_state: Option<i32>, vel (attacker-facing-relative knockback), pausetime(self,other), fall, hit/slide/ctrl times }`. hitflag/guardflag + stance decide Hit vs Guard vs Miss (block needs matching guardflag + holding back). No fp-character/fp-vm dep. Tested. | 6.1 |
-| 6.3b | TODO | **Hit detection + apply** (two characters) | `fp-character` | A function over two Characters: extract current-frame Clsn1(attacker)/Clsn2(defender) from their AIR, run `fp_combat::detect_hit`; if hit + attacker has `active_hitdef` + not already hit this move, call `resolve_hit`, then APPLY to defender — life -= damage, set knockback vel (mirrored by attacker facing), ChangeState to the get-hit state (`p2stateno` or common 5000-series), populate `GetHitVars`, set hitpause on both, clear/flag the HitDef (hitonce). Unit-tested with two synthetic Characters. | 6.3a, 6.2 |
+| 6.3a | DONE | **Hit resolution logic** (pure) | `fp-combat` | ✅ `resolve_hit(&HitDef, DefenderState) -> HitOutcome` — Guard/Hit/Miss (guard=holding-back+guardflag admits stance; empty=unblockable), damage, facing-relative knockback, pause/hit times, fall, get-hit state (p2stateno else 5000/5010/5020). 42 tests; Critic PASS. Commit `103da80`. SHOULD_FIX → CB28 (distinct slidetime/ctrltime). | 6.1 |
+| 6.3b | DONE | **Hit detection + apply** (two characters) | `fp-character` | A function over two Characters: extract current-frame Clsn1(attacker)/Clsn2(defender) from their AIR, run `fp_combat::detect_hit`; if hit + attacker has `active_hitdef` + not already hit this move, call `resolve_hit`, then APPLY to defender — life -= damage, set knockback vel (mirrored by attacker facing), ChangeState to the get-hit state (`p2stateno` or common 5000-series), populate `GetHitVars`, set hitpause on both, clear/flag the HitDef (hitonce). Unit-tested with two synthetic Characters. | 6.3a, 6.2 |
 
 (Live two-player fights on screen — ticking P1+P2, running detection each tick, KO/round — are
 **Phase 7** `fp-engine` + fp-app, where the demo becomes an actual match.)
@@ -234,6 +234,16 @@ parallelizable once the core exists. Deps: Phase 7.
   lives in the executor (`pos.x += vel.x * facing`).
 - **CB27** *(folded into 6.2b)* `executor.rs` HitDef-controller doc lists `air.type` among parsed
   params, but it isn't read (no `air_type` field; MUGEN defaults air.type→ground.type). Fix the doc.
+- **CB28** `fp-combat` HitDef models only `hittimes` (ground/air/guard); MUGEN's `ground.slidetime`,
+  `guard.slidetime`, `guard.ctrltime`, `airguard.ctrltime` are independent — `resolve_hit` currently
+  approximates slidetime/ctrltime as hittime. Add the distinct fields (+ controller parse) for
+  faithful hitstun/blockstun frame data. *(added 6.3a — refinement, not blocking first combat)*
+- **CB29** `fp-character` `resolve_attack`/`change_state`/`tick_with` take a bare
+  `HashMap<i32, CompiledState>` in their public signatures; introduce a re-exported `StateGraph` type
+  alias so the API reads consistently and the representation can change without rippling. *(added 6.3b)*
+- **CB30** Executor hit-pause currently runs NO controllers during the pause; MUGEN also runs
+  `ignorehitpause`-flagged controllers mid-pause. Implement that exception (doc now states it's
+  deferred). *(added 6.3b — benign until a get-hit state needs it)*
 
 ---
 

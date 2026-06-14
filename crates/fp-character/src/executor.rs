@@ -47,7 +47,7 @@
 //! integration applies the facing sign. `PosAdd` is likewise facing-relative
 //! (`pos.x += dx * facing_sign`), while `PosSet` and the `Pos X` trigger operate
 //! on the **absolute** stage position (no mirroring). See
-//! [`Character::integrate_position`].
+//! `Character::integrate_position` (private).
 //!
 //! ## Controller dispatch
 //!
@@ -118,6 +118,10 @@ pub struct TickReport {
     /// `true` if the per-tick transition cap was hit and processing was stopped
     /// early to avoid an infinite loop.
     pub transition_cap_hit: bool,
+    /// `true` if the character was frozen by hit-pause this tick: normal state
+    /// and physics processing was skipped and the pause counter decremented. No
+    /// controllers fire and no transitions happen on a hit-paused tick.
+    pub hitpaused: bool,
 }
 
 impl Character {
@@ -151,6 +155,26 @@ impl Character {
     ) -> TickReport {
         let mut report = TickReport::default();
 
+        // Hit-pause gate: while frozen by a connecting hit, this minimal model holds
+        // the character completely still for the paused tick — it skips ALL state/
+        // physics processing and counts the pause down by one. (MUGEN additionally
+        // runs controllers flagged `ignorehitpause` during the pause; that exception
+        // is NOT implemented here yet — deferred, tracked as CB30 — and is currently
+        // benign because no get-hit common state relies on it.) The shake timer (the
+        // defender's visual jitter during the pause) counts down alongside it.
+        // Decrementing after the gate makes a freshly-set `hitpause = N` last N ticks.
+        if self.hitpause > 0 {
+            self.hitpause -= 1;
+            if self.shaketime > 0 {
+                self.shaketime -= 1;
+            }
+            report.hitpaused = true;
+            return report;
+        }
+        if self.shaketime > 0 {
+            self.shaketime -= 1;
+        }
+
         // Process the special states first, in MUGEN order, then the current
         // state. The current state number is re-read after each special state in
         // case one of them changed it via ChangeState.
@@ -172,6 +196,19 @@ impl Character {
         self.advance_animation(air);
 
         report
+    }
+
+    /// Forces this character into `target` exactly as a `ChangeState` would:
+    /// records `prev_state_no`, resets time-in-state and the `persistent`
+    /// bookkeeping, and applies the destination statedef's entry parameters
+    /// (`type`/`movetype`/`physics`/`anim`/`ctrl`/`velset`).
+    ///
+    /// This is the public seam hit resolution ([`resolve_attack`](crate::resolve_attack))
+    /// uses to put a defender into its get-hit state. An unknown destination
+    /// still updates the cursor (so `StateNo` reads the requested number) but
+    /// applies no entry parameters — never panics.
+    pub fn change_state(&mut self, states: &HashMap<i32, CompiledState>, target: i32) {
+        self.enter_state(states, target);
     }
 
     /// Runs every controller of the state numbered `state_no` (if it exists),

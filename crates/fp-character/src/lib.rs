@@ -68,9 +68,11 @@
 
 #![warn(missing_docs)]
 
+pub mod combat;
 pub mod executor;
 pub mod loader;
 
+pub use combat::{resolve_attack, AttackResolution};
 pub use executor::TickReport;
 pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
@@ -697,6 +699,16 @@ pub struct Character {
     pub power_max: i32,
     /// Whether the player currently has control (`Ctrl`).
     pub ctrl: bool,
+    /// Whether this character is currently holding the "back" direction (away
+    /// from the opponent), i.e. attempting to guard.
+    ///
+    /// Hit resolution ([`resolve_attack`]) reads this on the **defender** to
+    /// build the [`fp_combat::DefenderState`] that decides hit-vs-guard. The
+    /// executor sets it from `fp-input` once cross-entity facing is wired
+    /// (Phase 7); until then it stays `false` (attacks land rather than block),
+    /// matching the task's "else false for now" rule. Tests set it directly to
+    /// drive the guard path.
+    pub holding_back: bool,
 
     // ---- State categories --------------------------------------------------
     /// Stance category (`StateType`).
@@ -789,6 +801,69 @@ pub struct Character {
     /// (task 6.3); until then it stays at its default and every `GetHitVar`
     /// member reads back its default.
     pub get_hit_vars: GetHitVars,
+
+    /// Remaining hit-pause / hit-stop ticks for **this** character.
+    ///
+    /// MUGEN freezes both participants for a few ticks when an attack connects
+    /// (the "hit stop") so the impact reads. While `hitpause > 0` the executor
+    /// skips normal state processing for this character and decrements the
+    /// counter by one each tick (see [`Character::tick`]). Set on both attacker
+    /// (from `pausetime.p1`) and defender (from `pausetime.p2`/`shaketime`) by
+    /// hit resolution ([`resolve_attack`]). `0` means "not paused".
+    pub hitpause: i32,
+
+    /// Remaining hit-shake ticks for **this** character (the defender's visual
+    /// shake during hit-pause), read by `GetHitVar(hitshaketime)` and the
+    /// `HitShakeOver` trigger. Set from the connecting hit's `pausetime.p2`.
+    pub shaketime: i32,
+
+    /// Connection state of this character's currently-active move, for the
+    /// `MoveContact` / `MoveHit` / `MoveGuarded` triggers and the `hitonce`
+    /// (numhits = 1) rule.
+    ///
+    /// Updated by hit resolution ([`resolve_attack`]) on the **attacker** when
+    /// its [`active_hitdef`](Character::active_hitdef) connects, and reset when a
+    /// new move begins. See [`MoveConnect`].
+    pub move_connect: MoveConnect,
+}
+
+/// Tracks whether the attacker's current move has connected, for the
+/// `MoveContact` / `MoveHit` / `MoveGuarded` triggers and the `hitonce` rule.
+///
+/// MUGEN exposes three related triggers an attacker reads about its *own*
+/// in-progress move:
+///
+/// - `MoveHit` — the move landed as a **clean hit** at least once.
+/// - `MoveGuarded` — the move was **blocked** at least once.
+/// - `MoveContact` — the move made contact at all (`MoveHit || MoveGuarded`).
+///
+/// Hit resolution ([`resolve_attack`]) sets [`hit`](MoveConnect::hit) /
+/// [`guarded`](MoveConnect::guarded) when the attacker's
+/// [`active_hitdef`](Character::active_hitdef) connects. The same `hit ||
+/// guarded` flag also enforces `hitonce` (`numhits = 1`): once a move has
+/// connected, [`resolve_attack`] will not let it connect again until the move is
+/// reset with [`MoveConnect::reset`] (called on a fresh `HitDef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MoveConnect {
+    /// `true` once the current move landed a clean hit (`MoveHit`).
+    pub hit: bool,
+    /// `true` once the current move was guarded/blocked (`MoveGuarded`).
+    pub guarded: bool,
+}
+
+impl MoveConnect {
+    /// `MoveContact`: the move made contact at all (hit **or** guarded).
+    #[must_use]
+    pub const fn contact(self) -> bool {
+        self.hit || self.guarded
+    }
+
+    /// Clears all connection flags — called when a new move (a fresh `HitDef`)
+    /// begins, so `MoveContact`/`MoveHit`/`MoveGuarded` and `hitonce` start over.
+    pub fn reset(&mut self) {
+        self.hit = false;
+        self.guarded = false;
+    }
 }
 
 impl Default for Character {
@@ -803,6 +878,7 @@ impl Default for Character {
             power: 0,
             power_max: constants.power_max,
             ctrl: false,
+            holding_back: false,
             state_type: StateType::default(),
             move_type: MoveType::default(),
             physics: Physics::default(),
@@ -822,6 +898,9 @@ impl Default for Character {
             fire_counts: std::collections::HashMap::new(),
             active_hitdef: None,
             get_hit_vars: GetHitVars::default(),
+            hitpause: 0,
+            shaketime: 0,
+            move_connect: MoveConnect::default(),
         }
     }
 }
@@ -1163,6 +1242,23 @@ impl EvalContext for Character {
             return Value::from(self.life > 0);
         }
 
+        // Move-connection triggers an attacker reads about its own in-progress
+        // move. Populated by hit resolution (`resolve_attack`) on the attacker.
+        // `MoveContact` is `MoveHit || MoveGuarded`.
+        if name.eq_ignore_ascii_case("MoveHit") {
+            return Value::from(self.move_connect.hit);
+        }
+        if name.eq_ignore_ascii_case("MoveGuarded") {
+            return Value::from(self.move_connect.guarded);
+        }
+        if name.eq_ignore_ascii_case("MoveContact") {
+            return Value::from(self.move_connect.contact());
+        }
+        // `HitShakeOver` is true once the defender's hit-shake has elapsed.
+        if name.eq_ignore_ascii_case("HitShakeOver") {
+            return Value::from(self.shaketime <= 0);
+        }
+
         // ---- Deferred triggers (documented, not silently wrong) -------------
         //
         // The following standard triggers appear in the stock `kfm.cns` /
@@ -1173,11 +1269,11 @@ impl EvalContext for Character {
         // the common states do not actively misfire on them today. They are
         // listed here so the omission is explicit rather than accidental.
         //
-        // * Get-hit state (Phase 6): `HitOver`, `HitShakeOver`, `HitFall`,
-        //   `CanRecover`, `InGuardDist`, `MoveContact`, `MoveHit`,
-        //   `MoveGuarded`. These read the active `HitDef`/get-hit record, which
-        //   `Character` does not carry yet. `GetHitVar(...)` is likewise
-        //   deferred and handled (also defaulting) in `trigger_str`.
+        // * Get-hit state (Phase 6): `HitOver`, `HitFall`, `CanRecover`,
+        //   `InGuardDist`. These read the active get-hit record this crate does
+        //   not fully model yet. (`MoveContact`/`MoveHit`/`MoveGuarded` and
+        //   `HitShakeOver` are now answered above from the fields hit resolution
+        //   populates.) `GetHitVar(...)` is handled in `trigger_str`.
         // * Round / match state (engine, Phase 5+): `RoundState`, `RoundNo`,
         //   `RoundsExisted`, `MatchOver`, `GameTime`. These live on the round
         //   coordinator (`fp-engine`), not on a single `Character`.
@@ -1346,11 +1442,9 @@ mod tests {
         let ch = sample();
         for t in [
             "HitOver",
-            "HitShakeOver",
             "HitFall",
             "CanRecover",
             "InGuardDist",
-            "MoveContact",
             "RoundState",
             "GameTime",
             "MatchOver",
@@ -2799,9 +2893,10 @@ mod tests {
         // / cross-entity geometry / anim-table queries). Includes case variants
         // to confirm the default holds regardless of spelling.
         let deferred = [
-            // Get-hit state (Phase 6).
-            "HitOver", "hitover", "HitShakeOver", "HitFall", "CanRecover",
-            "InGuardDist", "MoveContact", "MoveHit", "MoveGuarded",
+            // Get-hit state (Phase 6). `HitShakeOver`/`MoveContact`/`MoveHit`/
+            // `MoveGuarded` are no longer here: task 6.3b answers them from the
+            // fields hit resolution populates (see `move_connect_triggers`).
+            "HitOver", "hitover", "HitFall", "CanRecover", "InGuardDist",
             // Round / match state (engine, Phase 5+).
             "RoundState", "roundstate", "RoundNo", "RoundsExisted", "MatchOver",
             "GameTime",
@@ -2823,6 +2918,40 @@ mod tests {
         // not panic.
         assert_eq!(ch.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
         assert_eq!(ch.trigger("P2BodyDist", &[Value::Int(0)]), Value::Int(0));
+    }
+
+    #[test]
+    fn move_connect_triggers_track_the_move_connect_field() {
+        // MoveHit / MoveGuarded / MoveContact read `move_connect`, populated by
+        // hit resolution (task 6.3b). A fresh move reads all false.
+        let mut ch = Character::new();
+        assert_eq!(ev("MoveHit", &ch), Value::Int(0));
+        assert_eq!(ev("MoveGuarded", &ch), Value::Int(0));
+        assert_eq!(ev("MoveContact", &ch), Value::Int(0));
+
+        // A clean hit sets MoveHit (and so MoveContact), not MoveGuarded.
+        ch.move_connect.hit = true;
+        assert_eq!(ev("MoveHit", &ch), Value::Int(1));
+        assert_eq!(ev("MoveGuarded", &ch), Value::Int(0));
+        assert_eq!(ev("MoveContact", &ch), Value::Int(1));
+
+        // A guard sets MoveGuarded (and so MoveContact), not MoveHit.
+        ch.move_connect.reset();
+        ch.move_connect.guarded = true;
+        assert_eq!(ev("MoveHit", &ch), Value::Int(0));
+        assert_eq!(ev("MoveGuarded", &ch), Value::Int(1));
+        assert_eq!(ev("MoveContact", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn hitshakeover_tracks_shaketime() {
+        // HitShakeOver is true once the defender's shake timer has elapsed.
+        let mut ch = Character::new();
+        assert_eq!(ev("HitShakeOver", &ch), Value::Int(1)); // no shake -> over
+        ch.shaketime = 3;
+        assert_eq!(ev("HitShakeOver", &ch), Value::Int(0)); // still shaking
+        ch.shaketime = 0;
+        assert_eq!(ev("HitShakeOver", &ch), Value::Int(1));
     }
 
     #[test]
