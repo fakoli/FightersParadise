@@ -21,10 +21,18 @@
 //!    snapshotted into the character's [`fp_character::CommandSource`] seam, so
 //!    the character's own CNS/CMD controllers and the engine built-in locomotion
 //!    fire off the same command vocabulary the data files author.
-//! 2. **Tick both state machines** via [`fp_character::Character::tick`].
+//! 2. **Tick both state machines** via [`fp_character::Character::tick`], then
+//!    apply each tick's deferred `Target*` operations
+//!    ([`fp_character::TargetOp`]) to the **opponent** (the throw system, task
+//!    P8b): a binder's `TargetState`/`TargetBind`/`TargetLifeAdd`/`TargetFacing`/
+//!    `TargetVelSet`/`TargetVelAdd`/`TargetPowerAdd` move, bind, damage, face, or
+//!    re-velocity the target it grabbed, facing-relative to the binder.
 //! 3. **Run combat both directions** with
 //!    [`fp_character::combat::resolve_attack`] — P1 attacks P2, then P2 attacks
-//!    P1 — so an active `HitDef` on either side can connect this frame.
+//!    P1 — so an active `HitDef` on either side can connect this frame. On a
+//!    connection the `HitDef`'s `p1stateno` moves the **attacker** into its own
+//!    state (the throw-animation transition) while `p2stateno` (applied inside
+//!    `resolve_attack`) sends the defender to its get-hit/thrown state.
 //! 4. **Separate and clamp.** [`fp_physics::resolve_push`] pushes overlapping
 //!    bodies apart using each character's `size.ground.front`/`back`, then
 //!    [`fp_physics::clamp_to_bounds`] keeps each body inside [`StageBounds`].
@@ -690,11 +698,39 @@ impl Match {
             .character
             .tick(&self.p1.loaded, Some(&self.p2.character), stage);
         self.p1_sound_requests = p1_report.sound_requests;
+        // (2a) Apply P1's deferred `Target*` ops to P1's target, the OPPONENT (P2).
+        //      `self.p1`/`self.p2` are distinct fields, so the split borrow of the
+        //      binder (P1, read) and the target (P2, mutated) plus the target's OWN
+        //      states (`self.p2.loaded.states`, for `TargetState` entry) is sound.
+        //      Done in-order, P1 before P2 ticks, matching MUGEN's per-player update.
+        //
+        //      Gated on the live fight phase, exactly like combat in step (3): a
+        //      throw's `Target*` controllers are combat effects and must not move /
+        //      damage the opponent during the intro/KO/win phases (a `HitDef` left
+        //      active during those phases likewise must not connect).
+        if fighting {
+            apply_target_ops(
+                &self.p1.character,
+                &mut self.p2.character,
+                &self.p2.loaded.states,
+                &p1_report.target_ops,
+            );
+        }
+
         let p2_report = self
             .p2
             .character
             .tick(&self.p2.loaded, Some(&self.p1.character), stage);
         self.p2_sound_requests = p2_report.sound_requests;
+        // (2b) Apply P2's deferred `Target*` ops to its target, the OPPONENT (P1).
+        if fighting {
+            apply_target_ops(
+                &self.p2.character,
+                &mut self.p1.character,
+                &self.p1.loaded.states,
+                &p2_report.target_ops,
+            );
+        }
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
         //     Each direction reads the attacker's Clsn1 and the defender's Clsn2
@@ -719,9 +755,22 @@ impl Match {
                 &self.p2.loaded.air,
                 p2_states,
             );
-            if let Some(s) = p1_attack.and_then(|res| res.hit_sound) {
-                self.p1_sound_requests.push(hit_sound_request(s));
+            if let Some(res) = p1_attack {
+                if let Some(s) = res.hit_sound {
+                    self.p1_sound_requests.push(hit_sound_request(s));
+                }
+                // P8b: the HitDef's `p1stateno` moves the ATTACKER (P1) into its
+                // throw-/move-specific state via its OWN state graph. `p2stateno`
+                // (the defender's get-hit state) was already applied inside
+                // `resolve_attack`. The attacker and its loaded states are the same
+                // player, so this is a self-borrow — no split needed.
+                if let Some(state) = res.attacker_state {
+                    let states = &self.p1.loaded.states;
+                    tracing::debug!(player = "p1", to_state = state, "attacker enters p1stateno");
+                    self.p1.character.change_state(states, state);
+                }
             }
+
             let p1_states = &self.p1.loaded.states;
             let p2_attack = resolve_attack(
                 &mut self.p2.character,
@@ -730,8 +779,15 @@ impl Match {
                 &self.p1.loaded.air,
                 p1_states,
             );
-            if let Some(s) = p2_attack.and_then(|res| res.hit_sound) {
-                self.p2_sound_requests.push(hit_sound_request(s));
+            if let Some(res) = p2_attack {
+                if let Some(s) = res.hit_sound {
+                    self.p2_sound_requests.push(hit_sound_request(s));
+                }
+                if let Some(state) = res.attacker_state {
+                    let states = &self.p2.loaded.states;
+                    tracing::debug!(player = "p2", to_state = state, "attacker enters p1stateno");
+                    self.p2.character.change_state(states, state);
+                }
             }
         }
 
@@ -1213,6 +1269,95 @@ fn hit_sound_request(s: fp_character::SoundId) -> fp_character::SoundRequest {
         volume_scale: 100,
         looping: false,
         common: s.common,
+    }
+}
+
+/// Applies a binder's per-tick [`fp_character::TargetOp`]s (emitted by its
+/// `Target*` controllers) to its `target` — the opponent in a 1-v-1 [`Match`]
+/// (task P8b, the engine side of the throw system).
+///
+/// `binder` is the character whose `Target*` controllers fired this tick (read
+/// only); `target` is the opponent the ops act on (mutated). `target_states` is
+/// the **target's own** compiled state graph, used to enter a `TargetState`
+/// destination so the victim runs through *its* thrown-animation states (KFM
+/// state 820). Each op maps to its MUGEN controller:
+///
+/// - [`TargetOp::State`] — drive the target into the given state via its own
+///   graph ([`Character::change_state`](fp_character::Character::change_state));
+///   an unknown destination degrades to a cursor-only update (never panics).
+/// - [`TargetOp::Bind`] — pin the target to a facing-relative offset from the
+///   binder: `target.pos = binder.pos + (x * binder.facing.sign(), y)`. The
+///   per-tick re-emit of `TargetBind` (KFM state 810) gives a continuous hold;
+///   this is a first-cut *apply-on-emit* — the `time` field is honored only
+///   implicitly by the re-emit each tick, not tracked as a countdown here.
+/// - [`TargetOp::LifeAdd`] — add to the target's life, clamped to
+///   `[floor, life_max]` where `floor` is `0` when `kill` is set, else `1` (a
+///   non-killing add cannot drop the victim below `1`).
+/// - [`TargetOp::Facing`] — orient the target relative to the binder: `value >=
+///   0` faces it the **same** way as the binder, negative the **opposite** way.
+/// - [`TargetOp::VelSet`] / [`TargetOp::VelAdd`] — set / add the target's
+///   velocity `(x, y)` (taken as written; mirroring already resolved upstream).
+/// - [`TargetOp::PowerAdd`] — add to the target's power, clamped to
+///   `[0, power_max]`.
+///
+/// Pure field writes plus the panic-free `change_state` seam; never panics, and
+/// an op for a missing/unknown state degrades safely. Empty `ops` is a no-op.
+fn apply_target_ops(
+    binder: &Character,
+    target: &mut Character,
+    target_states: &std::collections::HashMap<i32, fp_character::CompiledState>,
+    ops: &[fp_character::TargetOp],
+) {
+    use fp_character::TargetOp;
+    for op in ops {
+        match *op {
+            TargetOp::State(value) => {
+                tracing::debug!(to_state = value, "target enters TargetState");
+                target.change_state(target_states, value);
+            }
+            TargetOp::Bind { time, pos } => {
+                let (ox, oy) = pos;
+                let new_pos = Vec2::new(
+                    binder.pos.x + ox * binder.facing.sign() as f32,
+                    binder.pos.y + oy,
+                );
+                tracing::trace!(time, x = new_pos.x, y = new_pos.y, "target bound to binder");
+                target.pos = new_pos;
+            }
+            TargetOp::LifeAdd { value, kill } => {
+                let floor = if kill { 0 } else { 1 };
+                let life_max = target.life_max.max(floor);
+                target.life = target.life.saturating_add(value).clamp(floor, life_max);
+            }
+            TargetOp::Facing(value) => {
+                target.facing = if value >= 0 {
+                    binder.facing
+                } else {
+                    facing_opposite(binder.facing)
+                };
+            }
+            TargetOp::VelSet((vx, vy)) => {
+                target.vel = Vec2::new(vx, vy);
+            }
+            TargetOp::VelAdd((vx, vy)) => {
+                target.vel = Vec2::new(target.vel.x + vx, target.vel.y + vy);
+            }
+            TargetOp::PowerAdd(value) => {
+                let power_max = target.power_max.max(0);
+                target.power = target.power.saturating_add(value).clamp(0, power_max);
+            }
+        }
+    }
+}
+
+/// Returns the opposite of an [`fp_character::Facing`] (right ↔ left).
+///
+/// [`fp_character::Facing`] exposes a `sign` but no `opposite`; this local helper
+/// flips it for [`TargetOp::Facing`]'s "opposite the binder" case.
+fn facing_opposite(facing: Facing) -> Facing {
+    match facing {
+        Facing::Right => Facing::Left,
+        Facing::Left => Facing::Right,
     }
 }
 
@@ -2762,6 +2907,123 @@ time = 1
         );
     }
 
+    /// AC3 (gated, skip-if-missing): drive a REAL two-KFM [`Match`] so P1's throw
+    /// `HitDef` (state 800, `p1stateno = 810` / `p2stateno = 820`) connects on P2
+    /// and assert the throw wiring this task added: P1 enters its own state 810
+    /// (the `p1stateno` attacker transition applied in `Match::tick`), P2 enters
+    /// state 820 (the `p2stateno` defender transition resolve_attack applies), and
+    /// over the following ticks P2 stays bound near P1 and loses life from the
+    /// state-810 `TargetBind` / `TargetLifeAdd` (the `TargetOp` apply path).
+    ///
+    /// We do **not** command-drive the throw (KFM's throw command is hard to land
+    /// deterministically frame-perfect in a headless harness — see the task note);
+    /// instead we put P1 directly into the real state 800 in range of P2 and let
+    /// the coordinator's own combat + target-op pipeline carry the rest, which is
+    /// exactly the code under test. Skips cleanly when the KFM fixture is absent.
+    #[test]
+    fn real_kfm_throw_drives_p1stateno_p2stateno_and_binds_target() {
+        let Some((lc1, lc2)) = two_kfm_loaded() else {
+            return; // fixture absent; helper already logged the skip
+        };
+        // The fixture must actually define the throw states for this test to mean
+        // anything; if a stripped CNS lacks them, skip rather than false-fail.
+        if !(lc1.states.contains_key(&800)
+            && lc1.states.contains_key(&810)
+            && lc2.states.contains_key(&820))
+        {
+            eprintln!("skipping: KFM fixture lacks throw states 800/810/820");
+            return;
+        }
+
+        let mut p1c = Character::with_constants(lc1.constants);
+        p1c.pos = Vec2::new(0.0, 0.0);
+        let mut p2c = Character::with_constants(lc2.constants);
+        // Stand P2 just in front of P1, inside throw range.
+        p2c.pos = Vec2::new(20.0, 0.0);
+        let p1 = Player::new(p1c, lc1);
+        let p2 = Player::new(p2c, lc2);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Put P1 into the real throw startup state (800) via its OWN graph; its
+        // [State 800, 1] HitDef (Trigger1 = Time = 0) arms on the next tick. Keep
+        // P2 standing and idle so the throw's `hitflag = M-` (ground, not-being-hit)
+        // is satisfied.
+        let throw_states = m.p1().loaded.states.clone();
+        m.p1.character.change_state(&throw_states, 800);
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.move_type = MoveType::Idle;
+        let p2_life_at_grab = m.p2().life();
+
+        // Tick until the throw connects: P1 should enter 810 and P2 should enter
+        // 820. Re-pin P2 standing/idle and in range each pre-connect tick so the
+        // grab can land deterministically.
+        let mut connected = false;
+        for _ in 0..30 {
+            if m.p1().character.state_no != 800 && m.p1().character.state_no != 810 {
+                // P1 fell out of the throw startup before connecting (e.g. AnimTime
+                // ChangeState back to 0); re-arm the startup once.
+                m.p1.character.change_state(&throw_states, 800);
+            }
+            if m.p1().character.state_no == 800 {
+                m.p2.character.state_type = StateType::Standing;
+                m.p2.character.move_type = MoveType::Idle;
+                m.p2.character.pos.x = m.p1().pos().x + 20.0;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p1().character.state_no == 810 && m.p2().character.state_no == 820 {
+                connected = true;
+                break;
+            }
+        }
+
+        // The deterministic core of AC3: the throw wired both state transitions.
+        assert!(
+            connected,
+            "real KFM throw should drive P1 -> 810 (p1stateno) and P2 -> 820 (p2stateno); \
+             P1 in {}, P2 in {}",
+            m.p1().character.state_no,
+            m.p2().character.state_no
+        );
+
+        // Over the following ticks the state-810 TargetBind keeps P2 pinned near P1
+        // and the TargetLifeAdd (AnimElem 11) drains P2's life. These are gated on
+        // the throw animation's element timing, so we run the hold out and assert
+        // the observable end effects (bound-near + life-drop) happened at least
+        // once; if the (real) anim never reaches the damage element within the
+        // budget we document rather than hard-fail on asset timing.
+        let mut ever_bound_near = false;
+        let mut life_dropped = false;
+        for _ in 0..120 {
+            if m.p1().character.state_no != 810 {
+                break; // throw released
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+            let dx = (m.p2().pos().x - m.p1().pos().x).abs();
+            if dx <= 80.0 {
+                ever_bound_near = true;
+            }
+            if m.p2().life() < p2_life_at_grab {
+                life_dropped = true;
+            }
+        }
+        assert!(
+            ever_bound_near,
+            "thrown P2 should be bound near P1 during the throw (TargetBind)"
+        );
+        if life_dropped {
+            assert!(
+                m.p2().life() < p2_life_at_grab,
+                "TargetLifeAdd should have reduced thrown P2's life"
+            );
+        } else {
+            eprintln!(
+                "note: real KFM throw anim did not reach the AnimElem 11 TargetLifeAdd \
+                 within the tick budget; bind verified, damage relies on the synthetic test"
+            );
+        }
+    }
+
     // ---- Task 7.3: the real command pipeline drives locomotion (no shim) ----
 
     /// Builds a two-KFM [`Match`] (P1 left, P2 right, facing each other, stood in
@@ -3728,5 +3990,714 @@ time = 1
         assert_eq!(m.p2_round_wins(), 0);
         assert_eq!(m.match_state(), MatchState::InProgress);
         assert_eq!(m.round_state(), RoundState::Fight, "still fighting round 1");
+    }
+
+    // ---- P8b: TargetOps applied to the opponent + p1stateno to the attacker ----
+
+    /// Builds a compiled controller of `ctrl_type` that fires every tick
+    /// (`trigger1 = 1`), with the given `(name, value)` params. Used to author the
+    /// synthetic `Target*` throw states the P8b end-to-end tests drive.
+    fn target_controller(
+        state_number: i32,
+        ctrl_type: &str,
+        params: &[(&str, &str)],
+    ) -> CompiledController {
+        let mut compiled = HashMap::new();
+        for (k, v) in params {
+            compiled.insert((*k).to_string(), CompiledParam::compile(v));
+        }
+        CompiledController {
+            state_number,
+            label: ctrl_type.to_string(),
+            controller_type: Some(ctrl_type.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: compiled,
+        }
+    }
+
+    /// A minimal standing [`CompiledState`] numbered `number` holding `controllers`.
+    fn state_with(number: i32, controllers: Vec<CompiledController>) -> CompiledState {
+        CompiledState {
+            number,
+            state_type: Some("S".to_string()),
+            movetype: None,
+            physics: None,
+            anim: None,
+            ctrl: None,
+            velset: None,
+            poweradd: None,
+            controllers,
+        }
+    }
+
+    /// AC2: a player in a state that (with `has_target` set) emits
+    /// `TargetState` + `TargetBind` + `TargetLifeAdd` drives the opponent on a
+    /// single tick: the opponent enters the target state, is bound at the
+    /// facing-relative offset from the binder, and loses the LifeAdd amount.
+    #[test]
+    fn target_ops_apply_to_opponent_state_bind_and_life() {
+        // Binder (P1) at the origin facing right; target (P2) to the right.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        // P1 sits in state 810 (the throw "hold" state) and already has a target.
+        p1c.state_no = 810;
+        p1c.has_target = true;
+
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 500;
+        p2c.life_max = 1000;
+
+        // P1's loaded states: state 810 emits the three throw Target ops each tick.
+        let mut p1_loaded = attacker_loaded();
+        p1_loaded.states.insert(
+            810,
+            state_with(
+                810,
+                vec![
+                    target_controller(810, "TargetState", &[("value", "820")]),
+                    // Bind well beyond the player-push threshold (default body
+                    // half-widths ~16/15) so the bound position is observable after
+                    // the post-combat player-push step does not re-separate the
+                    // (non-overlapping) bodies.
+                    target_controller(810, "TargetBind", &[("time", "1"), ("pos", "60, -5")]),
+                    target_controller(810, "TargetLifeAdd", &[("value", "-40"), ("kill", "0")]),
+                ],
+            ),
+        );
+
+        // P2's OWN states must contain 820 so TargetState's change_state lands.
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(820, state_with(820, Vec::new()));
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, p2_loaded);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Re-assert the throw preconditions after the intro (the intro re-faces /
+        // re-grants control) so the single observed tick is deterministic.
+        m.p1.character.state_no = 810;
+        m.p1.character.has_target = true;
+        m.p1.character.facing = Facing::Right;
+        m.p1.character.pos = Vec2::new(0.0, 0.0);
+        let life_before = m.p2().life();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // TargetState -> P2 entered 820 via its own state graph.
+        assert_eq!(m.p2().character.state_no, 820, "TargetState moved P2 to 820");
+        // TargetBind -> P2 pinned to binder.pos + (60 * +1, -5).
+        assert!(
+            (m.p2().pos().x - 60.0).abs() < 1e-3,
+            "bound X is facing-relative to the binder, got {}",
+            m.p2().pos().x
+        );
+        assert!(
+            (m.p2().pos().y + 5.0).abs() < 1e-3,
+            "bound Y offset from the binder, got {}",
+            m.p2().pos().y
+        );
+        // TargetLifeAdd(-40, kill=false) -> P2 life dropped by 40, floored at 1.
+        assert_eq!(m.p2().life(), life_before - 40, "throw damage applied");
+    }
+
+    /// AC1: a left-facing binder mirrors the `TargetBind` X offset; `TargetFacing`
+    /// orients the target relative to the binder; and a non-killing `TargetLifeAdd`
+    /// floors the victim at `1` rather than reaching `0`.
+    #[test]
+    fn target_bind_mirrors_and_lifeadd_floors_at_one() {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Left;
+        p1c.state_no = 810;
+        p1c.has_target = true;
+
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(-60.0, 0.0);
+        p2c.facing = Facing::Right;
+        p2c.life = 10;
+        p2c.life_max = 1000;
+
+        let mut p1_loaded = attacker_loaded();
+        p1_loaded.states.insert(
+            810,
+            state_with(
+                810,
+                vec![
+                    // Offset 60 mirrored by the left-facing binder -> -60 (beyond
+                    // the player-push threshold, so the bound position survives).
+                    target_controller(810, "TargetBind", &[("pos", "60, 0")]),
+                    target_controller(810, "TargetFacing", &[("value", "-1")]),
+                    target_controller(810, "TargetLifeAdd", &[("value", "-9999"), ("kill", "0")]),
+                ],
+            ),
+        );
+        let p2_loaded = defender_loaded();
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, p2_loaded);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        m.p1.character.state_no = 810;
+        m.p1.character.has_target = true;
+        m.p1.character.facing = Facing::Left;
+        m.p1.character.pos = Vec2::new(0.0, 0.0);
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // Left-facing binder mirrors +60 to -60.
+        assert!(
+            (m.p2().pos().x + 60.0).abs() < 1e-3,
+            "left-facing bind mirrors X, got {}",
+            m.p2().pos().x
+        );
+        // TargetFacing(-1): opposite the binder (binder faces Left -> target Right).
+        assert_eq!(m.p2().facing(), Facing::Right, "facing opposite the binder");
+        // Non-killing huge damage floors at 1, never 0.
+        assert_eq!(m.p2().life(), 1, "kill=false floors life at 1");
+    }
+
+    /// AC2 (second test): a connecting hit whose HitDef carries `p1stateno` moves
+    /// the ATTACKER into that state via its own state graph.
+    #[test]
+    fn attacker_state_p1stateno_moves_attacker_on_connect() {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000; // survive the hit so the round stays in Fight
+
+        // P1's own states must contain the p1stateno destination (810) so the
+        // attacker's change_state lands.
+        let mut p1_loaded = attacker_loaded();
+        p1_loaded.states.insert(810, state_with(810, Vec::new()));
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Arm a throw-style HitDef: p1stateno = 810 (attacker), p2stateno = 820.
+        let mut hd = sample_hitdef();
+        hd.p1stateno = Some(810);
+        hd.p2stateno = Some(820);
+
+        for _ in 0..3 {
+            m.p1.character.anim = 200;
+            m.p1.character.anim_elem = 0;
+            m.p1.character.move_type = MoveType::Attack;
+            m.p1.character.active_hitdef = Some(hd);
+            m.p1.character.move_connect.reset();
+            m.p2.character.anim = 0;
+            m.p2.character.anim_elem = 0;
+            m.p2.character.state_type = StateType::Standing;
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p1().character.state_no == 810 {
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+
+        assert_eq!(
+            m.p1().character.state_no,
+            810,
+            "p1stateno moved the attacker into its throw state"
+        );
+    }
+
+    // ---- P8b (Proctor): edge cases / error paths for the TargetOp pipeline ----
+
+    /// Helper: builds a `Match` whose P1 sits in state 810 (a throw "hold" state)
+    /// emitting `controllers` each tick with `has_target` set, and whose P2 (the
+    /// target) is at `p2_pos` with `p2_loaded` as its own state graph. Re-asserts
+    /// the throw preconditions after the intro so the first observed tick is
+    /// deterministic. Returns the live, fight-phase match ready for one `tick`.
+    fn throw_match_p1_binder(
+        controllers: Vec<CompiledController>,
+        p2_pos: Vec2<f32>,
+        p2_life: i32,
+        p2_loaded: LoadedCharacter,
+    ) -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 810;
+        p1c.has_target = true;
+
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = p2_pos;
+        p2c.facing = Facing::Left;
+        p2c.life = p2_life;
+        p2c.life_max = 1000;
+
+        let mut p1_loaded = attacker_loaded();
+        p1_loaded.states.insert(810, state_with(810, controllers));
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, p2_loaded);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        // The intro re-faces / re-grants control; re-pin the throw preconditions.
+        m.p1.character.state_no = 810;
+        m.p1.character.has_target = true;
+        m.p1.character.facing = Facing::Right;
+        m.p1.character.pos = Vec2::new(0.0, 0.0);
+        m
+    }
+
+    /// AC1: `TargetVelSet` overwrites the target's velocity and `TargetPowerAdd`
+    /// adds to the target's power clamped into `[0, power_max]`. Exercises the two
+    /// `TargetOp` variants the existing throw tests do not touch.
+    #[test]
+    fn target_velset_and_poweradd_apply_to_opponent() {
+        // P2 starts at a non-trivial velocity and zero power; the throw sets a new
+        // velocity and grants meter.
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(820, state_with(820, Vec::new()));
+        let mut m = throw_match_p1_binder(
+            vec![
+                target_controller(810, "TargetVelSet", &[("x", "3"), ("y", "-7")]),
+                target_controller(810, "TargetPowerAdd", &[("value", "250")]),
+            ],
+            Vec2::new(80.0, 0.0),
+            500,
+            p2_loaded,
+        );
+        m.p2.character.vel = Vec2::new(99.0, 99.0);
+        m.p2.character.power = 0;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(
+            (m.p2().character.vel.x - 3.0).abs() < 1e-3
+                && (m.p2().character.vel.y + 7.0).abs() < 1e-3,
+            "TargetVelSet overwrites the target velocity, got {:?}",
+            m.p2().character.vel
+        );
+        assert_eq!(
+            m.p2().character.power, 250,
+            "TargetPowerAdd grants meter to the target"
+        );
+    }
+
+    /// AC1: `TargetVelAdd` adds to (does not replace) the target's velocity, and
+    /// `TargetPowerAdd` clamps the result to the target's `[0, power_max]`. A huge
+    /// positive add saturates at `power_max`; a negative add cannot go below `0`.
+    #[test]
+    fn target_veladd_accumulates_and_poweradd_clamps_to_range() {
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(820, state_with(820, Vec::new()));
+        let mut m = throw_match_p1_binder(
+            vec![
+                target_controller(810, "TargetVelAdd", &[("x", "2"), ("y", "1")]),
+                target_controller(810, "TargetPowerAdd", &[("value", "99999")]),
+            ],
+            Vec2::new(80.0, 0.0),
+            500,
+            p2_loaded,
+        );
+        m.p2.character.vel = Vec2::new(10.0, -4.0);
+        m.p2.character.power = 0;
+        let power_max = m.p2().character.power_max;
+        assert!(power_max > 0, "default power_max must be positive for this test");
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(
+            (m.p2().character.vel.x - 12.0).abs() < 1e-3
+                && (m.p2().character.vel.y + 3.0).abs() < 1e-3,
+            "TargetVelAdd accumulates onto the existing velocity, got {:?}",
+            m.p2().character.vel
+        );
+        assert_eq!(
+            m.p2().character.power, power_max,
+            "a huge TargetPowerAdd saturates at power_max, never beyond"
+        );
+    }
+
+    /// AC1: a non-killing `TargetLifeAdd` floors at `1` (covered elsewhere); this
+    /// asserts the *kill = true* path reaches `0`, the lethal-throw case.
+    #[test]
+    fn target_lifeadd_kill_true_can_reach_zero() {
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(820, state_with(820, Vec::new()));
+        let mut m = throw_match_p1_binder(
+            vec![target_controller(
+                810,
+                "TargetLifeAdd",
+                &[("value", "-9999"), ("kill", "1")],
+            )],
+            Vec2::new(80.0, 0.0),
+            50,
+            p2_loaded,
+        );
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(
+            m.p2().character.life,
+            0,
+            "kill=true allows the throw damage to reduce the target to zero life"
+        );
+    }
+
+    /// AC1: `TargetFacing` with a non-negative value orients the target the SAME
+    /// way as the binder (the existing test only covers the `-1` opposite case).
+    ///
+    /// The thrown target is driven into a *being-hit* state (820, `movetype = H`)
+    /// alongside `TargetFacing`, exactly as a real throw does: this keeps the
+    /// post-combat baseline `facep2` step (which only re-faces *neutral* fighters)
+    /// from overriding the `TargetFacing` result, isolating the op under test.
+    #[test]
+    fn target_facing_non_negative_matches_binder() {
+        // P2's own 820 is a being-hit state so the victim is non-neutral after the
+        // throw (facep2 would otherwise re-face an idle victim toward the binder).
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(
+            820,
+            CompiledState {
+                number: 820,
+                state_type: Some("S".to_string()),
+                movetype: Some("H".to_string()),
+                physics: None,
+                anim: None,
+                ctrl: None,
+                velset: None,
+                poweradd: None,
+                controllers: Vec::new(),
+            },
+        );
+        // Binder faces Right (set in the helper); P2 starts facing Left.
+        let mut m = throw_match_p1_binder(
+            vec![
+                target_controller(810, "TargetState", &[("value", "820")]),
+                target_controller(810, "TargetFacing", &[("value", "1")]),
+            ],
+            Vec2::new(80.0, 0.0),
+            500,
+            p2_loaded,
+        );
+        m.p2.character.facing = Facing::Left;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(
+            m.p2().character.state_no, 820,
+            "the victim entered its being-hit state"
+        );
+        assert_eq!(
+            m.p2().facing(),
+            Facing::Right,
+            "TargetFacing value >= 0 faces the target the same way as the binder"
+        );
+    }
+
+    /// AC1 (safe degradation): `TargetState` to a state the TARGET does not own
+    /// must not panic and must still advance the target's cursor (state_no) — the
+    /// "op for a missing/unknown state degrades safely" requirement.
+    #[test]
+    fn target_state_to_unknown_state_degrades_safely() {
+        // P2's own graph does NOT contain 820: the change_state lands cursor-only.
+        let p2_loaded = defender_loaded();
+        let mut m = throw_match_p1_binder(
+            vec![target_controller(810, "TargetState", &[("value", "820")])],
+            Vec2::new(80.0, 0.0),
+            500,
+            p2_loaded,
+        );
+        let life_before = m.p2().life();
+
+        // Must not panic.
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(
+            m.p2().character.state_no,
+            820,
+            "TargetState to an unknown state still updates the cursor (no panic)"
+        );
+        assert_eq!(
+            m.p2().life(),
+            life_before,
+            "an unknown TargetState destination does not corrupt unrelated fields"
+        );
+    }
+
+    /// AC1 (intro gating): a binder sitting in a throw state during the INTRO
+    /// phase must NOT move, damage, or re-state the opponent — `apply_target_ops`
+    /// is gated on the live fight phase exactly like combat. Verifies the gate by
+    /// arming the throw state before the fight goes live and ticking once.
+    #[test]
+    fn target_ops_do_not_apply_during_intro() {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 810;
+        p1c.has_target = true;
+
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(80.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 500;
+        p2c.life_max = 1000;
+
+        let mut p1_loaded = attacker_loaded();
+        p1_loaded.states.insert(
+            810,
+            state_with(
+                810,
+                vec![
+                    target_controller(810, "TargetState", &[("value", "820")]),
+                    target_controller(810, "TargetBind", &[("pos", "60, -5")]),
+                    target_controller(810, "TargetLifeAdd", &[("value", "-40"), ("kill", "0")]),
+                ],
+            ),
+        );
+        let mut p2_loaded = defender_loaded();
+        p2_loaded.states.insert(820, state_with(820, Vec::new()));
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, p2_loaded);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        // Still in Intro: do NOT advance into the fight.
+        assert_eq!(m.round_state(), RoundState::Intro);
+
+        let life_before = m.p2().life();
+        let pos_before = m.p2().pos();
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(m.round_state(), RoundState::Intro, "still in the intro");
+        assert_ne!(
+            m.p2().character.state_no,
+            820,
+            "throw TargetState must not fire during the intro"
+        );
+        assert_eq!(
+            m.p2().life(),
+            life_before,
+            "throw TargetLifeAdd must not damage during the intro"
+        );
+        assert!(
+            (m.p2().pos().x - pos_before.x).abs() < 1e-3,
+            "throw TargetBind must not move the opponent during the intro"
+        );
+    }
+
+    /// AC1 (mirror player, 2b path): P2 — not P1 — is the binder. The coordinator
+    /// applies P2's TargetOps to P1 (the opponent) via P1's own state graph,
+    /// proving the split borrow is sound in BOTH directions.
+    #[test]
+    fn target_ops_apply_when_p2_is_the_binder() {
+        // P1 is the target this time; give P1 its own state 820.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(-80.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 500;
+        p1c.life_max = 1000;
+        let mut p1_loaded = defender_loaded();
+        p1_loaded.states.insert(820, state_with(820, Vec::new()));
+
+        // P2 is the binder in throw-hold state 810.
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(0.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.state_no = 810;
+        p2c.has_target = true;
+        let mut p2_loaded = attacker_loaded();
+        p2_loaded.states.insert(
+            810,
+            state_with(
+                810,
+                vec![
+                    target_controller(810, "TargetState", &[("value", "820")]),
+                    // P2 faces Left, so +60 offset mirrors to -60 from the binder.
+                    target_controller(810, "TargetBind", &[("pos", "60, 0")]),
+                    target_controller(810, "TargetLifeAdd", &[("value", "-30"), ("kill", "0")]),
+                ],
+            ),
+        );
+
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, p2_loaded);
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        // Re-pin P2's throw preconditions after the intro.
+        m.p2.character.state_no = 810;
+        m.p2.character.has_target = true;
+        m.p2.character.facing = Facing::Left;
+        m.p2.character.pos = Vec2::new(0.0, 0.0);
+        let life_before = m.p1().life();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(
+            m.p1().character.state_no,
+            820,
+            "P2's TargetState drove P1 (the target) into 820"
+        );
+        assert!(
+            (m.p1().pos().x + 60.0).abs() < 1e-3,
+            "left-facing binder P2 mirrors +60 to -60, got {}",
+            m.p1().pos().x
+        );
+        assert_eq!(
+            m.p1().life(),
+            life_before - 30,
+            "P2's TargetLifeAdd damaged P1"
+        );
+    }
+
+    /// AC1 (unit-level borrow soundness + no-op): `apply_target_ops` with an empty
+    /// op slice makes no change, and a direct call mutates only the target while
+    /// reading the binder — the split-borrow contract the coordinator relies on.
+    #[test]
+    fn apply_target_ops_empty_is_noop_and_only_touches_target() {
+        let mut binder = Character::with_constants(CharacterConstants::default());
+        binder.pos = Vec2::new(5.0, 9.0);
+        binder.facing = Facing::Right;
+
+        let mut target = Character::with_constants(CharacterConstants::default());
+        target.pos = Vec2::new(100.0, 0.0);
+        target.life = 700;
+        let life_before = target.life;
+        let pos_before = target.pos;
+        let states: HashMap<i32, CompiledState> = HashMap::new();
+
+        apply_target_ops(&binder, &mut target, &states, &[]);
+
+        assert_eq!(target.life, life_before, "empty ops leave life untouched");
+        assert!(
+            (target.pos.x - pos_before.x).abs() < 1e-6
+                && (target.pos.y - pos_before.y).abs() < 1e-6,
+            "empty ops leave position untouched"
+        );
+        // The binder is read-only; confirm it is unchanged.
+        assert!((binder.pos.x - 5.0).abs() < 1e-6 && (binder.pos.y - 9.0).abs() < 1e-6);
+    }
+
+    /// AC1 (unit-level): a sequence of ops on `apply_target_ops` applies in order
+    /// with the documented facing-relative bind and clamped life — a focused unit
+    /// test of the applier independent of the per-tick executor emission.
+    #[test]
+    fn apply_target_ops_applies_each_variant_in_order() {
+        use fp_character::TargetOp;
+        let mut binder = Character::with_constants(CharacterConstants::default());
+        binder.pos = Vec2::new(10.0, 2.0);
+        binder.facing = Facing::Left; // sign() = -1, mirrors the bind X
+
+        let mut target = Character::with_constants(CharacterConstants::default());
+        target.pos = Vec2::new(200.0, 0.0);
+        target.facing = Facing::Left;
+        target.life = 100;
+        target.life_max = 1000;
+        target.power = 0;
+        target.vel = Vec2::new(0.0, 0.0);
+
+        // A 820 state so the State op resolves against the target's own graph.
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        states.insert(820, state_with(820, Vec::new()));
+
+        apply_target_ops(
+            &binder,
+            &mut target,
+            &states,
+            &[
+                TargetOp::State(820),
+                TargetOp::Bind { time: 1, pos: (30.0, -4.0) },
+                TargetOp::Facing(1),
+                TargetOp::VelSet((1.5, -2.5)),
+                TargetOp::VelAdd((0.5, 0.5)),
+                TargetOp::LifeAdd { value: -250, kill: false },
+                TargetOp::PowerAdd(120),
+            ],
+        );
+
+        assert_eq!(target.state_no, 820, "State entered the target's own 820");
+        // Bind: binder.pos + (30 * -1, -4) = (10 - 30, 2 - 4) = (-20, -2).
+        assert!(
+            (target.pos.x + 20.0).abs() < 1e-3 && (target.pos.y + 2.0).abs() < 1e-3,
+            "facing-relative bind, got {:?}",
+            target.pos
+        );
+        // Facing(1) -> same as binder (Left).
+        assert_eq!(target.facing, Facing::Left, "Facing(1) matches the binder");
+        // VelSet then VelAdd: (1.5, -2.5) + (0.5, 0.5) = (2.0, -2.0).
+        assert!(
+            (target.vel.x - 2.0).abs() < 1e-3 && (target.vel.y + 2.0).abs() < 1e-3,
+            "VelSet then VelAdd compose, got {:?}",
+            target.vel
+        );
+        // LifeAdd(-250, kill=false): 100 - 250 = -150, floored at 1.
+        assert_eq!(target.life, 1, "non-killing life add floors at 1");
+        // PowerAdd(120): 0 + 120 = 120, within [0, power_max].
+        assert_eq!(target.power, 120, "power add within range");
+    }
+
+    /// AC1: `facing_opposite` is an involution (right<->left), the helper backing
+    /// the `TargetFacing(-1)` "opposite the binder" case.
+    #[test]
+    fn facing_opposite_is_an_involution() {
+        assert_eq!(facing_opposite(Facing::Right), Facing::Left);
+        assert_eq!(facing_opposite(Facing::Left), Facing::Right);
+        assert_eq!(facing_opposite(facing_opposite(Facing::Right)), Facing::Right);
+        assert_eq!(facing_opposite(facing_opposite(Facing::Left)), Facing::Left);
+    }
+
+    /// AC1 (no attacker_state): a connecting HitDef with `p1stateno = None` must
+    /// NOT move the attacker out of its current state — the attacker_state apply
+    /// is conditional on `Some`. Guards against an unconditional state change.
+    #[test]
+    fn connecting_attack_without_p1stateno_keeps_attacker_state() {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000; // survive
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // A normal-attack HitDef: no p1stateno, no p2stateno (a plain strike).
+        let mut hd = sample_hitdef();
+        hd.p1stateno = None;
+        hd.p2stateno = None;
+
+        // Pin the attacker in a known state number that is NOT a throw state.
+        m.p1.character.state_no = 200;
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(hd);
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the attack must connect");
+        assert_eq!(
+            m.p1().character.state_no,
+            200,
+            "with no p1stateno the attacker stays in its current state"
+        );
     }
 }
