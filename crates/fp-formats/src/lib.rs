@@ -7,6 +7,7 @@
 //! has its own submodule:
 //!
 //! - [`sff`] — Sprite File Format (SFF v1/v2) — indexed-color sprite containers
+//! - [`act`] — ACT external palette files — 256-color VGA palettes (reverse-ordered)
 //! - [`air`] — Animation file format — frame sequences with timing and collision boxes
 //! - [`cmd`] — CMD command file format — input command sequences and timing
 //! - [`cns`] — CNS state files — statedefs and state controllers with raw triggers
@@ -16,6 +17,7 @@
 
 #![warn(missing_docs)]
 
+pub mod act;
 pub mod air;
 pub mod cmd;
 pub mod cns;

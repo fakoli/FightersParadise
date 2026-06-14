@@ -501,6 +501,7 @@ mod tests {
             blend: BlendMode::Normal,
             clsn1,
             clsn2,
+            ..Default::default()
         };
         let mut actions = HashMap::new();
         actions.insert(

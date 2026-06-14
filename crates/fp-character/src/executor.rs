@@ -3044,6 +3044,7 @@ mod tests {
                 blend: BlendMode::Normal,
                 clsn1: Vec::new(),
                 clsn2: Vec::new(),
+                ..Default::default()
             })
             .collect();
         let mut actions = HashMap::new();

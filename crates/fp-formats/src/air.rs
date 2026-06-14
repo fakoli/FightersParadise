@@ -43,7 +43,11 @@ pub struct AnimAction {
 }
 
 /// A single animation frame within an action.
-#[derive(Debug, Clone)]
+///
+/// Implements [`Default`] (an empty sprite-0 frame with no transforms) so
+/// callers can build a frame and override only the fields they care about via
+/// `AnimFrame { ..Default::default() }`.
+#[derive(Debug, Clone, Default)]
 pub struct AnimFrame {
     /// Which sprite to display (group, image).
     pub sprite: SpriteId,
@@ -57,10 +61,47 @@ pub struct AnimFrame {
     pub flip_v: bool,
     /// Sprite blending mode.
     pub blend: BlendMode,
+    /// Optional per-frame scale `(xscale, yscale)` from the extended AIR
+    /// `... , xscale, yscale` columns. `None` when the frame omits them
+    /// (the common case — MUGEN then uses the default scale of `1.0`).
+    pub scale: Option<Vec2<f32>>,
+    /// Optional per-frame rotation in degrees from the extended AIR `angle`
+    /// column. `None` when the frame omits it (default: no rotation).
+    pub angle: Option<f32>,
+    /// Which transforms interpolate from the *previous* frame into this one,
+    /// as declared by the `Interpolate ...` lines preceding this frame.
+    pub interpolate: Interpolate,
     /// Attack collision boxes (Clsn1) for this frame.
     pub clsn1: Vec<Rect>,
     /// Hurtbox collision boxes (Clsn2) for this frame.
     pub clsn2: Vec<Rect>,
+}
+
+/// Which transforms a frame interpolates from the previous frame.
+///
+/// MUGEN AIR allows standalone `Interpolate Offset` / `Interpolate Scale` /
+/// `Interpolate Angle` / `Interpolate Blend` lines between two frame lines; each
+/// requests smooth interpolation of that transform across the *preceding*
+/// frame's duration into the frame that follows the line. All fields default to
+/// `false`, so a plain AIR with no `Interpolate` lines is byte-for-byte
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Interpolate {
+    /// Interpolate the position offset (`Interpolate Offset`).
+    pub offset: bool,
+    /// Interpolate the scale (`Interpolate Scale`).
+    pub scale: bool,
+    /// Interpolate the rotation angle (`Interpolate Angle`).
+    pub angle: bool,
+    /// Interpolate the blend parameters (`Interpolate Blend`).
+    pub blend: bool,
+}
+
+impl Interpolate {
+    /// Returns `true` if no interpolation flag is set (the default).
+    pub fn is_none(&self) -> bool {
+        !self.offset && !self.scale && !self.angle && !self.blend
+    }
 }
 
 /// Sprite blending mode for rendering.
@@ -125,6 +166,18 @@ impl AirFile {
                 continue;
             }
 
+            // Check for `Interpolate <Offset|Scale|Angle|Blend>` lines. These
+            // accumulate onto the next frame's `interpolate` field.
+            if let Some(kind) = parse_interpolate(line) {
+                match kind {
+                    InterpolateKind::Offset => builder.interpolate_pending.offset = true,
+                    InterpolateKind::Scale => builder.interpolate_pending.scale = true,
+                    InterpolateKind::Angle => builder.interpolate_pending.angle = true,
+                    InterpolateKind::Blend => builder.interpolate_pending.blend = true,
+                }
+                continue;
+            }
+
             // Check for collision box declarations
             if let Some(count) = parse_clsn_default(line, "Clsn2Default") {
                 builder.clsn2_default_count = count;
@@ -178,6 +231,8 @@ impl AirFile {
                 builder.clsn1_frame_count = 0;
                 builder.clsn2_frame_count = 0;
                 builder.collecting_clsn = None;
+                // Pending interpolation flags were consumed by this frame.
+                builder.interpolate_pending = Interpolate::default();
                 continue;
             }
 
@@ -239,6 +294,9 @@ struct ActionBuilder {
     clsn2_frame_count: usize,
     // What we're currently collecting
     collecting_clsn: Option<ClsnTarget>,
+    // Interpolation flags accumulated from `Interpolate ...` lines seen since
+    // the previous frame; applied to the next frame, then reset.
+    interpolate_pending: Interpolate,
 }
 
 impl ActionBuilder {
@@ -257,6 +315,7 @@ impl ActionBuilder {
             clsn1_frame_count: 0,
             clsn2_frame_count: 0,
             collecting_clsn: None,
+            interpolate_pending: Interpolate::default(),
         }
     }
 
@@ -348,7 +407,10 @@ fn parse_clsn_entry(line: &str) -> Option<Rect> {
     Some(Rect::new(left, top, right - left, bottom - top))
 }
 
-/// Parse a frame line: `group, image, x_offset, y_offset, ticks[, flip[, blend]]`
+/// Parse a frame line. The base form is
+/// `group, image, x_offset, y_offset, ticks[, flip[, blend]]`; MUGEN also allows
+/// extended trailing columns `[, xscale, yscale[, angle]]`:
+/// `group, image, x, y, ticks, flip, blend, xscale, yscale, angle`.
 fn parse_frame_line(line: &str, builder: &ActionBuilder) -> Option<AnimFrame> {
     let parts: Vec<&str> = line.split(',').collect();
     if parts.len() < 5 {
@@ -377,6 +439,20 @@ fn parse_frame_line(line: &str, builder: &ActionBuilder) -> Option<AnimFrame> {
         blend = parse_blend_mode(parts[6].trim());
     }
 
+    // Parse optional extended scale/angle columns. `xscale` and `yscale` (cols 7
+    // and 8) come as a pair; `angle` (col 9) is the rotation in degrees. A column
+    // that is missing, empty, or unparseable leaves the corresponding field
+    // `None` so plain AIR frames are unaffected.
+    let xscale = parts.get(7).and_then(|s| parse_opt_f32(s));
+    let yscale = parts.get(8).and_then(|s| parse_opt_f32(s));
+    let scale = match (xscale, yscale) {
+        (Some(x), Some(y)) => Some(Vec2::new(x, y)),
+        // A lone xscale with no yscale falls back to a uniform scale.
+        (Some(x), None) => Some(Vec2::new(x, x)),
+        _ => None,
+    };
+    let angle = parts.get(9).and_then(|s| parse_opt_f32(s));
+
     // Determine collision boxes: per-frame overrides take priority over defaults
     let clsn1 = if !builder.clsn1_frame.is_empty() {
         builder.clsn1_frame.clone()
@@ -397,9 +473,51 @@ fn parse_frame_line(line: &str, builder: &ActionBuilder) -> Option<AnimFrame> {
         flip_h,
         flip_v,
         blend,
+        scale,
+        angle,
+        interpolate: builder.interpolate_pending,
         clsn1,
         clsn2,
     })
+}
+
+/// Parse a possibly-empty trimmed column as an `f32`, returning `None` for an
+/// empty or unparseable column (so a placeholder like `... , , ...` is skipped).
+fn parse_opt_f32(s: &str) -> Option<f32> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        t.parse::<f32>().ok()
+    }
+}
+
+/// Which transform an `Interpolate ...` line requests.
+#[derive(Debug, Clone, Copy)]
+enum InterpolateKind {
+    Offset,
+    Scale,
+    Angle,
+    Blend,
+}
+
+/// Parse an `Interpolate <Offset|Scale|Angle|Blend>` line.
+///
+/// Returns the requested transform, or `None` if the line is not an
+/// `Interpolate` directive (case-insensitive, whitespace-tolerant).
+fn parse_interpolate(line: &str) -> Option<InterpolateKind> {
+    let lower = line.to_ascii_lowercase();
+    let rest = lower.trim().strip_prefix("interpolate")?;
+    match rest.trim() {
+        "offset" => Some(InterpolateKind::Offset),
+        "scale" => Some(InterpolateKind::Scale),
+        "angle" => Some(InterpolateKind::Angle),
+        "blend" => Some(InterpolateKind::Blend),
+        other => {
+            tracing::warn!("AIR: unknown Interpolate target: {other}");
+            None
+        }
+    }
 }
 
 /// Parse a blend mode string.
@@ -604,6 +722,134 @@ Clsn1: 1
         let frame = &air.action(0).unwrap().frames[0];
         assert_eq!(frame.offset.x, -5);
         assert_eq!(frame.offset.y, 10);
+    }
+
+    #[test]
+    fn plain_frames_have_no_extended_params() {
+        // Regression: a plain KFM-style AIR must leave every extended field
+        // at its default (None / no interpolation).
+        let air = AirFile::from_str(SIMPLE_AIR).unwrap();
+        let action = air.action(0).unwrap();
+        for frame in &action.frames {
+            assert!(frame.scale.is_none());
+            assert!(frame.angle.is_none());
+            assert!(frame.interpolate.is_none());
+        }
+    }
+
+    #[test]
+    fn parse_extended_scale_and_angle() {
+        // group, image, x, y, ticks, flip, blend, xscale, yscale, angle
+        let air_text = "\
+[Begin Action 30]
+0,0, 0,0, 5, , , 2.0, 3.0, 45
+0,1, 0,0, 5, H, A, 1.5, 1.5, -90
+0,2, 0,0, 5
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let action = air.action(30).unwrap();
+
+        let f0 = &action.frames[0];
+        let scale = f0.scale.expect("frame 0 has scale");
+        assert_eq!(scale.x, 2.0);
+        assert_eq!(scale.y, 3.0);
+        assert_eq!(f0.angle, Some(45.0));
+
+        let f1 = &action.frames[1];
+        assert!(f1.flip_h);
+        assert_eq!(f1.blend, BlendMode::Additive);
+        let scale = f1.scale.expect("frame 1 has scale");
+        assert_eq!(scale.x, 1.5);
+        assert_eq!(scale.y, 1.5);
+        assert_eq!(f1.angle, Some(-90.0));
+
+        // Frame without extended columns stays None.
+        let f2 = &action.frames[2];
+        assert!(f2.scale.is_none());
+        assert!(f2.angle.is_none());
+    }
+
+    #[test]
+    fn extended_scale_without_angle() {
+        let air_text = "\
+[Begin Action 31]
+0,0, 0,0, 5, , , 2.0, 4.0
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let f = &air.action(31).unwrap().frames[0];
+        let scale = f.scale.expect("has scale");
+        assert_eq!(scale.x, 2.0);
+        assert_eq!(scale.y, 4.0);
+        assert!(f.angle.is_none());
+    }
+
+    #[test]
+    fn parse_interpolate_lines() {
+        let air_text = "\
+[Begin Action 40]
+0,0, 0,0, 5
+Interpolate Offset
+Interpolate Scale
+0,1, 0,0, 5, , , 2.0, 2.0
+Interpolate Angle
+Interpolate Blend
+0,2, 0,0, 5, , , 1.0, 1.0, 90
+0,3, 0,0, 5
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let action = air.action(40).unwrap();
+
+        // Frame 0: no interpolation declared before it.
+        assert!(action.frames[0].interpolate.is_none());
+
+        // Frame 1: Offset + Scale interpolate into it.
+        let i1 = action.frames[1].interpolate;
+        assert!(i1.offset);
+        assert!(i1.scale);
+        assert!(!i1.angle);
+        assert!(!i1.blend);
+
+        // Frame 2: Angle + Blend interpolate into it (flags were reset after f1).
+        let i2 = action.frames[2].interpolate;
+        assert!(!i2.offset);
+        assert!(!i2.scale);
+        assert!(i2.angle);
+        assert!(i2.blend);
+
+        // Frame 3: flags reset again, none pending.
+        assert!(action.frames[3].interpolate.is_none());
+    }
+
+    #[test]
+    fn interpolate_is_case_insensitive() {
+        let air_text = "\
+[Begin Action 41]
+0,0, 0,0, 5
+interpolate offset
+INTERPOLATE Scale
+0,1, 0,0, 5
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let i = air.action(41).unwrap().frames[1].interpolate;
+        assert!(i.offset);
+        assert!(i.scale);
+    }
+
+    #[test]
+    fn extended_params_coexist_with_collision_boxes() {
+        let air_text = "\
+[Begin Action 42]
+Clsn2Default: 1
+ Clsn2[0] = -10, -80, 10, 0
+Interpolate Scale
+0,0, 0,0, 3, , , 2.0, 2.0, 30
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let f = &air.action(42).unwrap().frames[0];
+        assert_eq!(f.clsn2.len(), 1);
+        assert!(f.interpolate.scale);
+        assert_eq!(f.scale.map(|s| s.x), Some(2.0));
+        assert_eq!(f.angle, Some(30.0));
     }
 
     #[test]
