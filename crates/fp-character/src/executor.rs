@@ -1562,11 +1562,32 @@ impl Character {
     /// trigger contract. An unknown animation degrades to a no-op.
     fn advance_animation(&mut self, air: &AirFile) {
         let Some(action) = air.action(self.anim) else {
-            // Unknown animation: nothing to advance (safe no-op).
+            // Unknown animation: nothing to advance (safe no-op). Drop any stale
+            // per-element table so `AnimElemTime(n)` falls back to the legacy
+            // scalar rather than indexing a table for a different action.
+            if self.anim_table_action != Some(self.anim) {
+                self.anim_elem_start_offsets.clear();
+                self.anim_table_action = Some(self.anim);
+            }
             return;
         };
         if action.frames.is_empty() {
+            if self.anim_table_action != Some(self.anim) {
+                self.anim_elem_start_offsets.clear();
+                self.anim_table_action = Some(self.anim);
+            }
             return;
+        }
+
+        // (Re)build the per-element start-offset table whenever the active action
+        // number changes (or on first entry). `start_offset[i]` is the cumulative
+        // sum of the `ticks` of elements `0..i` — element 0 starts at 0 — so
+        // `AnimElemTime(n)` can compute time-since-element-n for ANY element of
+        // the action (see `Character::anim_elem_time_for`). Hold-forever frames
+        // (`ticks <= 0`) contribute 0 to later offsets: such a frame never ends,
+        // so no later element ever begins this iteration anyway.
+        if self.anim_table_action != Some(self.anim) {
+            self.rebuild_anim_elem_offsets(action);
         }
 
         // Clamp the element index into range defensively (it can only go out of
@@ -1593,6 +1614,29 @@ impl Character {
 
         self.anim_elem = i32::try_from(elem).unwrap_or(0);
         self.anim_time = remaining_anim_time(action, elem, self.anim_elem_time);
+    }
+
+    /// Builds the per-element cumulative start-offset table on the character from
+    /// an AIR action's frame durations and records the action it was built for.
+    ///
+    /// `start_offset[i] = sum(ticks of elements 0..i)`, so element 0 starts at
+    /// `0` and each later element starts after the cumulative duration of the
+    /// elements before it. Negative durations (`-1` = hold-forever) are treated
+    /// as contributing `0`: a hold-forever element never ends, so the offsets of
+    /// elements after it are only meaningful in the (impossible) case the cursor
+    /// reaches them, and a `0` contribution keeps the running sum monotonic and
+    /// panic-free. This is the offset table read by
+    /// [`Character::anim_elem_time_for`] to answer `AnimElemTime(n)` for any `n`.
+    fn rebuild_anim_elem_offsets(&mut self, action: &fp_formats::air::AnimAction) {
+        self.anim_elem_start_offsets.clear();
+        self.anim_elem_start_offsets.reserve(action.frames.len());
+        let mut cumulative: i32 = 0;
+        for frame in &action.frames {
+            self.anim_elem_start_offsets.push(cumulative);
+            // Hold-forever (`ticks <= 0`) contributes 0 to later start offsets.
+            cumulative = cumulative.saturating_add(frame.ticks.max(0));
+        }
+        self.anim_table_action = Some(self.anim);
     }
 }
 
@@ -6925,5 +6969,482 @@ mod tests {
         assert_eq!(req.channel, -1, "unspecified channel → MUGEN default -1");
         assert_eq!(req.volume_scale, 100, "unspecified volumescale → 100");
         assert!(!req.looping, "unspecified loop → false");
+    }
+
+    // =====================================================================
+    // Task A.P6: AnimElemTime(n) per-element timing table. The executor builds
+    // a cumulative start-offset table in advance_animation so AnimElemTime(n)
+    // resolves for EVERY element of the current action (past = positive,
+    // current = anim_elem_time, future = negative), reflects the current loop
+    // iteration, and is safe for out-of-range n. All synthetic except the gated
+    // real-KFM test at the end.
+    // =====================================================================
+
+    /// Convenience: read `AnimElemTime(n)` (one-based) through the trigger seam,
+    /// exactly as a compiled CNS expression would.
+    fn anim_elem_time(ch: &Character, n: i32) -> i32 {
+        ch.trigger("AnimElemTime", &[fp_vm::Value::Int(n)]).to_int()
+    }
+
+    /// AC1/AC3: a synthetic three-element action (ticks `[3, 5, 2]`) ticked
+    /// forward; `AnimElemTime(1/2/3)` is positive-and-growing for the current /
+    /// past elements, equals `anim_elem_time` for the current element, and is
+    /// negative for not-yet-reached future elements.
+    #[test]
+    fn anim_elem_time_resolves_for_all_elements() {
+        // Element start offsets for ticks [3,5,2]: [0, 3, 8]; total = 10.
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+
+        // --- During element 0 (ticks 1..3) ---
+        lc.tick(&mut ch); // elem 0, time 1
+        assert_eq!(ch.anim_elem, 0);
+        assert_eq!(ch.anim_elem_time, 1);
+        assert_eq!(anim_elem_time(&ch, 1), 1, "current element == anim_elem_time");
+        assert!(anim_elem_time(&ch, 2) < 0, "element 2 not yet reached");
+        assert!(anim_elem_time(&ch, 3) < 0, "element 3 not yet reached");
+
+        lc.tick(&mut ch); // elem 0, time 2
+        assert_eq!(anim_elem_time(&ch, 1), 2, "current element grows with time");
+
+        // --- Cross into element 1 (tick 3 ends element 0 at dur 3) ---
+        lc.tick(&mut ch); // elem 1, time 0
+        assert_eq!(ch.anim_elem, 1);
+        assert_eq!(ch.anim_elem_time, 0);
+        // Element 1 just began: time-since == anim_elem_time == 0.
+        assert_eq!(anim_elem_time(&ch, 2), 0, "current element == anim_elem_time");
+        // Element 1 starts at offset 3; elapsed is 3 → time-since-element-1 = 3.
+        assert_eq!(anim_elem_time(&ch, 1), 3, "past element positive & growing");
+        assert!(anim_elem_time(&ch, 3) < 0, "element 3 still not reached");
+
+        lc.tick(&mut ch); // elem 1, time 1
+        assert_eq!(anim_elem_time(&ch, 2), 1, "current element grows");
+        assert_eq!(anim_elem_time(&ch, 1), 4, "past element keeps growing");
+        assert!(anim_elem_time(&ch, 3) < 0);
+
+        // Drive into element 2 (element 1 has dur 5: ends after 5 ticks in it).
+        for _ in 0..4 {
+            lc.tick(&mut ch);
+        }
+        // After 5 ticks in elem 1 we land on elem 2, time 0.
+        assert_eq!(ch.anim_elem, 2);
+        assert_eq!(ch.anim_elem_time, 0);
+        assert_eq!(anim_elem_time(&ch, 3), 0, "current element == anim_elem_time");
+        // Element 2 starts at offset 8; element 1 at 3, element 0 at 0.
+        assert_eq!(anim_elem_time(&ch, 1), 8);
+        assert_eq!(anim_elem_time(&ch, 2), 5);
+    }
+
+    /// AC2/AC3: a looping action reflects the CURRENT loop iteration — after the
+    /// action wraps back to element 0, AnimElemTime restarts from that iteration
+    /// (it is not cumulative across loops).
+    #[test]
+    fn anim_elem_time_reflects_current_loop_iteration() {
+        // Two elements, ticks [2, 2], loopstart 0. Total iteration length 4.
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[2, 2]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+
+        // Play a full iteration (4 ticks) so the cursor wraps back to element 0.
+        for _ in 0..4 {
+            lc.tick(&mut ch);
+        }
+        assert_eq!(ch.anim_elem, 0, "wrapped back to loopstart element 0");
+        assert_eq!(ch.anim_elem_time, 0);
+        // Fresh iteration: element 0 just (re)started, element 1 not yet reached.
+        assert_eq!(anim_elem_time(&ch, 1), 0, "loop iteration restarts the clock");
+        assert!(
+            anim_elem_time(&ch, 2) < 0,
+            "element 2 negative again in the new loop iteration"
+        );
+
+        // One more tick keeps us in the current iteration's element 0.
+        lc.tick(&mut ch);
+        assert_eq!(anim_elem_time(&ch, 1), 1);
+        assert!(anim_elem_time(&ch, 2) < 0);
+    }
+
+    /// AC3: a non-zero loopstart action wraps to its loopstart and AnimElemTime
+    /// is measured from that element's offset in the new iteration.
+    #[test]
+    fn anim_elem_time_with_nonzero_loopstart() {
+        // Three elements, ticks [1, 1, 1], loopstart 1: after the last element
+        // the cursor returns to element 1 (offsets [0, 1, 2]).
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], air_with_loopstart(0, &[1, 1, 1], 1));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+
+        // 3 ticks plays elements 0,1,2; the 3rd tick ends element 2 → wrap to 1.
+        for _ in 0..3 {
+            lc.tick(&mut ch);
+        }
+        assert_eq!(ch.anim_elem, 1, "wrapped to loopstart 1");
+        assert_eq!(ch.anim_elem_time, 0);
+        // In this iteration element 1 just began (offset 1). Element 0 (offset 0)
+        // reads as the current iteration's element-1 elapsed minus its offset.
+        assert_eq!(anim_elem_time(&ch, 2), 0, "current element == anim_elem_time");
+        assert_eq!(anim_elem_time(&ch, 1), 1, "offset gap to element 1 start");
+        assert!(anim_elem_time(&ch, 3) < 0, "element 3 not yet reached again");
+    }
+
+    /// AC2: out-of-range `n` (n < 1 and n > num_elements) is clamped to a valid
+    /// element and never panics; the result is a finite, sane time.
+    #[test]
+    fn anim_elem_time_out_of_range_is_safe() {
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        lc.tick(&mut ch); // elem 0, time 1
+
+        // n = 0 clamps to element 1; n = 99 clamps to the last element (3).
+        let clamped_low = anim_elem_time(&ch, 0);
+        let clamped_high = anim_elem_time(&ch, 99);
+        assert_eq!(clamped_low, anim_elem_time(&ch, 1), "n<1 clamps to element 1");
+        assert_eq!(clamped_high, anim_elem_time(&ch, 3), "n>len clamps to last element");
+        // Strongly negative n must also be safe (no overflow, no panic).
+        let _ = anim_elem_time(&ch, i32::MIN);
+        let _ = anim_elem_time(&ch, i32::MAX);
+    }
+
+    /// AC1/AC3 (regression): for the current element, AnimElemTime equals the
+    /// legacy `anim_elem_time` scalar at every tick, with and without a built
+    /// offset table.
+    #[test]
+    fn anim_elem_time_current_matches_legacy_scalar() {
+        // With NO table yet (fields set directly, never ticked) the legacy
+        // fallback path must still answer current==anim_elem_time, future<0.
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 1; // one-based element 2 is current
+        ch.anim_elem_time = 7;
+        assert!(ch.anim_elem_start_offsets.is_empty(), "no table built yet");
+        assert_eq!(anim_elem_time(&ch, 2), 7, "legacy: current == anim_elem_time");
+        assert!(anim_elem_time(&ch, 5) < 0, "legacy: future element negative");
+
+        // With a table built by ticking, the current element still matches.
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[4, 4, 4]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        for _ in 0..10 {
+            lc.tick(&mut ch);
+            let current_one_based = ch.anim_elem + 1;
+            assert_eq!(
+                anim_elem_time(&ch, current_one_based),
+                ch.anim_elem_time,
+                "current element AnimElemTime must equal the legacy scalar"
+            );
+        }
+    }
+
+    /// AC1: the offset table is rebuilt when the action number changes (a
+    /// ChangeAnim to a different-length action repopulates the offsets), so
+    /// AnimElemTime reads the new action's geometry.
+    #[test]
+    fn offset_table_rebuilds_on_action_change() {
+        let mut air = tiny_air(0, &[2, 2]);
+        add_action(&mut air, 1, &[5, 1, 1]); // different action, different offsets
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], air);
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem_start_offsets, vec![0, 2], "action 0 offsets");
+        assert_eq!(ch.anim_table_action, Some(0));
+
+        // Switch to action 1; the table must rebuild on the next advance.
+        ch.anim = 1;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem_start_offsets, vec![0, 5, 6], "action 1 offsets");
+        assert_eq!(ch.anim_table_action, Some(1));
+    }
+
+    /// AC2 (gated, skips if test-assets absent): drive a real KFM action and
+    /// confirm two distinct elements report distinct, sane AnimElemTime values.
+    #[test]
+    fn real_kfm_anim_elem_time_two_elements_distinct() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        let mut ch = Character::with_constants(lc.constants);
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.ctrl = true;
+
+        // Tick until KFM's idle/stand action has advanced past its first element
+        // so element 1 is in the past and the current element is later. Stop once
+        // we are on at least the second element with a multi-element table.
+        let mut advanced = false;
+        for _ in 0..120 {
+            let _ = ch.tick(&lc, None, StageView::default());
+            if ch.anim_elem >= 1 && ch.anim_elem_start_offsets.len() >= 2 {
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            eprintln!("skipping: KFM anim 0 did not advance past element 0 in 120 ticks");
+            return;
+        }
+
+        let cur = ch.anim_elem + 1; // one-based current element
+        let past = cur - 1; // a strictly-earlier element
+        let t_cur = anim_elem_time(&ch, cur);
+        let t_past = anim_elem_time(&ch, past);
+        // Current element equals the legacy scalar; past element is strictly
+        // larger (it began earlier in this iteration) — distinct, sane times.
+        assert_eq!(t_cur, ch.anim_elem_time, "current == legacy scalar");
+        assert!(
+            t_past > t_cur,
+            "earlier element ({past}) must report a larger time-since than the \
+             current element ({cur}): {t_past} vs {t_cur}"
+        );
+        assert!(t_past >= 0 && t_cur >= 0, "reached elements are non-negative");
+    }
+
+    // =====================================================================
+    // Task A.P6 — Proctor supplementary coverage. These exercise gaps the
+    // implementation-author tests did not cover: hold-forever (`ticks <= 0`)
+    // elements, stale-table cleanup when the action becomes unknown / empty,
+    // the offset/elapsed invariant across a multi-element advance, the bare
+    // AnimElem / AnimElemNo / AnimTime triggers as a co-regression, and a
+    // single-element action. All synthetic, never panics.
+    // =====================================================================
+
+    /// AC1/AC2: a hold-forever element (`ticks <= 0`, MUGEN's `-1`) contributes
+    /// `0` to later start offsets, the cursor parks on it forever, and
+    /// `AnimElemTime` stays sane: the current (hold-forever) element grows with
+    /// time and equals the legacy scalar; an element BEFORE it stays positive.
+    #[test]
+    fn anim_elem_time_hold_forever_element_is_safe() {
+        // ticks [2, -1, 4]: offsets [0, 2, 2] (the -1 contributes 0 onward).
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[2, -1, 4]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+
+        // 2 ticks finish element 0 and land us on the hold-forever element 1.
+        lc.tick(&mut ch);
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem, 1, "parked on the hold-forever element");
+        assert_eq!(ch.anim_elem_start_offsets, vec![0, 2, 2], "hold-forever → 0 onward");
+        assert_eq!(ch.anim_elem_time, 0);
+        // Current element (2, one-based) just began.
+        assert_eq!(anim_elem_time(&ch, 2), 0, "current == anim_elem_time");
+        // Element 1 (offset 0) began 2 ticks ago.
+        assert_eq!(anim_elem_time(&ch, 1), 2);
+        // Element 3 shares element 2's offset (2) → reads as already reached (0),
+        // which is fine: the cursor never gets there, so it is never queried in
+        // anger. The key contract is no panic and a finite value.
+        let _ = anim_elem_time(&ch, 3);
+
+        // Many more ticks: the cursor must NOT advance off the hold-forever frame
+        // and the current-element time must keep growing in lockstep with the
+        // legacy scalar.
+        for expected in 1..=20 {
+            lc.tick(&mut ch);
+            assert_eq!(ch.anim_elem, 1, "still parked on hold-forever element");
+            assert_eq!(ch.anim_elem_time, expected);
+            assert_eq!(
+                anim_elem_time(&ch, 2),
+                ch.anim_elem_time,
+                "hold-forever current element tracks the legacy scalar"
+            );
+            assert_eq!(anim_elem_time(&ch, 1), 2 + expected, "earlier element grows too");
+        }
+    }
+
+    /// AC1 (invariant): at an arbitrary mid-action moment the public
+    /// `AnimElemTime(n)` for a PAST element equals the hand-computed
+    /// `offset[cur] + anim_elem_time - offset[n-1]`. Guards against an off-by-one
+    /// in the elapsed/offset arithmetic across a multi-element advance.
+    #[test]
+    fn anim_elem_time_matches_offset_elapsed_invariant() {
+        // ticks [3, 5, 2, 4]: offsets [0, 3, 8, 10].
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2, 4]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+
+        // Tick to land mid-action on element 2 (one-based 3): 3 + 5 = 8 ticks to
+        // reach it, +1 tick into it.
+        for _ in 0..9 {
+            lc.tick(&mut ch);
+        }
+        assert_eq!(ch.anim_elem, 2, "mid-action, on element index 2");
+        assert_eq!(ch.anim_elem_time, 1);
+
+        let offsets = ch.anim_elem_start_offsets.clone();
+        assert_eq!(offsets, vec![0, 3, 8, 10]);
+        let cur = ch.anim_elem as usize;
+        let elapsed = offsets[cur] + ch.anim_elem_time; // 8 + 1 = 9
+        assert_eq!(elapsed, 9);
+        // Verify the trigger output for EVERY element against the closed form.
+        for one_based in 1..=4i32 {
+            let expected = elapsed - offsets[(one_based - 1) as usize];
+            assert_eq!(
+                anim_elem_time(&ch, one_based),
+                expected,
+                "AnimElemTime({one_based}) must equal elapsed - offset[n-1]"
+            );
+        }
+        // Spot-check signs: elements 1,2,3 reached (>=0), element 4 future (<0).
+        assert!(anim_elem_time(&ch, 1) > 0);
+        assert!(anim_elem_time(&ch, 2) > 0);
+        assert_eq!(anim_elem_time(&ch, 3), ch.anim_elem_time, "current == scalar");
+        assert!(anim_elem_time(&ch, 4) < 0, "last element not yet reached");
+    }
+
+    /// AC2: switching to an UNKNOWN animation drops the stale offset table so
+    /// `AnimElemTime` reverts to the legacy single-element fallback (rather than
+    /// indexing the previous action's geometry). Never panics.
+    #[test]
+    fn unknown_action_clears_stale_offset_table() {
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem_start_offsets, vec![0, 3, 8], "table built for action 0");
+
+        // Point anim at an action the AIR does not define.
+        ch.anim = 9999;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 4;
+        lc.tick(&mut ch);
+        assert!(
+            ch.anim_elem_start_offsets.is_empty(),
+            "stale table dropped for unknown action"
+        );
+        assert_eq!(ch.anim_table_action, Some(9999));
+        // Legacy fallback: current element (1) == scalar, others negative.
+        assert_eq!(anim_elem_time(&ch, 1), ch.anim_elem_time, "fallback current == scalar");
+        assert!(anim_elem_time(&ch, 2) < 0, "fallback future element negative");
+    }
+
+    /// AC2: an action with zero frames also yields the empty-table legacy
+    /// fallback and never panics.
+    #[test]
+    fn empty_frame_action_uses_legacy_fallback() {
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        // tiny_air with an empty slice → action 0 exists but has no frames.
+        let lc = loaded(vec![st], tiny_air(0, &[]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 2;
+        lc.tick(&mut ch);
+        assert!(ch.anim_elem_start_offsets.is_empty(), "no frames → empty table");
+        assert_eq!(anim_elem_time(&ch, 1), ch.anim_elem_time, "current via legacy fallback");
+        assert!(anim_elem_time(&ch, 2) < 0);
+        // Strong out-of-range n on the legacy path must also be safe.
+        let _ = anim_elem_time(&ch, i32::MIN);
+        let _ = anim_elem_time(&ch, i32::MAX);
+        let _ = anim_elem_time(&ch, 0);
+    }
+
+    /// AC1: a single-element action — `AnimElemTime(1)` tracks the scalar and any
+    /// other (clamped) n collapses to element 1; never negative-by-accident.
+    #[test]
+    fn anim_elem_time_single_element_action() {
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        // Single hold-forever element so the cursor parks and time accrues.
+        let lc = loaded(vec![st], tiny_air(0, &[-1]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        for expected in 1..=5 {
+            lc.tick(&mut ch);
+            assert_eq!(ch.anim_elem, 0, "single element stays current");
+            assert_eq!(anim_elem_time(&ch, 1), expected, "element 1 == scalar");
+            // Out-of-range high clamps to element 1 (the only element).
+            assert_eq!(anim_elem_time(&ch, 7), anim_elem_time(&ch, 1));
+            // Out-of-range low (and i32::MIN) clamp to element 1 too — never panic.
+            assert_eq!(anim_elem_time(&ch, 0), anim_elem_time(&ch, 1));
+            let _ = anim_elem_time(&ch, i32::MIN);
+        }
+    }
+
+    /// AC3 (co-regression): the per-element AnimElemTime work leaves the bare
+    /// `AnimElem`, `AnimElemNo`, and `AnimTime` triggers intact and consistent
+    /// with the cursor at every tick of a multi-element action.
+    #[test]
+    fn bare_anim_triggers_unchanged_alongside_elem_time() {
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        for _ in 0..12 {
+            lc.tick(&mut ch);
+            let elem_no = ch.trigger("AnimElemNo", &[]).to_int();
+            let elem = ch.trigger("AnimElem", &[]).to_int();
+            let anim_time = ch.trigger("AnimTime", &[]).to_int();
+            // AnimElem and AnimElemNo are both the one-based current element.
+            assert_eq!(elem, ch.anim_elem + 1, "AnimElem one-based current");
+            assert_eq!(elem_no, ch.anim_elem + 1, "AnimElemNo one-based current");
+            // AnimTime mirrors the executor's anim_time field unchanged.
+            assert_eq!(anim_time, ch.anim_time, "AnimTime mirrors anim_time field");
+            // And AnimElemTime(current) still agrees with the scalar.
+            assert_eq!(anim_elem_time(&ch, elem_no), ch.anim_elem_time);
+        }
+    }
+
+    /// AC2: a looping action queried for an element BEYOND the loopstart element
+    /// reports negative again on each fresh iteration (the "reached" guard
+    /// re-arms every loop), proving the time is per-iteration, not cumulative.
+    #[test]
+    fn looping_future_element_re_arms_each_iteration() {
+        // ticks [2, 2, 2], loopstart 0: offsets [0, 2, 4], iteration length 6.
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(vec![st], air_with_loopstart(0, &[2, 2, 2], 0));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+
+        // Iteration 1: drive to element 2, where element 3 is still future (<0).
+        for _ in 0..5 {
+            lc.tick(&mut ch);
+        }
+        assert_eq!(ch.anim_elem, 2);
+        assert!(anim_elem_time(&ch, 3) >= 0, "element 3 reached in iter 1");
+
+        // Complete the iteration → wrap to element 0 (one more tick ends elem 2).
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem, 0, "wrapped to loopstart");
+        assert_eq!(ch.anim_elem_time, 0);
+        // Fresh iteration: elements 2 AND 3 are future again (negative).
+        assert!(anim_elem_time(&ch, 2) < 0, "element 2 future again after wrap");
+        assert!(anim_elem_time(&ch, 3) < 0, "element 3 future again after wrap");
+        // Element 1 (current, offset 0) just restarted.
+        assert_eq!(anim_elem_time(&ch, 1), 0, "current element restarted at 0");
     }
 }

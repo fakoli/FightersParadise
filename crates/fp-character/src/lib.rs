@@ -322,6 +322,20 @@ const AXIS_Y: i32 = 1;
 /// the tail from spuriously firing. `-1` is the conventional MUGEN value.
 const ANIM_ELEM_NOT_REACHED: i32 = -1;
 
+/// Clamps a possibly-out-of-range signed element index into `0..len`, returning
+/// `0` when `len` is `0`. Used to look up the current element safely in the
+/// per-element start-offset table without panicking on stale/external mutation.
+fn clamp_usize(index: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if index < 0 {
+        0
+    } else {
+        (index as usize).min(len - 1)
+    }
+}
+
 /// Static, per-character constants read from the `.cns`
 /// `[Data]`/`[Size]`/`[Velocity]`/`[Movement]` groups.
 ///
@@ -800,6 +814,41 @@ pub struct Character {
     /// read.
     pub anim_time: i32,
 
+    /// Per-element cumulative start-offset table for the **current** animation
+    /// action, used to answer `AnimElemTime(n)` for *any* element of the action
+    /// (not just the current one).
+    ///
+    /// `anim_elem_start_offsets[i]` is the number of ticks, measured from the
+    /// start of the current loop iteration of the action, at which element `i`
+    /// (zero-based) begins: element `0` starts at `0`, element `i` at the sum of
+    /// the `ticks` durations of elements `0..i`. The executor (re)builds this
+    /// from the AIR action's frame durations in
+    /// [`advance_animation`](executor) whenever the active action number
+    /// changes, and never touches it for an action with no frames (the vector is
+    /// then empty and `AnimElemTime` falls back to the legacy scalar).
+    ///
+    /// Combined with [`anim_elem`](Character::anim_elem) and
+    /// [`anim_elem_time`](Character::anim_elem_time) this lets `AnimElemTime(n)`
+    /// compute *time-since-element-n began* for the current loop iteration:
+    /// `elapsed_in_action = start_offset[anim_elem] + anim_elem_time`, then
+    /// `AnimElemTime(n) = elapsed_in_action - start_offset[n-1]` (one-based `n`).
+    /// For the current element this is exactly `anim_elem_time`; for a
+    /// not-yet-reached future element it is negative, matching MUGEN.
+    ///
+    /// Public only because the entity is struct-based (no hidden state); callers
+    /// other than the executor and the `AnimElemTime` trigger should not touch
+    /// it — mutating it directly desynchronizes it from the live AIR data.
+    pub anim_elem_start_offsets: Vec<i32>,
+    /// The action number that [`anim_elem_start_offsets`](Character::anim_elem_start_offsets)
+    /// was built for, or `None` before any table has been built.
+    ///
+    /// The executor compares this against the live [`anim`](Character::anim) in
+    /// [`advance_animation`](executor) to decide whether the offset table must
+    /// be rebuilt (the action changed) or can be reused (same action, advancing
+    /// within it). Treated as opaque bookkeeping; see
+    /// [`anim_elem_start_offsets`](Character::anim_elem_start_offsets).
+    pub anim_table_action: Option<i32>,
+
     // ---- State machine cursor ----------------------------------------------
     /// Current state number (`StateNo`).
     pub state_no: i32,
@@ -955,6 +1004,8 @@ impl Default for Character {
             anim_elem: 0,
             anim_elem_time: 0,
             anim_time: 0,
+            anim_elem_start_offsets: Vec::new(),
+            anim_table_action: None,
             state_no: 0,
             prev_state_no: 0,
             state_time: 0,
@@ -1024,6 +1075,64 @@ impl Character {
     /// character directly. Writes the [`hitpause`](Character::hitpause) field.
     pub fn set_hitpause_time(&mut self, ticks: i32) {
         self.hitpause = ticks.max(0);
+    }
+
+    /// Computes MUGEN's `AnimElemTime(n)` for the **one-based** element index
+    /// `n` of the *current* animation action: the number of ticks elapsed since
+    /// element `n` began, within the current loop iteration.
+    ///
+    /// The value is **positive** for the current and already-played elements
+    /// (growing as the action plays), exactly equal to
+    /// [`anim_elem_time`](Character::anim_elem_time) for the current element (so
+    /// there is no regression versus the legacy single-element behavior), and
+    /// **negative** for elements not yet reached this iteration — matching
+    /// MUGEN, where the `AnimElem = N, op M` lowering relies on
+    /// `AnimElemTime(N) >= 0` as the "element reached" guard.
+    ///
+    /// # Looping
+    ///
+    /// The offset table and [`anim_elem`](Character::anim_elem) /
+    /// [`anim_elem_time`](Character::anim_elem_time) are reset by the executor
+    /// when the action loops back to its `loopstart`, so the returned time
+    /// reflects the **current loop iteration**, not cumulative play-through —
+    /// again matching MUGEN.
+    ///
+    /// # Edge cases (never panics)
+    ///
+    /// - If the offset table is empty (no AIR action is active yet, or the
+    ///   active action has no frames) this falls back to the legacy scalar:
+    ///   [`anim_elem_time`](Character::anim_elem_time) when `n` names the current
+    ///   element, else [`ANIM_ELEM_NOT_REACHED`] (`-1`).
+    /// - `n` out of range — `n < 1` or `n` greater than the number of elements —
+    ///   is **clamped into range** before lookup (MUGEN's `AnimElemTime` clamps a
+    ///   request to the nearest valid element rather than erroring), so the
+    ///   result is always a sane, finite time and the function never panics.
+    #[must_use]
+    fn anim_elem_time_for(&self, n: i32) -> i32 {
+        let offsets = &self.anim_elem_start_offsets;
+        if offsets.is_empty() {
+            // No per-element table available: preserve the legacy single-element
+            // contract (current element → its elapsed time, else not-reached).
+            return if n == self.anim_elem + 1 {
+                self.anim_elem_time
+            } else {
+                ANIM_ELEM_NOT_REACHED
+            };
+        }
+
+        // Clamp the one-based request into `1..=len` (MUGEN clamps rather than
+        // erroring), then index zero-based. `len >= 1` here. `saturating_sub`
+        // guards `n == i32::MIN` (where `n - 1` would overflow); `clamp_usize`
+        // then folds the zero-based index safely into `0..len`.
+        let len = offsets.len();
+        let idx = clamp_usize(n.saturating_sub(1), len);
+
+        // Elapsed ticks since the start of this loop iteration of the action:
+        // the current element's start offset plus the time spent in it.
+        let cur = clamp_usize(self.anim_elem, len);
+        let elapsed = offsets[cur].saturating_add(self.anim_elem_time);
+        // Time since element `idx` began (positive once reached, negative before).
+        elapsed.saturating_sub(offsets[idx])
     }
 
     /// Reads integer variable `index`, or `0` if the index is out of range.
@@ -1319,18 +1428,22 @@ impl EvalContext for Character {
             return Value::Int(self.anim_elem + 1);
         }
         if name.eq_ignore_ascii_case("AnimElemTime") {
-            // `AnimElemTime(n)` is the time since element `n` (one-based) was
-            // reached. Task 5.1 models only "time in the *current* element": if
-            // the requested element is the current one, return its elapsed time;
-            // otherwise the element has **not yet been reached**, which MUGEN
-            // reports as a NEGATIVE value. Returning the negative sentinel
-            // [`ANIM_ELEM_NOT_REACHED`] (rather than the `0` safe default) is
-            // load-bearing: the VM lowers `AnimElem = N, op M` to a "reached"
-            // guard of `AnimElemTime(N) >= 0`, so a not-yet-reached element must
-            // read negative or the tail would spuriously fire (5.1 follow-up a).
+            // `AnimElemTime(n)` is the time (in ticks) since element `n`
+            // (one-based) of the CURRENT animation action began, within the
+            // current loop iteration. Task A.P6 resolves this for ANY element of
+            // the action via the per-element start-offset table the executor
+            // builds in `advance_animation`: positive for the current/past
+            // elements (equal to `anim_elem_time` for the current one — no
+            // regression), and NEGATIVE for not-yet-reached future elements.
+            //
+            // The negative-for-future contract is load-bearing: the VM lowers
+            // `AnimElem = N, op M` to a "reached" guard of `AnimElemTime(N) >= 0`,
+            // so a not-yet-reached element must read negative or the tail would
+            // spuriously fire. Out-of-range `n` is clamped to a valid element
+            // (never panics); a missing argument is the safe default. See
+            // [`Character::anim_elem_time_for`].
             return match first_int() {
-                Some(n) if n == self.anim_elem + 1 => Value::Int(self.anim_elem_time),
-                Some(_) => Value::Int(ANIM_ELEM_NOT_REACHED),
+                Some(n) => Value::Int(self.anim_elem_time_for(n)),
                 None => Value::DEFAULT,
             };
         }

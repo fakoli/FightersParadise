@@ -313,6 +313,7 @@ rationale in 08). Drive these top-down; they supersede ad-hoc probing.
 - **CB39** Pin the `persistent = n` + `ignorehitpause` interaction during frozen ticks: a flagged controller fires every nth qualifying tick, and frozen ticks DO count (plausibly MUGEN-correct but untested). Add a test locking the chosen semantics. *(added 6.5, Critic SHOULD_FIX)*
 - **CB40** Get-hit state ENTRY exprs lose the opponent: resolve_attack -> change_state uses EvalEnv::self_only(), so a [Statedef 5xxx] header that references p2dist/enemy reads 0. Harmless for stock common1/KFM (static headers); thread the attacker as the defender opponent into the get-hit enter_state (a `change_state_vs`). *(added by audit-keystone Critic; 3-lens)*
 - **CB41** `enemynear(n)` with n>0 silently resolves to the single opponent (1-v-1 model); add a debug log/note so a future multi-enemy impl does not inherit a wrong-target bug. *(audit-keystone nit)*
+- **CB42** AnimElemTime(n): elements AFTER a hold-forever frame (ticks<=0) inherit the hold frame offset and read non-negative ("reached") instead of negative ("never reached"). Sentinelize offsets strictly after the first hold-forever frame. Low impact (post-hold elements are malformed authoring). *(added A.P6, Critic SHOULD_FIX)*
 
 ### ✅ Locomotion-shim debt — RESOLVED by 7.3
 ~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,
