@@ -175,6 +175,15 @@ parallelizable once the core exists. Deps: Phase 7.
 - **8.3b** DONE — surface + play (`fp-engine` exposes per-player `sound_requests` from `tick`; `fp-app` owns an `fp_audio::AudioSystem` + lazily decodes `LoadedCharacter` SndFile sounds → `Sound`, plays each request). Cross-crate → direct Agent `ac56ee167f6c6abe4`. Deps: 8.3a.
 - **8.4** DONE — HitDef `hitsound`/`guardsound` impact audio + fidelity fix (`HitResources.hitsound`/`guardsound` are currently a lossy single `i32` dropping the sample; real KFM uses `hitsound = 5, 0`). fp-combat: `SoundId{group,sample,common}` + parse group,sample with F-prefix; fp-character: `AttackResolution.hit_sound` (hitsound on Hit, guardsound on Guard); fp-engine: stop discarding `resolve_attack`, append the attacker's hit/guard sound as a `SoundRequest` (flows through the 8.3b play path). Cross-crate atomic → direct Agent. Deps: 8.3b. *(direct Agent)*
 
+**Phase 8 (audio) COMPLETE** — SND parser (S8.1), fp-audio playback (8.2), PlaySnd emit+play (8.3a/b),
+HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix convention from PlaySnd
+(default=common, `S`=own); orchestrator caught the Forge agent implementing it backwards.
+
+- **11.1** DONE — Storyboard `.def` parser + typed scene model (`fp-storyboard`, single-crate).
+  Validated against real `test-assets/kfm-motif-sffv1/intro.def` etc. (the only stub-crate work with
+  real fixtures — no stage `.def`/`fight.def`/`.fnt` in assets). Parsing+model only; rendering deferred.
+  Deps: DEF parser. *(via fp-loop-batch wkszpf4ly)*
+
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).
 - ~~**AABB collision** in `fp-physics`~~ ✅ DONE (task P6.1: `collision::{Clsn, Facing, rects_overlap, place_clsn, any_overlap, any_clsn_overlap}` — the Clsn1×Clsn2 hit-detection primitive). Critic PASS; orchestrator fixed a false `to_rect` doc claim.
@@ -274,6 +283,7 @@ parallelizable once the core exists. Deps: Phase 7.
 - **CB37** Common/fight sound file: PlaySnd `F`-prefixed groups (`common=true`) currently fall back to
   the character's own SND (8.3b). Load the engine common SND (`data/common.snd`/fight motif) once and
   route `common=true` requests to it. *(added 8.3b)*
+- **CB38** fp-storyboard BG-group layer matching re-scans all sections per group (O(n*groups)) and couples grouping to naming; a layer could attach to two overlapping-prefix groups. Refactor to assign each "[<name> <layer>]" to its single nearest-preceding "[<name>Def]" in file order. *(added 11.1, Critic SHOULD_FIX)*
 
 ### ✅ Locomotion-shim debt — RESOLVED by 7.3
 ~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,

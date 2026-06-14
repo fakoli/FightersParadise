@@ -499,6 +499,7 @@ name = "fp-storyboard"
 version = "0.1.0"
 dependencies = [
  "fp-core",
+ "fp-formats",
  "tracing",
 ]
 
