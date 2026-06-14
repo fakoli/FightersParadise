@@ -77,9 +77,11 @@
 //! Two **documented gaps** remain — neither silently mis-runs:
 //!
 //! 1. The get-hit-specific controllers (`HitVelSet`, `HitFallSet`, `HitFallVel`,
-//!    `HitFallDamage`, `HitAdd`, `SelfState`, `LifeAdd`, …) are not yet
+//!    `HitFallDamage`, `HitAdd`, `LifeAdd`, …) are not yet
 //!    implemented; the dispatch routes them to its safe, **debug-logged** no-op
 //!    branch (visible, not silent) and they are deferred to task 6.3+.
+//!    (`SelfState` and `VelMul`, formerly in this list, are now handled —
+//!    audit P3+P11.)
 //! 2. [`Character::get_hit_vars`] stays at its default until hit *resolution*
 //!    (task 6.3) populates it, so a get-hit state run *before* 6.3 sees zeroed
 //!    hit effects. This is expected: 6.2 only wires the read path.
@@ -683,7 +685,9 @@ impl Character {
     /// [`SoundRequest`]). Task 6.2 adds the `HitDef` controller, which builds a
     /// [`fp_combat::HitDef`] into [`active_hitdef`](Character::active_hitdef).
     /// Task 6.6 adds `PowerAdd`/`PowerSet`, which mutate the super meter
-    /// (clamped to `[0, power_max]`).
+    /// (clamped to `[0, power_max]`). Audit P3+P11 adds `SelfState` (a
+    /// self-`ChangeState` in this model; see [`ctrl_self_state`](Self::ctrl_self_state))
+    /// and `VelMul` (component-wise velocity multiply).
     /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -695,10 +699,14 @@ impl Character {
         let kind = ctrl.controller_type.as_deref().unwrap_or("");
         if kind.eq_ignore_ascii_case("ChangeState") {
             self.ctrl_change_state(states, ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("SelfState") {
+            self.ctrl_self_state(states, ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("VelSet") {
             self.ctrl_vel_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("VelAdd") {
             self.ctrl_vel_add(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("VelMul") {
+            self.ctrl_vel_mul(ctrl, env);
         } else if kind.eq_ignore_ascii_case("CtrlSet") {
             self.ctrl_ctrl_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PosSet") {
@@ -769,6 +777,51 @@ impl Character {
         // ChangeState's optional `ctrl` parameter overrides the statedef ctrl.
         if let Some(ctrl_val) = ctrl.params.get("ctrl").and_then(|p| self.eval_param(p, env)) {
             self.ctrl = ctrl_val.as_bool();
+        }
+    }
+
+    /// `SelfState`: change the character back to one of its **own** states,
+    /// named by the `value` parameter, performing state entry exactly as
+    /// [`ctrl_change_state`](Self::ctrl_change_state) does (the destination
+    /// statedef header — `anim`/`ctrl`/`poweradd`/`velset` — applies and the
+    /// optional `ctrl`/`anim`-bearing entry path runs through the same
+    /// opponent-aware [`EvalEnv`]). The optional `ctrl` parameter overrides the
+    /// destination statedef's control flag, just like `ChangeState`.
+    ///
+    /// In MUGEN, `SelfState` differs from `ChangeState` only when the player is
+    /// currently in a *custom state* imposed by an opponent (e.g. mid-throw via
+    /// `TargetState`): `SelfState` returns control of the state machine to the
+    /// player's OWN states, whereas `ChangeState` would change the state *within*
+    /// the opponent's custom-state table. We do **not** yet model custom-state
+    /// ownership (there are no throws/`TargetState` in this flat 1-v-1 model), so
+    /// here `SelfState` is exactly a self-`ChangeState`. The own-vs-custom-state
+    /// distinction is intentionally deferred to the throw/`TargetState` work
+    /// (faithfulness audit P8); when that lands, this controller must instead
+    /// detach from the opponent's state table before entering `value`.
+    fn ctrl_self_state(
+        &mut self,
+        states: &HashMap<i32, CompiledState>,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        // Identical mechanics to ChangeState in this model: value + optional
+        // ctrl override, via the shared enter_state path (so the destination
+        // statedef's entry anim/ctrl/etc. apply). The only future divergence is
+        // detaching from an opponent-imposed custom state, which is deferred.
+        self.ctrl_change_state(states, ctrl, env, report);
+    }
+
+    /// `VelMul`: multiply the current velocity component-wise by the `x`/`y`
+    /// parameters (`vel.x *= x`, `vel.y *= y`). An **absent** axis multiplies by
+    /// `1.0` (that component is left unchanged), matching MUGEN. A missing or
+    /// garbage value is a safe no-op for that axis; this never panics.
+    fn ctrl_vel_mul(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p, env)) {
+            self.vel.x *= v.to_float();
+        }
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p, env)) {
+            self.vel.y *= v.to_float();
         }
     }
 
@@ -3255,6 +3308,462 @@ mod tests {
         assert_eq!(ch.state_no, 0);
         assert_eq!(ch.prev_state_no, 0, "self-transition sets prev to self");
         assert_eq!(ch.state_time, 1, "time reset to 0 then advanced one tick");
+    }
+
+    // ---- Audit P3+P11: SelfState + VelMul dispatch arms --------------------
+
+    #[test]
+    fn self_state_changes_state_via_enter_path() {
+        // `type=SelfState value=N` must change state_no to N through the normal
+        // enter_state path: prev_state_no = old, state_time reset, and the
+        // destination statedef's entry header (here, anim) applied.
+        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[("value", "5210")]);
+        // Destination state 5210 carries an entry anim so we can prove the
+        // statedef header ran (mirrors a get-hit recovery state's `anim`).
+        let dest = state(
+            5210,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("5210"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c]), dest], tiny_air(5210, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.prev_state_no = -1;
+        ch.anim = 0;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 1, "SelfState transitions via enter_state");
+        assert_eq!(ch.state_no, 5210);
+        assert_eq!(ch.prev_state_no, 0, "prev set to the departed state");
+        assert_eq!(ch.state_time, 1, "time reset on entry then advanced one tick");
+        assert_eq!(ch.anim, 5210, "destination statedef entry anim applied");
+    }
+
+    #[test]
+    fn self_state_ctrl_param_overrides_ctrl_flag() {
+        // SelfState honors the optional `ctrl` override exactly like ChangeState.
+        let c = ctrl(
+            0,
+            "SelfState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1"), ("ctrl", "1")],
+        );
+        // Destination state 1 has NO ctrl entry param, so the controller's wins.
+        let lc = loaded(
+            vec![stand_n(0, vec![c]), stand_n(1, vec![])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.ctrl = false;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 1);
+        assert!(ch.ctrl, "SelfState ctrl=1 enabled control");
+    }
+
+    #[test]
+    fn self_state_without_value_is_safe_noop() {
+        // A SelfState lacking a `value` must not transition or panic.
+        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[]); // no value
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 0, "no value → no transition");
+        assert_eq!(ch.state_no, 0);
+    }
+
+    #[test]
+    fn vel_mul_scales_x_and_leaves_absent_axis_unchanged() {
+        // VelMul x=0.5 halves vel.x; with `y` absent, vel.y is multiplied by 1.0
+        // (left unchanged), matching MUGEN.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "0.5")]);
+        // Physics::None so apply_physics does not perturb the velocity we assert.
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(4.0, 3.0);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - 2.0).abs() < 1e-6, "x halved, got {}", ch.vel.x);
+        assert!((ch.vel.y - 3.0).abs() < 1e-6, "absent y axis unchanged (×1.0)");
+    }
+
+    #[test]
+    fn vel_mul_zero_on_both_axes_zeroes_velocity() {
+        // VelMul x=0 y=0 zeroes both components.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "0"), ("y", "0")]);
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(7.0, -9.0);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x).abs() < 1e-6, "x zeroed, got {}", ch.vel.x);
+        assert!((ch.vel.y).abs() < 1e-6, "y zeroed, got {}", ch.vel.y);
+    }
+
+    // ---- Proctor: extra SelfState coverage (edge + MUGEN semantics) ---------
+
+    #[test]
+    fn self_state_value_is_an_expression_not_just_a_literal() {
+        // `value` is an expr like ChangeState's. KFM authors literal state
+        // numbers, but the path must evaluate an expression. `value = 5200 + 10`
+        // must resolve to 5210 and enter it.
+        let c = ctrl(
+            0,
+            "SelfState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5200 + 10")],
+        );
+        let lc = loaded(
+            vec![stand_n(0, vec![c]), stand_n(5210, vec![])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 1, "SelfState transitioned");
+        assert_eq!(ch.state_no, 5210, "value expression 5200+10 evaluated");
+    }
+
+    #[test]
+    fn self_state_ctrl_override_beats_conflicting_destination_ctrl_header() {
+        // Mirrors ChangeState's ordering: enter_state applies the destination
+        // statedef's `ctrl` entry header FIRST, then the controller's `ctrl`
+        // param overrides it. Destination authors `ctrl = 0`, controller says
+        // `ctrl = 1`; the controller must win.
+        let c = ctrl(
+            0,
+            "SelfState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "9"), ("ctrl", "1")],
+        );
+        let dest = state(
+            9,
+            Entry { st: Some("S"), ph: Some("N"), ctrl: Some("0"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c]), dest], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.ctrl = false;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 9);
+        assert!(ch.ctrl, "controller ctrl=1 override beats destination ctrl=0 header");
+    }
+
+    #[test]
+    fn self_state_to_unknown_state_is_safe_noncrashing_transition() {
+        // SelfState to a state that does not exist in the map must not panic:
+        // enter_state moves the cursor (transitions counted) but applies no entry
+        // header. This mirrors ChangeState's "unknown state; cursor updated only".
+        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[("value", "424242")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 7;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 1, "transition counted even for unknown target");
+        assert_eq!(ch.state_no, 424_242, "cursor moved to the requested (missing) state");
+        assert_eq!(ch.prev_state_no, 0, "prev recorded");
+        assert_eq!(ch.anim, 7, "no entry header applied for a missing state → anim unchanged");
+    }
+
+    #[test]
+    fn self_state_dispatch_is_case_insensitive() {
+        // MUGEN controller-type names are case-insensitive: `selfstate` /
+        // `SELFSTATE` must reach the same arm as `SelfState`.
+        for spelling in ["selfstate", "SELFSTATE", "SelfState"] {
+            let c = ctrl(0, spelling, &[], &[(1, &["1"])], None, &[("value", "3")]);
+            let lc = loaded(
+                vec![stand_n(0, vec![c]), stand_n(3, vec![])],
+                tiny_air(0, &[5]),
+            );
+            let mut ch = Character::new();
+            ch.state_no = 0;
+            let report = lc.tick(&mut ch);
+            assert_eq!(report.transitions, 1, "{spelling}: transitioned");
+            assert_eq!(ch.state_no, 3, "{spelling}: reached state 3");
+        }
+    }
+
+    #[test]
+    fn self_state_resets_state_time_on_self_transition() {
+        // SelfState onto the SAME state number is a re-entry: it still resets
+        // state_time (MUGEN semantics, shared with ChangeState's self-transition).
+        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.state_time = 50;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 1, "self-transition counts as a re-entry");
+        assert_eq!(ch.state_no, 0);
+        // enter_state set state_time = 0, then advance_time ticked it to 1.
+        assert_eq!(ch.state_time, 1, "state_time reset on re-entry then advanced");
+    }
+
+    // ---- Proctor: extra VelMul coverage (edge + MUGEN semantics) -----------
+
+    #[test]
+    fn vel_mul_y_only_scales_y_and_leaves_absent_x_unchanged() {
+        // Symmetric to the x-only case: `y` present, `x` absent → x × 1.0.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("y", "2.0")]);
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(5.0, -1.5);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - 5.0).abs() < 1e-6, "absent x axis unchanged (×1.0)");
+        assert!((ch.vel.y - (-3.0)).abs() < 1e-6, "y doubled, got {}", ch.vel.y);
+    }
+
+    #[test]
+    fn vel_mul_with_no_params_is_a_total_noop() {
+        // VelMul with neither x nor y: both axes × 1.0, velocity untouched, the
+        // controller still "fires" (it qualified). Must never panic.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[]);
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(3.25, -6.5);
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "VelMul fired even with no params");
+        assert!((ch.vel.x - 3.25).abs() < 1e-6, "x unchanged");
+        assert!((ch.vel.y - (-6.5)).abs() < 1e-6, "y unchanged");
+    }
+
+    #[test]
+    fn vel_mul_negative_factor_reverses_direction() {
+        // A negative multiplier flips the sign and scales magnitude.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "-2"), ("y", "-0.5")]);
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(3.0, -8.0);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - (-6.0)).abs() < 1e-6, "x = 3 × -2, got {}", ch.vel.x);
+        assert!((ch.vel.y - 4.0).abs() < 1e-6, "y = -8 × -0.5, got {}", ch.vel.y);
+    }
+
+    #[test]
+    fn vel_mul_evaluates_an_expression_factor() {
+        // The factor is an expr, like KFM's `x = .85 * ifelse(...)`. Use a pure
+        // arithmetic expr so the result is deterministic: x ×= (0.5 * 0.5) = 0.25.
+        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "0.5 * 0.5")]);
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(8.0, 1.0);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - 2.0).abs() < 1e-6, "x = 8 × 0.25, got {}", ch.vel.x);
+        assert!((ch.vel.y - 1.0).abs() < 1e-6, "absent y unchanged");
+    }
+
+    #[test]
+    fn vel_mul_garbage_factor_is_a_safe_noop_for_that_axis() {
+        // A garbage expression compiles to the const-0 fallback in MUGEN's
+        // "bad expression -> 0" philosophy, so VelMul multiplies that axis by 0.
+        // The key contract is *no panic*; we assert the engine's defined behavior
+        // (fallback factor 0 ⇒ that axis zeroed) and that the other axis is
+        // untouched and intact.
+        let c = ctrl(
+            0,
+            "VelMul",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", ")(@#$ not an expr"), ("y", "3")],
+        );
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            vec![c],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(4.0, 2.0);
+        // Must not panic.
+        lc.tick(&mut ch);
+        // Garbage x → const-0 fallback → 4 × 0 = 0 (defined, non-panicking).
+        assert!((ch.vel.x).abs() < 1e-6, "garbage x factor → 0 fallback, got {}", ch.vel.x);
+        // Valid y still applied: 2 × 3 = 6.
+        assert!((ch.vel.y - 6.0).abs() < 1e-6, "valid y still scaled, got {}", ch.vel.y);
+    }
+
+    #[test]
+    fn vel_mul_dispatch_is_case_insensitive() {
+        // `velmul` / `VELMUL` must reach the same arm as `VelMul`.
+        for spelling in ["velmul", "VELMUL", "VelMul"] {
+            let c = ctrl(0, spelling, &[], &[(1, &["1"])], None, &[("x", "0.5")]);
+            let st = state(
+                0,
+                Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+                vec![c],
+            );
+            let lc = loaded(vec![st], tiny_air(0, &[5]));
+            let mut ch = Character::new();
+            ch.state_no = 0;
+            ch.physics = Physics::None;
+            ch.vel = Vec2::new(10.0, 0.0);
+            lc.tick(&mut ch);
+            assert!((ch.vel.x - 5.0).abs() < 1e-6, "{spelling}: x halved, got {}", ch.vel.x);
+        }
+    }
+
+    // ---- Proctor: SelfState + VelMul via the REAL CNS parser (lowercased) ---
+
+    #[test]
+    fn self_state_and_vel_mul_dispatch_from_real_cns_text() {
+        // Drive both new controllers through the actual CNS parser (which
+        // lowercases keys and types), compiling via CompiledState::from_parsed.
+        // This proves the dispatch matches parser output, not just hand-built
+        // controllers. State 200 runs a VelMul then a SelfState to 0.
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\ntype = S\nphysics = N\n\
+             [State 200, fric]\ntype = VelMul\ntrigger1 = Time = 0\nx = .5\n\
+             [State 200, back]\ntype = SelfState\ntrigger1 = Time = 0\nvalue = 0\nctrl = 1\n\
+             [Statedef 0]\ntype = S\nphysics = N\n",
+        )
+        .unwrap();
+        let st200 = CompiledState::from_parsed(&cns.statedefs[0]);
+        let st0 = CompiledState::from_parsed(&cns.statedefs[1]);
+        let lc = loaded(vec![st200, st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 200;
+        ch.physics = Physics::None;
+        ch.ctrl = false;
+        ch.vel = Vec2::new(6.0, 2.0);
+        let report = lc.tick(&mut ch);
+        // VelMul x=.5 applied before the SelfState moved us out of 200.
+        assert!((ch.vel.x - 3.0).abs() < 1e-6, "VelMul halved x, got {}", ch.vel.x);
+        assert!((ch.vel.y - 2.0).abs() < 1e-6, "absent y unchanged");
+        // SelfState carried us back to state 0 with control enabled.
+        assert_eq!(ch.state_no, 0, "SelfState returned to own state 0");
+        assert!(ch.ctrl, "SelfState ctrl=1 enabled control");
+        assert!(report.transitions >= 1, "the SelfState transition is counted");
+    }
+
+    // ---- Proctor: gated real-KFM fixtures for SelfState + VelMul -----------
+
+    #[test]
+    fn real_kfm_authors_self_state_and_vel_mul_controllers() {
+        // The faithfulness driver: KFM really does author both controllers
+        // (audit P3+P11). Gated to skip when test-assets is absent.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        let has = |kind: &str| {
+            lc.states.values().any(|s| {
+                s.controllers.iter().any(|c| {
+                    c.controller_type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(kind))
+                })
+            })
+        };
+        assert!(has("SelfState"), "KFM authors at least one SelfState (e.g. state 821)");
+        assert!(has("VelMul"), "KFM authors at least one VelMul (e.g. state 1020)");
+    }
+
+    #[test]
+    fn real_kfm_vel_mul_state_1020_scales_velocity() {
+        // End-to-end: enter KFM's real [Statedef 1020] (which authors
+        // `type=VelMul x = .85 * ifelse(...)`, y absent, physics=N), seed a known
+        // velocity, tick once, and confirm x was scaled by one of the two valid
+        // friction factors while the absent y axis is untouched. Gated on assets.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        const VM_STATE: i32 = 1020;
+        let Some(state) = lc.states.get(&VM_STATE).cloned() else {
+            eprintln!("skipping: KFM has no [Statedef {VM_STATE}]; asset differs");
+            return;
+        };
+        assert!(
+            state.controllers.iter().any(|c| c
+                .controller_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("VelMul"))),
+            "KFM [Statedef {VM_STATE}] should author a VelMul controller"
+        );
+        let mut states = HashMap::new();
+        states.insert(VM_STATE, state);
+        let air = lc.air.clone();
+        let mut ch = Character::with_constants(lc.constants);
+        // Enter through the proper seam (runs the velset=0,0 entry header), then
+        // seed a known velocity so VelMul has something to scale.
+        ch.change_state(&states, VM_STATE);
+        ch.physics = Physics::None; // pin physics so apply_physics cannot perturb x
+        ch.vel = Vec2::new(10.0, 4.0);
+        ch.tick_with(&states, &air, None, StageView::default());
+        // x = 10 × (.85 × {1 or .8}) = either 8.5 or 6.8; y absent → unchanged.
+        let x = ch.vel.x;
+        assert!(
+            (x - 8.5).abs() < 1e-4 || (x - 6.8).abs() < 1e-4,
+            "VelMul scaled x by .85×{{1,.8}}; expected 8.5 or 6.8, got {x}"
+        );
+        assert!((ch.vel.y - 4.0).abs() < 1e-6, "absent y axis unchanged, got {}", ch.vel.y);
     }
 
     // ---- AC1: persistent re-arms on state re-entry (fire_counts cleared) ----
