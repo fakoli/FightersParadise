@@ -12,4 +12,7 @@ pub mod state;
 
 pub use buffer::InputBuffer;
 pub use command::{compile_command, CommandDef, CommandElement, CommandMatcher, InputModifier};
-pub use state::{Button, DirToken, Direction, InputState, LogicalDirection, BUTTON_COUNT};
+pub use state::{
+    dir_matches, dir_matches_detect, logical_direction, Button, DirToken, Direction, InputState,
+    LogicalDirection, BUTTON_COUNT,
+};

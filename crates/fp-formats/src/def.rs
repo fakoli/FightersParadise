@@ -41,12 +41,19 @@ impl DefFile {
     }
 
     /// Parses a DEF file from a string.
+    ///
+    /// Tolerates a leading UTF-8 BOM (real MUGEN `.def` files are sometimes saved
+    /// UTF-8-with-BOM) and CRLF line endings.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> FpResult<Self> {
         let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut current_section: Option<String> = None;
 
+        // Strip a leading UTF-8 BOM if present so the first line parses cleanly.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
         for raw_line in text.lines() {
+            // `lines()` already strips the trailing `\r` of CRLF endings.
             let line = strip_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
@@ -184,5 +191,19 @@ ending.storyboard =
         let def_path = Path::new("/chars/kfm/kfm.def");
         let resolved = DefFile::resolve_path(def_path, "kfm.sff");
         assert_eq!(resolved, Path::new("/chars/kfm/kfm.sff"));
+    }
+
+    #[test]
+    fn leading_bom_and_crlf_tolerated() {
+        // Some MUGEN `.def` files are saved UTF-8-with-BOM and CRLF-terminated;
+        // the BOM can land directly on the first `[Section]` header.
+        let text = "\u{feff}[Info]\r\nname = \"Kung Fu Man\"\r\nauthor = \"Elecbyte\"\r\n";
+        let def = DefFile::from_str(text).unwrap();
+        assert_eq!(
+            def.get("Info", "name"),
+            Some("Kung Fu Man"),
+            "[Info] name must parse despite BOM/CRLF"
+        );
+        assert_eq!(def.get("Info", "author"), Some("Elecbyte"));
     }
 }

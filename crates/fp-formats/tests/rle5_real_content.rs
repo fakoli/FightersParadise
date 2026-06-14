@@ -16,9 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Builds a complete, valid SFF v2 file holding a single RLE5-compressed sprite.
 ///
-/// The layout matches the SFF v2 header the current parser expects: a 512-byte
-/// header (12 reserved bytes after the version, then `num_groups`, `num_sprites`,
-/// and the sprite/palette/LData/TData offset+length pairs), one 28-byte sprite
+/// The layout matches the real MUGEN 1.0 SFF v2 header the parser expects: a
+/// 512-byte header whose directory fields begin at offset 36 — `sprite_offset`,
+/// `num_sprites` (a count), `palette_offset`, `num_palettes` (a count), then the
+/// LData/TData offset+length pairs. The block byte-lengths are *derived* from the
+/// counts by the parser, not stored. This is followed by one 28-byte sprite
 /// sub-header, one 16-byte palette sub-header, a 768-byte LData palette block,
 /// and a TData block carrying the RLE5 codec stream.
 ///
@@ -34,10 +36,8 @@ fn synthesize_rle5_sff() -> Vec<u8> {
     // RLE5 codec stream: 4-byte LE decompressed size (6) followed by the packet.
     let rle5: [u8; 9] = [6, 0, 0, 0, 0x00, 0x82, 0x05, 0x23, 0x47];
 
-    let sprite_offset: u32 = 512;
-    let sprite_length: u32 = 28; // 1 sprite sub-header
-    let palette_offset: u32 = 540;
-    let palette_length: u32 = 16; // 1 palette sub-header
+    let sprite_offset: u32 = 512; // 1 sprite sub-header (28 bytes), length derived
+    let palette_offset: u32 = 540; // 1 palette sub-header (16 bytes), length derived
     let ldata_offset: u32 = 556;
     let ldata_length: u32 = 768; // 256 RGB triples
     let tdata_offset: u32 = ldata_offset + ldata_length; // 1324
@@ -46,23 +46,24 @@ fn synthesize_rle5_sff() -> Vec<u8> {
     let total = tdata_offset as usize + tdata_length as usize;
     let mut buf = vec![0u8; total];
 
-    // --- Header ---
+    // --- Header (real MUGEN 1.0 SFF v2 layout) ---
+    // Offsets 16..36 are reserved u32s (left zero). The directory fields begin at
+    // offset 36 and store sprite/palette OFFSETS and COUNTS; the parser derives the
+    // block byte-lengths from the counts. Mirrors `header::parse_header` /
+    // `header::make_test_header`.
     buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
     buf[12] = 0; // version minor3
     buf[13] = 0; // version minor2
     buf[14] = 1; // version minor1
     buf[15] = 2; // version major -> SFF v2
-    // buf[16..28] = 12 reserved bytes (left zero)
-    buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // num_groups
-    buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // num_sprites
-    buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
-    buf[40..44].copy_from_slice(&sprite_length.to_le_bytes());
-    buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
-    buf[48..52].copy_from_slice(&palette_length.to_le_bytes());
-    buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
-    buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
-    buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());
-    buf[64..68].copy_from_slice(&tdata_length.to_le_bytes());
+    buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes()); // sprite_offset @36
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes()); // num_sprites @40 (count)
+    buf[44..48].copy_from_slice(&palette_offset.to_le_bytes()); // palette_offset @44
+    buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // num_palettes @48 (count)
+    buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes()); // ldata_offset @52
+    buf[56..60].copy_from_slice(&ldata_length.to_le_bytes()); // ldata_length @56
+    buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes()); // tdata_offset @60
+    buf[64..68].copy_from_slice(&tdata_length.to_le_bytes()); // tdata_length @64
 
     // --- Sprite sub-header (28 bytes) at 512: a 3x2 RLE5 sprite living in TData ---
     let s = sprite_offset as usize;

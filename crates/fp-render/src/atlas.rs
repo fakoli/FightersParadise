@@ -240,10 +240,10 @@ mod tests {
         let mut atlas = TextureAtlas::new(&device, 256, 256);
 
         let r1 = atlas
-            .pack(&queue, SpriteId::new(0, 0), 64, 32, &vec![0u8; 64 * 32])
+            .pack(&queue, SpriteId::new(0, 0), 64, 32, &[0u8; 64 * 32])
             .unwrap();
         let r2 = atlas
-            .pack(&queue, SpriteId::new(0, 1), 64, 32, &vec![0u8; 64 * 32])
+            .pack(&queue, SpriteId::new(0, 1), 64, 32, &[0u8; 64 * 32])
             .unwrap();
 
         // First sprite at x=0, second at x=64
@@ -264,12 +264,12 @@ mod tests {
 
         // Fill the first row with a 100-wide sprite
         atlas
-            .pack(&queue, SpriteId::new(0, 0), 100, 30, &vec![0u8; 100 * 30])
+            .pack(&queue, SpriteId::new(0, 0), 100, 30, &[0u8; 100 * 30])
             .unwrap();
 
         // This 50-wide sprite won't fit (100+50 > 128), so it starts a new row
         let r2 = atlas
-            .pack(&queue, SpriteId::new(0, 1), 50, 20, &vec![0u8; 50 * 20])
+            .pack(&queue, SpriteId::new(0, 1), 50, 20, &[0u8; 50 * 20])
             .unwrap();
 
         // New row starts at y = 30 (height of the first shelf)
@@ -288,11 +288,11 @@ mod tests {
 
         // Fill with a sprite taking the entire atlas
         atlas
-            .pack(&queue, SpriteId::new(0, 0), 64, 64, &vec![0u8; 64 * 64])
+            .pack(&queue, SpriteId::new(0, 0), 64, 64, &[0u8; 64 * 64])
             .unwrap();
 
         // No room for another sprite
-        let result = atlas.pack(&queue, SpriteId::new(0, 1), 1, 1, &vec![0u8; 1]);
+        let result = atlas.pack(&queue, SpriteId::new(0, 1), 1, 1, &[0u8; 1]);
         assert!(result.is_none());
     }
 
@@ -306,7 +306,7 @@ mod tests {
         let mut atlas = TextureAtlas::new(&device, 256, 256);
         let id = SpriteId::new(5, 3);
         atlas
-            .pack(&queue, id, 16, 16, &vec![0u8; 16 * 16])
+            .pack(&queue, id, 16, 16, &[0u8; 16 * 16])
             .unwrap();
 
         assert!(atlas.get(id).is_some());

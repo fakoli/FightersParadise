@@ -7,4 +7,15 @@ license.workspace = true
 
 [dependencies]
 fp-core.workspace = true
+fp-character.workspace = true
+fp-physics.workspace = true
+fp-input.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Test-only: synthetic LoadedCharacter/HitDef construction for the headless
+# Match tests. Both crates already exist at the workspace level (fp-character
+# brings them transitively at runtime); declaring them here only edits this
+# crate's own manifest, not the root.
+fp-formats.workspace = true
+fp-combat.workspace = true

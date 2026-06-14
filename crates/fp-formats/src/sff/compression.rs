@@ -1,7 +1,7 @@
 //! SFF v2 sprite decompression routines.
 //!
-//! Implements the RLE8, RLE5, and LZ5 decompression algorithms used by SFF v2
-//! sprite data. PNG-based formats return an unsupported-format error.
+//! Implements the RLE8 decompression algorithm used by most SFF v2 sprite data.
+//! RLE5, LZ5, and PNG-based formats are stubbed with error returns.
 
 use fp_core::{FpError, FpResult};
 
@@ -186,13 +186,25 @@ pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
 
 /// Decompresses LZ5-encoded sprite data.
 ///
-/// LZ5 is an LZ77-style compression using an 8192-byte sliding window.
-/// A control byte encodes 8 operations (LSB first):
-/// - Bit = 1: literal byte — read one byte and output it.
-/// - Bit = 0: back reference — read a 16-bit LE value; lower 13 bits are the
-///   offset into the recycling buffer, upper 3 bits + 2 give the copy length.
+/// LZ5 is MUGEN's bespoke LZ77 variant for SFF v2. The first 4 bytes are a
+/// little-endian `u32` giving the decompressed size; the bit-stream follows.
 ///
-/// The first 4 bytes are a little-endian u32 giving the decompressed size.
+/// Decoding processes tokens grouped under a *control byte*: its 8 bits (LSB
+/// first) flag each token as a **back-reference** (bit set) or a **literal run**
+/// (bit clear). A fresh control byte is fetched after every 8 tokens.
+///
+/// - **Literal run** (control bit clear): the token byte `d` is either a short
+///   run (`d & 0xE0 != 0`) whose length is `d >> 5` and color is `d & 0x1F`, or a
+///   long run (`d & 0xE0 == 0`) whose length is `next_byte + 8` of color 0.
+/// - **Back-reference** (control bit set): copies already-emitted bytes at a
+///   relative distance `d` behind the write head. Short references pack the high
+///   two bits of `d` across consecutive tokens via a "recycled bits" accumulator
+///   (`rb`/`rbc`); long references (`d & 0x3F == 0`) spell out the distance and
+///   length in following bytes.
+///
+/// This mirrors the reference Elecbyte / Ikemen GO algorithm. All indexing is
+/// bounds-checked so malformed input yields a best-effort, zero-padded buffer
+/// rather than panicking (never-crash).
 pub fn decompress_lz5(data: &[u8]) -> FpResult<Vec<u8>> {
     if data.len() < 4 {
         return Err(FpError::parse(
@@ -204,75 +216,125 @@ pub fn decompress_lz5(data: &[u8]) -> FpResult<Vec<u8>> {
     let decompressed_size =
         u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
-    let mut output = Vec::with_capacity(decompressed_size);
-    let mut recycling_buf = vec![0u8; 8192];
-    let mut buf_pos: usize = 0;
-    let mut i = 4;
+    // The compressed bit-stream begins after the 4-byte size prefix.
+    let rle = &data[4..];
+    let mut p = vec![0u8; decompressed_size];
 
-    while i < data.len() && output.len() < decompressed_size {
-        if i >= data.len() {
-            break;
+    if rle.is_empty() || decompressed_size == 0 {
+        return Ok(p);
+    }
+
+    // `i` advances through `rle`; like the reference decoder it saturates at the
+    // last byte (`next` below) so a truncated stream re-reads the final byte
+    // rather than overrunning — the output-size bound still terminates the loop.
+    let mut i = 0usize;
+    let mut j = 0usize; // write head into `p`
+    let mut n: usize; // current run / copy length
+
+    // Recycled-bits accumulator for short back-reference distances.
+    let mut rb: u8 = 0;
+    let mut rbc: u32 = 0;
+
+    let next = |i: &mut usize| {
+        if *i < rle.len() - 1 {
+            *i += 1;
         }
-        let control = data[i];
-        i += 1;
+    };
 
-        for bit in 0..8 {
-            if output.len() >= decompressed_size {
-                break;
-            }
+    let mut ct = rle[i];
+    let mut cts: u32 = 0;
+    next(&mut i);
 
-            if (control >> bit) & 1 == 1 {
-                // Literal byte
-                if i >= data.len() {
-                    return Err(FpError::parse(
-                        "SFF",
-                        "LZ5 unexpected end of data during literal read",
-                    ));
-                }
-                let byte = data[i];
-                i += 1;
+    while j < decompressed_size {
+        let d_byte = rle[i];
+        next(&mut i);
 
-                output.push(byte);
-                recycling_buf[buf_pos] = byte;
-                buf_pos = (buf_pos + 1) % 8192;
+        if ct & (1u8 << cts) != 0 {
+            // Back-reference token.
+            let dist: usize;
+            if d_byte & 0x3f == 0 {
+                // Long reference: distance and length spelled out in next bytes.
+                let dd = ((d_byte as usize) << 2 | rle[i] as usize) + 1;
+                next(&mut i);
+                n = rle[i] as usize + 2;
+                next(&mut i);
+                dist = dd;
             } else {
-                // Back reference
-                if i + 1 >= data.len() {
-                    return Err(FpError::parse(
-                        "SFF",
-                        "LZ5 unexpected end of data during back-reference read",
-                    ));
+                // Short reference: accumulate the high two bits across tokens.
+                rb |= (d_byte & 0xc0) >> rbc;
+                rbc += 2;
+                n = (d_byte & 0x3f) as usize;
+                if rbc < 8 {
+                    dist = rle[i] as usize + 1;
+                    next(&mut i);
+                } else {
+                    dist = rb as usize + 1;
+                    rb = 0;
+                    rbc = 0;
                 }
-                let value = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-
-                let ref_offset = (value & 0x1FFF) as usize;
-                let copy_length = (((value >> 13) & 0x07) + 2) as usize;
-
-                for j in 0..copy_length {
-                    if output.len() >= decompressed_size {
+            }
+            // Copy `n + 1` bytes from `dist` behind the write head.
+            loop {
+                if j < decompressed_size && dist <= j {
+                    p[j] = p[j - dist];
+                    j += 1;
+                } else if j < decompressed_size {
+                    // Distance points before the start of output: emit 0 to keep
+                    // the geometry intact instead of panicking on `j - dist`.
+                    p[j] = 0;
+                    j += 1;
+                }
+                if n == 0 {
+                    break;
+                }
+                n -= 1;
+            }
+        } else {
+            // Literal-run token.
+            if d_byte & 0xe0 == 0 {
+                // Long run of zeros: length spelled out in the next byte.
+                n = rle[i] as usize + 8;
+                next(&mut i);
+                for _ in 0..n {
+                    if j >= decompressed_size {
                         break;
                     }
-                    let byte = recycling_buf[(ref_offset + j) % 8192];
-                    output.push(byte);
-                    recycling_buf[buf_pos] = byte;
-                    buf_pos = (buf_pos + 1) % 8192;
+                    p[j] = 0;
+                    j += 1;
+                }
+            } else {
+                // Short run: count in the high 3 bits, color in the low 5.
+                n = (d_byte >> 5) as usize;
+                let color = d_byte & 0x1f;
+                while n > 0 {
+                    if j >= decompressed_size {
+                        break;
+                    }
+                    p[j] = color;
+                    j += 1;
+                    n -= 1;
                 }
             }
         }
+
+        cts += 1;
+        if cts >= 8 {
+            ct = rle[i];
+            cts = 0;
+            next(&mut i);
+        }
     }
 
-    // Pad with zeros if we didn't reach the expected size
-    if output.len() < decompressed_size {
+    if j < decompressed_size {
         tracing::warn!(
             expected = decompressed_size,
-            actual = output.len(),
+            actual = j,
             "LZ5 decompressed data shorter than expected, padding with zeros"
         );
-        output.resize(decompressed_size, 0);
+        // `p` is already zero-initialized to `decompressed_size`.
     }
 
-    Ok(output)
+    Ok(p)
 }
 
 /// Stub for PNG sprite decoding (not yet implemented).
@@ -416,6 +478,26 @@ mod tests {
     }
 
     #[test]
+    fn rle5_truncated_stream_pads_without_panicking() {
+        // Declares 8 output bytes but supplies only one packet's header. The
+        // decoder must terminate (never-crash) and zero-pad to the declared size.
+        //   rl byte = 0x02 -> rl = 2 (emit colour 3 times)
+        //   data    = 0x80 -> dl = 0, explicit-colour flag set
+        //   colour  = 0x09 -> c = 9  -> emit [9,9,9]
+        // The read head then saturates on the last byte; remaining packets write
+        // zero-derived padding until the 8-byte buffer is full.
+        let data = [
+            8, 0, 0, 0, //
+            0x02,       // rl = 2
+            0x80,       // dl = 0, explicit-colour flag set
+            0x09,       // colour = 9
+        ];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result.len(), 8, "output must match declared size");
+        assert_eq!(&result[0..3], &[9, 9, 9], "real pixels preserved");
+    }
+
+    #[test]
     fn rle5_flag_clear_with_segments() {
         // size = 4. Header data byte has the high bit CLEAR, so the header colour
         // defaults to 0 and NO explicit colour byte is read; dl = 1 still pulls one
@@ -452,59 +534,82 @@ mod tests {
         assert!(err.to_string().contains("exceeds sane limit"));
     }
 
+    // ---- LZ5 tests ----
+    //
+    // These exercise the *real* MUGEN LZ5 codec (Elecbyte / Ikemen GO layout),
+    // not a generic LZ77. The control byte's bits run LSB-first: a clear bit is a
+    // literal run, a set bit is a back-reference. Each test byte sequence below is
+    // hand-traced in its comments. The decoder is validated end-to-end against the
+    // real `kfm.sff` fixture in `tests/real_content.rs`.
+
     #[test]
-    fn rle5_truncated_stream_pads_without_panicking() {
-        // Declares 8 output bytes but supplies only one packet's header. The
-        // decoder must terminate (never-crash) and zero-pad to the declared size.
-        //   rl byte = 0x02 -> rl = 2 (emit colour 3 times)
-        //   data    = 0x80 -> dl = 0, explicit-colour flag set
-        //   colour  = 0x09 -> c = 9  -> emit [9,9,9]
-        // The read head then saturates on the last byte; remaining packets write
-        // zero-derived padding until the 8-byte buffer is full.
+    fn lz5_short_literal_runs() {
+        // size = 3. Control = 0x00 (both tokens are literals).
+        //   token 0xC3? No — short-literal run: length = d>>5, color = d&0x1f.
+        //   token 0x43 -> n=2, color=3 -> emit 3,3
+        //   token 0x27 -> n=1, color=7 -> emit 7
+        let data = [
+            3, 0, 0, 0, //
+            0x00,       // control: bits clear -> literal tokens
+            0x43,       // n=2 (0x43>>5), color=3 (0x43&0x1f)
+            0x27,       // n=1, color=7
+        ];
+        let result = decompress_lz5(&data).unwrap();
+        assert_eq!(result, vec![3, 3, 7]);
+    }
+
+    #[test]
+    fn lz5_long_zero_run() {
+        // A literal token with the top 3 bits clear (d & 0xe0 == 0) is a long run
+        // of zeros: length = next_byte + 8.
         let data = [
             8, 0, 0, 0, //
-            0x02,       // rl = 2
-            0x80,       // dl = 0, explicit-colour flag set
-            0x09,       // colour = 9
-        ];
-        let result = decompress_rle5(&data).unwrap();
-        assert_eq!(result.len(), 8, "output must match declared size");
-        assert_eq!(&result[0..3], &[9, 9, 9], "real pixels preserved");
-    }
-
-    // ---- LZ5 tests ----
-
-    #[test]
-    fn lz5_literals_only() {
-        // Decompressed size = 3, control byte = 0b00000111 (3 literal bits)
-        let data = [
-            3, 0, 0, 0, // decompressed size = 3
-            0x07,       // control: bits 0,1,2 = 1 (literal), rest 0
-            0xAA,       // literal byte 1
-            0xBB,       // literal byte 2
-            0xCC,       // literal byte 3
+            0x00,       // control: bit0 clear -> literal
+            0x00,       // d & 0xe0 == 0 -> long zero run
+            0x00,       // length = 0 + 8 = 8 zeros
         ];
         let result = decompress_lz5(&data).unwrap();
-        assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(result, vec![0; 8]);
     }
 
     #[test]
-    fn lz5_back_reference() {
-        // Write 2 literal bytes, then back-reference them
-        // Decompressed size = 4
-        // Control byte: bits 0,1 = 1 (literal), bit 2 = 0 (back-ref)
-        // Control = 0b00000011 = 0x03
-        // Back-ref: offset = 0, length_bits = 0 -> copy_length = 0 + 2 = 2
-        // value = (0 << 13) | 0 = 0x0000
+    fn lz5_short_back_reference() {
+        // Emit one literal, then a short back-reference that copies it forward.
+        //   control = 0x02: bit0 clear (literal), bit1 set (back-ref)
+        //   literal token 0x29 -> n=1, color=9 -> emit 9
+        //   back-ref token 0x01: d&0x3f=1 (n=1 -> copy n+1 = 2 bytes),
+        //     rbc<8 so distance = next_byte + 1 = 0 + 1 = 1
+        //   copy 2 bytes at distance 1: p[1]=p[0]=9, p[2]=p[1]=9
         let data = [
-            4, 0, 0, 0,
-            0x03,       // control: bit0=1(lit), bit1=1(lit), bit2=0(ref)
-            0x11,       // literal: 0x11 -> recycling_buf[0]
-            0x22,       // literal: 0x22 -> recycling_buf[1]
-            0x00, 0x00, // back-ref: offset=0, length=0+2=2 -> copies buf[0],buf[1]
+            3, 0, 0, 0, //
+            0x02,       // control: bit0=lit, bit1=back-ref
+            0x29,       // literal: n=1, color=9
+            0x01,       // short back-ref: n=1, distance from next byte
+            0x00,       // distance - 1 = 0 -> distance = 1
         ];
         let result = decompress_lz5(&data).unwrap();
-        assert_eq!(result, vec![0x11, 0x22, 0x11, 0x22]);
+        assert_eq!(result, vec![9, 9, 9]);
+    }
+
+    #[test]
+    fn lz5_long_back_reference() {
+        // Emit 1,2,3 as literals, then a long back-reference copying them.
+        //   control = 0x08: bits 0..2 clear (literals), bit3 set (back-ref)
+        //   literals 0x21,0x22,0x23 -> emit 1,2,3
+        //   long back-ref: token 0x00 (d & 0x3f == 0) ->
+        //     dist = (0<<2 | next=0x02) + 1 = 3
+        //     n    = next2=0x00 + 2 = 2 -> copy n+1 = 3 bytes
+        //   copy 3 bytes at distance 3: p[3..6] = p[0..3] = 1,2,3
+        let data = [
+            6, 0, 0, 0, //
+            0x08,       // control: 3 literals then a back-ref
+            0x21, 0x22, 0x23, // literals 1, 2, 3
+            0x00,       // long back-ref marker (d & 0x3f == 0)
+            0x02,       // distance bytes -> dist = 3
+            0x00,       // length byte -> n = 2 -> copy 3 bytes
+        ];
+        let result = decompress_lz5(&data).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 1, 2, 3]);
     }
 
     #[test]
@@ -522,20 +627,27 @@ mod tests {
     }
 
     #[test]
-    fn lz5_longer_back_reference() {
-        // Write 1 literal byte, then back-reference it with length 5
-        // Decompressed size = 6
-        // Control = 0b00000001 = 0x01 (bit0=1 literal, bit1=0 ref)
-        // Back-ref: offset=0, length_bits=3 -> copy_length=3+2=5
-        // value = (3 << 13) | 0 = 0x6000
+    fn lz5_truncated_stream_pads_without_panicking() {
+        // Declares 64 output bytes but supplies almost no stream. The decoder
+        // must terminate (never-crash) and zero-pad to the declared size.
         let data = [
-            6, 0, 0, 0,
-            0x01,       // control: bit0=1(lit), bit1=0(ref)
-            0xFF,       // literal: 0xFF -> recycling_buf[0]
-            0x00, 0x60, // back-ref: 0x6000 LE -> offset=0, length=3+2=5
+            64, 0, 0, 0, //
+            0x00,        // control: literal
+            0x21,        // single literal token (n=1, color=1)
         ];
         let result = decompress_lz5(&data).unwrap();
-        assert_eq!(result, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(result.len(), 64, "output must match declared size");
+        // First byte is the one real pixel; the remainder is zero padding.
+        assert_eq!(result[0], 1);
+    }
+
+    #[test]
+    fn lz5_output_only_prefix_yields_zeroes() {
+        // Just the 4-byte size prefix with an empty bit-stream: a valid, fully
+        // zero-padded buffer, never an error or panic.
+        let data = [5, 0, 0, 0];
+        let result = decompress_lz5(&data).unwrap();
+        assert_eq!(result, vec![0; 5]);
     }
 
     #[test]

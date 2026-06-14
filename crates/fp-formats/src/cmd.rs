@@ -132,10 +132,13 @@ impl CmdFile {
 
     /// Parses a CMD file from a string.
     ///
+    /// Tolerates a leading UTF-8 BOM (real MUGEN `.cmd` files are commonly saved
+    /// UTF-8-with-BOM) and CRLF line endings.
+    ///
     /// # Errors
     ///
-    /// Returns [`FpError::Parse`] only when truly unrecoverable. Missing or
-    /// malformed commands are logged as warnings and skipped.
+    /// Returns [`fp_core::FpError::Parse`] only when truly unrecoverable. Missing
+    /// or malformed commands are logged as warnings and skipped.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> FpResult<Self> {
         let mut defaults = CmdDefaults::default();
@@ -143,7 +146,11 @@ impl CmdFile {
         let mut section = Section::None;
         let mut builder: Option<CommandBuilder> = None;
 
+        // Strip a leading UTF-8 BOM if present so the first line parses cleanly.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
         for raw_line in text.lines() {
+            // `lines()` already strips the trailing `\r` of CRLF endings.
             let line = strip_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
@@ -402,5 +409,16 @@ command = y
         let cmd = CmdFile::from_str(text).unwrap();
         assert_eq!(cmd.commands.len(), 1);
         assert_eq!(cmd.commands[0].name, "valid");
+    }
+
+    #[test]
+    fn leading_bom_and_crlf_tolerated() {
+        // Real MUGEN `.cmd` files are UTF-8-with-BOM and CRLF-terminated; the
+        // BOM can land directly on a `[Command]` header.
+        let text = "\u{feff}[Command]\r\nname = \"QCF_x\"\r\ncommand = ~D, DF, F, x\r\n";
+        let cmd = CmdFile::from_str(text).unwrap();
+        assert_eq!(cmd.commands.len(), 1, "command must parse despite BOM/CRLF");
+        assert_eq!(cmd.commands[0].name, "QCF_x");
+        assert_eq!(cmd.commands[0].command, "~D, DF, F, x");
     }
 }
