@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 fp-core.workspace = true
+fp-physics.workspace = true
 tracing.workspace = true

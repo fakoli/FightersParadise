@@ -133,13 +133,21 @@ finalized fp-vm `EvalContext`. **Phase 4 is complete** (4.1–4.6, 4.8, 4.10, 4.
 | 5.6b | DONE | `alive` trigger (+ common-state trigger audit) | `fp-character` | ✅ `alive`=>Life>0 (case-insensitive); audited all kfm/common1 triggers, documented the rest (HitOver/RoundState/P2BodyDist…) as deferred to Phase 6/7. +10 tests; 1073 workspace. Critic PASS. Commit `470dafe`. | 5.5 |
 | 5.6c | DONE | Remove fp-app band-aids (faithful KFM walk) | `fp-app` | ✅ 2 of 3 band-aids removed (raw `/$F` compiles; `alive` keeps stand out of death 5050). Strengthened walk test (state 20 + strictly advancing). 1 minimal TODO'd shim left, gated on 2 diagnosed gaps → 5.6d + CB25. 1084 tests. Commit `7983361`. | 5.6a, 5.6b |
 | 5.6d | DOING | **`const(<member>)` resolution** (vm routing) | `fp-vm` | Route `const(<member>)` like `GetHitVar` — pass the member NAME via `trigger_str` (member-keyed func set), not evaluate the dotted ident as a nested trigger. Additive/safe. Enables 5.6e. | 4.11 |
-| 5.6e | TODO | **`const(<member>)` resolution** (char resolver) | `fp-character` | `trigger_str("const", member)` resolves the named constant from `self.constants` (e.g. `velocity.walk.fwd.x`→2.4). Then KFM `[Statedef 20]` `VelSet x=const(velocity.walk.fwd.x)` works natively → remove the shim's velocity-repair (CB26). | 5.6d |
+| 5.6e | DONE | **`const(<member>)` resolution** (char resolver) | `fp-character` | ✅ `trigger_str("const",member)` → CharacterConstants (velocity/size/movement/data). Gated KFM test: `const(velocity.walk.fwd.x)`==2.4 via parse+eval. +17 tests; 1125 workspace. Commit `2dc4e09`. **Closes the const() gap.** Residuals: CB26 (drop shim velocity-repair), CB25 (stand↔walk engine built-in). | 5.6d |
 
-### Phase 6 — `fp-combat`  *(expand when reached)*
-HitDef application; Clsn1×Clsn2 overlap; priority/trade; damage; guard; p1/p2 state-takeover;
-GetHitVars; juggle. Deps: Phase 5.
-- Physics prep already done: **P6.1** ✅ AABB (`collision.rs`), **P6.2** ✅ player-push + bound-clamp
-  (`push.rs`). Both Critic-reviewed (P6.2 cosmetic doctest nit → CB15).
+### Phase 6 — `fp-combat` (characters can fight)
+
+Built on the faithful VM (const/alive/commands resolved). Physics prep done: **P6.1** ✅ AABB
+(`collision.rs`), **P6.2** ✅ push/bound (`push.rs`).
+
+| ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
+|----|--------|------|----------|--------------------|------|
+| 6.1 | DOING | **HitDef data model + hit-detection primitive** | `fp-combat` | Define a concrete `HitDef` (attr `S/C/A`+`{N\|S\|H}{A\|T\|P}`, damage, guardflag/hitflag, pausetime, ground/air velocity, fall, p1/p2 stateno, sparkno/sound, priority) as plain data (numeric — controller evaluates exprs in 6.2). A pure `detect_hit(attacker Clsn1 + pos/facing, defender Clsn2 + pos/facing, &HitDef) -> Option<HitContact>` using fp-physics `place_clsn`/`any_overlap`. Deps fp-core+fp-physics only (no cycle). Tested with synthetic boxes. | P6.1 |
+| 6.2 | TODO | **HitDef controller + GetHitVars + get-hit states** | `fp-character` | `HitDef` state controller evaluates its param exprs (via fp-vm against the attacker) → builds `fp_combat::HitDef`, stores `Character.active_hitdef`. Implement `GetHitVar(...)` (deferred from 5.6b) from a `GetHitVars` struct populated on hit. Wire common get-hit states (5000–5xxx). | 6.1 |
+| 6.3 | TODO | **Hit resolution + apply** | `fp-combat`+`fp-character` | Given a `HitContact` + defender: hitflag/guardflag/stance check (block vs hit), damage, hitpause (both sides), get-hit velocities, `p2stateno` state-takeover, fall/juggle accounting. Unit-tested with two synthetic Characters. | 6.2 |
+
+(Live two-player fights on screen — ticking P1+P2, running detection each tick, KO/round — are
+**Phase 7** `fp-engine` + fp-app, where the demo becomes an actual match.)
 
 ### Phase 7 — `fp-engine` (round flow)  *(expand when reached)*
 Move loop out of `fp-app`; P1/P2 coordination; round states (intro→fight→KO→win); timer; win
