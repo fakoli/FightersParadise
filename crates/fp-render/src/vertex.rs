@@ -43,3 +43,40 @@ impl SpriteVertex {
         }
     }
 }
+
+/// A vertex for the unlit debug overlay (collision-box outlines/fills).
+///
+/// Carries a screen-space position and a per-vertex RGBA color; the debug
+/// shader performs no texture lookup, so this is all the geometry it needs.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DebugVertex {
+    /// Screen-space position in pixels.
+    pub position: [f32; 2],
+    /// Per-vertex color, RGBA in the range 0.0–1.0.
+    pub color: [f32; 4],
+}
+
+impl DebugVertex {
+    /// Returns the vertex buffer layout descriptor for the debug pipeline.
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<DebugVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                // position
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                // color
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}

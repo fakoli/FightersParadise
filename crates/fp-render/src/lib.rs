@@ -19,6 +19,6 @@ mod vertex;
 pub use animation::AnimController;
 pub use atlas::{AtlasRegion, TextureAtlas};
 pub use params::{BlendMode, SpriteDrawParams};
-pub use renderer::{RenderFrame, Renderer};
+pub use renderer::{DebugBox, RenderFrame, Renderer};
 pub use texture::{PaletteTexture, SpriteTexture};
-pub use vertex::SpriteVertex;
+pub use vertex::{DebugVertex, SpriteVertex};
