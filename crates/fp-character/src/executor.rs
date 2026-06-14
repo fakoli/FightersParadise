@@ -374,6 +374,20 @@ impl Character {
         // character asserts nothing.)
         self.asserted.clear();
         self.cur_width.clear();
+        // Per-tick `HitDef`-fired flag (#16): cleared here, set by `ctrl_hit_def`.
+        // A same-tick `ChangeState` consults it so a freshly-set HitDef survives
+        // the move for this frame's detection (see `apply_state_entry`).
+        self.hitdef_set_this_tick = false;
+
+        // Air-juggle refill (#16): while the character is on the ground its juggle
+        // pool is full. MUGEN refills the points when the defender lands; doing it
+        // at the start of every grounded tick is equivalent (the pool is only ever
+        // spent while airborne, by hit resolution) and keeps the rule a simple,
+        // self-contained field write. A character knocked airborne therefore
+        // starts the combo with its full `[Data] airjuggle` allowance.
+        if self.state_type != StateType::Air {
+            self.juggle_points = self.constants.airjuggle;
+        }
 
         // Build the opponent's cross-entity context ONCE for this whole tick. Its
         // own opponent is `None` (a single level of `p2, ...` is enough for KFM /
@@ -1001,6 +1015,8 @@ impl Character {
             self.ctrl_hit_fall_damage();
         } else if kind.eq_ignore_ascii_case("HitOverride") {
             self.ctrl_hit_override(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("SprPriority") {
+            self.ctrl_spr_priority(ctrl, env);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -1941,6 +1957,9 @@ impl Character {
             hd.givepower
         );
         self.active_hitdef = Some(hd);
+        // Mark that a HitDef was established this tick so a later same-tick
+        // `ChangeState` does not clear it before this frame's hit detection (#16).
+        self.hitdef_set_this_tick = true;
     }
 
     /// `NotHitBy` / `HitBy`: install an attack-attribute invulnerability window
@@ -2090,6 +2109,28 @@ impl Character {
             .eval_param_component(param, 1, env)
             .map_or(front, |v| v.to_float());
         self.cur_width.set(front, back);
+    }
+
+    /// `SprPriority`: set the character's sprite-draw priority mid-state
+    /// (faithfulness audit #16).
+    ///
+    /// `value` is the new priority: higher draws **in front of** lower. The
+    /// renderer (`fp-app`) orders the two fighters by
+    /// [`Character::cur_sprpriority`] each frame, so a move can pull its sprite in
+    /// front of (or behind) the opponent — common1 uses this dynamically (e.g.
+    /// the throw / get-hit states). A missing or unparseable `value` is a safe
+    /// no-op (the priority is left at its current value); never panics.
+    fn ctrl_spr_priority(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(param) = ctrl.params.get("value") else {
+            tracing::debug!(
+                "tick: SprPriority in state {} had no value; no-op",
+                ctrl.state_number
+            );
+            return;
+        };
+        if let Some(v) = self.eval_param_component(param, 0, env) {
+            self.cur_sprpriority = v.to_int();
+        }
     }
 
     /// `HitVelSet`: (re)set the character's velocity from its `GetHitVar` x/y
@@ -2399,6 +2440,65 @@ impl Character {
         if let Some(poweradd_expr) = &state.poweradd {
             let delta = self.eval_value(poweradd_expr, env).to_int();
             self.add_power_clamped(delta);
+        }
+
+        // `sprpriority` (#16): set the sprite-draw priority on entry. Higher draws
+        // in front. Absent leaves the current priority unchanged (MUGEN keeps the
+        // last value rather than resetting it on every state change).
+        if let Some(spr_expr) = &state.sprpriority {
+            self.cur_sprpriority = self.eval_value(spr_expr, env).to_int();
+        }
+
+        // `juggle` (#16): the air-juggle cost of THIS move, charged to the
+        // defender's juggle pool on an airborne hit. A state with no `juggle`
+        // header costs nothing (`0`), so a non-attack state never spends juggle.
+        // Read on every entry so the cost always reflects the current move.
+        self.cur_juggle_cost = state
+            .juggle
+            .as_ref()
+            .map_or(0, |e| self.eval_value(e, env).to_int());
+
+        // `facep2` (#16): when truthy, turn to face the opponent. Throw states use
+        // it (KFM state 810). Resolve which way the opponent is via the opponent
+        // context in view; a self-only entry (no opponent) cannot determine a
+        // direction and leaves the facing unchanged.
+        if let Some(facep2_expr) = &state.facep2 {
+            if self.eval_value(facep2_expr, env).as_bool() {
+                if let Some(opp) = env.opponent {
+                    let opp_x = opp.me_pos_x();
+                    self.facing = if opp_x >= self.pos.x {
+                        Facing::Right
+                    } else {
+                        Facing::Left
+                    };
+                }
+            }
+        }
+
+        // `hitdefpersist` / `movehitpersist` (#16): MUGEN clears the active HitDef
+        // and the move-hit / move-contact flags on a state change UNLESS the
+        // corresponding persist flag is set. Honor the flags: clear by default,
+        // keep when persist is truthy.
+        let hitdef_persist = state
+            .hitdefpersist
+            .as_ref()
+            .is_some_and(|e| self.eval_value(e, env).as_bool());
+        // Clear the active HitDef on a state change, UNLESS `hitdefpersist` is set
+        // OR the HitDef was set during THIS tick. The latter exception preserves
+        // MUGEN's frame semantics: a HitDef set earlier this tick stays live for
+        // this frame's hit detection (which the round coordinator runs after the
+        // tick) even when a later same-tick `ChangeState` moves the character on —
+        // so a `HitDef` + same-tick `ChangeState(... AnimTime=0)` state still
+        // connects. A HitDef set on a PRIOR tick (not re-set this tick) is dropped.
+        if !hitdef_persist && !self.hitdef_set_this_tick {
+            self.active_hitdef = None;
+        }
+        let movehit_persist = state
+            .movehitpersist
+            .as_ref()
+            .is_some_and(|e| self.eval_value(e, env).as_bool());
+        if !movehit_persist {
+            self.move_connect.reset();
         }
     }
 
@@ -2889,6 +2989,10 @@ mod tests {
         ctrl: Option<&'a str>,
         velset: Option<&'a str>,
         poweradd: Option<&'a str>,
+        sprpriority: Option<&'a str>,
+        facep2: Option<&'a str>,
+        hitdefpersist: Option<&'a str>,
+        movehitpersist: Option<&'a str>,
     }
 
     /// Builds a compiled state with the given entry params and controllers.
@@ -2902,6 +3006,11 @@ mod tests {
             ctrl: e.ctrl.map(CompiledExpr::compile),
             velset: e.velset.map(str::to_string),
             poweradd: e.poweradd.map(CompiledExpr::compile),
+            sprpriority: e.sprpriority.map(CompiledExpr::compile),
+            juggle: None,
+            facep2: e.facep2.map(CompiledExpr::compile),
+            hitdefpersist: e.hitdefpersist.map(CompiledExpr::compile),
+            movehitpersist: e.movehitpersist.map(CompiledExpr::compile),
             controllers,
         }
     }
@@ -10239,5 +10348,254 @@ mod tests {
         lc.tick(&mut ch);
         // No slot armed.
         assert!(ch.hit_overrides.slots.iter().all(|s| !s.is_active()));
+    }
+
+    // ====================================================================
+    // #16: Statedef `sprpriority` / `SprPriority` controller / `facep2` /
+    // `hitdefpersist` / `movehitpersist` on state entry.
+    // ====================================================================
+
+    /// A `[Statedef] sprpriority = 3` header sets `cur_sprpriority` on entry.
+    #[test]
+    fn sprpriority_header_sets_priority_on_entry() {
+        let st0 = stand_n(0, vec![]);
+        let st9 = state(
+            9,
+            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), sprpriority: Some("3"), ..Entry::default() },
+            vec![],
+        );
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(st0.number, st0);
+            m.insert(st9.number, st9);
+            m
+        };
+        let mut ch = Character::new();
+        assert_eq!(ch.cur_sprpriority, 0, "default priority is 0");
+        ch.change_state(&states, 9);
+        assert_eq!(ch.cur_sprpriority, 3, "sprpriority header applied on entry");
+    }
+
+    /// The `SprPriority` controller sets `cur_sprpriority` mid-state.
+    #[test]
+    fn spr_priority_controller_sets_priority_mid_state() {
+        let spr = ctrl(0, "SprPriority", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let st0 = stand_n(0, vec![spr]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        assert_eq!(ch.cur_sprpriority, 0);
+        lc.tick(&mut ch);
+        assert_eq!(ch.cur_sprpriority, 5, "SprPriority controller set the priority");
+    }
+
+    /// `SprPriority` with no `value` is a safe no-op (priority unchanged).
+    #[test]
+    fn spr_priority_controller_without_value_is_noop() {
+        let spr = ctrl(0, "SprPriority", &[], &[(1, &["1"])], None, &[]);
+        let st0 = stand_n(0, vec![spr]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.cur_sprpriority = 2;
+        lc.tick(&mut ch);
+        assert_eq!(ch.cur_sprpriority, 2, "missing value leaves the priority unchanged");
+    }
+
+    /// Entering a `facep2 = 1` state turns the character to face the opponent.
+    #[test]
+    fn facep2_header_faces_opponent_on_entry() {
+        // P1 at x=0 facing LEFT (wrong way); opponent at x=100 (to the right).
+        // Entering a facep2 state must flip P1 to face Right (toward the opponent).
+        let st0 = stand_n(0, vec![]);
+        let throw = state(
+            810,
+            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), facep2: Some("1"), ..Entry::default() },
+            vec![
+                // A ChangeState back to 0 must NOT fire this tick; gate it off.
+            ],
+        );
+        let air = tiny_air(0, &[5]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(810, throw);
+            m
+        };
+
+        let mut me = Character::new();
+        me.pos = Vec2::new(0.0, 0.0);
+        me.facing = Facing::Left;
+        me.state_no = 810;
+
+        let mut opp = Character::new();
+        opp.pos = Vec2::new(100.0, 0.0);
+
+        // Tick `me` with the opponent in view; the state-810 entry already
+        // happened via state_no assignment, so drive entry through a real
+        // change_state under an opponent-aware tick instead: re-enter from tick.
+        // Simplest: enter via the cross-entity path inside tick_with by having
+        // state 0 ChangeState to 810. Build that:
+        let to_throw = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "810")]);
+        let st0b = stand_n(0, vec![to_throw]);
+        let mut states2 = states;
+        states2.insert(0, st0b);
+        me.state_no = 0;
+        me.facing = Facing::Left;
+
+        me.tick_with(&states2, &air, Some(&opp), StageView::default());
+        assert_eq!(me.state_no, 810, "entered the throw state");
+        assert_eq!(me.facing, Facing::Right, "facep2 turned me to face the opponent on my right");
+    }
+
+    /// A facep2 entry with NO opponent in view leaves the facing unchanged.
+    #[test]
+    fn facep2_without_opponent_is_noop() {
+        let st0 = stand_n(0, vec![]);
+        let throw = state(
+            810,
+            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), facep2: Some("1"), ..Entry::default() },
+            vec![],
+        );
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(810, throw);
+            m
+        };
+        let mut ch = Character::new();
+        ch.facing = Facing::Left;
+        // change_state uses the self-only env (no opponent) — facing must not flip.
+        ch.change_state(&states, 810);
+        assert_eq!(ch.facing, Facing::Left, "no opponent -> facep2 leaves facing unchanged");
+    }
+
+    /// On a plain state entry (no `hitdefpersist`) the active HitDef is cleared.
+    #[test]
+    fn state_entry_clears_active_hitdef_by_default() {
+        let st0 = stand_n(0, vec![]);
+        let st5 = stand_n(5, vec![]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(5, st5);
+            m
+        };
+        let mut ch = Character::new();
+        ch.active_hitdef = Some(fp_combat::HitDef::default());
+        // change_state happens outside a tick, so `hitdef_set_this_tick` is false:
+        // a carried-over HitDef is cleared.
+        ch.change_state(&states, 5);
+        assert!(ch.active_hitdef.is_none(), "default entry clears a stale HitDef");
+    }
+
+    /// `hitdefpersist = 1` keeps the active HitDef across a state change.
+    #[test]
+    fn hitdefpersist_keeps_active_hitdef_across_state_change() {
+        let st0 = stand_n(0, vec![]);
+        let persist = state(
+            5,
+            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), hitdefpersist: Some("1"), ..Entry::default() },
+            vec![],
+        );
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(5, persist);
+            m
+        };
+        let mut ch = Character::new();
+        ch.active_hitdef = Some(fp_combat::HitDef::default());
+        ch.change_state(&states, 5);
+        assert!(ch.active_hitdef.is_some(), "hitdefpersist=1 keeps the active HitDef");
+    }
+
+    /// On a plain state entry (no `movehitpersist`) the move-hit flags reset.
+    #[test]
+    fn state_entry_resets_move_connect_by_default() {
+        let st0 = stand_n(0, vec![]);
+        let st5 = stand_n(5, vec![]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(5, st5);
+            m
+        };
+        let mut ch = Character::new();
+        ch.move_connect.hit = true;
+        ch.change_state(&states, 5);
+        assert!(!ch.move_connect.contact(), "default entry resets move-hit flags");
+    }
+
+    /// `movehitpersist = 1` keeps the move-hit flags across a state change.
+    #[test]
+    fn movehitpersist_keeps_move_connect_across_state_change() {
+        let st0 = stand_n(0, vec![]);
+        let persist = state(
+            5,
+            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), movehitpersist: Some("1"), ..Entry::default() },
+            vec![],
+        );
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(5, persist);
+            m
+        };
+        let mut ch = Character::new();
+        ch.move_connect.hit = true;
+        ch.change_state(&states, 5);
+        assert!(ch.move_connect.hit, "movehitpersist=1 keeps the move-hit flag");
+    }
+
+    /// The `juggle` header sets `cur_juggle_cost` on entry; absent leaves it 0.
+    #[test]
+    fn juggle_header_sets_cur_juggle_cost_on_entry() {
+        // Build a state carrying a juggle cost directly (the Entry builder pins
+        // juggle to None, so construct the CompiledState by hand here).
+        let attack = CompiledState {
+            number: 200,
+            state_type: Some("S".into()),
+            movetype: Some("A".into()),
+            physics: Some("S".into()),
+            anim: Some(CompiledExpr::compile("200")),
+            ctrl: None,
+            velset: None,
+            poweradd: None,
+            sprpriority: None,
+            juggle: Some(CompiledExpr::compile("30")),
+            facep2: None,
+            hitdefpersist: None,
+            movehitpersist: None,
+            controllers: vec![],
+        };
+        let st0 = stand_n(0, vec![]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert(0, st0);
+            m.insert(200, attack);
+            m
+        };
+        let mut ch = Character::new();
+        assert_eq!(ch.cur_juggle_cost, 0);
+        ch.change_state(&states, 200);
+        assert_eq!(ch.cur_juggle_cost, 30, "juggle header -> cur_juggle_cost");
+        // Re-entering a state with no juggle header resets the cost to 0.
+        ch.change_state(&states, 0);
+        assert_eq!(ch.cur_juggle_cost, 0, "no juggle header -> cost 0");
+    }
+
+    /// The juggle pool refills to `[Data] airjuggle` whenever grounded.
+    #[test]
+    fn juggle_pool_refills_when_grounded() {
+        let st0 = stand_n(0, vec![]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let consts = CharacterConstants {
+            airjuggle: 15,
+            ..CharacterConstants::default()
+        };
+        let mut ch = Character::with_constants(consts);
+        ch.juggle_points = 2; // simulate a spent pool
+        ch.state_type = StateType::Standing; // grounded
+        lc.tick(&mut ch);
+        assert_eq!(ch.juggle_points, 15, "grounded tick refills the juggle pool");
     }
 }

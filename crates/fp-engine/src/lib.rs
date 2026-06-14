@@ -3903,6 +3903,7 @@ time = 1
             velset: None,
             poweradd: None,
             controllers: vec![controller],
+            ..Default::default()
         }
     }
 
@@ -4012,6 +4013,7 @@ time = 1
                 varset_controller(1, "p2bodydist X"),
                 varset_controller(2, "P2Life"),
             ],
+            ..Default::default()
         }
     }
 
@@ -4725,6 +4727,7 @@ time = 1
             velset: None,
             poweradd: None,
             controllers,
+            ..Default::default()
         }
     }
 
@@ -5072,6 +5075,7 @@ time = 1
                 velset: None,
                 poweradd: None,
                 controllers: Vec::new(),
+                ..Default::default()
             },
         );
         // Binder faces Right (set in the helper); P2 starts facing Left.
