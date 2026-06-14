@@ -1074,6 +1074,16 @@ fn read_movement_group(ini: &DefFile, mv: &mut MovementConstants) {
     if let Some(v) = ini.get_parsed::<f32>("Movement", "down.friction.threshold") {
         mv.down_friction_threshold = v;
     }
+    // Air-jump (double/multi jump) allowance — read by the air-jump engine
+    // built-in (faithfulness audit P14). Both default to MUGEN's "no air jump"
+    // baseline (`0`) when the key is absent; KFM authors `airjump.num = 1` and
+    // `airjump.height = 35`.
+    if let Some(v) = ini.get_parsed::<i32>("Movement", "airjump.num") {
+        mv.airjump_num = v;
+    }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "airjump.height") {
+        mv.airjump_height = v;
+    }
 }
 
 /// Parses a velocity entry that is either a bare scalar (`"2.4"` → `(2.4, 0)`)
@@ -2880,6 +2890,122 @@ mod tests {
         assert!((m.yaccel - 0.44).abs() < 1e-6);
         assert!((m.stand_friction - 0.85).abs() < 1e-6);
         assert!((m.crouch_friction - 0.82).abs() < 1e-6);
+        // Air-jump defaults to MUGEN's "no air jump" baseline when absent.
+        assert_eq!(m.airjump_num, 0, "airjump.num defaults to 0 (no air jump)");
+        assert!((m.airjump_height - 0.0).abs() < 1e-6, "airjump.height defaults to 0");
+    }
+
+    #[test]
+    fn load_constants_reads_airjump_movement_keys() {
+        // `[Movement] airjump.num` / `airjump.height` are read; KFM-style values.
+        let dir = scratch_dir("consts_airjump");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nairjump.num = 1\nairjump.height = 35\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(consts.movement.airjump_num, 1, "airjump.num read from [Movement]");
+        assert!(
+            (consts.movement.airjump_height - 35.0).abs() < 1e-6,
+            "airjump.height read from [Movement]"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_airjump_absent_keeps_default() {
+        // A character that omits the air-jump keys gets the no-air-jump default.
+        let dir = scratch_dir("consts_airjump_absent");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n");
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(consts.movement.airjump_num, 0, "absent airjump.num keeps default 0");
+        assert!(
+            (consts.movement.airjump_height - 0.0).abs() < 1e-6,
+            "absent airjump.height keeps default 0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_airjump_malformed_keeps_default() {
+        // Messy content: a non-integer airjump.num and a non-float airjump.height
+        // must NOT panic and must leave each field at its no-air-jump default
+        // (`get_parsed` returns None on a bad value, so the prior value is kept).
+        let dir = scratch_dir("consts_airjump_malformed");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nairjump.num = lots\nairjump.height = high\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(
+            consts.movement.airjump_num, 0,
+            "malformed airjump.num falls back to the default 0"
+        );
+        assert!(
+            (consts.movement.airjump_height - 0.0).abs() < 1e-6,
+            "malformed airjump.height falls back to the default 0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_airjump_num_negative_is_read_verbatim() {
+        // The loader stores whatever integer it reads (a negative is syntactically
+        // valid); the executor's gate (`airjump_num > 0`) is what neutralizes it.
+        // This pins the loader contract: it does not silently clamp.
+        let dir = scratch_dir("consts_airjump_negative");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nairjump.num = -2\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(
+            consts.movement.airjump_num, -2,
+            "a negative airjump.num is read verbatim (the executor gate handles it)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_real_kfm_airjump_when_present() {
+        // Gated real-KFM check (skips when the fixture is absent): KFM's authored
+        // [Movement] airjump.num = 1 / airjump.height = 35 round-trip through the
+        // real loader, proving the keys are read from genuine MUGEN content (not
+        // just synthetic INI).
+        let def = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        assert_eq!(
+            lc.constants.movement.airjump_num, 1,
+            "KFM authors airjump.num = 1"
+        );
+        assert!(
+            (lc.constants.movement.airjump_height - 35.0).abs() < 1e-6,
+            "KFM authors airjump.height = 35; got {}",
+            lc.constants.movement.airjump_height
+        );
     }
 
     // =====================================================================

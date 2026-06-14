@@ -527,11 +527,32 @@ pub struct MovementConstants {
     pub crouch_friction_threshold: f32,
     /// `down.friction.threshold` — stop threshold while lying down.
     pub down_friction_threshold: f32,
+    /// `airjump.num` — how many **air jumps** (double/multi jumps) the character
+    /// may perform before touching the ground again.
+    ///
+    /// MUGEN's `[Movement] airjump.num`. `0` (the default when the key is absent)
+    /// means the character has **no** air jump: the air-jump engine built-in is
+    /// gated off entirely. KFM authors `airjump.num = 1` (a single double jump).
+    /// The engine resets the per-character air-jump counter to `0` whenever the
+    /// character is grounded, so a fresh ground jump restores the full allowance.
+    pub airjump_num: i32,
+    /// `airjump.height` — the minimum height **above the floor** (in pixels) the
+    /// character must have risen before an air jump is permitted.
+    ///
+    /// MUGEN's `[Movement] airjump.height`. Because the world floor is `Y = 0`
+    /// and up is the negative-Y direction, the engine permits an air jump only
+    /// when `pos.y <= -airjump_height` (i.e. the character is at least this many
+    /// pixels off the ground). `0` (the default when the key is absent) imposes no
+    /// minimum height. KFM authors `airjump.height = 35`.
+    pub airjump_height: f32,
 }
 
 impl Default for MovementConstants {
     fn default() -> Self {
-        // KFM's authored [Movement] values.
+        // KFM's authored [Movement] values, except the air-jump fields which
+        // default to MUGEN's "no air jump" baseline (`0`) when a character omits
+        // them — KFM's own `airjump.num = 1` / `airjump.height = 35` are supplied
+        // by the loader from `[Movement]`.
         Self {
             yaccel: 0.44,
             stand_friction: 0.85,
@@ -539,6 +560,8 @@ impl Default for MovementConstants {
             stand_friction_threshold: 2.0,
             crouch_friction_threshold: 0.05,
             down_friction_threshold: 0.05,
+            airjump_num: 0,
+            airjump_height: 0.0,
         }
     }
 }
@@ -908,6 +931,31 @@ pub struct Character {
     /// hidden state), but callers other than the executor should not touch it.
     pub fire_counts: std::collections::HashMap<(i32, usize), i32>,
 
+    /// How many **air jumps** (double/multi jumps) this character has already
+    /// performed since it last left the ground — the engine's air-jump counter
+    /// for the MUGEN air-jump built-in (faithfulness audit P14).
+    ///
+    /// The air-jump built-in (in the executor) permits an air jump only while
+    /// `air_jump_count < constants.movement.airjump_num`, incrementing this on
+    /// each air jump it grants. It is reset to `0` whenever the character is
+    /// grounded (any non-[`StateType::Air`] state at tick start), so a fresh
+    /// ground jump restores the full air-jump allowance. Public only because the
+    /// entity is struct-based; callers other than the executor should not touch
+    /// it.
+    pub air_jump_count: i32,
+
+    /// Whether the **up** direction was active (held) on the *previous* tick,
+    /// used by the air-jump built-in to detect a **fresh up-press** (the rising
+    /// edge of `holdup`).
+    ///
+    /// MUGEN's air jump fires only on a *new* up press, never while up is merely
+    /// held — otherwise a single held up would burn every air jump on consecutive
+    /// frames. The executor computes the rising edge each tick as
+    /// `holdup_active && !up_held_prev`, then stores the current `holdup` active
+    /// state here for the next tick's comparison. Public only because the entity
+    /// is struct-based; callers other than the executor should not touch it.
+    pub up_held_prev: bool,
+
     // ---- Combat (Phase 6) -------------------------------------------------
     /// The character's currently-active [`fp_combat::HitDef`], if any.
     ///
@@ -1073,6 +1121,8 @@ impl Default for Character {
             constants,
             commands: Box::new(NoCommands),
             fire_counts: std::collections::HashMap::new(),
+            air_jump_count: 0,
+            up_held_prev: false,
             active_hitdef: None,
             get_hit_vars: GetHitVars::default(),
             hitpause: 0,
@@ -1298,6 +1348,7 @@ impl Character {
     ///   `velocity.airjump.back.x` / `velocity.airjump.y`
     /// - `size.ground.front` / `size.ground.back` / `size.height`
     /// - `movement.yaccel` / `movement.stand.friction` / `movement.crouch.friction`
+    /// - `movement.airjump.num` (integer) / `movement.airjump.height` (float)
     /// - `data.life` / `data.power` / `data.attack` / `data.defence`
     ///
     /// An **unknown** member resolves to [`Value::DEFAULT`] (`0`) and is logged
@@ -1328,6 +1379,9 @@ impl Character {
         }
         if m.eq_ignore_ascii_case("size.height") {
             return Value::Int(c.size.height);
+        }
+        if m.eq_ignore_ascii_case("movement.airjump.num") {
+            return Value::Int(c.movement.airjump_num);
         }
 
         // Float-typed members (`[Velocity]` and `[Movement]`).
@@ -1402,6 +1456,9 @@ impl Character {
         }
         if m.eq_ignore_ascii_case("movement.down.friction.threshold") {
             return Value::Float(c.movement.down_friction_threshold);
+        }
+        if m.eq_ignore_ascii_case("movement.airjump.height") {
+            return Value::Float(c.movement.airjump_height);
         }
 
         // Unknown member: safe default 0. `debug!` (not `warn!`) because unmodeled
@@ -2440,6 +2497,8 @@ mod tests {
                 stand_friction_threshold: 3.0,
                 crouch_friction_threshold: 0.07,
                 down_friction_threshold: 0.09,
+                airjump_num: 2,
+                airjump_height: 30.0,
             },
             localcoord: (320, 240),
         };

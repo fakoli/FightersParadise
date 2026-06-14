@@ -164,6 +164,18 @@ const MAX_TRANSITIONS_PER_TICK: u32 = 512;
 /// it without hunting for a magic literal.
 const GROUND_Y: f32 = 0.0;
 
+/// State number of common1's **AirJump Start** state ([Statedef 45]).
+///
+/// MUGEN's air-jump (double jump) is triggered by an *engine built-in*, not by a
+/// CNS controller: when the player presses up again in the air (with control,
+/// below the air-jump limit and above the air-jump height) the engine changes the
+/// character into state 45. The built-in here ([`Character::update_air_jump`])
+/// performs ONLY that engine-side transition into 45; the character's `common1`
+/// `[Statedef 45]` is what sets the air-jump velocity from
+/// `const(velocity.airjump.*)` and then proceeds to the jump-up state 50. Kept as
+/// a named constant so the magic state number has a single documented home.
+const AIRJUMP_START_STATE: i32 = 45;
+
 /// A request to play one sound, emitted by a `PlaySnd` controller during a tick.
 ///
 /// `fp-character` is a *pure simulation* crate: it never touches the audio
@@ -409,6 +421,15 @@ impl Character {
         // destination in the same tick (bounded by run_current_with_transitions).
         self.run_current_with_transitions(states, env, &mut report);
 
+        // ---- Air-jump (double jump) engine built-in (audit P14) -------------
+        // Runs AFTER the authored states so a character's own `[State -1]`
+        // specials/attacks keep priority: this is an engine fallback, exactly
+        // like the locomotion / auto-land built-ins. It tracks an air-jump count
+        // and the rising edge of `holdup` on `Character`, both of which CNS
+        // controllers cannot express, so it lives here in Rust rather than as a
+        // loader-injected controller.
+        self.update_air_jump(states, &mut report);
+
         // ---- Per-tick physics, integration, time, and animation advance -----
         // MUGEN order: controllers set velocity, then `physics` modifies it
         // (friction/gravity), then the world position is integrated from the
@@ -438,6 +459,81 @@ impl Character {
     /// entry expression would read the safe default `0` rather than misfire.
     pub fn change_state(&mut self, states: &HashMap<i32, CompiledState>, target: i32) {
         self.enter_state(states, target, EvalEnv::self_only());
+    }
+
+    /// The MUGEN **air-jump** (double / multi jump) engine built-in
+    /// (faithfulness audit P14): grounded reset, fresh-up-press edge detection,
+    /// and the engine-side transition into the AirJump Start state
+    /// ([`AIRJUMP_START_STATE`], common1's [Statedef 45]).
+    ///
+    /// Called once per tick from [`tick_with`](Self::tick_with), **after** the
+    /// authored states have run, so a character's own specials/attacks keep
+    /// priority (this is an engine fallback, like the locomotion / auto-land
+    /// built-ins). Air-jump is **not** expressible as a CNS controller because it
+    /// needs engine state — an air-jump *count* and *rising-edge* detection of the
+    /// up direction — so it is implemented here in Rust.
+    ///
+    /// # Behavior
+    ///
+    /// 1. **Grounded reset.** Whenever the character is not airborne
+    ///    (`state_type != StateType::Air`) the air-jump count is reset to `0`.
+    ///    This is the faithful reset point: a fresh ground jump (which only leaves
+    ///    the ground by entering an `A`-type state) therefore always starts with
+    ///    the full allowance, so the canonical *jump → air-jump → land → jump →
+    ///    air-jump* sequence works repeatedly.
+    /// 2. **Fresh up-press.** The up direction (`holdup`) is *held*, not edged, by
+    ///    the command source. Firing on the held state would burn every air jump
+    ///    on consecutive frames, so the built-in computes a rising edge
+    ///    `holdup_active && !up_held_prev` and only that fresh press qualifies.
+    ///    The current `holdup` active state is stored in
+    ///    [`up_held_prev`](Character::up_held_prev) for the next tick **every**
+    ///    tick (even when no air jump fires), so the edge tracks correctly.
+    /// 3. **Air-jump transition.** When the character is airborne, has control,
+    ///    has a fresh up-press, has not used up its allowance
+    ///    (`air_jump_count < airjump_num`), and is high enough above the floor
+    ///    (`pos.y <= -airjump_height`, since the floor is `Y = 0` and up is
+    ///    negative-Y), it changes to [`AIRJUMP_START_STATE`] and increments the
+    ///    count. A character whose `airjump_num` is `0` never air-jumps (the whole
+    ///    built-in is gated on `airjump_num > 0`).
+    ///
+    /// The `holdup` command name is queried case-insensitively through the
+    /// character's [`CommandSource`]; with the default [`NoCommands`] source it is
+    /// never active and the built-in is a safe no-op. Never panics.
+    fn update_air_jump(&mut self, states: &HashMap<i32, CompiledState>, report: &mut TickReport) {
+        // (1) Grounded reset: any non-air state restores the full allowance.
+        if self.state_type != StateType::Air {
+            self.air_jump_count = 0;
+        }
+
+        // (2) Fresh up-press = rising edge of the held `holdup` direction.
+        let up_active = self.commands.is_active("holdup");
+        let fresh_up_press = up_active && !self.up_held_prev;
+        // Record the current held state for next tick's edge regardless of
+        // whether an air jump fires.
+        self.up_held_prev = up_active;
+
+        // A character with no air-jump allowance never air-jumps.
+        let airjump_num = self.constants.movement.airjump_num;
+        if airjump_num <= 0 {
+            return;
+        }
+
+        // (3) Air-jump transition gate.
+        let airborne = self.state_type == StateType::Air;
+        // Up is negative-Y and the floor is `GROUND_Y` (0); the character is high
+        // enough when it has risen at least `airjump_height` above the floor.
+        let high_enough = self.pos.y <= GROUND_Y - self.constants.movement.airjump_height;
+        if airborne
+            && self.ctrl
+            && fresh_up_press
+            && self.air_jump_count < airjump_num
+            && high_enough
+        {
+            self.air_jump_count += 1;
+            self.enter_state(states, AIRJUMP_START_STATE, EvalEnv::self_only());
+            // Count this engine-side transition like a `ChangeState`.
+            report.transitions += 1;
+        }
     }
 
     /// Runs every controller of the state numbered `state_no` (if it exists),
@@ -2885,6 +2981,426 @@ mod tests {
     #[test]
     fn ground_y_constant_is_floor_zero() {
         assert!((GROUND_Y - 0.0).abs() < f32::EPSILON, "floor is the world origin Y=0");
+    }
+
+    // ---- A.P14: air-jump (double jump) engine built-in ---------------------
+
+    /// Builds the synthetic state graph for the air-jump tests: an airborne idle
+    /// state `0` (`type=A`, `physics=N` so the character holds its position and
+    /// the height check is deterministic) plus the AirJump Start state `45`
+    /// (also `type=A`, so the character stays airborne after the engine
+    /// transition). Neither carries controllers — the air-jump transition is the
+    /// engine built-in, not a CNS controller.
+    fn air_jump_synth() -> Synth {
+        let air_idle = state(
+            0,
+            Entry { st: Some("A"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            vec![],
+        );
+        let airjump_start = state(
+            AIRJUMP_START_STATE,
+            Entry { st: Some("A"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            vec![],
+        );
+        loaded(vec![air_idle, airjump_start], tiny_air(0, &[5]))
+    }
+
+    /// An airborne, in-control character with the given `airjump.num`, positioned
+    /// well above the air-jump height, starting in the airborne idle state `0`.
+    fn airborne_ctrl_char(airjump_num: i32, airjump_height: f32) -> Character {
+        let consts = CharacterConstants {
+            movement: MovementConstants {
+                airjump_num,
+                airjump_height,
+                ..MovementConstants::default()
+            },
+            ..CharacterConstants::default()
+        };
+        let mut ch = Character::with_constants(consts);
+        ch.state_no = 0;
+        ch.state_type = StateType::Air;
+        ch.physics = Physics::None;
+        ch.ctrl = true;
+        // High above the floor (up is negative Y) so the height gate passes.
+        ch.pos = Vec2::new(0.0, -100.0);
+        ch
+    }
+
+    /// AC2/AC3: an airborne ctrl char with a **fresh** up-press, count < num and
+    /// above the height, transitions to state 45 and increments the count.
+    #[test]
+    fn air_jump_fresh_up_press_transitions_to_45_and_increments() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 35.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let report = synth.tick(&mut ch);
+        assert_eq!(ch.state_no, AIRJUMP_START_STATE, "fresh up-press in the air → state 45");
+        assert_eq!(ch.air_jump_count, 1, "the air-jump count is incremented");
+        assert!(report.transitions >= 1, "the engine air-jump counts as a transition");
+    }
+
+    /// AC2/AC3: **holding** up does not burn a second air-jump — the second tick
+    /// has no rising edge, so a char with `airjump.num = 2` still has one left.
+    #[test]
+    fn air_jump_held_up_does_not_burn_a_second_jump() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(2, 35.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+
+        // Tick 1: fresh press → one air-jump (into 45).
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "first fresh press = one air-jump");
+        assert_eq!(ch.state_no, AIRJUMP_START_STATE);
+
+        // Put the character back into the airborne idle state but KEEP up held;
+        // no new rising edge, so no further air-jump despite num = 2.
+        ch.change_state(&synth.states, 0);
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "held up (no rising edge) must NOT air-jump again");
+        assert_eq!(ch.state_no, 0, "stays in the airborne idle state");
+    }
+
+    /// AC3: a fresh **release-then-press** of up does burn the second air-jump
+    /// (the rising edge fires again), and then `count == num` blocks any further
+    /// air-jump even with another fresh press.
+    #[test]
+    fn air_jump_count_equals_num_blocks_further_jumps() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 35.0);
+
+        // First fresh press → the single allowed air-jump.
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1);
+
+        // Release up (clears the held state), back to airborne idle.
+        ch.set_command_source(Box::new(NoCommands));
+        ch.change_state(&synth.states, 0);
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        let _ = synth.tick(&mut ch); // up not held → up_held_prev = false
+
+        // Fresh press again — but the allowance (num = 1) is already spent.
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "count == num blocks further air-jumps");
+        assert_eq!(ch.state_no, 0, "no transition to 45 once the allowance is spent");
+    }
+
+    /// AC2/AC3: below `airjump.height` (too close to the floor) blocks the
+    /// air-jump even with a fresh up-press and an available allowance.
+    #[test]
+    fn air_jump_below_height_is_blocked() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 35.0);
+        // Only 10px above the floor; the gate needs pos.y <= -35.
+        ch.pos = Vec2::new(0.0, -10.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "below airjump.height: no air-jump");
+        assert_eq!(ch.state_no, 0, "stays airborne idle when too low");
+    }
+
+    /// AC2/AC3: a character with `airjump.num = 0` never air-jumps, regardless of
+    /// a fresh up-press while airborne with control and above any height.
+    #[test]
+    fn air_jump_num_zero_never_triggers() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(0, 0.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "airjump.num = 0: counter never moves");
+        assert_eq!(ch.state_no, 0, "airjump.num = 0: never transitions to 45");
+    }
+
+    /// AC2/AC3/AC5 (synthetic): landing resets the count, so the canonical
+    /// jump → air-jump → land → jump → air-jump sequence works again. The
+    /// grounded reset fires on any non-air state at tick start.
+    #[test]
+    fn air_jump_landing_resets_allowance() {
+        let synth = air_jump_synth();
+        // Add a grounded stand state 11 to "land" into.
+        let mut states = synth.states;
+        states.insert(
+            11,
+            stand_n(11, vec![]),
+        );
+        let synth = Synth { states, air: synth.air };
+
+        let mut ch = airborne_ctrl_char(1, 35.0);
+
+        // First airborne sequence: fresh up-press → air-jump (count 1).
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "first air-jump used");
+
+        // Land: enter a grounded (type=S) state. The next tick's grounded reset
+        // restores the allowance.
+        ch.change_state(&synth.states, 11);
+        ch.set_command_source(Box::new(NoCommands)); // release up while landing
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "grounded tick resets the air-jump count");
+
+        // Fresh ground jump back into the air, then a fresh up-press air-jumps
+        // again (the allowance was restored by landing).
+        ch.change_state(&synth.states, 0);
+        ch.state_type = StateType::Air;
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "after landing, a fresh ground jump restores the air-jump");
+        assert_eq!(ch.state_no, AIRJUMP_START_STATE, "air-jump works again after landing");
+    }
+
+    // =====================================================================
+    // Proctor (task A.P14): complementary air-jump edge cases, layered on
+    // top of Forge's executor tests. These exercise the gate conditions
+    // individually (ctrl, airborne, height boundary, fresh-edge tracking on
+    // the early-return path) plus the multi-jump and never-panic guarantees.
+    // =====================================================================
+
+    /// A **grounded** character (`StateType` != Air) with a fresh up-press, an
+    /// available allowance, control, and "above the height" never air-jumps: the
+    /// built-in is gated on being airborne. (A grounded up-press is a ground jump,
+    /// handled by the locomotion built-in, not the air-jump built-in.) The
+    /// grounded reset also keeps the count pinned at 0.
+    #[test]
+    fn air_jump_grounded_never_triggers() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 35.0);
+        // Force the character GROUNDED despite being high in the air: the gate is
+        // `state_type == Air`, not a position check, so this isolates that gate.
+        ch.state_type = StateType::Standing;
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "a grounded character never air-jumps");
+        assert_eq!(ch.state_no, 0, "no transition to 45 while grounded");
+    }
+
+    /// Without `ctrl`, an airborne character with a fresh up-press, an available
+    /// allowance, and above the height does NOT air-jump: MUGEN gates the air-jump
+    /// on the player having control (you cannot air-jump out of hitstun / a
+    /// no-control air state).
+    #[test]
+    fn air_jump_without_ctrl_is_blocked() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 35.0);
+        ch.ctrl = false; // no control
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "no ctrl: the air-jump is blocked");
+        assert_eq!(ch.state_no, 0, "no ctrl: no transition to 45");
+    }
+
+    /// The height gate is `pos.y <= -airjump_height`, so a character sitting
+    /// **exactly** at the boundary (`pos.y == -airjump_height`) is permitted to
+    /// air-jump (the comparison is inclusive). One pixel closer to the floor
+    /// (`pos.y == -airjump_height + 1`) is blocked. This pins the exact boundary.
+    #[test]
+    fn air_jump_height_boundary_is_inclusive() {
+        let synth = air_jump_synth();
+
+        // Exactly at the boundary: -35.0 with airjump_height = 35 → permitted.
+        let mut at = airborne_ctrl_char(1, 35.0);
+        at.pos = Vec2::new(0.0, -35.0);
+        at.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut at);
+        assert_eq!(at.air_jump_count, 1, "pos.y == -airjump_height is high enough (inclusive)");
+        assert_eq!(at.state_no, AIRJUMP_START_STATE);
+
+        // One pixel below the boundary (closer to the floor): blocked.
+        let mut below = airborne_ctrl_char(1, 35.0);
+        below.pos = Vec2::new(0.0, -34.0);
+        below.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut below);
+        assert_eq!(below.air_jump_count, 0, "one pixel below the boundary is too low");
+        assert_eq!(below.state_no, 0);
+    }
+
+    /// `airjump.height = 0` (the default) imposes no minimum height: an airborne
+    /// character one pixel off the floor can air-jump immediately. Combined with
+    /// the gated-on-`airjump_num` guard this proves height and count are
+    /// independent gates.
+    #[test]
+    fn air_jump_zero_height_permits_immediately() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(1, 0.0);
+        ch.pos = Vec2::new(0.0, -1.0); // barely off the floor
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "airjump.height = 0: any airborne height qualifies");
+        assert_eq!(ch.state_no, AIRJUMP_START_STATE);
+    }
+
+    /// A negative `airjump.num` (messy content) is treated exactly like `0`: the
+    /// built-in is gated on `airjump_num > 0`, so a negative value never
+    /// air-jumps and never panics. (The loader stores whatever integer it reads;
+    /// the executor's gate must tolerate a nonsense value.)
+    #[test]
+    fn air_jump_negative_num_never_triggers() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(-3, 35.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 0, "negative airjump.num behaves like 0 (no air jump)");
+        assert_eq!(ch.state_no, 0);
+    }
+
+    /// `airjump.num = 0` still tracks the fresh-press edge (`up_held_prev`) so the
+    /// built-in's early return does not desync edge detection. This guards the
+    /// ordering in `update_air_jump`: the held state is recorded BEFORE the
+    /// `airjump_num <= 0` early return, so a later change to a positive allowance
+    /// (e.g. a state controller) sees a correct edge rather than a stale one.
+    #[test]
+    fn air_jump_num_zero_still_tracks_up_held_prev() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(0, 0.0);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        assert!(!ch.up_held_prev, "starts un-held");
+        let _ = synth.tick(&mut ch);
+        assert!(
+            ch.up_held_prev,
+            "even with airjump.num = 0, the held-up state is recorded for next tick's edge"
+        );
+        assert_eq!(ch.air_jump_count, 0, "and still no air-jump");
+    }
+
+    /// A multi-jump character (`airjump.num = 2`) air-jumps **twice** across two
+    /// distinct fresh up-presses (release between them), then is blocked on the
+    /// third press — proving the count gate (`air_jump_count < airjump_num`)
+    /// allows exactly `airjump_num` air-jumps per airborne stretch.
+    #[test]
+    fn air_jump_double_allows_exactly_two() {
+        let synth = air_jump_synth();
+        let mut ch = airborne_ctrl_char(2, 35.0);
+
+        // Press 1 (fresh): first air-jump.
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 1, "first fresh press → air-jump 1");
+
+        // Release up, stay airborne (back to idle, still high, still ctrl).
+        ch.set_command_source(Box::new(NoCommands));
+        ch.change_state(&synth.states, 0);
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        let _ = synth.tick(&mut ch); // up not held → up_held_prev cleared
+        assert_eq!(ch.air_jump_count, 1, "release does not change the count");
+
+        // Press 2 (fresh again): second air-jump (allowance is 2).
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 2, "second fresh press → air-jump 2");
+        assert_eq!(ch.state_no, AIRJUMP_START_STATE);
+
+        // Release + press 3 (fresh): blocked, count == num.
+        ch.set_command_source(Box::new(NoCommands));
+        ch.change_state(&synth.states, 0);
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        let _ = synth.tick(&mut ch);
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+        let _ = synth.tick(&mut ch);
+        assert_eq!(ch.air_jump_count, 2, "third press blocked: count (2) == num (2)");
+        assert_eq!(ch.state_no, 0, "no third air-jump");
+    }
+
+    /// A default-constructed [`Character`] (the [`NoCommands`] source, no
+    /// air-jump allowance) ticks through the air-jump built-in without panicking
+    /// and never air-jumps — the engine-wide "never crash on bad/absent content"
+    /// guarantee applied to this built-in.
+    #[test]
+    fn air_jump_default_character_is_safe_noop() {
+        let synth = air_jump_synth();
+        let mut ch = Character::new(); // NoCommands, airjump_num = 0
+        ch.state_no = 0;
+        ch.state_type = StateType::Air;
+        ch.physics = Physics::None;
+        ch.ctrl = true;
+        ch.pos = Vec2::new(0.0, -100.0);
+        // Tick several times: no holdup source, no allowance → pure no-op.
+        for _ in 0..5 {
+            let _ = synth.tick(&mut ch);
+        }
+        assert_eq!(ch.air_jump_count, 0, "default character never air-jumps");
+        assert_eq!(ch.state_no, 0, "and never transitions to 45");
+    }
+
+    /// Gated real-KFM air-jump integration test (skips silently when the
+    /// `test-assets/kfm` fixture is absent). KFM authors `airjump.num = 1`, so a
+    /// grounded jump (state 50) followed, while airborne and above the air-jump
+    /// height, by a fresh up-press drives the engine air-jump built-in into
+    /// AirJump Start (state 45) **exactly once**; a second held/fresh press is
+    /// then blocked by the spent allowance.
+    #[test]
+    fn real_kfm_air_jump_reaches_state_45_once() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        // KFM authors airjump.num = 1.
+        assert!(
+            lc.constants.movement.airjump_num >= 1,
+            "KFM should author airjump.num >= 1; got {}",
+            lc.constants.movement.airjump_num
+        );
+
+        let mut ch = Character::with_constants(lc.constants);
+        ch.facing = Facing::Right;
+        // Enter the jump-up state 50 with the authored jump velocity and rise.
+        // The player has control while airborne (MUGEN grants ctrl in jumpstart
+        // before reaching 50); model that directly.
+        ch.change_state(&lc.states, 50);
+        ch.ctrl = true;
+        ch.vel = Vec2::new(0.0, lc.constants.velocity.jump_up);
+        // Up was NOT held before the air-jump press, so the edge is fresh.
+        ch.up_held_prev = false;
+
+        let mut reached_45 = 0u32;
+        let mut prev_state = ch.state_no;
+        let mut pressing_up = false;
+        for _ in 0..240 {
+            // Start holding up only once the character is airborne, above the
+            // air-jump height, and in control — a clean fresh up-press (the
+            // rising edge) at that point, exactly as a player taps up again at
+            // the apex. Holding it thereafter must NOT burn a second jump.
+            let high_enough =
+                ch.pos.y <= GROUND_Y - lc.constants.movement.airjump_height - 1.0;
+            if !pressing_up && ch.state_type == StateType::Air && high_enough && ch.ctrl {
+                ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+                pressing_up = true;
+            }
+            let _ = ch.tick(&lc, None, StageView::default());
+            // Count distinct *entries* into AirJump Start (45), not ticks spent
+            // in it, so a multi-tick stay in 45 is one air-jump.
+            if ch.state_no == AIRJUMP_START_STATE && prev_state != AIRJUMP_START_STATE {
+                reached_45 += 1;
+            }
+            prev_state = ch.state_no;
+        }
+        assert_eq!(
+            reached_45, 1,
+            "KFM air-jump (airjump.num = 1) should reach AirJump Start (45) exactly once; \
+             held up must not burn a second jump"
+        );
+        // The allowance is 1; the count must not exceed airjump.num.
+        assert!(
+            ch.air_jump_count <= lc.constants.movement.airjump_num,
+            "air-jump count {} must not exceed airjump.num {}",
+            ch.air_jump_count,
+            lc.constants.movement.airjump_num
+        );
     }
 
     /// Synthetic full jump arc driven by **air gravity** (no real fixtures
