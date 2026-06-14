@@ -182,6 +182,24 @@ pub enum Winner {
     Draw,
 }
 
+/// Whether the **whole match** (best-of-N rounds) is still being contested or has
+/// been decided.
+///
+/// A [`Match`] is best-of-N: the first player to win [`Match::rounds_to_win`]
+/// rounds wins the match. While the match is undecided this stays
+/// [`MatchState::InProgress`] and the coordinator resets for the next round each
+/// time a round is decided below the win threshold; once a player reaches the
+/// threshold it becomes the terminal [`MatchState::Over`] and
+/// [`Match::match_winner`] reports who.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchState {
+    /// The match is still being contested; more rounds may be played.
+    InProgress,
+    /// The match is decided; see [`Match::match_winner`]. Terminal — no further
+    /// rounds are played and [`Match::tick`] makes no further round/match changes.
+    Over,
+}
+
 /// The number of frames the [`RoundState::Intro`] phase lasts before combat
 /// begins. MUGEN's intro length is configurable; this is a simple fixed baseline.
 const INTRO_FRAMES: i32 = 60;
@@ -196,6 +214,11 @@ const DEFAULT_ROUND_SECONDS: i32 = 99;
 
 /// Ticks per second; the engine runs at a fixed 60Hz (see the architecture KB).
 const TICKS_PER_SECOND: i32 = 60;
+
+/// The default number of round wins required to win the match. MUGEN's default
+/// `rounds.to.win` is `2` — best of three rounds. Override per-match with
+/// [`Match::with_rounds_to_win`] / [`Match::set_rounds_to_win`].
+const DEFAULT_ROUNDS_TO_WIN: i32 = 2;
 
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
 /// and the input/command source feeding its state machine.
@@ -351,44 +374,152 @@ pub struct Match {
     /// See [`Match::p1_sound_requests`] for the capture/replace semantics; read
     /// it via [`Match::p2_sound_requests`].
     p2_sound_requests: Vec<fp_character::SoundRequest>,
+
+    // ---- Best-of-N match flow (task 7.4) ----------------------------------
+    /// Number of round wins a player needs to win the **match** (best-of-N).
+    /// Default [`DEFAULT_ROUNDS_TO_WIN`] (`2`, best of three). Always at least
+    /// `1` (a non-positive override is clamped at construction/set time).
+    rounds_to_win: i32,
+    /// Rounds player 1 has won so far this match.
+    p1_round_wins: i32,
+    /// Rounds player 2 has won so far this match.
+    p2_round_wins: i32,
+    /// The 1-based number of the round currently being fought (starts at `1`,
+    /// increments on each round reset).
+    round_number: i32,
+    /// Whether the whole match is still in progress or decided (terminal).
+    match_state: MatchState,
+    /// The match winner, set once [`match_state`](Match::match_state) becomes
+    /// [`MatchState::Over`]; [`None`] while the match is in progress. A match is
+    /// never declared a draw (see [`Match`] docs): a drawn round credits neither
+    /// player, so the match simply continues to another round.
+    match_winner: Option<Winner>,
+    /// The round-reset template for player 1: the start position, facing, and
+    /// life/power maxima captured at construction. Used to restore P1 between
+    /// rounds (life to max, back to start position + facing, transient state
+    /// cleared). See [`RoundResetState`].
+    p1_reset: RoundResetState,
+    /// The round-reset template for player 2. See [`p1_reset`](Match::p1_reset).
+    p2_reset: RoundResetState,
+    /// The round length in **frames** the timer is reset to at the start of each
+    /// round (the constructor's `round_seconds * 60`, already clamped to `>= 0`).
+    round_frames: i32,
+}
+
+/// The per-fighter state captured at match construction and restored at the
+/// start of every round (task 7.4 round reset).
+///
+/// MUGEN returns both fighters to their starting positions and facing, full
+/// life, and a neutral stand at the top of each round. This snapshots exactly the
+/// pieces the coordinator needs to recreate that: the seeded start position and
+/// facing (so a reset re-seeds the same opener), and the life/power maxima (so a
+/// reset restores `life` to `life_max`).
+#[derive(Debug, Clone, Copy)]
+struct RoundResetState {
+    /// The world position the fighter started the match at, restored each round.
+    pos: Vec2<f32>,
+    /// The facing the fighter started the match with, restored each round.
+    facing: Facing,
+    /// The fighter's maximum life, the value `life` is restored to each round.
+    life_max: i32,
 }
 
 impl Match {
     /// Creates a match between two players on the given stage bounds, with the
-    /// default 99-second round clock and both fighters facing each other.
+    /// default 99-second round clock, the default best-of-three round target
+    /// (`2` round wins; see [`Match::rounds_to_win`]), and both fighters facing
+    /// each other.
     ///
-    /// The players start in [`RoundState::Intro`]; a fixed number of intro ticks
-    /// run before combat begins (see [`Match::tick`]).
+    /// The players start in [`RoundState::Intro`] of round `1`; a fixed number of
+    /// intro ticks run before combat begins (see [`Match::tick`]).
     #[must_use]
     pub fn new(p1: Player, p2: Player, bounds: StageBounds) -> Self {
         Self::with_round_seconds(p1, p2, bounds, DEFAULT_ROUND_SECONDS)
     }
 
     /// Creates a match with an explicit round length in seconds (the timer starts
-    /// at `round_seconds * 60` frames). A non-positive `round_seconds` is treated
-    /// as `0` (an immediate time-over once the fight begins) rather than producing
-    /// a negative timer.
+    /// at `round_seconds * 60` frames) and the default best-of-three round target.
+    /// A non-positive `round_seconds` is treated as `0` (an immediate time-over
+    /// once the fight begins) rather than producing a negative timer.
     #[must_use]
     pub fn with_round_seconds(
+        p1: Player,
+        p2: Player,
+        bounds: StageBounds,
+        round_seconds: i32,
+    ) -> Self {
+        Self::with_config(p1, p2, bounds, round_seconds, DEFAULT_ROUNDS_TO_WIN)
+    }
+
+    /// Creates a match with an explicit best-of-N round target (`rounds_to_win`
+    /// round wins decide the match) and the default 99-second round clock. A
+    /// `rounds_to_win` below `1` is clamped to `1` (a one-round match) rather than
+    /// producing an unwinnable match.
+    #[must_use]
+    pub fn with_rounds_to_win(
+        p1: Player,
+        p2: Player,
+        bounds: StageBounds,
+        rounds_to_win: i32,
+    ) -> Self {
+        Self::with_config(p1, p2, bounds, DEFAULT_ROUND_SECONDS, rounds_to_win)
+    }
+
+    /// Creates a match with explicit round length (seconds) and best-of-N target,
+    /// the shared constructor the other `new`/`with_*` helpers delegate to.
+    ///
+    /// `round_seconds` is clamped to `>= 0` (a non-positive value yields an
+    /// immediate time-over) and `rounds_to_win` to `>= 1` (so the match is always
+    /// winnable). Both fighters are seeded facing each other, and their start
+    /// position/facing/maxima are captured so each subsequent round can reset to
+    /// them.
+    #[must_use]
+    pub fn with_config(
         mut p1: Player,
         mut p2: Player,
         bounds: StageBounds,
         round_seconds: i32,
+        rounds_to_win: i32,
     ) -> Self {
         // Seed facing so the two start looking at each other (baseline facep2).
         face_each_other(&mut p1.character, &mut p2.character);
-        let timer = round_seconds.max(0).saturating_mul(TICKS_PER_SECOND);
+        // Capture each fighter's seeded opener so every round can reset to it.
+        let p1_reset = RoundResetState::capture(&p1.character);
+        let p2_reset = RoundResetState::capture(&p2.character);
+        let round_frames = round_seconds.max(0).saturating_mul(TICKS_PER_SECOND);
         Self {
             p1,
             p2,
             bounds,
             round_state: RoundState::Intro,
-            timer,
+            timer: round_frames,
             phase_timer: 0,
             winner: None,
             p1_sound_requests: Vec::new(),
             p2_sound_requests: Vec::new(),
+            rounds_to_win: rounds_to_win.max(1),
+            p1_round_wins: 0,
+            p2_round_wins: 0,
+            round_number: 1,
+            match_state: MatchState::InProgress,
+            match_winner: None,
+            p1_reset,
+            p2_reset,
+            round_frames,
         }
+    }
+
+    /// Overrides the number of round wins needed to win the match, clamping a
+    /// non-positive value to `1`. Existing round-win tallies are preserved; if the
+    /// new target is already met by a player the match is **not** retroactively
+    /// ended here (the decision is made when a round is decided), but a subsequent
+    /// round decision will end it as soon as the threshold is observed.
+    ///
+    /// Has **no effect once the match is over** ([`match_state`](Self::match_state)
+    /// is [`MatchState::Over`]): the threshold still updates but no further round is
+    /// decided, so the terminal result stands.
+    pub fn set_rounds_to_win(&mut self, rounds_to_win: i32) {
+        self.rounds_to_win = rounds_to_win.max(1);
     }
 
     /// Read access to player 1.
@@ -423,11 +554,62 @@ impl Match {
         self.timer
     }
 
-    /// The decided winner, or [`None`] until the round reaches
-    /// [`RoundState::Win`].
+    /// The decided winner of the **current round**, or [`None`] until the round
+    /// reaches [`RoundState::Win`]. Reset to [`None`] when the next round begins.
+    /// For the winner of the whole match, use [`Match::match_winner`].
+    ///
+    /// On the match-over frame this still holds the **final round's** winner (no
+    /// next round begins to clear it); for the match result always use
+    /// [`match_winner`](Self::match_winner), which can differ when the deciding
+    /// sequence included drawn rounds.
     #[must_use]
     pub fn winner(&self) -> Option<Winner> {
         self.winner
+    }
+
+    /// The number of round wins a player needs to win the match (best-of-N). The
+    /// match ends as soon as either [`Match::p1_round_wins`] or
+    /// [`Match::p2_round_wins`] reaches this. Defaults to `2` (best of three);
+    /// always at least `1`.
+    #[must_use]
+    pub fn rounds_to_win(&self) -> i32 {
+        self.rounds_to_win
+    }
+
+    /// The number of rounds player 1 has won so far this match.
+    #[must_use]
+    pub fn p1_round_wins(&self) -> i32 {
+        self.p1_round_wins
+    }
+
+    /// The number of rounds player 2 has won so far this match.
+    #[must_use]
+    pub fn p2_round_wins(&self) -> i32 {
+        self.p2_round_wins
+    }
+
+    /// The 1-based number of the round currently being fought. Starts at `1` and
+    /// increments each time the match resets for the next round.
+    #[must_use]
+    pub fn round_number(&self) -> i32 {
+        self.round_number
+    }
+
+    /// Whether the whole match is still in progress or has been decided.
+    #[must_use]
+    pub fn match_state(&self) -> MatchState {
+        self.match_state
+    }
+
+    /// The winner of the **whole match**, or [`None`] until the match is over.
+    ///
+    /// Becomes `Some(Winner::P1)`/`Some(Winner::P2)` the moment a player reaches
+    /// [`Match::rounds_to_win`] round wins (at which point [`Match::match_state`]
+    /// is [`MatchState::Over`]). A match is never a draw: a drawn round credits
+    /// neither player, so this never returns `Some(Winner::Draw)`.
+    #[must_use]
+    pub fn match_winner(&self) -> Option<Winner> {
+        self.match_winner
     }
 
     /// Player 1's sound-play requests for the MOST RECENT [`Match::tick`], in
@@ -573,15 +755,22 @@ impl Match {
         self.p2.character.pos.x = clamped_b;
     }
 
-    /// Advances the round phase and the down-counting timer for this frame.
+    /// Advances the round phase and the down-counting timer for this frame, and
+    /// drives the best-of-N match flow at the end of a round.
     ///
     /// - [`RoundState::Intro`]: count [`INTRO_FRAMES`], then enter
     ///   [`RoundState::Fight`].
     /// - [`RoundState::Fight`]: decrement the timer; a life reaching `0` (KO) or
-    ///   the timer hitting `0` (time over) decides the [`Winner`] and enters
-    ///   [`RoundState::Ko`].
+    ///   the timer hitting `0` (time over) decides the round [`Winner`], **credits
+    ///   the round win** (a draw credits neither — see [`Match::credit_round`]),
+    ///   and enters [`RoundState::Ko`].
     /// - [`RoundState::Ko`]: hold [`KO_FRAMES`], then enter [`RoundState::Win`].
-    /// - [`RoundState::Win`]: terminal; nothing further changes.
+    /// - [`RoundState::Win`]: the round is decided. If a player has reached
+    ///   [`Match::rounds_to_win`] the match is **over** ([`MatchState::Over`],
+    ///   [`Match::match_winner`] set) and nothing further changes. Otherwise the
+    ///   coordinator **resets for the next round** (life/positions/state/timer
+    ///   restored, `round_number` incremented) and re-enters [`RoundState::Intro`]
+    ///   to resume fighting.
     fn advance_round(&mut self) {
         match self.round_state {
             RoundState::Intro => {
@@ -602,21 +791,19 @@ impl Match {
                 let p2_down = self.p2.character.life <= 0;
                 if p1_down || p2_down {
                     // Knockout: whoever still has life wins; both down is a draw.
-                    self.winner = Some(if p1_down && p2_down {
+                    let winner = if p1_down && p2_down {
                         Winner::Draw
                     } else if p2_down {
                         Winner::P1
                     } else {
                         Winner::P2
-                    });
-                    self.enter_ko();
+                    };
+                    self.decide_round(winner);
                 } else if self.timer == 0 {
                     // Time over: compare remaining life.
-                    self.winner = Some(compare_life(
-                        self.p1.character.life,
-                        self.p2.character.life,
-                    ));
-                    self.enter_ko();
+                    let winner =
+                        compare_life(self.p1.character.life, self.p2.character.life);
+                    self.decide_round(winner);
                 }
             }
             RoundState::Ko => {
@@ -626,12 +813,127 @@ impl Match {
                     self.phase_timer = 0;
                 }
             }
-            RoundState::Win => {
-                // Terminal phase: the round is decided. A higher-level match
-                // manager (best-of-N) would start a new round here; that is out of
-                // scope for a single Match.
+            RoundState::Win => self.resolve_match_or_next_round(),
+        }
+    }
+
+    /// Records the decided round [`Winner`], credits the round win, and enters
+    /// the [`RoundState::Ko`] hold. Called from both the KO and the time-over
+    /// decision paths in [`Match::advance_round`].
+    fn decide_round(&mut self, winner: Winner) {
+        self.winner = Some(winner);
+        self.credit_round(winner);
+        self.enter_ko();
+    }
+
+    /// Credits a decided round to its winner, incrementing that player's
+    /// round-win tally.
+    ///
+    /// **Draw rule (MUGEN-faithful).** A [`Winner::Draw`] (a double KO, or equal
+    /// life at time over) credits **neither** player: both tallies are left
+    /// unchanged. MUGEN's default match flow treats a drawn round as won by no
+    /// one — neither side progresses toward the win threshold and the match simply
+    /// plays another round. (MUGEN exposes a `Match.maxdrawgames` cap as a tunable;
+    /// we keep the faithful default of "draws just continue", with no separate cap
+    /// in this baseline.) Because of this rule the match itself is never a draw —
+    /// [`Match::match_winner`] only ever yields [`Winner::P1`]/[`Winner::P2`].
+    fn credit_round(&mut self, winner: Winner) {
+        match winner {
+            Winner::P1 => {
+                self.p1_round_wins += 1;
+                tracing::info!(
+                    round = self.round_number,
+                    p1_round_wins = self.p1_round_wins,
+                    p2_round_wins = self.p2_round_wins,
+                    "round decided: P1 wins the round"
+                );
+            }
+            Winner::P2 => {
+                self.p2_round_wins += 1;
+                tracing::info!(
+                    round = self.round_number,
+                    p1_round_wins = self.p1_round_wins,
+                    p2_round_wins = self.p2_round_wins,
+                    "round decided: P2 wins the round"
+                );
+            }
+            Winner::Draw => {
+                tracing::info!(
+                    round = self.round_number,
+                    "round decided: draw — neither player is credited"
+                );
             }
         }
+    }
+
+    /// At the end of a decided round ([`RoundState::Win`]): if a player has
+    /// reached [`Match::rounds_to_win`], end the match; otherwise reset for the
+    /// next round and resume fighting.
+    fn resolve_match_or_next_round(&mut self) {
+        // Already terminal — nothing changes once the match is over.
+        if self.match_state == MatchState::Over {
+            return;
+        }
+
+        if self.p1_round_wins >= self.rounds_to_win {
+            self.end_match(Winner::P1);
+        } else if self.p2_round_wins >= self.rounds_to_win {
+            self.end_match(Winner::P2);
+        } else {
+            self.reset_for_next_round();
+        }
+    }
+
+    /// Enters the terminal [`MatchState::Over`] state with the given match winner.
+    fn end_match(&mut self, winner: Winner) {
+        self.match_state = MatchState::Over;
+        self.match_winner = Some(winner);
+        tracing::info!(
+            rounds = self.round_number,
+            p1_round_wins = self.p1_round_wins,
+            p2_round_wins = self.p2_round_wins,
+            ?winner,
+            "match over"
+        );
+    }
+
+    /// Resets both fighters and the round clock for the next round, then
+    /// re-enters [`RoundState::Intro`] to resume the match.
+    ///
+    /// Restores each fighter to full life and its captured start position/facing,
+    /// clears transient combat state (velocity, hit-pause/shake, get-hit reaction,
+    /// active HitDef, move-connect), and returns it to a neutral standing/idle
+    /// state with control removed for the intro. The round timer is reset to the
+    /// configured round length and `round_number` is incremented.
+    ///
+    /// **Power carry (MUGEN-faithful).** Power (the super meter) is *carried
+    /// across rounds* within a match — it is **not** reset here. MUGEN preserves a
+    /// fighter's power between the rounds of a single match (only a new match
+    /// resets it), so a meter built in round one is still available in round two.
+    fn reset_for_next_round(&mut self) {
+        reset_fighter_for_round(&mut self.p1.character, self.p1_reset);
+        reset_fighter_for_round(&mut self.p2.character, self.p2_reset);
+
+        // Re-seed facing toward each other (positions were just restored).
+        face_each_other(&mut self.p1.character, &mut self.p2.character);
+
+        // Fresh round clock and bookkeeping.
+        self.timer = self.round_frames;
+        self.phase_timer = 0;
+        self.winner = None;
+        self.round_number += 1;
+        self.round_state = RoundState::Intro;
+
+        // No stale sound requests carry into the new round's first tick.
+        self.p1_sound_requests.clear();
+        self.p2_sound_requests.clear();
+
+        tracing::info!(
+            round = self.round_number,
+            p1_round_wins = self.p1_round_wins,
+            p2_round_wins = self.p2_round_wins,
+            "round reset: starting next round"
+        );
     }
 
     /// Enters [`RoundState::Ko`], freezing the round clock and removing control
@@ -778,6 +1080,66 @@ fn face_each_other(a: &mut Character, b: &mut Character) {
     let (fa, fb) = facings_toward(a.pos.x, b.pos.x);
     a.facing = fa;
     b.facing = fb;
+}
+
+impl RoundResetState {
+    /// Captures the reset template (start position, facing, life maximum) from a
+    /// freshly-seeded character at match construction.
+    fn capture(c: &Character) -> Self {
+        Self {
+            pos: c.pos,
+            facing: c.facing,
+            life_max: c.life_max,
+        }
+    }
+}
+
+/// Resets one fighter to the top-of-round state from its captured
+/// [`RoundResetState`] (task 7.4 round reset).
+///
+/// Restores full life and the start position/facing; zeroes velocity; clears the
+/// transient combat state that must not survive a round (active HitDef, hit-pause
+/// and hit-shake timers, last-hit `GetHitVar`s, and the move-connect latch); and
+/// returns the fighter to a neutral standing-idle state with the animation cursor
+/// rewound and control removed (the intro re-grants control when the next round's
+/// fight begins). Power is **not** touched here — it carries across rounds (see
+/// [`Match::reset_for_next_round`]). Pure field writes; never panics.
+fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
+    // Resources: full life, max from the captured template; power carries over.
+    c.life_max = reset.life_max;
+    c.life = reset.life_max;
+
+    // Kinematics: back to the start, at rest, facing the captured direction.
+    c.pos = reset.pos;
+    c.vel = Vec2::new(0.0, 0.0);
+    c.facing = reset.facing;
+
+    // Neutral stance: standing, idle, on the ground, no control during intro.
+    c.state_type = StateType::Standing;
+    c.move_type = MoveType::Idle;
+    c.ctrl = false;
+    c.holding_back = false;
+
+    // State machine: back to the standing state with a fresh timer.
+    c.state_no = 0;
+    c.prev_state_no = 0;
+    c.state_time = 0;
+
+    // Animation cursor: rewind to the idle action's first element.
+    c.anim = 0;
+    c.anim_elem = 0;
+    c.anim_elem_time = 0;
+    c.anim_time = 0;
+
+    // Transient combat state must not leak across the round boundary.
+    c.active_hitdef = None;
+    c.hitpause = 0;
+    c.shaketime = 0;
+    c.get_hit_vars = fp_character::GetHitVars::default();
+    c.move_connect.reset();
+
+    // Drop any stale commands so nothing fires before the next round goes live.
+    c.set_command_source(Box::new(fp_character::NoCommands));
 }
 
 /// Applies the baseline `facep2`: each character that is in a neutral state turns
@@ -1264,8 +1626,11 @@ time = 1
         m.p2.character.life = 0;
         m.tick(MatchInput::none(), MatchInput::none());
         assert_eq!(m.round_state(), RoundState::Ko);
-        // Hold through the KO phase into Win.
-        for _ in 0..(KO_FRAMES + 1) {
+        // Hold through the KO phase: after exactly KO_FRAMES ticks the round is in
+        // the Win (results) phase with the current-round winner decided. (One more
+        // tick would run the best-of-N transition out of Win — see
+        // `ko_p2_twice_wins_match_for_p1` — so we assert the Win phase here.)
+        for _ in 0..KO_FRAMES {
             m.tick(MatchInput::none(), MatchInput::none());
         }
         assert_eq!(m.round_state(), RoundState::Win);
@@ -1523,8 +1888,11 @@ time = 1
         }
     }
 
-    /// AC2: the round state machine never moves backwards. Drive a full match and
-    /// assert monotonic non-decreasing phase ordering across every tick.
+    /// AC2: WITHIN a single round the state machine never moves backwards. (Across
+    /// a best-of-N match it deliberately cycles Win -> Intro on a round reset; that
+    /// reset is covered by `ko_p2_twice_wins_match_for_p1`. Here we assert monotone
+    /// ordering up to and including the first arrival at Win, the round-decided
+    /// phase.)
     #[test]
     fn round_state_is_monotonic() {
         fn rank(s: RoundState) -> u8 {
@@ -1539,7 +1907,10 @@ time = 1
         into_fight(&mut m);
         m.p2.character.life = 0; // force the KO path
         let mut prev = rank(m.round_state());
-        for _ in 0..(KO_FRAMES + 30) {
+        // From Fight: one tick enters Ko, then KO_FRAMES ticks reach Win — all
+        // monotone, with no reset (the reset happens on the tick AFTER Win is
+        // first observed).
+        for _ in 0..(KO_FRAMES + 1) {
             m.tick(MatchInput::none(), MatchInput::none());
             let now = rank(m.round_state());
             assert!(now >= prev, "round state went backwards: {prev} -> {now}");
@@ -1548,24 +1919,31 @@ time = 1
         assert_eq!(m.round_state(), RoundState::Win);
     }
 
-    /// AC2: once the round reaches Win it is terminal — further ticks change
-    /// nothing (state, timer, and winner all hold).
+    /// AC2: the Win (round-decided) phase holds for exactly one observable frame
+    /// per round — the round winner is stable while it is displayed, and the very
+    /// next tick runs the best-of-N transition out of Win (to the next round's
+    /// Intro here, since one KO is below the best-of-three threshold). Under
+    /// best-of-N, Win is per-round, not match-terminal; the terminal invariant
+    /// belongs to match-over (see `match_over_is_terminal`).
     #[test]
-    fn win_phase_is_terminal() {
+    fn win_phase_holds_then_advances_round() {
         let mut m = basic_match();
         into_fight(&mut m);
         m.p2.character.life = 0;
-        for _ in 0..(KO_FRAMES + 2) {
+        // From Fight, one tick enters Ko and KO_FRAMES more reach Win.
+        for _ in 0..(KO_FRAMES + 1) {
             m.tick(MatchInput::none(), MatchInput::none());
         }
         assert_eq!(m.round_state(), RoundState::Win);
-        let (w, t) = (m.winner(), m.timer());
-        for _ in 0..50 {
-            m.tick(MatchInput::none(), MatchInput::none());
-            assert_eq!(m.round_state(), RoundState::Win, "Win is terminal");
-            assert_eq!(m.winner(), w, "winner is stable in Win");
-            assert_eq!(m.timer(), t, "timer is stable in Win");
-        }
+        assert_eq!(m.winner(), Some(Winner::P1), "round winner decided in Win");
+        assert_eq!(m.round_number(), 1, "still round 1 while Win is displayed");
+
+        // The next tick runs the Win-arm transition: below threshold -> next round.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Intro, "Win advances to next round");
+        assert_eq!(m.round_number(), 2, "round_number incremented out of Win");
+        assert_eq!(m.p1_round_wins(), 1, "the round win was credited");
+        assert_eq!(m.winner(), None, "current-round winner cleared for the new round");
     }
 
     /// AC2: winner() is None until the round is actually decided.
@@ -2600,5 +2978,574 @@ time = 1
             m.p1_sound_requests().is_empty(),
             "a tick with no PlaySnd replaces the slice with empty (not appended)"
         );
+    }
+
+    // ---- Task 7.4: best-of-N match flow ------------------------------------
+
+    /// Advances the match one full round-decision cycle: from a live Fight,
+    /// force the given KO, then tick through the KO hold so `advance_round`
+    /// processes the [`RoundState::Win`] arm (either resetting for the next round
+    /// or ending the match). After this returns, the match is in either the next
+    /// round's `Intro` or the terminal match-over state.
+    fn ko_p2_and_settle(m: &mut Match) {
+        // We must be live to decide a round.
+        assert_eq!(m.round_state(), RoundState::Fight);
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Ko, "KO enters the KO hold");
+        // Hold through KO -> Win, then one more tick runs the Win-arm transition.
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+    }
+
+    /// Same as [`ko_p2_and_settle`] but KOs P1 (so P2 wins the round).
+    fn ko_p1_and_settle(m: &mut Match) {
+        assert_eq!(m.round_state(), RoundState::Fight);
+        m.p1.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Ko);
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+    }
+
+    /// AC1: a fresh match exposes the documented best-of-N defaults.
+    #[test]
+    fn match_starts_best_of_three_round_one() {
+        let m = basic_match();
+        assert_eq!(m.rounds_to_win(), DEFAULT_ROUNDS_TO_WIN, "default best of three");
+        assert_eq!(m.rounds_to_win(), 2);
+        assert_eq!(m.round_number(), 1, "first round is round 1");
+        assert_eq!(m.p1_round_wins(), 0);
+        assert_eq!(m.p2_round_wins(), 0);
+        assert_eq!(m.match_state(), MatchState::InProgress);
+        assert_eq!(m.match_winner(), None, "no match winner at the start");
+    }
+
+    /// AC1/AC3: `with_rounds_to_win` and `set_rounds_to_win` override the target;
+    /// a non-positive value clamps to 1 (a one-round match is always winnable).
+    #[test]
+    fn rounds_to_win_override_and_clamp() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let m = Match::with_rounds_to_win(p1, p2, StageBounds::default(), 3);
+        assert_eq!(m.rounds_to_win(), 3, "explicit best of five");
+
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let m = Match::with_rounds_to_win(p1, p2, StageBounds::default(), 0);
+        assert_eq!(m.rounds_to_win(), 1, "non-positive target clamps to 1");
+
+        let mut m = basic_match();
+        m.set_rounds_to_win(-4);
+        assert_eq!(m.rounds_to_win(), 1, "setter clamps a non-positive target");
+        m.set_rounds_to_win(5);
+        assert_eq!(m.rounds_to_win(), 5);
+    }
+
+    /// AC2/AC4 headline: KO P2 twice — P1 reaches 2 round wins and the match is
+    /// over with `match_winner() == P1`. Between the rounds the fighters reset
+    /// (life to max, back to start positions/facing) and `round_number` advances.
+    #[test]
+    fn ko_p2_twice_wins_match_for_p1() {
+        // Two characters apart; short stage; default best-of-three.
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        let p1_start = m.p1().pos();
+        let p2_start = m.p2().pos();
+
+        // --- Round 1: KO P2 ---
+        into_fight(&mut m);
+        // Damage P2 partway and move both off their start spots before the KO so
+        // we can prove the reset restores them.
+        m.p2.character.life = 400;
+        m.p1.character.pos.x = -10.0;
+        m.p2.character.pos.x = 10.0;
+        ko_p2_and_settle(&mut m);
+
+        assert_eq!(m.p1_round_wins(), 1, "P1 credited the round-1 KO");
+        assert_eq!(m.p2_round_wins(), 0);
+        assert_eq!(m.match_state(), MatchState::InProgress, "match not over after 1");
+        assert_eq!(m.match_winner(), None);
+        assert_eq!(m.round_number(), 2, "round_number incremented to 2");
+        assert_eq!(m.round_state(), RoundState::Intro, "reset re-enters Intro");
+        assert_eq!(m.winner(), None, "current-round winner cleared on reset");
+
+        // Reset restored life to max and positions/facing to the captured start.
+        assert_eq!(m.p1().life(), m.p1().life_max(), "P1 life restored to max");
+        assert_eq!(m.p2().life(), m.p2().life_max(), "P2 life restored to max");
+        assert_eq!(m.p1().pos(), p1_start, "P1 back at its start position");
+        assert_eq!(m.p2().pos(), p2_start, "P2 back at its start position");
+        assert_eq!(m.p1().facing(), Facing::Right, "P1 re-faces the opponent");
+        assert_eq!(m.p2().facing(), Facing::Left, "P2 re-faces the opponent");
+        // Timer reset to the full round length for round 2.
+        assert_eq!(m.timer(), DEFAULT_ROUND_SECONDS * TICKS_PER_SECOND);
+
+        // --- Round 2: KO P2 again -> P1 reaches the threshold, match over ---
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+
+        assert_eq!(m.p1_round_wins(), 2, "P1 reached the win threshold");
+        assert_eq!(m.match_state(), MatchState::Over, "match is now over");
+        assert_eq!(m.match_winner(), Some(Winner::P1), "P1 wins the match");
+        assert_eq!(m.round_number(), 2, "no further round after the match ends");
+    }
+
+    /// AC2/AC4: a split (each player wins one round) advances to round 3 with the
+    /// match still in progress.
+    #[test]
+    fn split_rounds_advance_to_round_three() {
+        let mut m = basic_match();
+
+        // Round 1: P1 wins (KO P2).
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.p1_round_wins(), 1);
+        assert_eq!(m.round_number(), 2);
+        assert_eq!(m.match_state(), MatchState::InProgress);
+
+        // Round 2: P2 wins (KO P1).
+        into_fight(&mut m);
+        ko_p1_and_settle(&mut m);
+        assert_eq!(m.p1_round_wins(), 1, "P1 still on one");
+        assert_eq!(m.p2_round_wins(), 1, "P2 now on one");
+        assert_eq!(m.match_state(), MatchState::InProgress, "1-1 is undecided");
+        assert_eq!(m.match_winner(), None);
+        assert_eq!(m.round_number(), 3, "the split advances to round 3");
+        assert_eq!(m.round_state(), RoundState::Intro);
+    }
+
+    /// AC2/AC4: time-over credits the higher-life fighter (round win goes to P1
+    /// when P1 has more life), and the round resets for the next round.
+    #[test]
+    fn time_over_credits_higher_life_fighter() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.life = 800;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        p2c.life = 500;
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        // One-second round so time-over is reached quickly.
+        let mut m = Match::with_round_seconds(p1, p2, StageBounds::new(-200.0, 200.0), 1);
+        into_fight(&mut m);
+
+        // Burn the clock; both survive, so the decision is by life compare.
+        for _ in 0..(TICKS_PER_SECOND + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert_ne!(m.round_state(), RoundState::Fight, "timer expired");
+        assert_eq!(m.winner(), Some(Winner::P1), "more life wins the round");
+
+        // Hold through KO -> Win -> reset.
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.p1_round_wins(), 1, "time-over winner credited the round");
+        assert_eq!(m.p2_round_wins(), 0);
+        assert_eq!(m.round_number(), 2, "time-over round still resets for the next");
+        assert_eq!(m.round_state(), RoundState::Intro);
+    }
+
+    /// AC3/AC4: a drawn round (double KO) credits NEITHER player, and the match
+    /// continues to the next round per the documented MUGEN-faithful draw rule.
+    #[test]
+    fn draw_round_credits_neither_and_continues() {
+        let mut m = basic_match();
+        into_fight(&mut m);
+        // Double KO on the same frame.
+        m.p1.character.life = 0;
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.winner(), Some(Winner::Draw), "double KO is a draw round");
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.p1_round_wins(), 0, "a draw credits neither player");
+        assert_eq!(m.p2_round_wins(), 0);
+        assert_eq!(m.match_state(), MatchState::InProgress, "draw keeps the match live");
+        assert_eq!(m.match_winner(), None);
+        assert_eq!(m.round_number(), 2, "a drawn round still advances to the next");
+        assert_eq!(m.round_state(), RoundState::Intro);
+    }
+
+    /// AC2: the match-over state is terminal — once decided, further ticks change
+    /// neither the match state, the match winner, nor the round number.
+    #[test]
+    fn match_over_is_terminal() {
+        // Best of one: a single KO ends the match.
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let mut m = Match::with_rounds_to_win(p1, p2, StageBounds::default(), 1);
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+
+        assert_eq!(m.match_state(), MatchState::Over, "best-of-one ends in one KO");
+        assert_eq!(m.match_winner(), Some(Winner::P1));
+        assert_eq!(m.round_number(), 1, "no reset when the match is already won");
+        let (state, winner, round) = (m.match_state(), m.match_winner(), m.round_number());
+        for _ in 0..120 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert_eq!(m.match_state(), state, "match-over is terminal");
+            assert_eq!(m.match_winner(), winner, "match winner is stable");
+            assert_eq!(m.round_number(), round, "round number stable once over");
+        }
+    }
+
+    /// AC3: power carries across rounds (it is NOT reset on a round reset), the
+    /// documented MUGEN-faithful behavior.
+    #[test]
+    fn power_carries_across_rounds() {
+        let mut m = basic_match();
+        into_fight(&mut m);
+        // Bank some power, then decide the round.
+        m.p1.character.power = 1234;
+        m.p2.character.power = 567;
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.round_number(), 2, "advanced to round 2");
+        assert_eq!(m.p1().character.power, 1234, "P1 power carries across rounds");
+        assert_eq!(m.p2().character.power, 567, "P2 power carries across rounds");
+    }
+
+    /// AC3 (reset coverage): a round reset clears transient combat state —
+    /// hit-pause, active HitDef, and the get-hit reaction are all neutralized.
+    #[test]
+    fn round_reset_clears_transient_combat_state() {
+        let mut m = basic_match();
+        into_fight(&mut m);
+        // Dirty up P2's transient state before the KO.
+        m.p2.character.hitpause = 12;
+        m.p2.character.shaketime = 8;
+        m.p2.character.active_hitdef = Some(sample_hitdef());
+        m.p2.character.move_type = MoveType::BeingHit;
+        m.p2.character.vel = Vec2::new(7.0, -3.0);
+        ko_p2_and_settle(&mut m);
+
+        assert_eq!(m.round_number(), 2);
+        let p2 = m.p2();
+        assert_eq!(p2.character.hitpause, 0, "hit-pause cleared on reset");
+        assert_eq!(p2.character.shaketime, 0, "hit-shake cleared on reset");
+        assert!(p2.character.active_hitdef.is_none(), "active HitDef cleared");
+        assert_eq!(p2.character.move_type, MoveType::Idle, "back to idle");
+        assert_eq!(p2.character.state_type, StateType::Standing, "back to standing");
+        assert_eq!(p2.character.vel, Vec2::new(0.0, 0.0), "velocity zeroed");
+        assert_eq!(p2.character.state_no, 0, "state machine back to state 0");
+    }
+
+    /// AC2 (no premature reset): a round decision that does NOT reach the
+    /// threshold still leaves the round playable — re-entering Fight after the
+    /// reset works and the timer counts down again.
+    #[test]
+    fn next_round_resumes_fighting() {
+        let mut m = basic_match();
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.round_state(), RoundState::Intro, "reset re-enters Intro");
+        // Drive the new round into Fight; the timer must count down again.
+        into_fight(&mut m);
+        assert_eq!(m.round_state(), RoundState::Fight, "next round goes live");
+        let before = m.timer();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.timer(), before - 1, "the reset round clock counts down");
+    }
+
+    // ---- Task 7.4: additional Proctor coverage (edge cases / semantics) -----
+
+    /// AC1/AC3: `with_config` is the shared constructor — both `round_seconds`
+    /// (clamped `>= 0`) and `rounds_to_win` (clamped `>= 1`) take effect at once.
+    /// Covers the constructor that the other `with_*` helpers delegate to.
+    #[test]
+    fn with_config_applies_both_clamps() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        // Non-positive seconds AND non-positive target: both clamp.
+        let m = Match::with_config(p1, p2, StageBounds::default(), -3, -7);
+        assert_eq!(m.timer(), 0, "negative round_seconds clamps to a 0-frame timer");
+        assert_eq!(m.rounds_to_win(), 1, "non-positive rounds_to_win clamps to 1");
+
+        // Valid values pass straight through.
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let m = Match::with_config(p1, p2, StageBounds::default(), 5, 4);
+        assert_eq!(m.timer(), 5 * TICKS_PER_SECOND, "round_seconds honored");
+        assert_eq!(m.rounds_to_win(), 4, "rounds_to_win honored");
+        assert_eq!(m.round_number(), 1);
+        assert_eq!(m.match_state(), MatchState::InProgress);
+    }
+
+    /// AC2/AC4: a best-of-FIVE match (`rounds_to_win = 3`) is decided only after a
+    /// player banks three round wins. This drives multiple resets in a row and
+    /// asserts the running tallies, the climbing `round_number`, and that the match
+    /// stays in progress until — and becomes terminal exactly at — the third win.
+    #[test]
+    fn best_of_five_needs_three_round_wins() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let mut m = Match::with_rounds_to_win(p1, p2, StageBounds::new(-200.0, 200.0), 3);
+
+        // P1 wins rounds 1 and 2 — still in progress (needs three).
+        for expected_wins in 1..=2 {
+            into_fight(&mut m);
+            ko_p2_and_settle(&mut m);
+            assert_eq!(m.p1_round_wins(), expected_wins);
+            assert_eq!(m.match_state(), MatchState::InProgress, "not over before 3");
+            assert_eq!(m.match_winner(), None);
+            assert_eq!(m.round_number(), expected_wins + 1, "round_number climbs");
+            assert_eq!(m.round_state(), RoundState::Intro, "reset between rounds");
+        }
+
+        // Round 3: P1's third win ends the match.
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.p1_round_wins(), 3, "P1 reached the best-of-five threshold");
+        assert_eq!(m.match_state(), MatchState::Over);
+        assert_eq!(m.match_winner(), Some(Winner::P1));
+        assert_eq!(m.round_number(), 3, "no reset once the match is decided");
+    }
+
+    /// AC3/AC4: consecutive drawn rounds credit NEITHER player and keep advancing
+    /// the round count without ever ending the match — the documented "draws just
+    /// continue" rule, exercised across several rounds in a row.
+    #[test]
+    fn repeated_draws_never_end_the_match() {
+        let mut m = basic_match();
+        for round in 1..=4 {
+            into_fight(&mut m);
+            assert_eq!(m.round_number(), round, "round_number tracks each draw");
+            // Double KO -> draw.
+            m.p1.character.life = 0;
+            m.p2.character.life = 0;
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert_eq!(m.winner(), Some(Winner::Draw));
+            for _ in 0..(KO_FRAMES + 1) {
+                m.tick(MatchInput::none(), MatchInput::none());
+            }
+            assert_eq!(m.p1_round_wins(), 0, "draws never credit P1");
+            assert_eq!(m.p2_round_wins(), 0, "draws never credit P2");
+            assert_eq!(m.match_state(), MatchState::InProgress, "a draw never ends it");
+            assert_eq!(m.match_winner(), None, "match winner is never Draw");
+        }
+        assert_eq!(m.round_number(), 5, "four draws advanced to round 5");
+    }
+
+    /// AC2/AC3: lowering `rounds_to_win` below a player's existing tally is NOT
+    /// applied retroactively (the doc contract), but the NEXT decided round ends
+    /// the match as soon as the now-met threshold is observed at the Win arm.
+    #[test]
+    fn lowering_threshold_ends_match_on_next_decision() {
+        let mut m = basic_match(); // best of three (target 2)
+
+        // Round 1: P1 wins one round (tally = 1, below the default target 2).
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.p1_round_wins(), 1);
+        assert_eq!(m.match_state(), MatchState::InProgress, "1 < 2, still going");
+
+        // Lower the target to 1. The match is NOT ended here (no round is being
+        // decided at this instant) — the decision happens at the next Win arm.
+        m.set_rounds_to_win(1);
+        assert_eq!(m.rounds_to_win(), 1);
+        assert_eq!(
+            m.match_state(),
+            MatchState::InProgress,
+            "lowering the target does not retroactively end the match"
+        );
+
+        // The next decided round observes tally(1) >= target(1) and ends it.
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.match_state(), MatchState::Over, "next decision ends the match");
+        assert_eq!(m.match_winner(), Some(Winner::P1));
+        assert_eq!(m.p1_round_wins(), 2);
+    }
+
+    /// AC3 (reset fidelity): the round reset restores `life` from the CAPTURED
+    /// `life_max` template even if a fighter's `life_max` was mutated mid-round —
+    /// the snapshot taken at construction is the source of truth, and full life is
+    /// restored to it. Also confirms `holding_back`/`ctrl` are cleared for intro.
+    #[test]
+    fn round_reset_restores_life_to_captured_max() {
+        let mut m = basic_match();
+        let captured_max = m.p2().life_max(); // template max from construction
+        into_fight(&mut m);
+
+        // Mutate P2's live life_max and dirty its guard/ctrl flags before the KO.
+        m.p2.character.life_max = 12345; // a spurious mid-round change
+        m.p2.character.holding_back = true;
+        m.p1.character.holding_back = true;
+        ko_p2_and_settle(&mut m);
+
+        assert_eq!(m.round_number(), 2);
+        // Reset restored life to the captured template max (NOT the mutated value).
+        assert_eq!(
+            m.p2().life_max(),
+            captured_max,
+            "life_max restored from the captured reset template"
+        );
+        assert_eq!(m.p2().life(), captured_max, "life restored to the captured max");
+        // Intro means no control and no stale guard latch.
+        assert!(!m.p1().character.ctrl, "control off during the reset intro");
+        assert!(!m.p2().character.ctrl);
+        assert!(!m.p1().character.holding_back, "guard latch cleared on reset");
+        assert!(!m.p2().character.holding_back);
+    }
+
+    /// AC3: a round reset clears any stale per-player sound requests so the new
+    /// round's first tick does not surface a previous round's audio.
+    #[test]
+    fn round_reset_clears_stale_sound_requests() {
+        let mut m = play_snd_match(); // P1 fires a PlaySnd each tick
+        into_fight(&mut m);
+        // Confirm there ARE requests to clear, then decide the round.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(!m.p1_sound_requests().is_empty(), "P1 has pending requests");
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Ko);
+        // Hold through KO -> Win; the Win-arm reset clears the request vecs.
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.round_number(), 2, "reset happened");
+        assert!(
+            m.p1_sound_requests().is_empty(),
+            "the reset clears stale sound requests"
+        );
+        assert!(m.p2_sound_requests().is_empty());
+    }
+
+    /// AC2: a time-over decided round in a best-of-N match still resets and the
+    /// match continues; a second time-over win for the SAME fighter ends it.
+    /// Exercises the time-over decision path through the full best-of-N flow twice.
+    #[test]
+    fn two_time_over_wins_decide_the_match() {
+        let build = || {
+            let mut p1c = Character::new();
+            p1c.pos = Vec2::new(-50.0, 0.0);
+            p1c.life = 900;
+            let mut p2c = Character::new();
+            p2c.pos = Vec2::new(50.0, 0.0);
+            p2c.life = 100; // P1 always ahead on life -> P1 wins each time-over
+            let p1 = Player::new(p1c, defender_loaded());
+            let p2 = Player::new(p2c, defender_loaded());
+            Match::with_round_seconds(p1, p2, StageBounds::new(-200.0, 200.0), 1)
+        };
+        let mut m = build();
+
+        let run_time_over = |m: &mut Match| {
+            into_fight(m);
+            for _ in 0..(TICKS_PER_SECOND + 1) {
+                m.tick(MatchInput::none(), MatchInput::none());
+                if m.round_state() != RoundState::Fight {
+                    break;
+                }
+            }
+            assert_ne!(m.round_state(), RoundState::Fight, "timer expired");
+            for _ in 0..(KO_FRAMES + 1) {
+                m.tick(MatchInput::none(), MatchInput::none());
+            }
+        };
+
+        // Round 1 time-over: P1 ahead, credited, match continues (1 < 2).
+        run_time_over(&mut m);
+        assert_eq!(m.p1_round_wins(), 1);
+        assert_eq!(m.match_state(), MatchState::InProgress);
+        assert_eq!(m.round_number(), 2);
+        // Reset restored both fighters to full life for round 2 (so the 900-vs-100
+        // life gap is a property of the reset template, not the round-1 carryover).
+        assert_eq!(m.p1().life(), m.p1().life_max());
+        assert_eq!(m.p2().life(), m.p2().life_max());
+
+        // Round 2 time-over: both reset to full life (equal!) — that would draw.
+        // To prove the SECOND win path, damage P2 during round 2 before time-over.
+        into_fight(&mut m);
+        m.p2.character.life = 50; // P1 (full) ahead again
+        for _ in 0..(TICKS_PER_SECOND + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert_eq!(m.winner(), Some(Winner::P1), "P1 ahead at the second time-over");
+        for _ in 0..(KO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.p1_round_wins(), 2, "P1's second round win");
+        assert_eq!(m.match_state(), MatchState::Over);
+        assert_eq!(m.match_winner(), Some(Winner::P1));
+    }
+
+    /// AC2 (semantics): once the match is over, the round phase machine is frozen
+    /// — it never leaves the terminal `Win` it ended on, and no new KO/time-over is
+    /// processed. Pairs with `match_over_is_terminal` (which guards the match-level
+    /// fields) by guarding the round-phase side.
+    #[test]
+    fn round_phase_frozen_after_match_over() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let mut m = Match::with_rounds_to_win(p1, p2, StageBounds::default(), 1);
+        into_fight(&mut m);
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.match_state(), MatchState::Over);
+        // The round stays in Win (the phase it ended the match on); further ticks
+        // do not advance it, and re-forcing a "KO" changes nothing.
+        let phase = m.round_state();
+        assert_eq!(phase, RoundState::Win, "match ended out of the Win arm");
+        m.p1.character.life = 0; // would be a KO if the machine were live
+        for _ in 0..30 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert_eq!(m.round_state(), phase, "round phase frozen after match over");
+        }
+        assert_eq!(m.match_winner(), Some(Winner::P1), "winner unchanged");
+    }
+
+    /// AC1: the public best-of-N enums derive the traits the public API promises
+    /// (Copy/Clone/Debug/PartialEq/Eq), and the variants are distinct — a guard so
+    /// the renderer-/test-facing surface stays usable.
+    #[test]
+    fn match_state_and_winner_enums_are_well_behaved() {
+        // MatchState: Copy + Eq + distinct variants + Debug.
+        let a = MatchState::InProgress;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(MatchState::InProgress, MatchState::Over);
+        assert!(format!("{:?}", MatchState::Over).contains("Over"));
+
+        // Winner has three distinct variants, all Copy/Eq/Debug.
+        assert_ne!(Winner::P1, Winner::P2);
+        assert_ne!(Winner::P1, Winner::Draw);
+        assert_ne!(Winner::P2, Winner::Draw);
+        let w = Winner::Draw;
+        assert_eq!(w, w);
+        assert!(format!("{:?}", Winner::P1).contains("P1"));
+    }
+
+    /// AC2: round 1 itself never auto-resets — a match that is never decided stays
+    /// in round 1 indefinitely (the reset only fires at a round decision). Guards
+    /// against an off-by-one that might "reset" before any round is won.
+    #[test]
+    fn undecided_match_stays_in_round_one() {
+        let mut m = basic_match();
+        into_fight(&mut m);
+        // Many fight ticks with nobody dying and a 99s clock that won't expire.
+        for _ in 0..300 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.round_number(), 1, "no decision -> still round 1");
+        assert_eq!(m.p1_round_wins(), 0);
+        assert_eq!(m.p2_round_wins(), 0);
+        assert_eq!(m.match_state(), MatchState::InProgress);
+        assert_eq!(m.round_state(), RoundState::Fight, "still fighting round 1");
     }
 }

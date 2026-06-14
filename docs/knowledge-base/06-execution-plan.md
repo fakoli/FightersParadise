@@ -193,6 +193,11 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   unreachable. Apply the `[Statedef]` header `poweradd` on state entry (KFM's meter source — every
   attack state adds power) + implement the `PowerAdd`/`PowerSet` controllers; clamp to `[0,power_max]`.
   Enables KFM's signature super moves. Deps: 6.x. *(via fp-loop-batch wfh9xkpkd)*
+- **7.4** DONE — **Best-of-N match flow** (`fp-engine`, single-crate). Match was SINGLE-round
+  (Intro→Fight→Ko→Win terminal); real MUGEN is best-of-3. Add `rounds_to_win` (def 2), per-player
+  round-win counts, `round_number`, a terminal match-over state + `match_winner()`, and round RESET
+  between rounds (life→max, start positions/facing, clear transient state + timer). Deps: 7.1.
+  *(via fp-loop-batch wn2xh1py6)*
 
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).
