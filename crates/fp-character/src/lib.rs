@@ -73,7 +73,7 @@ pub mod executor;
 pub mod loader;
 
 pub use combat::{resolve_attack, AttackResolution};
-pub use executor::TickReport;
+pub use executor::{SoundRequest, TickReport};
 pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
     LoadedCharacter,

@@ -55,9 +55,11 @@
 //! KFM's basic states. From task 5.3: `ChangeState`, `VelSet`, `VelAdd`,
 //! `CtrlSet`, and `Null`. Added in task 5.4: `ChangeAnim` (and the
 //! `ChangeAnim2` alias), `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`,
-//! `StateTypeSet`, `Turn`, and a `PlaySnd` stub (parsed and logged; real audio
-//! is Phase 8). Task 6.2 adds the `HitDef` controller (builds a
-//! [`fp_combat::HitDef`] into [`Character::active_hitdef`]). Any other controller
+//! `StateTypeSet`, `Turn`, and `PlaySnd`. Task 8.3a turns `PlaySnd` into a real
+//! emitter: it pushes a [`SoundRequest`] onto [`TickReport::sound_requests`] for
+//! a downstream audio player to consume — `fp-character` stays a pure simulation
+//! crate and produces no audio itself. Task 6.2 adds the `HitDef` controller
+//! (builds a [`fp_combat::HitDef`] into [`Character::active_hitdef`]). Any other controller
 //! type is a safe no-op (debug-logged) and is deferred to a later task. The
 //! dispatch never panics; a malformed parameter resolves to its safe default.
 //!
@@ -102,13 +104,54 @@ use crate::{
 /// the cap is hit, degrading safely rather than hanging.
 const MAX_TRANSITIONS_PER_TICK: u32 = 512;
 
+/// A request to play one sound, emitted by a `PlaySnd` controller during a tick.
+///
+/// `fp-character` is a *pure simulation* crate: it never touches the audio
+/// device or any file format. Instead, each `PlaySnd` that fires pushes a
+/// [`SoundRequest`] onto [`TickReport::sound_requests`], and a downstream player
+/// (the `fp-audio` mixer in Phase 8) consumes the report and performs the actual
+/// playback. This keeps the executor dependency-free and deterministic.
+///
+/// The fields mirror MUGEN's `PlaySnd` parameters. The `value` parameter is a
+/// `group, sample` pair into the character's `.snd` file (or the common/fight
+/// sound file when the group token is `F`-prefixed — see [`common`]).
+///
+/// [`common`]: SoundRequest::common
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundRequest {
+    /// The sound *group* number (the first half of the `value` pair). When the
+    /// authored group token carried a leading `F` flag it is stripped before
+    /// parsing and [`common`](SoundRequest::common) is set; the integer stored
+    /// here is the group number with that flag removed.
+    pub group: i32,
+    /// The sound *sample* number within [`group`](SoundRequest::group) (the
+    /// second half of the `value` pair).
+    pub sample: i32,
+    /// The playback channel. MUGEN's `PlaySnd` default is `-1` ("play on the
+    /// next free channel"); channel `0` is the reserved voice channel that only
+    /// holds one sound at a time. See the `PlaySnd` controller's defaults for
+    /// the full rationale.
+    pub channel: i32,
+    /// Output volume scale as a percentage (MUGEN's `volumescale`). Defaults to
+    /// `100` (unattenuated) when the parameter is absent.
+    pub volume_scale: i32,
+    /// Whether the sound should loop. Set from the `loop` parameter
+    /// (`1`/`-1`/`true` → looping); defaults to `false`.
+    pub looping: bool,
+    /// `true` when the `PlaySnd` group token was `F`-prefixed, meaning the sound
+    /// comes from the **common / fight** sound file (`fight.snd`) rather than the
+    /// character's own `.snd`. An `S` or any other (or no) leading letter leaves
+    /// this `false` (the character's own `.snd`).
+    pub common: bool,
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
 /// All counters are best-effort and never affect gameplay; they exist so a
 /// caller (or a test) can assert that the expected work happened without
 /// reaching into private executor state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
     /// Number of controllers whose dispatch ran (gating passed and `persistent`
     /// allowed it to fire) this tick.
@@ -122,6 +165,11 @@ pub struct TickReport {
     /// and physics processing was skipped and the pause counter decremented. No
     /// controllers fire and no transitions happen on a hit-paused tick.
     pub hitpaused: bool,
+    /// Sound-play requests emitted by `PlaySnd` controllers this tick, in fire
+    /// order. Empty on a tick with no `PlaySnd` (a fresh [`TickReport`] is built
+    /// per tick, so this never carries requests across ticks). Consumed by the
+    /// downstream audio player; `fp-character` itself produces no sound.
+    pub sound_requests: Vec<SoundRequest>,
 }
 
 impl Character {
@@ -457,10 +505,10 @@ impl Character {
     /// Handles the core MOVEMENT/CONTROL controllers: `ChangeState`, `VelSet`,
     /// `VelAdd`, `CtrlSet`, `Null` (task 5.3) plus `ChangeAnim`/`ChangeAnim2`,
     /// `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`, `StateTypeSet`,
-    /// `Turn`, and a `PlaySnd` stub (task 5.4). Task 6.2 adds the `HitDef`
-    /// controller, which builds a [`fp_combat::HitDef`] into
-    /// [`active_hitdef`](Character::active_hitdef). Every other type is a safe
-    /// no-op, debug-logged and deferred to a later task.
+    /// `Turn`, and `PlaySnd` (task 5.4; 8.3a makes `PlaySnd` emit a
+    /// [`SoundRequest`]). Task 6.2 adds the `HitDef` controller, which builds a
+    /// [`fp_combat::HitDef`] into [`active_hitdef`](Character::active_hitdef).
+    /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
         states: &HashMap<i32, CompiledState>,
@@ -499,7 +547,7 @@ impl Character {
         } else if kind.eq_ignore_ascii_case("Turn") {
             self.ctrl_turn();
         } else if kind.eq_ignore_ascii_case("PlaySnd") {
-            self.ctrl_play_snd(ctrl);
+            self.ctrl_play_snd(ctrl, report);
         } else if kind.eq_ignore_ascii_case("HitDef") {
             self.ctrl_hit_def(ctrl);
         } else if kind.eq_ignore_ascii_case("Null") {
@@ -772,15 +820,99 @@ impl Character {
         };
     }
 
-    /// `PlaySnd` (stub): parse the `value` parameter and log it; no audio is
-    /// produced. Real sound playback arrives in Phase 8.
-    fn ctrl_play_snd(&mut self, ctrl: &CompiledController) {
-        // `value` is a `group, index` sound reference; keep the raw source for
-        // diagnostics. The expression VM cannot represent the pair, so the raw
-        // text is the useful artifact here.
-        let value = ctrl.params.get("value").map_or("<none>", CompiledParam::raw);
+    /// `PlaySnd`: emit a [`SoundRequest`] onto `report.sound_requests`.
+    ///
+    /// `fp-character` produces *no* audio — it only describes the request. The
+    /// downstream player (`fp-audio`, Phase 8) consumes
+    /// [`TickReport::sound_requests`] and performs playback.
+    ///
+    /// Parameters (MUGEN `PlaySnd` semantics):
+    ///
+    /// - `value = group, sample`. The `group` token may carry a single leading
+    ///   letter *flag*: `F` (case-insensitive) selects the common / fight sound
+    ///   file (sets [`SoundRequest::common`]) and is stripped before parsing the
+    ///   group integer; `S` (or any other unknown letter) means the character's
+    ///   own `.snd` (`common = false`) but its digits are still parsed. The
+    ///   `value` is read from the **raw** source because the leading-letter form
+    ///   (`F0`) is not arithmetic and would not survive the expression compiler.
+    /// - `channel` (i32): the playback channel. **Default `-1`** — MUGEN's
+    ///   documented `PlaySnd` default, meaning "play on the next free channel".
+    ///   (Channel `0` is the reserved single-slot voice channel, so it is *not*
+    ///   the no-op default.) The KB (`03-engine-architecture.md`) does not
+    ///   override this.
+    /// - `volumescale` (i32): output volume percentage. Default `100`.
+    /// - `loop` (bool-ish): `1` / `-1` / `true` (case-insensitive) → looping.
+    ///   Default `false`.
+    ///
+    /// Robust to bad content: a missing `value`, or a `value` whose group or
+    /// sample cannot be parsed as an integer, logs at `debug` and pushes **no**
+    /// request. Never panics, unwraps, or expects.
+    fn ctrl_play_snd(&mut self, ctrl: &CompiledController, report: &mut TickReport) {
+        // `value = group, sample`. Read the raw source: the group may be
+        // `F`/`S`-prefixed (non-arithmetic), so it cannot go through the VM.
+        let Some(raw) = raw_param(ctrl, "value") else {
+            tracing::debug!(
+                "tick: PlaySnd in state {} has no `value`; no sound requested",
+                ctrl.state_number
+            );
+            return;
+        };
+        let mut parts = raw.split(',');
+        let group_tok = parts.next().unwrap_or("").trim();
+        let sample_tok = parts.next().unwrap_or("").trim();
+
+        // Strip an optional single leading letter flag from the group token:
+        // `F`/`f` → common/fight sound file; any other letter (`S`, …) → own
+        // .snd. The remaining text must parse as the integer group number.
+        let (common, group_digits) = match group_tok.chars().next() {
+            Some(c) if c.eq_ignore_ascii_case(&'F') => (true, group_tok[c.len_utf8()..].trim()),
+            Some(c) if c.is_ascii_alphabetic() => (false, group_tok[c.len_utf8()..].trim()),
+            _ => (false, group_tok),
+        };
+
+        let Ok(group) = group_digits.parse::<i32>() else {
+            tracing::debug!(
+                "tick: PlaySnd in state {} has unparseable group {group_tok:?}; no sound requested",
+                ctrl.state_number
+            );
+            return;
+        };
+        let Ok(sample) = sample_tok.parse::<i32>() else {
+            tracing::debug!(
+                "tick: PlaySnd in state {} has unparseable sample {sample_tok:?}; \
+                 no sound requested",
+                ctrl.state_number
+            );
+            return;
+        };
+
+        // Optional numeric params evaluate against `self`; absent → MUGEN default.
+        let channel = ctrl
+            .params
+            .get("channel")
+            .and_then(|p| self.eval_param(p))
+            .map_or(-1, |v| v.to_int());
+        let volume_scale = ctrl
+            .params
+            .get("volumescale")
+            .and_then(|p| self.eval_param(p))
+            .map_or(100, |v| v.to_int());
+
+        // `loop` is bool-ish: 1 / -1 / "true" all mean looping. Read the raw
+        // token so a textual `true` is honored alongside the numeric forms.
+        let looping = raw_param(ctrl, "loop").is_some_and(parse_loop_flag);
+
+        report.sound_requests.push(SoundRequest {
+            group,
+            sample,
+            channel,
+            volume_scale,
+            looping,
+            common,
+        });
         tracing::debug!(
-            "tick: PlaySnd {value:?} in state {} (audio is Phase 8; no-op)",
+            "tick: PlaySnd group={group} sample={sample} channel={channel} \
+             volscale={volume_scale} loop={looping} common={common} in state {}",
             ctrl.state_number
         );
     }
@@ -1323,6 +1455,19 @@ fn parse_resource_id(raw: &str, fallback: i32) -> i32 {
         .map(str::trim)
         .unwrap_or(first);
     digits.parse::<i32>().unwrap_or(fallback)
+}
+
+/// Interprets a `PlaySnd` `loop` flag token as a boolean.
+///
+/// MUGEN treats the loop flag as bool-ish: `1`, `-1`, and the textual `true`
+/// (case-insensitive) all enable looping; `0`, `false`, empty, or anything else
+/// disables it. Only the first comma-separated token is considered. Never panics.
+fn parse_loop_flag(raw: &str) -> bool {
+    let token = raw.split(',').next().unwrap_or("").trim();
+    if token.eq_ignore_ascii_case("true") {
+        return true;
+    }
+    matches!(token.parse::<i32>(), Ok(1) | Ok(-1))
 }
 
 /// Maps the first two evaluated components to a [`Vec2`], falling back to the
@@ -3459,11 +3604,11 @@ mod tests {
         assert_eq!(ch2.facing, Facing::Right, "Turn flipped left → right");
     }
 
-    // ---- 5.4 AC: PlaySnd is a safe no-op stub ----
+    // ---- 5.4 / 8.3a AC: PlaySnd never mutates character state ----
 
     #[test]
-    fn play_snd_is_safe_noop() {
-        // PlaySnd parses its value and logs; it must not panic or mutate state.
+    fn play_snd_does_not_mutate_character_state() {
+        // PlaySnd emits a request but must not panic or mutate the character.
         let c = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "1, 0")]);
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -3472,6 +3617,7 @@ mod tests {
         ch.vel = Vec2::new(3.0, 4.0);
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
+        assert_eq!(report.sound_requests.len(), 1, "one request emitted");
         assert!((ch.vel.x - 3.0).abs() < 1e-6);
         assert!((ch.vel.y - 4.0).abs() < 1e-6);
     }
@@ -3485,6 +3631,120 @@ mod tests {
         ch.physics = Physics::None;
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 1);
+        assert!(
+            report.sound_requests.is_empty(),
+            "missing value → no request"
+        );
+    }
+
+    // ---- 8.3a AC: PlaySnd emits SoundRequest into TickReport ----
+
+    /// Helper: build a single-PlaySnd state, run one tick, return the report.
+    fn play_snd_tick(params: &[(&str, &str)]) -> TickReport {
+        let c = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, params);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch)
+    }
+
+    #[test]
+    fn play_snd_simple_value_emits_one_request_with_defaults() {
+        let report = play_snd_tick(&[("value", "1, 0")]);
+        assert_eq!(
+            report.sound_requests,
+            vec![SoundRequest {
+                group: 1,
+                sample: 0,
+                channel: -1,
+                volume_scale: 100,
+                looping: false,
+                common: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn play_snd_f_prefix_sets_common() {
+        // `value = F0, 5` → common/fight sound file, group 0, sample 5.
+        let report = play_snd_tick(&[("value", "F0, 5")]);
+        let req = &report.sound_requests[0];
+        assert!(req.common, "F prefix → common = true");
+        assert_eq!(req.group, 0);
+        assert_eq!(req.sample, 5);
+        // Lowercase `f` is honored too.
+        let report = play_snd_tick(&[("value", "f3, 2")]);
+        assert!(report.sound_requests[0].common);
+        assert_eq!(report.sound_requests[0].group, 3);
+    }
+
+    #[test]
+    fn play_snd_s_prefix_is_own_snd_but_parses_digits() {
+        // `S` (own .snd) → common = false, digits still parsed.
+        let report = play_snd_tick(&[("value", "S7, 4")]);
+        let req = &report.sound_requests[0];
+        assert!(!req.common, "S prefix → common = false");
+        assert_eq!(req.group, 7);
+        assert_eq!(req.sample, 4);
+    }
+
+    #[test]
+    fn play_snd_honors_channel_volumescale_and_loop() {
+        let report = play_snd_tick(&[
+            ("value", "2, 3"),
+            ("channel", "5"),
+            ("volumescale", "75"),
+            ("loop", "1"),
+        ]);
+        let req = &report.sound_requests[0];
+        assert_eq!(req.channel, 5);
+        assert_eq!(req.volume_scale, 75);
+        assert!(req.looping, "loop = 1 → looping");
+
+        // loop = -1 is also looping; loop = 0 is not; textual `true` loops.
+        assert!(play_snd_tick(&[("value", "1,0"), ("loop", "-1")]).sound_requests[0].looping);
+        assert!(!play_snd_tick(&[("value", "1,0"), ("loop", "0")]).sound_requests[0].looping);
+        assert!(play_snd_tick(&[("value", "1,0"), ("loop", "true")]).sound_requests[0].looping);
+    }
+
+    #[test]
+    fn play_snd_garbage_value_emits_no_request() {
+        // Non-numeric group, non-numeric sample, and a value missing the sample
+        // each push NO request and must not panic.
+        assert!(play_snd_tick(&[("value", "abc, 0")]).sound_requests.is_empty());
+        assert!(play_snd_tick(&[("value", "1, xyz")]).sound_requests.is_empty());
+        assert!(play_snd_tick(&[("value", "1")]).sound_requests.is_empty());
+        assert!(play_snd_tick(&[("value", "")]).sound_requests.is_empty());
+        // A bare `F` flag with no digits is unparseable → no request.
+        assert!(play_snd_tick(&[("value", "F, 5")]).sound_requests.is_empty());
+    }
+
+    #[test]
+    fn sound_requests_empty_on_tick_without_play_snd() {
+        // A state whose only controller is a VelSet emits no sound requests.
+        let c = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert!(
+            report.sound_requests.is_empty(),
+            "no PlaySnd → empty sound_requests"
+        );
+    }
+
+    #[test]
+    fn parse_loop_flag_bool_ish() {
+        assert!(parse_loop_flag("1"));
+        assert!(parse_loop_flag("-1"));
+        assert!(parse_loop_flag("true"));
+        assert!(parse_loop_flag("TRUE"));
+        assert!(!parse_loop_flag("0"));
+        assert!(!parse_loop_flag("false"));
+        assert!(!parse_loop_flag(""));
+        assert!(!parse_loop_flag("2"));
     }
 
     // ---- 5.4 helper: parse_var_bank_key unit coverage ----
@@ -3945,9 +4205,9 @@ mod tests {
     // ---- AC1: PlaySnd via real CNS text (the `value = g, i` pair form) ----
 
     #[test]
-    fn play_snd_pair_value_from_cns_is_noop_stub() {
+    fn play_snd_pair_value_from_cns_emits_request_without_mutating_state() {
         // The canonical PlaySnd form `value = group, index` parses through the CNS
-        // parser; the stub must dispatch, log, and leave all state untouched.
+        // parser; it must dispatch, emit one request, and leave all state untouched.
         let cns = CnsFile::from_str(
             "[Statedef 0]\ntype = S\nphysics = N\n\
              [State 0, snd]\ntype = PlaySnd\ntrigger1 = 1\nvalue = S1, 0\n",
@@ -3962,7 +4222,19 @@ mod tests {
         let before_vars = ch.vars;
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
-        assert_eq!(ch.life, 1000, "PlaySnd stub mutates nothing");
+        // `S1` → own .snd (common = false), group 1, sample 0, MUGEN defaults.
+        assert_eq!(
+            report.sound_requests,
+            vec![SoundRequest {
+                group: 1,
+                sample: 0,
+                channel: -1,
+                volume_scale: 100,
+                looping: false,
+                common: false,
+            }]
+        );
+        assert_eq!(ch.life, 1000, "PlaySnd mutates no character state");
         assert_eq!(ch.vars, before_vars);
     }
 
@@ -4732,5 +5004,449 @@ mod tests {
         assert_eq!(hd.attr.class, fp_combat::StateClass::Air);
         assert_eq!(hd.attr.power, fp_combat::AttackPower::Special);
         assert_eq!(hd.attr.kind, fp_combat::AttackKind::Projectile);
+    }
+
+    // =====================================================================
+    // Proctor (task 8.3a): additional edge-case, error-path, and
+    // MUGEN-semantics coverage for the `PlaySnd` -> `SoundRequest` emitter,
+    // layered on top of Forge's tests. Every test is annotated with the
+    // acceptance criterion (AC1..AC5) it exercises. All synthetic except the
+    // gated real-KFM fixture test at the end.
+    // =====================================================================
+
+    // ---- AC1: SoundRequest struct shape, derives, and field semantics ------
+
+    /// AC1: `SoundRequest` derives `Debug`, `Clone`, and `PartialEq`, and the
+    /// fields round-trip through a clone. Pins the public contract so a later
+    /// refactor that drops a derive (which downstream `fp-audio` relies on) is
+    /// caught here.
+    #[test]
+    fn sound_request_is_debug_clone_partial_eq() {
+        let req = SoundRequest {
+            group: 5,
+            sample: 2,
+            channel: 3,
+            volume_scale: 80,
+            looping: true,
+            common: true,
+        };
+        // Clone + PartialEq.
+        let copy = req.clone();
+        assert_eq!(req, copy);
+        // Debug renders every field (used in tracing / test failure messages).
+        let dbg = format!("{req:?}");
+        for needle in [
+            "group", "sample", "channel", "volume_scale", "looping", "common",
+        ] {
+            assert!(dbg.contains(needle), "Debug output missing field {needle:?}");
+        }
+        // Distinct field values compare unequal (PartialEq is structural).
+        let other = SoundRequest {
+            group: 6,
+            ..req
+        };
+        assert_ne!(req, other);
+    }
+
+    // ---- AC1/AC2: TickReport.sound_requests is fresh per tick --------------
+
+    /// AC1: `TickReport` is built fresh each tick, so `sound_requests` never
+    /// carries a request from a previous tick into a later one. A PlaySnd that
+    /// fires on tick 1 (Time = 0) but not tick 2 must leave tick 2's report
+    /// empty.
+    #[test]
+    fn sound_requests_do_not_leak_across_ticks() {
+        // Fire PlaySnd only on the entry tick (Time = 0), persistent default.
+        let c = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("value", "1, 0")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.state_time = 0;
+
+        // Tick 1: Time == 0 → one request.
+        let r1 = lc.tick(&mut ch);
+        assert_eq!(r1.sound_requests.len(), 1, "tick 1 emits one request");
+
+        // Tick 2: Time is now 1 → trigger false → fresh empty report.
+        let r2 = lc.tick(&mut ch);
+        assert!(
+            r2.sound_requests.is_empty(),
+            "tick 2 report must be fresh/empty, not carry tick 1's request"
+        );
+    }
+
+    // ---- AC2: multiple PlaySnd in one tick preserve fire order -------------
+
+    /// AC2: two PlaySnd controllers in the same state both fire on one tick and
+    /// push their requests onto `sound_requests` **in controller (fire) order**,
+    /// as the doc comment on the field promises.
+    #[test]
+    fn multiple_play_snd_emit_in_fire_order() {
+        let first = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "1, 0")]);
+        let second = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "F2, 3")]);
+        let lc = loaded(vec![stand_n(0, vec![first, second])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.sound_requests.len(), 2, "both PlaySnd fired");
+        // Order matches controller order: own-snd group 1 first, common group 2.
+        assert_eq!(report.sound_requests[0].group, 1);
+        assert!(!report.sound_requests[0].common);
+        assert_eq!(report.sound_requests[1].group, 2);
+        assert!(report.sound_requests[1].common);
+    }
+
+    /// AC2/AC3: a PlaySnd whose trigger is false does NOT fire and emits no
+    /// request — gating must precede emission.
+    #[test]
+    fn play_snd_not_fired_when_trigger_false_emits_no_request() {
+        let c = ctrl(0, "PlaySnd", &[], &[(1, &["0"])], None, &[("value", "1, 0")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 0, "gating failed → not dispatched");
+        assert!(report.sound_requests.is_empty(), "no fire → no request");
+    }
+
+    // ---- AC2: MUGEN-semantic value parsing edge cases ----------------------
+
+    /// AC2: negative group and sample numbers are valid MUGEN sound ids and must
+    /// parse through unchanged (the `value` is read from raw source, so the `-`
+    /// is preserved).
+    #[test]
+    fn play_snd_negative_group_and_sample_parse() {
+        let report = play_snd_tick(&[("value", "-1, -2")]);
+        let req = &report.sound_requests[0];
+        assert_eq!(req.group, -1);
+        assert_eq!(req.sample, -2);
+        assert!(!req.common);
+    }
+
+    /// AC2: surrounding/interior whitespace and tab padding in the `value`
+    /// tokens is trimmed before parsing (MUGEN ignores it).
+    #[test]
+    fn play_snd_value_tolerates_whitespace_padding() {
+        let report = play_snd_tick(&[("value", "  7 ,   8 ")]);
+        let req = &report.sound_requests[0];
+        assert_eq!(req.group, 7);
+        assert_eq!(req.sample, 8);
+    }
+
+    /// AC2: an `F` prefix followed by whitespace then digits (`F 5`) still sets
+    /// `common` and parses the group — the flag char is stripped and the
+    /// remainder is trimmed before the integer parse.
+    #[test]
+    fn play_snd_f_prefix_with_inner_space_still_common() {
+        let report = play_snd_tick(&[("value", "F 5, 1")]);
+        let req = &report.sound_requests[0];
+        assert!(req.common, "F<space>5 → common");
+        assert_eq!(req.group, 5);
+        assert_eq!(req.sample, 1);
+    }
+
+    /// AC2: an unknown leading letter other than F/S (e.g. `X`) is treated as a
+    /// non-common flag (own .snd) but its trailing digits are still parsed,
+    /// matching the documented "S or other unknown leading letter" rule.
+    #[test]
+    fn play_snd_unknown_letter_prefix_is_own_snd_parses_digits() {
+        let report = play_snd_tick(&[("value", "X9, 1")]);
+        let req = &report.sound_requests[0];
+        assert!(!req.common, "non-F letter → own .snd (common = false)");
+        assert_eq!(req.group, 9);
+        assert_eq!(req.sample, 1);
+    }
+
+    // ---- AC2: param defaults when individually present/absent --------------
+
+    /// AC2: when only `channel` is given, `volume_scale` still defaults to 100
+    /// and `looping` to false; conversely when only `volumescale` is given,
+    /// `channel` still defaults to -1. Confirms each optional param defaults
+    /// independently.
+    #[test]
+    fn play_snd_optional_params_default_independently() {
+        let only_channel = play_snd_tick(&[("value", "1, 0"), ("channel", "4")]);
+        let r = &only_channel.sound_requests[0];
+        assert_eq!(r.channel, 4);
+        assert_eq!(r.volume_scale, 100, "volumescale defaults when absent");
+        assert!(!r.looping, "loop defaults to false when absent");
+
+        let only_vol = play_snd_tick(&[("value", "1, 0"), ("volumescale", "50")]);
+        let r = &only_vol.sound_requests[0];
+        assert_eq!(r.channel, -1, "channel defaults to -1 when absent");
+        assert_eq!(r.volume_scale, 50);
+    }
+
+    /// AC2: `channel = 0` is honored as an explicit value (the reserved voice
+    /// channel), distinct from the absent default of -1. Guards against an
+    /// implementation that confuses "channel 0" with "no channel".
+    #[test]
+    fn play_snd_explicit_channel_zero_is_honored() {
+        let report = play_snd_tick(&[("value", "1, 0"), ("channel", "0")]);
+        assert_eq!(
+            report.sound_requests[0].channel, 0,
+            "explicit channel 0 must not collapse to the -1 default"
+        );
+    }
+
+    /// AC2: optional numeric params are *expressions* evaluated against the
+    /// character, not literals. A `volumescale = 50 + 25` and a
+    /// `channel = var(3)` resolve against `self`. Confirms the emitter uses the
+    /// VM (`eval_param`) for these params, matching authored MUGEN content.
+    #[test]
+    fn play_snd_numeric_params_are_evaluated_expressions() {
+        let c = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1, 0"), ("channel", "var(3)"), ("volumescale", "50 + 25")],
+        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[3] = 6;
+        let report = lc.tick(&mut ch);
+        let req = &report.sound_requests[0];
+        assert_eq!(req.channel, 6, "channel resolved from var(3)");
+        assert_eq!(req.volume_scale, 75, "volumescale resolved from 50 + 25");
+    }
+
+    /// AC2 (MUGEN distinction): the MUGEN `volume`/`volumescale` distinction —
+    /// the emitter reads `volumescale`, NOT `volume`. A controller carrying only
+    /// `volume` (as real KFM does, e.g. `volume = -40`) leaves `volume_scale` at
+    /// its 100 default. This documents the known gap: `volume` is not yet mapped.
+    #[test]
+    fn play_snd_volume_param_is_not_volumescale() {
+        let report = play_snd_tick(&[("value", "1, 0"), ("volume", "-40")]);
+        assert_eq!(
+            report.sound_requests[0].volume_scale, 100,
+            "`volume` (additive dB) is not `volumescale`; volume_scale stays at default"
+        );
+    }
+
+    // ---- AC3: robustness — bad content never panics, emits nothing ---------
+
+    /// AC3: a wide battery of malformed `value` strings each push NO request and
+    /// never panic. Extends Forge's garbage test with whitespace-only, lone
+    /// comma, float-looking, and trailing-junk forms.
+    #[test]
+    fn play_snd_more_garbage_values_emit_no_request() {
+        for bad in [
+            "   ",      // whitespace only
+            ",",        // lone comma, both tokens empty
+            ", 5",      // empty group
+            "5, ",      // empty sample
+            "1.5, 0",   // float group (parse::<i32> fails)
+            "1, 2.5",   // float sample
+            "1 2, 0",   // space-separated junk in group
+            "0x1, 0",   // hex literal (not a plain i32)
+            "S, 0",     // S prefix with no digits
+            "FF, 0",    // F prefix then a non-digit letter
+        ] {
+            let report = play_snd_tick(&[("value", bad)]);
+            assert!(
+                report.sound_requests.is_empty(),
+                "garbage value {bad:?} must emit no request"
+            );
+        }
+    }
+
+    /// AC3: a malformed optional param (`channel`/`volumescale` that evaluate via
+    /// the const-0 fallback, `loop` garbage) never prevents the request when the
+    /// `value` is well-formed; the bad params fall back to safe defaults and the
+    /// request is still emitted. Never panics.
+    #[test]
+    fn play_snd_garbage_optional_params_fall_back_and_still_emit() {
+        // `channel`/`volumescale` are compiled expressions; a non-arithmetic
+        // token compiles to the const-0 fallback (group = 0). `loop` garbage is
+        // not bool-ish → false.
+        let report = play_snd_tick(&[
+            ("value", "1, 0"),
+            ("channel", "@@@"),
+            ("volumescale", "$$$"),
+            ("loop", "maybe"),
+        ]);
+        assert_eq!(report.sound_requests.len(), 1, "request still emitted");
+        let req = &report.sound_requests[0];
+        assert_eq!(req.group, 1);
+        // Fallback expressions evaluate to 0.
+        assert_eq!(req.channel, 0, "garbage channel expr → const-0 fallback");
+        assert_eq!(req.volume_scale, 0, "garbage volumescale expr → const-0 fallback");
+        assert!(!req.looping, "non-bool-ish loop token → false");
+    }
+
+    // ---- AC4: empty sound_requests on a no-controller / empty state --------
+
+    /// AC4: a state with no controllers at all produces an empty
+    /// `sound_requests` (complements Forge's "VelSet-only" empty test).
+    #[test]
+    fn sound_requests_empty_on_state_with_no_controllers() {
+        let lc = loaded(vec![stand_n(0, vec![])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        assert!(lc.tick(&mut ch).sound_requests.is_empty());
+    }
+
+    // ---- AC2: loop flag bool-ish corner values via the full pipeline -------
+
+    /// AC2: the `loop` flag corner values exercised end-to-end through the
+    /// emitter (not just the `parse_loop_flag` unit): `+1`/`-1`/`true`/`TRUE`
+    /// loop; `0`/`2`/`false`/empty do not.
+    #[test]
+    fn play_snd_loop_flag_corner_values_end_to_end() {
+        for (tok, expect) in [
+            ("1", true),
+            ("-1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("2", false),
+            ("false", false),
+            ("", false),
+        ] {
+            let report = play_snd_tick(&[("value", "1, 0"), ("loop", tok)]);
+            assert_eq!(
+                report.sound_requests[0].looping, expect,
+                "loop = {tok:?} should be looping = {expect}"
+            );
+        }
+    }
+
+    // ---- AC2: F-prefix common flag survives the CNS pipeline (real form) ---
+
+    /// AC2: the `value = F5, 2` form — exactly as authored in real KFM
+    /// (`kfm.cns` state 200) — parses through the CNS parser and the compiled
+    /// controller, emitting a common-file request with the F flag stripped. This
+    /// is the synthetic-CNS counterpart to the gated fixture test below.
+    #[test]
+    fn play_snd_f_prefix_via_cns_text_sets_common() {
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, snd]\ntype = PlaySnd\ntrigger1 = 1\nvalue = F5, 2\nvolume = -40\n",
+        )
+        .expect("valid synthetic CNS");
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
+        assert_eq!(
+            report.sound_requests,
+            vec![SoundRequest {
+                group: 5,
+                sample: 2,
+                channel: -1,
+                volume_scale: 100, // `volume` is not `volumescale`; stays default
+                looping: false,
+                common: true, // F prefix → common/fight sound file
+            }]
+        );
+    }
+
+    // ---- AC5: gated real-KFM fixture — PlaySnd emits from authored content --
+
+    /// AC5: load the real KFM character and run a real parsed/compiled state
+    /// that authors a `PlaySnd` firing on its **entry tick** (`Time = 0`), so the
+    /// authored `value = group, sample` flows through the whole
+    /// parse -> compile -> emit pipeline and yields a `SoundRequest`.
+    ///
+    /// KFM's `[Statedef 1300]` (the stand reversal/counter) authors
+    /// `[State 1300, 1] type = PlaySnd / trigger1 = Time = 0 / value = 0, 1`,
+    /// and its only `ChangeState` is gated on `AnimTime = 0` (the end of the
+    /// move), so the PlaySnd fires on tick 1 before anything transitions away.
+    /// The compiled state is run directly through [`Character::tick_with`] over a
+    /// minimal map holding only that state, bypassing KFM's `[Statedef -1]`
+    /// command bridge — which would otherwise `ChangeState` an idle,
+    /// control-less character back to stand every tick. This still exercises the
+    /// real authored controller and the real compiled `value` param. Skips
+    /// cleanly when `test-assets/` is absent.
+    ///
+    /// A `Time = 0` PlaySnd is deliberately chosen over the stand-punch
+    /// (`Statedef 200`, PlaySnd at `Time = 1`): the executor advances
+    /// `anim_time` only at the *end* of a tick, so on a state's first tick an
+    /// `AnimTime = 0`-gated `ChangeState` fires spuriously and pre-empts a
+    /// later-than-entry PlaySnd. Firing at `Time = 0` avoids that unrelated
+    /// quirk and keeps this test focused on the 8.3a emit path.
+    #[test]
+    fn real_kfm_play_snd_emits_sound_request() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+
+        // KFM's stand reversal state authors a PlaySnd at Time = 0.
+        const SND_STATE: i32 = 1300;
+        let Some(state) = lc.states.get(&SND_STATE).cloned() else {
+            eprintln!("skipping: KFM has no [Statedef {SND_STATE}]; asset differs");
+            return;
+        };
+        // Sanity: the authored state really does carry a PlaySnd controller.
+        assert!(
+            state.controllers.iter().any(|c| c
+                .controller_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("PlaySnd"))),
+            "KFM [Statedef {SND_STATE}] should author a PlaySnd controller"
+        );
+
+        // Minimal state map: just the real compiled state. Drive it directly so
+        // the special states do not bounce us out before the PlaySnd fires.
+        let mut states = HashMap::new();
+        states.insert(SND_STATE, state);
+        let air = lc.air.clone();
+
+        let mut ch = Character::with_constants(lc.constants);
+        // Enter through the proper seam so entry params initialize the cursor.
+        ch.change_state(&states, SND_STATE);
+
+        // The PlaySnd fires on the entry tick (Time = 0).
+        let report = ch.tick_with(&states, &air);
+
+        // KFM authors `value = 0, 1` (own .snd) here: one request, group 0,
+        // sample 1, common = false, with the emitter's MUGEN defaults for the
+        // params it does not author.
+        assert!(
+            report
+                .sound_requests
+                .iter()
+                .any(|r| r.group == 0 && r.sample == 1 && !r.common),
+            "expected the authored `value = 0, 1` own-snd request from real KFM \
+             [Statedef {SND_STATE}]; got {:?}",
+            report.sound_requests
+        );
+        // Defaults (channel -1, volume_scale 100, not looping) hold for the
+        // authored request since KFM 1300 specifies none of those params.
+        let req = report
+            .sound_requests
+            .iter()
+            .find(|r| r.group == 0 && r.sample == 1)
+            .expect("authored request present (asserted above)");
+        assert_eq!(req.channel, -1, "unspecified channel → MUGEN default -1");
+        assert_eq!(req.volume_scale, 100, "unspecified volumescale → 100");
+        assert!(!req.looping, "unspecified loop → false");
     }
 }
