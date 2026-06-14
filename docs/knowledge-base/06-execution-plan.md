@@ -160,7 +160,7 @@ facing velocity, 6.3a resolution, 6.3b detection+apply). Now wire two characters
 | ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
 |----|--------|------|----------|--------------------|------|
 | 7.1 | DONE | **Match coordinator** (2 players) | `fp-engine` | `Match` holds P1+P2 (Character + LoadedCharacter each); `Match::tick()` ticks both, runs `combat::resolve_attack` BOTH directions, applies player-push (P6.2) + screen-bound clamp, keeps each character facing the opponent (facep2 baseline), advances a round state machine (intro→fight→KO when a life hits 0→win) + a round timer. Headless-tested (two KFMs: P1 hit → P2 life drops; KO ends the round). Deps: fp-character/fp-combat/fp-physics. | 6.3b |
-| 7.2 | TODO | **fp-app 2-player render + input** | `fp-app` | Drive a `fp-engine::Match` in the window: render BOTH characters from their current AIR frame; P1 = keyboard, P2 = idle/dummy (or a 2nd input map); a minimal life readout; round-state feedback (KO). The "two characters fight on screen" demo. Deps: 7.1 |
+| 7.2 | DONE | **fp-app 2-player render + input** | `fp-app` | Drive a `fp-engine::Match` in the window: render BOTH characters from their current AIR frame; P1 = keyboard, P2 = idle/dummy (or a 2nd input map); a minimal life readout; round-state feedback (KO). The "two characters fight on screen" demo. Deps: 7.1 |
 
 ### Phase 8–11 — stage / audio / ui / storyboard  *(expand when reached)*
 `fp-stage`, `fp-audio`+SND, `fp-ui`+FNT (lifebars/select/screenpacks), `fp-storyboard`. Largely
@@ -250,6 +250,8 @@ parallelizable once the core exists. Deps: Phase 7.
 - **CB30** Executor hit-pause currently runs NO controllers during the pause; MUGEN also runs
   `ignorehitpause`-flagged controllers mid-pause. Implement that exception (doc now states it's
   deferred). *(added 6.3b — benign until a get-hit state needs it)*
+- **CB31** `fp-engine` declares `tracing` but never logs; wire `tracing::debug!` on round-state
+  transitions (KO/time-over/round start) or drop the dep. *(added 7.1)*
 
 ---
 

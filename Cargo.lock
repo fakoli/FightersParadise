@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "fp-character",
  "fp-core",
+ "fp-engine",
  "fp-formats",
  "fp-input",
  "fp-physics",
