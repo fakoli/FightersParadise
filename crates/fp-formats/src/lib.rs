@@ -12,9 +12,7 @@
 //! - [`cns`] — CNS state files — statedefs and state controllers with raw triggers
 //! - [`def`] — DEF configuration files — simple INI-like key/value config
 //! - [`snd`] — Sound container format — WAV/PCM blobs addressed by (group, sample)
-//!
-//! Future modules (not yet implemented):
-//! - `fnt` — Font format
+//! - [`fnt`] — FNT bitmap font format (v1) — embedded PCX glyph strip + glyph map
 
 #![warn(missing_docs)]
 
@@ -22,5 +20,6 @@ pub mod air;
 pub mod cmd;
 pub mod cns;
 pub mod def;
+pub mod fnt;
 pub mod sff;
 pub mod snd;

@@ -2,6 +2,7 @@ use fp_core::{FpError, FpResult};
 use wgpu::util::DeviceExt;
 
 use crate::params::{BlendMode, SpriteDrawParams};
+use crate::text::{GlyphFont, TextDrawParams};
 use crate::texture::{PaletteTexture, SpriteTexture};
 use crate::vertex::{DebugVertex, SpriteVertex};
 
@@ -466,6 +467,10 @@ pub struct RenderFrame<'a> {
 
 impl RenderFrame<'_> {
     /// Draw a palette-indexed sprite with the given parameters.
+    ///
+    /// Samples the whole texture (UV `0..1`). For sampling a sub-rectangle of a
+    /// larger atlas — e.g. one glyph out of a font strip — use
+    /// [`draw_sprite_region`](Self::draw_sprite_region).
     pub fn draw_sprite(
         &mut self,
         texture: &SpriteTexture,
@@ -474,9 +479,47 @@ impl RenderFrame<'_> {
     ) {
         let w = texture.width as f32 * params.scale_x;
         let h = texture.height as f32 * params.scale_y;
+        self.draw_textured_quad(texture, palette, params, w, h, [0.0, 0.0, 1.0, 1.0]);
+    }
 
-        let (u_left, u_right) = if params.flip_h { (1.0, 0.0) } else { (0.0, 1.0) };
-        let (v_top, v_bottom) = if params.flip_v { (1.0, 0.0) } else { (0.0, 1.0) };
+    /// Draw a sub-rectangle of a palette-indexed texture as a quad.
+    ///
+    /// `uv` is the source region `[u_min, v_min, u_max, v_max]` in normalized
+    /// (0–1) texture coordinates; `dst_w`/`dst_h` are the destination size in
+    /// screen pixels (already scaled). `params.x`/`params.y` place the top-left
+    /// corner; `flip_h`/`flip_v`/`angle`/`alpha`/`blend` apply as for
+    /// [`draw_sprite`](Self::draw_sprite). This is the primitive the glyph/text
+    /// path ([`draw_text`](Self::draw_text)) builds on: one font strip texture,
+    /// many sub-rectangle draws.
+    pub fn draw_sprite_region(
+        &mut self,
+        texture: &SpriteTexture,
+        palette: &PaletteTexture,
+        params: &SpriteDrawParams,
+        uv: [f32; 4],
+        dst_w: f32,
+        dst_h: f32,
+    ) {
+        self.draw_textured_quad(texture, palette, params, dst_w, dst_h, uv);
+    }
+
+    /// Shared quad-draw core for [`draw_sprite`](Self::draw_sprite) and
+    /// [`draw_sprite_region`](Self::draw_sprite_region).
+    ///
+    /// `w`/`h` are the destination quad size in screen pixels; `uv` is the
+    /// source `[u_min, v_min, u_max, v_max]` rectangle. `flip_h`/`flip_v` swap
+    /// the corresponding UV bounds; rotation is around the quad centre.
+    fn draw_textured_quad(
+        &mut self,
+        texture: &SpriteTexture,
+        palette: &PaletteTexture,
+        params: &SpriteDrawParams,
+        w: f32,
+        h: f32,
+        uv: [f32; 4],
+    ) {
+        let (u_left, u_right) = if params.flip_h { (uv[2], uv[0]) } else { (uv[0], uv[2]) };
+        let (v_top, v_bottom) = if params.flip_v { (uv[3], uv[1]) } else { (uv[1], uv[3]) };
 
         // Corner positions relative to sprite origin, before rotation.
         let mut corners = [
@@ -570,6 +613,44 @@ impl RenderFrame<'_> {
                 wgpu::IndexFormat::Uint16,
             );
             pass.draw_indexed(0..6, 0, 0..1);
+        }
+    }
+
+    /// Draw a string with a bitmap font at the origin in `params`.
+    ///
+    /// Lays the string out with [`GlyphFont::layout`] (string → positioned
+    /// glyphs, advancing the pen per character, with the font's missing-char
+    /// fallback) and draws each glyph as a sub-rectangle of the font's strip
+    /// texture via [`draw_sprite_region`](Self::draw_sprite_region) — reusing the
+    /// palette-lookup sprite pipeline. [`TextDrawParams`] supplies the origin,
+    /// uniform scale, opacity, and blend mode. Glyph palette index 0 is
+    /// transparent (the shader discards it), so inter-glyph gaps show through.
+    ///
+    /// Drawing the empty string, or a font whose glyphs all map to nothing, is a
+    /// no-op (never panics).
+    pub fn draw_text(&mut self, font: &GlyphFont, text: &str, params: &TextDrawParams) {
+        let scale = params.scale;
+        for g in font.layout(text) {
+            let uv = font.glyph_uv(&g);
+            let sprite_params = SpriteDrawParams {
+                x: params.x + g.dst_x * scale,
+                y: params.y + g.dst_y * scale,
+                scale_x: scale,
+                scale_y: scale,
+                alpha: params.alpha,
+                blend: params.blend,
+                ..Default::default()
+            };
+            let dst_w = g.width as f32 * scale;
+            let dst_h = g.height as f32 * scale;
+            self.draw_sprite_region(
+                &font.texture,
+                &font.palette,
+                &sprite_params,
+                uv,
+                dst_w,
+                dst_h,
+            );
         }
     }
 
