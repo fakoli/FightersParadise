@@ -85,11 +85,23 @@ pub use loader::{
     LoadedCharacter,
 };
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use fp_core::Vec2;
 use fp_formats::air::AnimAction;
-use fp_vm::{EvalContext, Redirect, Value};
+use fp_vm::{EvalContext, Redirect, Rng, Value};
+
+/// The fixed default seed for a fresh character's `random` RNG stream.
+///
+/// A [`Character`] is seeded to this value so the MUGEN `random` trigger is
+/// **deterministic out of the box** — every fresh character draws the same
+/// sequence on every run and every machine, which is what frame-perfect netplay
+/// rollback / replay (#38) requires. It is a fixed constant on purpose: seeding
+/// from the wall clock or an OS RNG would make replays diverge. To give a match
+/// its own reproducible stream (e.g. one derived from a shared match seed), call
+/// [`Character::seed_rng`] after construction.
+pub const DEFAULT_RNG_SEED: i32 = 1;
 
 /// Number of integer variables (`var(0)`..=`var(59)`) every player owns.
 pub const NUM_VARS: usize = 60;
@@ -1051,6 +1063,32 @@ pub struct Character {
     /// Defaults to an all-inactive mask (`time_remaining = 0`), which blocks
     /// nothing. See [`crate::invuln`].
     pub invuln: InvulnMask,
+
+    /// The raw Park–Miller RNG state backing the MUGEN `random` trigger
+    /// (faithfulness audit #28).
+    ///
+    /// MUGEN's `random` is **not** OS randomness: it is the Park–Miller
+    /// "minimal standard" LCG, advanced purely deterministically from a
+    /// match-start seed. Keeping the state here — as a plain `i32` rather than an
+    /// opaque generator object — means it is part of the entity's normal struct
+    /// state and so trivially **serializable for frame-perfect netplay rollback /
+    /// replay** (#38): a saved/rolled-back `Character` carries its RNG position
+    /// with it, and two peers seeded identically draw an identical sequence.
+    ///
+    /// Wrapped in a [`Cell`] because the [`EvalContext::random`] seam is
+    /// `&self` (triggers evaluate against an immutable context), yet each draw
+    /// must advance the state. The cell holds the raw seed in the generator's
+    /// valid range `1..=2^31-2`; [`Character::random`] reconstructs an
+    /// [`Rng`] from it (a lossless round-trip for any reachable state, since
+    /// [`Rng::new`] only normalizes the degenerate `0`), advances it one step,
+    /// and stores the new seed back. It is seeded deterministically to
+    /// [`DEFAULT_RNG_SEED`] (a *fixed* default — never wall-clock or OS RNG,
+    /// which would break determinism); set it via [`Character::seed_rng`] to give
+    /// a match its own reproducible stream.
+    ///
+    /// Public only because the entity is struct-based (no hidden state); prefer
+    /// [`Character::seed_rng`] / the `random` trigger over poking it directly.
+    pub rng_seed: Cell<i32>,
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1135,6 +1173,9 @@ impl Default for Character {
             invuln: InvulnMask::default(),
             attack_mul: 1.0,
             defence_mul: 1.0,
+            // Deterministic fixed seed (never wall-clock); the cell is kept in
+            // the generator's valid range via `Rng::new`. See `DEFAULT_RNG_SEED`.
+            rng_seed: Cell::new(Rng::new(DEFAULT_RNG_SEED).seed()),
         }
     }
 }
@@ -1160,6 +1201,38 @@ impl Character {
             constants,
             ..Self::default()
         }
+    }
+
+    /// Reseeds this character's `random` RNG stream to a deterministic seed.
+    ///
+    /// Use this to give a match its own reproducible randomness — for example
+    /// seeding each player from a single shared match seed so both peers draw
+    /// the same sequence (frame-perfect netplay / replay, #38). The seed is
+    /// normalized into the Park–Miller generator's valid range `1..=2^31-2`
+    /// (any `i32` is accepted, including `0` and negatives); the stream then
+    /// advances purely deterministically from there. Never seed from the wall
+    /// clock or OS RNG, which would break determinism — pass a fixed/derived
+    /// value.
+    pub fn seed_rng(&mut self, seed: i32) {
+        // Round-trip through `Rng::new` so the stored cell is always a valid,
+        // in-range Park–Miller state regardless of the caller's seed.
+        self.rng_seed.set(Rng::new(seed).seed());
+    }
+
+    /// Draws one raw Park–Miller value and advances this character's RNG state.
+    ///
+    /// Returns the next raw draw in `1..=2^31-2` (the generator's range), exactly
+    /// what the [`EvalContext::random`] seam contract asks for: the evaluator
+    /// maps it to MUGEN's `random` → `[0,999]` or `random(lo,hi)` → `[lo,hi]`.
+    /// Reconstructs an [`Rng`] from the stored raw seed, steps it once, and
+    /// writes the new seed back through the [`Cell`] — so the state lives in
+    /// plain (serializable) struct state. Takes `&self` because the seam is
+    /// immutable; the interior mutability is confined to the cell.
+    fn draw_random(&self) -> i32 {
+        let mut rng = Rng::new(self.rng_seed.get());
+        let raw = rng.next_u31();
+        self.rng_seed.set(rng.seed());
+        raw
     }
 
     /// Replaces the command source (called by the executor to inject
@@ -1768,6 +1841,16 @@ impl EvalContext for Character {
 
     fn command_active(&self, name: &str) -> bool {
         self.commands.is_active(name)
+    }
+
+    fn random(&self) -> i32 {
+        // The RNG seam (faithfulness audit #28): advance this character's own
+        // deterministic Park–Miller stream and return the raw draw. The
+        // evaluator maps it to MUGEN's `random` ([0,999]) / `random(lo,hi)`
+        // range. State lives in `rng_seed` (plain, serializable) so it survives
+        // rollback. The default trait impl returns a fixed 0 — overriding it
+        // here is what makes `random` actually random rather than constant 0.
+        self.draw_random()
     }
 
     fn redirect(&self, _target: fp_vm::Redirect) -> Option<&dyn EvalContext> {
@@ -4981,5 +5064,177 @@ mod tests {
             ev_with_anim("SelfAnimExist(999) = 0", &ch, &actions),
             Value::Int(1)
         );
+    }
+
+    // ---- RNG-in-state: the `random` trigger (faithfulness audit #28) ----
+
+    #[test]
+    fn random_seam_is_not_constant_zero() {
+        // Regression guard for audit gap #28: before this fix `Character` used the
+        // trait default `EvalContext::random` which always returned 0, so every
+        // `random` trigger read 0. A fresh (default-seeded) character must now draw
+        // a *varied* [0,999] sequence — i.e. NOT all zeros.
+        let ch = Character::new();
+        let draws: Vec<i32> = (0..50)
+            .map(|_| match ev("random", &ch) {
+                Value::Int(i) => i,
+                other => panic!("bare `random` should be Int, got {other:?}"),
+            })
+            .collect();
+        // Every draw is in MUGEN's classic inclusive range [0, 999].
+        for &v in &draws {
+            assert!((0..=999).contains(&v), "random out of [0,999]: {v}");
+        }
+        // The sequence is not pinned to a single value (would prove it is still
+        // the old constant-0 / constant-anything stub).
+        assert!(
+            draws.iter().any(|&v| v != draws[0]),
+            "random must vary across draws, got all {}",
+            draws[0]
+        );
+    }
+
+    #[test]
+    fn random_covers_a_wide_band_of_the_range() {
+        // Across many draws `random` should spread across the [0,999] range, not
+        // cluster at one end — a sanity check that the Park–Miller stream is wired
+        // and mapped, not returning a degenerate fixed/near-fixed value.
+        let ch = Character::new();
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for _ in 0..1000 {
+            if let Value::Int(v) = ev("random", &ch) {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        assert!(lo < 100, "min draw {lo} unexpectedly high — range not covered");
+        assert!(hi > 900, "max draw {hi} unexpectedly low — range not covered");
+    }
+
+    #[test]
+    fn random_is_deterministic_for_a_fixed_seed() {
+        // Same seed ⇒ identical sequence (the determinism that netplay rollback /
+        // replay, #38, relies on).
+        let mut a = Character::new();
+        let mut b = Character::new();
+        a.seed_rng(12345);
+        b.seed_rng(12345);
+        let seq_a: Vec<Value> = (0..20).map(|_| ev("random", &a)).collect();
+        let seq_b: Vec<Value> = (0..20).map(|_| ev("random", &b)).collect();
+        assert_eq!(seq_a, seq_b, "equal seeds must yield equal random sequences");
+    }
+
+    #[test]
+    fn random_different_seeds_diverge() {
+        // Distinct seeds should give distinct streams (otherwise the seed is
+        // ignored and seeding is a no-op).
+        let mut a = Character::new();
+        let mut b = Character::new();
+        a.seed_rng(1);
+        b.seed_rng(99999);
+        let seq_a: Vec<Value> = (0..20).map(|_| ev("random", &a)).collect();
+        let seq_b: Vec<Value> = (0..20).map(|_| ev("random", &b)).collect();
+        assert_ne!(seq_a, seq_b, "different seeds should diverge");
+    }
+
+    #[test]
+    fn random_advances_each_draw() {
+        // Two successive draws from the same character advance the RNG state, so
+        // they (with overwhelming probability for Park–Miller) differ; at minimum
+        // the underlying raw seed must change between draws.
+        let ch = Character::new();
+        let before = ch.rng_seed.get();
+        let _ = ch.random();
+        let after = ch.rng_seed.get();
+        assert_ne!(before, after, "a draw must advance the stored RNG state");
+        // And the raw `Character::random` seam itself returns successive,
+        // generally-distinct draws in the generator's range 1..=2^31-2.
+        let r1 = ch.random();
+        let r2 = ch.random();
+        // `next_u31` returns the generator state in 1..=2^31-2.
+        const PARK_MILLER_MAX: i32 = 2_147_483_646;
+        assert!((1..=PARK_MILLER_MAX).contains(&r1), "raw draw out of range: {r1}");
+        assert!((1..=PARK_MILLER_MAX).contains(&r2), "raw draw out of range: {r2}");
+        assert_ne!(r1, r2, "successive raw draws should differ");
+    }
+
+    #[test]
+    fn random_matches_fp_vm_rng_for_same_seed() {
+        // The character's stream must BE fp-vm's Park–Miller `Rng` (we reuse it,
+        // not reimplement it): the raw draws from `Character::random` after seeding
+        // to S equal `Rng::new(S)`'s `next_u31()` sequence.
+        let mut ch = Character::new();
+        ch.seed_rng(7);
+        let mut reference = Rng::new(7);
+        for _ in 0..16 {
+            assert_eq!(ch.random(), reference.next_u31());
+        }
+    }
+
+    #[test]
+    fn random_call_form_uses_the_same_seam() {
+        // `random(lo, hi)` evaluated against a character draws from the same seam
+        // as the bare `random`; equally-seeded characters agree on the call form.
+        let mut a = Character::new();
+        let mut b = Character::new();
+        a.seed_rng(42);
+        b.seed_rng(42);
+        for _ in 0..10 {
+            let va = ev("random(10, 20)", &a);
+            let vb = ev("random(10, 20)", &b);
+            assert_eq!(va, vb);
+            if let Value::Int(i) = va {
+                assert!((10..=20).contains(&i), "random(10,20) out of range: {i}");
+            } else {
+                panic!("random(lo,hi) should be Int, got {va:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn redirected_random_uses_targets_seam() {
+        // `enemy, random` must advance the OPPONENT's RNG, not self's — the
+        // `EvalCtx` redirect forwards `random()` to the target character. Seed the
+        // opponent so its stream is reproducible, leave `me` on the default seed,
+        // and confirm the redirected draw equals the opponent's own first draw.
+        let me = Character::new();
+        let mut opp = Character::new();
+        opp.seed_rng(555);
+        let stage = StageView::default();
+        // Reference: the opponent's own first [0,999] draw from an identical seed.
+        let mut reference = Character::new();
+        reference.seed_rng(555);
+        let expected = ev("random", &reference);
+        let drawn = ev_cross("enemy, random", &me, Some(&opp), stage);
+        assert_eq!(
+            drawn, expected,
+            "redirected `enemy, random` must draw from the opponent's RNG seam"
+        );
+        // And it must have advanced the OPPONENT's state, not `me`'s: me's seed is
+        // untouched by the redirected draw.
+        assert_eq!(
+            me.rng_seed.get(),
+            Character::new().rng_seed.get(),
+            "redirected random must not advance self's RNG"
+        );
+    }
+
+    #[test]
+    fn seed_rng_normalizes_degenerate_seed() {
+        // Seeding with 0 (Park–Miller is undefined there) must not collapse the
+        // stream: the stored seed is normalized into 1..=2^31-2 and draws stay in
+        // range and vary, never panicking.
+        let mut ch = Character::new();
+        ch.seed_rng(0);
+        assert_ne!(ch.rng_seed.get(), 0, "seed 0 must be normalized away from 0");
+        let mut any_nonzero = false;
+        for _ in 0..20 {
+            if let Value::Int(v) = ev("random", &ch) {
+                assert!((0..=999).contains(&v));
+                any_nonzero |= v != 0;
+            }
+        }
+        assert!(any_nonzero, "seed-0 stream must still produce nonzero draws");
     }
 }
