@@ -56,8 +56,8 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType, StageView,
-    StateType,
+    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
+    RoundView, StageView, StateType,
 };
 use fp_core::Vec2;
 use fp_input::{
@@ -184,6 +184,34 @@ pub enum RoundState {
     Ko,
     /// The round is decided; see [`Match::winner`].
     Win,
+}
+
+impl RoundState {
+    /// This phase as MUGEN's numeric `RoundState` trigger code (audit #21).
+    ///
+    /// MUGEN exposes the round phase to CNS as an integer: `0` intro, `1` fight
+    /// (control given, pre-KO), `2` pre-over (a KO or time-over has occurred — the
+    /// win-pose window), `3` over (the round is ending). The coordinator's phases
+    /// map straight onto those codes:
+    ///
+    /// | [`RoundState`]        | `RoundState` trigger |
+    /// |-----------------------|----------------------|
+    /// | [`Intro`](Self::Intro)| `0`                  |
+    /// | [`Fight`](Self::Fight)| `1`                  |
+    /// | [`Ko`](Self::Ko)      | `2`                  |
+    /// | [`Win`](Self::Win)    | `3`                  |
+    ///
+    /// KFM gates its intro-freeze and its wood-kick `Explod` on this trigger
+    /// (`kfm.cns` `RoundState` checks), so the code must match MUGEN exactly.
+    #[must_use]
+    pub const fn trigger_code(self) -> i32 {
+        match self {
+            RoundState::Intro => 0,
+            RoundState::Fight => 1,
+            RoundState::Ko => 2,
+            RoundState::Win => 3,
+        }
+    }
 }
 
 /// Which player won the round, once it reaches [`RoundState::Win`].
@@ -457,6 +485,15 @@ pub struct Match {
     /// The round length in **frames** the timer is reset to at the start of each
     /// round (the constructor's `round_seconds * 60`, already clamped to `>= 0`).
     round_frames: i32,
+    /// Total game ticks elapsed since the match began — MUGEN's `GameTime`
+    /// (audit #21).
+    ///
+    /// A monotonic counter incremented once per [`Match::tick`]. Unlike
+    /// [`timer`](Match::timer) (which counts *down* and resets each round), this
+    /// **never** resets between rounds; it is the running game clock the
+    /// `GameTime` trigger reads. Pushed onto each character via its
+    /// [`RoundView`](fp_character::RoundView) before that character ticks.
+    game_time: i32,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -559,6 +596,7 @@ impl Match {
             p1_reset,
             p2_reset,
             round_frames,
+            game_time: 0,
         }
     }
 
@@ -648,6 +686,31 @@ impl Match {
         self.round_number
     }
 
+    /// Total game ticks elapsed since the match began — MUGEN's `GameTime`
+    /// (audit #21). A monotonic counter, incremented once per [`Match::tick`],
+    /// that does **not** reset between rounds.
+    #[must_use]
+    pub fn game_time(&self) -> i32 {
+        self.game_time
+    }
+
+    /// The engine-global round / match clock the characters' `RoundState`,
+    /// `GameTime`, and `MatchOver` triggers read this tick (audit #21).
+    ///
+    /// Built from the live round phase ([`RoundState::trigger_code`]), the
+    /// monotonic [`game_time`](Match::game_time) counter, and whether the match is
+    /// over ([`MatchState::Over`]). [`Match::tick`] installs this on each character
+    /// via [`Character::set_round_view`](fp_character::Character::set_round_view)
+    /// before ticking it, so both fighters see the same coordinator view.
+    #[must_use]
+    pub fn round_view(&self) -> RoundView {
+        RoundView::new(
+            self.round_state.trigger_code(),
+            self.game_time,
+            self.match_state == MatchState::Over,
+        )
+    }
+
     /// Whether the whole match is still in progress or has been decided.
     #[must_use]
     pub fn match_state(&self) -> MatchState {
@@ -697,6 +760,19 @@ impl Match {
     /// face-the-opponent, and round-state/timer advance. See the
     /// [crate-level overview](crate) for the full description. Never panics.
     pub fn tick(&mut self, p1_input: MatchInput, p2_input: MatchInput) {
+        // (0) Advance the monotonic game clock, then push the engine-global round
+        //     view (RoundState / GameTime / MatchOver) onto both characters BEFORE
+        //     they tick, so their CNS triggers read this frame's values (audit
+        //     #21). The view reflects the round phase as it stands at the START of
+        //     this tick (the `advance_round` at the end may move it on for next
+        //     frame). `GameTime` is incremented first so a fighter sees the frame
+        //     count already including the current frame. The same view goes to
+        //     both fighters — these are engine-global values, not per-player.
+        self.game_time = self.game_time.saturating_add(1);
+        let view = self.round_view();
+        self.p1.character.set_round_view(view);
+        self.p2.character.set_round_view(view);
+
         // (1) Feed inputs into each character's command source, facing-relative.
         //     Inputs only drive the fighters once the round is live; during the
         //     intro/KO/win phases the characters still tick (so idle animations
@@ -1848,6 +1924,116 @@ time = 1
         }
         assert_eq!(m.round_state(), RoundState::Win);
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    // ---- Audit #21: RoundState / GameTime / MatchOver threaded to triggers ----
+
+    /// The coordinator maps each round phase to MUGEN's `RoundState` code.
+    #[test]
+    fn round_state_trigger_code_maps_phases() {
+        assert_eq!(RoundState::Intro.trigger_code(), 0);
+        assert_eq!(RoundState::Fight.trigger_code(), 1);
+        assert_eq!(RoundState::Ko.trigger_code(), 2);
+        assert_eq!(RoundState::Win.trigger_code(), 3);
+    }
+
+    /// Before its first tick the match has not pushed a view yet, but after a tick
+    /// the coordinator installs a live `RoundView` on BOTH characters reflecting
+    /// the current phase, the advanced game clock, and the match-over flag.
+    #[test]
+    fn tick_installs_round_view_on_both_characters() {
+        let mut m = basic_match();
+        // Round one, intro phase: RoundState 0. After one tick GameTime is 1.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Intro);
+        let v1 = m.p1().character.round_view;
+        let v2 = m.p2().character.round_view;
+        // Both fighters see the SAME engine-global view.
+        assert_eq!(v1, v2, "both characters get the same coordinator view");
+        assert_eq!(v1.round_state, 0, "intro maps to RoundState 0");
+        assert_eq!(v1.game_time, 1, "GameTime advanced to 1 after one tick");
+        assert!(!v1.match_over, "match not over during the intro");
+        // The character's `RoundState`/`GameTime`/`MatchOver` triggers read this
+        // installed `round_view` (the field-to-trigger mapping is pinned in
+        // fp-character's `round_clock_triggers_read_round_view`).
+    }
+
+    /// `RoundState` advances 0 (intro) -> 1 (fight) -> 2 (KO) as the round
+    /// progresses, and `GameTime` keeps climbing monotonically the whole time.
+    #[test]
+    fn round_state_and_game_time_advance_through_a_round() {
+        let mut m = basic_match();
+
+        // Intro: the characters' view reads RoundState 0 each tick.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.p1().character.round_view.round_state, 0);
+        let gt_after_first = m.game_time();
+        assert_eq!(gt_after_first, 1);
+
+        // Tick into the fight phase; the installed view now reads RoundState 1.
+        into_fight(&mut m);
+        assert_eq!(m.round_state(), RoundState::Fight);
+        assert_eq!(
+            m.p1().character.round_view.round_state,
+            1,
+            "fight phase maps to RoundState 1"
+        );
+        assert!(
+            m.game_time() > gt_after_first,
+            "GameTime advances monotonically into the fight"
+        );
+
+        // GameTime never decreases tick-to-tick.
+        let mut prev = m.game_time();
+        for _ in 0..5 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert!(m.game_time() >= prev, "GameTime is monotonic");
+            prev = m.game_time();
+        }
+
+        // Force a KO: the next tick enters the KO hold, and the view installed at
+        // the START of that tick still reads the fight code (1); a further tick in
+        // the KO phase reads 2.
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.round_state(), RoundState::Ko);
+        // Now in the KO phase: the next tick installs RoundState 2 on the chars.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.round_view.round_state,
+            2,
+            "KO / pre-over phase maps to RoundState 2"
+        );
+    }
+
+    /// `MatchOver` is 0 throughout a live best-of-one match and flips to 1 on the
+    /// tick that decides it; the characters' installed view reflects the flip.
+    #[test]
+    fn match_over_flips_at_match_end() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let mut m = Match::with_rounds_to_win(p1, p2, StageBounds::default(), 1);
+        into_fight(&mut m);
+
+        // Live fight: MatchOver is 0 on both the coordinator and the chars' view.
+        assert_eq!(m.match_state(), MatchState::InProgress);
+        assert!(!m.p1().character.round_view.match_over);
+
+        // Best-of-one: one settled KO ends the whole match.
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.match_state(), MatchState::Over);
+        assert_eq!(m.match_winner(), Some(Winner::P1));
+
+        // The very next tick installs a view with MatchOver = 1 on both chars,
+        // and GameTime is still climbing (the game clock never stops).
+        let gt_before = m.game_time();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p1().character.round_view.match_over,
+            "MatchOver is set once the match is decided"
+        );
+        assert!(m.p2().character.round_view.match_over);
+        assert!(m.game_time() > gt_before, "GameTime keeps advancing past match end");
     }
 
     #[test]

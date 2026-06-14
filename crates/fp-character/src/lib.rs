@@ -1367,6 +1367,17 @@ pub struct Character {
     /// Public only because the entity is struct-based (no hidden state); prefer
     /// [`Character::seed_rng`] / the `random` trigger over poking it directly.
     pub rng_seed: Cell<i32>,
+
+    /// The engine-global round / match clock this character's `RoundState`,
+    /// `GameTime`, and `MatchOver` triggers read (faithfulness audit #21).
+    ///
+    /// These values are owned by the round coordinator (`fp-engine`'s `Match`),
+    /// not by a single fighter, so the coordinator pushes the live view onto each
+    /// character via [`Character::set_round_view`] **before** ticking it. A bare /
+    /// freshly-constructed `Character` carries the [`RoundView::default`]
+    /// (`RoundState 0`, `GameTime 0`, match not over), so the three triggers read
+    /// their safe defaults when there is no coordinator in view. See [`RoundView`].
+    pub round_view: RoundView,
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1457,6 +1468,9 @@ impl Default for Character {
             // Deterministic fixed seed (never wall-clock); the cell is kept in
             // the generator's valid range via `Rng::new`. See `DEFAULT_RNG_SEED`.
             rng_seed: Cell::new(Rng::new(DEFAULT_RNG_SEED).seed()),
+            // Safe default round clock (intro / time 0 / not over) until a
+            // coordinator pushes the live view in via `set_round_view`.
+            round_view: RoundView::default(),
         }
     }
 }
@@ -1520,6 +1534,17 @@ impl Character {
     /// `fp-input`'s recognizer, or by tests to inject a synthetic set).
     pub fn set_command_source(&mut self, source: Box<dyn CommandSource>) {
         self.commands = source;
+    }
+
+    /// Installs the engine-global round / match clock this character's
+    /// `RoundState`, `GameTime`, and `MatchOver` triggers read (audit #21).
+    ///
+    /// Called by the round coordinator (`fp-engine`'s `Match`) **before** ticking
+    /// the character each frame, so its CNS triggers see the live round phase,
+    /// game time, and match-over flag. A character that is never given a view
+    /// keeps the [`RoundView::default`] (the safe defaults). See [`RoundView`].
+    pub fn set_round_view(&mut self, view: RoundView) {
+        self.round_view = view;
     }
 
     /// Returns the number of hit-pause (impact-freeze) ticks this character still
@@ -2052,6 +2077,24 @@ impl EvalContext for Character {
             return Value::from(self.shaketime <= 0);
         }
 
+        // ---- Round / match clock (audit #21) --------------------------------
+        // These read the engine-global round coordinator's view, pushed onto the
+        // character by `fp-engine`'s `Match` via `set_round_view` before each
+        // tick. A bare `Character` (no coordinator) carries the safe default view
+        // (`RoundState 0` = intro, `GameTime 0`, match not over), so each of these
+        // reads `0` when evaluated with no `Match` in hand — exactly the value
+        // MUGEN reports before a round/match is under way. KFM gates its
+        // intro-freeze and the wood-kick `Explod` on `RoundState`.
+        if name.eq_ignore_ascii_case("RoundState") {
+            return Value::Int(self.round_view.round_state);
+        }
+        if name.eq_ignore_ascii_case("GameTime") {
+            return Value::Int(self.round_view.game_time);
+        }
+        if name.eq_ignore_ascii_case("MatchOver") {
+            return Value::from(self.round_view.match_over);
+        }
+
         // ---- Deferred triggers (documented, not silently wrong) -------------
         //
         // The following standard triggers appear in the stock `kfm.cns` /
@@ -2067,9 +2110,10 @@ impl EvalContext for Character {
         //   not fully model yet. (`MoveContact`/`MoveHit`/`MoveGuarded` and
         //   `HitShakeOver` are now answered above from the fields hit resolution
         //   populates.) `GetHitVar(...)` is handled in `trigger_str`.
-        // * Round / match state (engine, Phase 5+): `RoundState`, `RoundNo`,
-        //   `RoundsExisted`, `MatchOver`, `GameTime`. These live on the round
-        //   coordinator (`fp-engine`), not on a single `Character`.
+        // * Round / match state (engine): `RoundNo`, `RoundsExisted`. These live
+        //   on the round coordinator (`fp-engine`) and are not yet threaded onto a
+        //   `Character` (unlike `RoundState`/`GameTime`/`MatchOver`, now answered
+        //   above from the coordinator-pushed `round_view`; audit #21).
         // * Cross-entity geometry: `P2Dist`, `P2BodyDist`, the screen-edge
         //   distances (`FrontEdgeDist`/`BackEdgeDist`/`FrontEdgeBodyDist`/
         //   `BackEdgeBodyDist`/`ScreenPos`), and opponent reads via `p2, ...` /
@@ -2144,6 +2188,63 @@ impl EvalContext for Character {
         // target's *nested* redirects (e.g. the inner level of `p2, ...`) bottom
         // out rather than looping.
         None
+    }
+}
+
+/// The engine-global **round / match clock** a character's triggers read across:
+/// `RoundState`, `GameTime`, and `MatchOver` (faithfulness audit #21).
+///
+/// These three triggers describe state the *round coordinator* owns
+/// (`fp-engine`'s `Match`), not a single `Character` — a lone fighter has no
+/// round phase, no game clock, and no match-over flag of its own. The coordinator
+/// builds a `RoundView` each tick from its round-state machine and pushes it onto
+/// each character via [`Character::set_round_view`] **before** ticking it, so the
+/// character's CNS triggers see the live values (KFM gates its intro-freeze and
+/// the wood-kick `Explod` on `RoundState`).
+///
+/// It is a tiny `Copy` value, mirroring [`StageView`]: it lives in `fp-character`
+/// (rather than `fp-engine`, which depends on this crate) so a `Character` can
+/// carry one without a dependency cycle. A bare / freshly-constructed `Character`
+/// carries the [`RoundView::default`] (`RoundState 0` = intro, `GameTime 0`,
+/// match not over) — the documented safe default for a character evaluated with
+/// no coordinator in view, so the self-only triggers degrade to `0` exactly as
+/// before this was wired.
+///
+/// ## Field semantics (MUGEN-faithful)
+///
+/// - [`round_state`](Self::round_state) — MUGEN's `RoundState`: `0` intro, `1`
+///   fight (control given, pre-KO), `2` pre-over (a KO or time-over just occurred;
+///   the win-pose window), `3` over (the round is ending). `fp-engine`'s
+///   `RoundState::{Intro, Fight, Ko, Win}` maps to `0/1/2/3` respectively.
+/// - [`game_time`](Self::game_time) — MUGEN's `GameTime`: a monotonic count of
+///   total game ticks elapsed (it does **not** reset between rounds).
+/// - [`match_over`](Self::match_over) — MUGEN's `MatchOver`: `true` once the whole
+///   best-of-N match is decided, else `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoundView {
+    /// MUGEN's `RoundState` code: `0` intro, `1` fight, `2` pre-over (KO / time
+    /// over), `3` over. Defaults to `0` (intro) for a character with no round
+    /// coordinator in view.
+    pub round_state: i32,
+    /// MUGEN's `GameTime`: total game ticks elapsed, a monotonic counter that is
+    /// **not** reset between the rounds of a match. Defaults to `0`.
+    pub game_time: i32,
+    /// MUGEN's `MatchOver`: `true` once the whole match is decided, else `false`.
+    /// Defaults to `false`.
+    pub match_over: bool,
+}
+
+impl RoundView {
+    /// Builds a round view from a `RoundState` code, the game-time counter, and
+    /// the match-over flag. The `round_state` is taken verbatim (callers pass the
+    /// MUGEN `0..=3` code); see the type docs for the mapping.
+    #[must_use]
+    pub const fn new(round_state: i32, game_time: i32, match_over: bool) -> Self {
+        Self {
+            round_state,
+            game_time,
+            match_over,
+        }
     }
 }
 
@@ -2647,27 +2748,63 @@ mod tests {
 
     #[test]
     fn deferred_triggers_stay_at_safe_default() {
-        // Triggers documented as deferred (need get-hit / round / cross-entity
-        // context not yet modeled) must still resolve to the safe default of 0,
-        // never panic. This pins the documented behavior so a future
-        // implementation is a deliberate change, not an accidental one.
+        // Triggers documented as deferred (need get-hit / cross-entity context not
+        // yet modeled) must still resolve to the safe default of 0, never panic.
+        // This pins the documented behavior so a future implementation is a
+        // deliberate change, not an accidental one.
+        //
+        // `RoundState`/`GameTime`/`MatchOver` are NO LONGER in this list (audit
+        // #21): they are now answered from the coordinator-pushed `round_view`.
+        // Their *default* (bare-character) value is still 0, pinned in
+        // `round_clock_triggers_default_to_zero`; their non-default behavior is
+        // pinned in `round_clock_triggers_read_round_view`.
         let ch = sample();
-        for t in [
-            "HitOver",
-            "HitFall",
-            "CanRecover",
-            "InGuardDist",
-            "RoundState",
-            "GameTime",
-            "MatchOver",
-            "SelfAnimExist",
-        ] {
+        for t in ["HitOver", "HitFall", "CanRecover", "InGuardDist", "SelfAnimExist"] {
             assert_eq!(
                 ch.trigger(t, &[]),
                 Value::DEFAULT,
                 "deferred trigger {t} should default to 0"
             );
         }
+    }
+
+    #[test]
+    fn round_clock_triggers_default_to_zero() {
+        // A bare `Character` (no round coordinator) carries the default
+        // `RoundView` (RoundState 0 = intro, GameTime 0, match not over), so the
+        // three round-clock triggers read 0 — the same safe default they had
+        // before audit #21 wired them, and what MUGEN reports pre-round.
+        let ch = sample();
+        assert_eq!(ch.trigger("RoundState", &[]), Value::Int(0));
+        assert_eq!(ch.trigger("GameTime", &[]), Value::Int(0));
+        assert_eq!(ch.trigger("MatchOver", &[]), Value::Int(0));
+        // Via the parsed VM path too (case-insensitive trigger names).
+        assert_eq!(ev("RoundState", &ch), Value::Int(0));
+        assert_eq!(ev("gametime", &ch), Value::Int(0));
+        assert_eq!(ev("MatchOver", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn round_clock_triggers_read_round_view() {
+        // Once the coordinator installs a live `RoundView`, the three triggers
+        // report its values (audit #21). Pins the wiring so a regression that
+        // drops them back to a constant 0 is caught.
+        let mut ch = sample();
+        ch.set_round_view(RoundView::new(2, 1234, true));
+        assert_eq!(ch.trigger("RoundState", &[]), Value::Int(2));
+        assert_eq!(ch.trigger("GameTime", &[]), Value::Int(1234));
+        // MatchOver is a boolean trigger → int 1 when set.
+        assert_eq!(ch.trigger("MatchOver", &[]), Value::Int(1));
+
+        // Through the VM eval path, mirroring KFM's `RoundState = 2` gates.
+        assert_eq!(ev("RoundState = 2", &ch), Value::Int(1));
+        assert_eq!(ev("RoundState = 1", &ch), Value::Int(0));
+        assert_eq!(ev("GameTime = 1234", &ch), Value::Int(1));
+        assert_eq!(ev("MatchOver", &ch), Value::Int(1));
+
+        // The fight phase (RoundState 1) with the match still live reads back too.
+        ch.set_round_view(RoundView::new(1, 60, false));
+        assert_eq!(ev("RoundState = 1 && !MatchOver", &ch), Value::Int(1));
     }
 
     #[test]
@@ -4631,9 +4768,13 @@ mod tests {
             // `MoveGuarded` are no longer here: task 6.3b answers them from the
             // fields hit resolution populates (see `move_connect_triggers`).
             "HitOver", "hitover", "HitFall", "CanRecover", "InGuardDist",
-            // Round / match state (engine, Phase 5+).
-            "RoundState", "roundstate", "RoundNo", "RoundsExisted", "MatchOver",
-            "GameTime",
+            // Round / match state (engine) STILL deferred. `RoundState`,
+            // `GameTime`, and `MatchOver` are no longer here: audit #21 answers
+            // them from the coordinator-pushed `round_view` (default 0 for a bare
+            // character, live values once a `Match` sets the view — see
+            // `round_clock_triggers_read_round_view`). `RoundNo`/`RoundsExisted`
+            // remain unmodeled and still default to 0.
+            "RoundNo", "RoundsExisted",
             // Cross-entity geometry (Phase 7 redirection).
             "P2BodyDist", "P2Dist", "FrontEdgeBodyDist", "BackEdgeBodyDist",
             "BackEdgeDist",
