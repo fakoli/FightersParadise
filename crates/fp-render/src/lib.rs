@@ -13,6 +13,7 @@ mod animation;
 pub mod atlas;
 mod params;
 mod renderer;
+mod text;
 mod texture;
 mod vertex;
 
@@ -20,5 +21,6 @@ pub use animation::AnimController;
 pub use atlas::{AtlasRegion, TextureAtlas};
 pub use params::{BlendMode, SpriteDrawParams};
 pub use renderer::{DebugBox, RenderFrame, Renderer};
+pub use text::{layout_text, GlyphFont, PlacedGlyph, TextDrawParams};
 pub use texture::{PaletteTexture, SpriteTexture};
 pub use vertex::{DebugVertex, SpriteVertex};
