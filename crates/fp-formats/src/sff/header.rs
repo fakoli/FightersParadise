@@ -25,7 +25,10 @@ pub struct SffHeader {
     pub version_minor2: u8,
     /// Minor version number (minor3 / lo component).
     pub version_minor3: u8,
-    /// Number of sprite groups in the file.
+    /// Always `0`. SFF v2 has no dedicated group-count field in its header
+    /// (groups are implied by the individual sprite entries), so this is never
+    /// populated from the file. The field is retained only for API/back-compat
+    /// with callers that still reference it.
     pub num_groups: u32,
     /// Total number of sprites in the file.
     pub num_sprites: u32,
@@ -162,7 +165,7 @@ mod tests {
     use super::*;
 
     /// Builds a minimal 512-byte synthetic SFF v2 header.
-    fn make_test_header(num_sprites: u32, num_groups: u32) -> Vec<u8> {
+    fn make_test_header(num_sprites: u32, num_palettes: u32) -> Vec<u8> {
         let mut buf = vec![0u8; 512];
 
         // Signature
@@ -175,9 +178,6 @@ mod tests {
         buf[15] = 2; // major
 
         // Reserved (16..36): zeros — real SFF v2 has five reserved u32s here.
-
-        // The `num_groups` parameter doubles as the palette count for the test.
-        let num_palettes = num_groups;
 
         // Directory fields, real MUGEN 1.0 layout (counts, not byte lengths):
         // sprite_offset @36

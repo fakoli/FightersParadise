@@ -102,6 +102,16 @@ pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
     let decompressed_size =
         u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
+    // A single SFF sprite is at most a few megapixels; reject absurd sizes from a
+    // corrupt prefix rather than attempting a multi-gigabyte allocation (never-crash).
+    const MAX_RLE5_OUTPUT: usize = 64 * 1024 * 1024;
+    if decompressed_size > MAX_RLE5_OUTPUT {
+        return Err(FpError::parse(
+            "SFF",
+            format!("RLE5 declared size {decompressed_size} exceeds sane limit ({MAX_RLE5_OUTPUT})"),
+        ));
+    }
+
     // The compressed stream begins after the 4-byte size prefix.
     let rle = &data[4..];
     let mut p = vec![0u8; decompressed_size];
@@ -485,6 +495,43 @@ mod tests {
         let result = decompress_rle5(&data).unwrap();
         assert_eq!(result.len(), 8, "output must match declared size");
         assert_eq!(&result[0..3], &[9, 9, 9], "real pixels preserved");
+    }
+
+    #[test]
+    fn rle5_flag_clear_with_segments() {
+        // size = 4. Header data byte has the high bit CLEAR, so the header colour
+        // defaults to 0 and NO explicit colour byte is read; dl = 1 still pulls one
+        // segment.
+        //   rl byte = 0x00 -> rl = 0 (emit header colour 0 once) -> [0]
+        //   data    = 0x01 -> dl = 1, high bit clear -> colour 0, no colour byte
+        //   segment = 0x47 -> colour 7, run (0x47>>5)+1 = 3 -> [7,7,7]
+        let data = [4, 0, 0, 0, 0x00, 0x01, 0x47];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result, vec![0, 7, 7, 7]);
+    }
+
+    #[test]
+    fn rle5_multiple_packets() {
+        // size = 3. Packet 1: rl=1 -> emit colour 5 twice ([5,5]); Packet 2: rl=0 ->
+        // emit colour 9 once ([9]). Both set the explicit-colour flag (0x80).
+        let data = [
+            3, 0, 0, 0, //
+            0x01, 0x80, 0x05, // packet 1 -> [5, 5]
+            0x00, 0x80, 0x09, // packet 2 -> [9]
+        ];
+        let result = decompress_rle5(&data).unwrap();
+        assert_eq!(result, vec![5, 5, 9]);
+    }
+
+    #[test]
+    fn rle5_rejects_absurd_size() {
+        // A corrupt 4-byte prefix declaring 0xFFFFFFFF (~4 GB) must be rejected
+        // before any allocation rather than aborting the process on OOM
+        // (never-crash). At least one codec byte follows so the size check, not the
+        // too-short guard, is what fires.
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        let err = decompress_rle5(&data).unwrap_err();
+        assert!(err.to_string().contains("exceeds sane limit"));
     }
 
     // ---- LZ5 tests ----
