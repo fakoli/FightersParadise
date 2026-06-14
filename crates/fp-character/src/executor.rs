@@ -4668,6 +4668,7 @@ mod tests {
                 yaccel: 1.5,
                 stand_friction: 0.5,
                 crouch_friction: 0.25,
+                ..MovementConstants::default()
             },
             ..CharacterConstants::default()
         };

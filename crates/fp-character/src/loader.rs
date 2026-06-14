@@ -1065,6 +1065,15 @@ fn read_movement_group(ini: &DefFile, mv: &mut MovementConstants) {
     if let Some(v) = ini.get_parsed::<f32>("Movement", "crouch.friction") {
         mv.crouch_friction = v;
     }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "stand.friction.threshold") {
+        mv.stand_friction_threshold = v;
+    }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "crouch.friction.threshold") {
+        mv.crouch_friction_threshold = v;
+    }
+    if let Some(v) = ini.get_parsed::<f32>("Movement", "down.friction.threshold") {
+        mv.down_friction_threshold = v;
+    }
 }
 
 /// Parses a velocity entry that is either a bare scalar (`"2.4"` → `(2.4, 0)`)

@@ -519,15 +519,26 @@ pub struct MovementConstants {
     pub stand_friction: f32,
     /// `crouch.friction` — x-velocity multiplier per tick while crouching.
     pub crouch_friction: f32,
+    /// `stand.friction.threshold` — speed below which a standing player snaps to a
+    /// stop. common1 gates its idle-stop (`VelSet x=0`) and return-to-idle on
+    /// `abs(vel x) < Const(movement.stand.friction.threshold)`.
+    pub stand_friction_threshold: f32,
+    /// `crouch.friction.threshold` — stop threshold while crouching.
+    pub crouch_friction_threshold: f32,
+    /// `down.friction.threshold` — stop threshold while lying down.
+    pub down_friction_threshold: f32,
 }
 
 impl Default for MovementConstants {
     fn default() -> Self {
-        // KFM's authored values.
+        // KFM's authored [Movement] values.
         Self {
             yaccel: 0.44,
             stand_friction: 0.85,
             crouch_friction: 0.82,
+            stand_friction_threshold: 2.0,
+            crouch_friction_threshold: 0.05,
+            down_friction_threshold: 0.05,
         }
     }
 }
@@ -1382,6 +1393,15 @@ impl Character {
         }
         if m.eq_ignore_ascii_case("movement.crouch.friction") {
             return Value::Float(c.movement.crouch_friction);
+        }
+        if m.eq_ignore_ascii_case("movement.stand.friction.threshold") {
+            return Value::Float(c.movement.stand_friction_threshold);
+        }
+        if m.eq_ignore_ascii_case("movement.crouch.friction.threshold") {
+            return Value::Float(c.movement.crouch_friction_threshold);
+        }
+        if m.eq_ignore_ascii_case("movement.down.friction.threshold") {
+            return Value::Float(c.movement.down_friction_threshold);
         }
 
         // Unknown member: safe default 0. `debug!` (not `warn!`) because unmodeled
@@ -2417,6 +2437,9 @@ mod tests {
                 yaccel: 0.5,
                 stand_friction: 0.83,
                 crouch_friction: 0.81,
+                stand_friction_threshold: 3.0,
+                crouch_friction_threshold: 0.07,
+                down_friction_threshold: 0.09,
             },
             localcoord: (320, 240),
         };
@@ -2675,6 +2698,32 @@ mod tests {
         assert_eq!(ch.trigger_str("const", "size.ground.front"), Value::Int(17));
         assert_eq!(ch.trigger_str("const", "size.ground.back"), Value::Int(19));
         assert_eq!(ch.trigger_str("const", "size.height"), Value::Int(63));
+    }
+
+    /// A.P12: the friction thresholds common1 reads via
+    /// `Const(movement.<stance>.friction.threshold)` resolve (were 0 -> idle-stop
+    /// triggers like `abs(vel x) < Const(...)` never fired, so a walker never stopped).
+    #[test]
+    fn const_resolves_friction_thresholds() {
+        let ch = const_sample();
+        assert_eq!(
+            ch.trigger_str("const", "movement.stand.friction.threshold"),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "movement.crouch.friction.threshold"),
+            Value::Float(0.07)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "movement.down.friction.threshold"),
+            Value::Float(0.09)
+        );
+        // The stand-friction stop trigger common1 uses now evaluates correctly.
+        assert_eq!(
+            ev("abs(1.5) < Const(movement.stand.friction.threshold)", &ch),
+            Value::Int(1),
+            "1.5 < 3.0 threshold -> idle-stop fires"
+        );
     }
 
     #[test]
