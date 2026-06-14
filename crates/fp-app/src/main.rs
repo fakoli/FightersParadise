@@ -621,9 +621,10 @@ struct HudRect {
     h: f32,
 }
 
-/// A minimal HUD: per-fighter life bars and a round/KO indicator, drawn as
-/// scaled solid-color quads through the existing `RenderFrame::draw_sprite`
-/// pipeline (no new renderer API). Full lifebars are a later phase.
+/// A minimal HUD: per-fighter life bars, a smaller power (super-meter) bar under
+/// each, and a round/KO indicator, drawn as scaled solid-color quads through the
+/// existing `RenderFrame::draw_sprite` pipeline (no new renderer API). Full
+/// lifebars are a later phase.
 struct Hud {
     /// Neutral dark frame/background.
     dark: HudColor,
@@ -635,6 +636,8 @@ struct Hud {
     yellow: HudColor,
     /// Draw / generic white.
     white: HudColor,
+    /// Power (super-meter) fill blue.
+    blue: HudColor,
 }
 
 impl Hud {
@@ -646,6 +649,7 @@ impl Hud {
             red: HudColor::new(renderer, 220, 60, 60),
             yellow: HudColor::new(renderer, 240, 220, 60),
             white: HudColor::new(renderer, 240, 240, 240),
+            blue: HudColor::new(renderer, 70, 150, 240),
         }
     }
 
@@ -663,18 +667,36 @@ impl Hud {
     }
 
     /// Draws the full match HUD: a life bar for each fighter (P1 top-left, P2
-    /// top-right) and a round/KO indicator. Crude by design.
+    /// top-right), a smaller power (super-meter) bar directly beneath each, and a
+    /// round/KO indicator. Crude by design.
     fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match) {
         const MARGIN: f32 = 12.0;
         const BAR_W: f32 = 200.0;
         const BAR_H: f32 = 16.0;
+        /// The power bar is shorter than the life bar and a touch thinner, sitting
+        /// just below it with a small vertical gap.
+        const POWER_BAR_W: f32 = 160.0;
+        const POWER_BAR_H: f32 = 8.0;
+        const POWER_GAP: f32 = 4.0;
+        let power_y = MARGIN + BAR_H + POWER_GAP;
 
         // P1 life bar, top-left, growing rightward.
         let p1_bar = HudRect { x: MARGIN, y: MARGIN, w: BAR_W, h: BAR_H };
         self.draw_life_bar(frame, p1_bar, m.p1(), false);
+        // P1 power bar, directly beneath the life bar, also growing rightward.
+        let p1_power = HudRect { x: MARGIN, y: power_y, w: POWER_BAR_W, h: POWER_BAR_H };
+        self.draw_power_bar(frame, p1_power, m.p1(), false);
         // P2 life bar, top-right, draining toward the center (mirrored).
         let p2_bar = HudRect { x: win_w - MARGIN - BAR_W, y: MARGIN, w: BAR_W, h: BAR_H };
         self.draw_life_bar(frame, p2_bar, m.p2(), true);
+        // P2 power bar, beneath the life bar, mirrored to anchor at the right edge.
+        let p2_power = HudRect {
+            x: win_w - MARGIN - POWER_BAR_W,
+            y: power_y,
+            w: POWER_BAR_W,
+            h: POWER_BAR_H,
+        };
+        self.draw_power_bar(frame, p2_power, m.p2(), true);
 
         // Round / KO indicator: a centered colored marker once the round is
         // decided. Intro/Fight show nothing here (the bars carry the state).
@@ -728,6 +750,36 @@ impl Hud {
             );
         }
     }
+
+    /// Draws one fighter's power (super-meter) bar: a dark backing the full `bar`,
+    /// then a blue fill proportional to `power / power_max`. When `mirror` is set
+    /// the fill is anchored to the right edge (so P2's bar fills toward the
+    /// center, matching its life bar above).
+    fn draw_power_bar(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        bar: HudRect,
+        player: &Player,
+        mirror: bool,
+    ) {
+        // Backing.
+        self.fill(frame, &self.dark, bar);
+
+        let frac = power_fraction(player.power(), player.power_max());
+        let fill_w = bar.w * frac;
+        if fill_w > 0.0 {
+            let fill_x = if mirror { bar.x + (bar.w - fill_w) } else { bar.x };
+            self.fill(
+                frame,
+                &self.blue,
+                HudRect {
+                    x: fill_x,
+                    w: fill_w,
+                    ..bar
+                },
+            );
+        }
+    }
 }
 
 /// The fraction of life remaining, clamped to `[0, 1]` and safe against a
@@ -737,6 +789,17 @@ fn life_fraction(life: i32, life_max: i32) -> f32 {
         return 0.0;
     }
     (life.max(0) as f32 / life_max as f32).clamp(0.0, 1.0)
+}
+
+/// The fraction of power (super meter) filled, clamped to `[0, 1]` and safe
+/// against a non-positive `power_max` (returns `0.0` rather than dividing by
+/// zero). Mirrors [`life_fraction`] so the power bar shares the same safety
+/// guarantees as the life bar.
+fn power_fraction(power: i32, power_max: i32) -> f32 {
+    if power_max <= 0 {
+        return 0.0;
+    }
+    (power.max(0) as f32 / power_max as f32).clamp(0.0, 1.0)
 }
 
 /// Maps a fighter's world X position into a screen X, centered on the window.
@@ -1124,12 +1187,22 @@ fn run() -> fp_core::FpResult<()> {
         accumulator += current - previous;
         previous = current;
 
+        // Sample the keyboard ONCE per real frame, BEFORE the fixed-timestep
+        // catch-up loop (audit #27). On a frame that has to run multiple ticks to
+        // catch up, every sub-tick is driven by this single physical snapshot —
+        // re-reading `keyboard_state()` inside the loop would replay the same live
+        // state N times anyway, but doing it here makes the "one input per frame"
+        // semantics explicit and keeps press-vs-hold edges and command timing
+        // correct (one buffer push per frame). P2 stays an idle dummy this
+        // milestone. The snapshot is cheap, so we take it unconditionally even in
+        // non-Match modes (which ignore it).
+        let p1_input = match_input_from_keyboard(&event_pump.keyboard_state());
+
         while accumulator >= TICK_DURATION {
             match mode {
                 Mode::Match(ref mut run) => {
-                    // P1 from the keyboard; P2 is an idle dummy this milestone.
-                    let keyboard = event_pump.keyboard_state();
-                    let p1_input = match_input_from_keyboard(&keyboard);
+                    // P1 from this frame's single keyboard snapshot; P2 is an idle
+                    // dummy this milestone.
                     run.m.tick(p1_input, MatchInput::none());
 
                     // AFTER the tick: play this frame's surfaced sound requests,
@@ -1392,6 +1465,20 @@ mod tests {
         assert_eq!(life_fraction(2000, 1000), 1.0, "over-full clamps to 1");
         assert_eq!(life_fraction(100, 0), 0.0, "zero life_max yields 0, no div-by-zero");
         assert_eq!(life_fraction(100, -10), 0.0, "negative life_max yields 0");
+    }
+
+    /// PR-C (audit #26): the power-bar fraction mirrors `life_fraction`'s safety —
+    /// always in `[0, 1]`, clamped at both ends, and never divides by a
+    /// zero/negative `power_max`.
+    #[test]
+    fn power_fraction_is_clamped_and_safe() {
+        assert!((power_fraction(3000, 3000) - 1.0).abs() < 1e-6, "full meter is 1.0");
+        assert!((power_fraction(1500, 3000) - 0.5).abs() < 1e-6, "half meter is 0.5");
+        assert!((power_fraction(0, 3000)).abs() < 1e-6, "empty meter is 0.0");
+        assert_eq!(power_fraction(-50, 3000), 0.0, "negative power clamps to 0");
+        assert_eq!(power_fraction(9999, 3000), 1.0, "over-full meter clamps to 1");
+        assert_eq!(power_fraction(100, 0), 0.0, "zero power_max yields 0, no div-by-zero");
+        assert_eq!(power_fraction(100, -10), 0.0, "negative power_max yields 0");
     }
 
     /// AC2: world X maps into the window centered on the midpoint, with the origin

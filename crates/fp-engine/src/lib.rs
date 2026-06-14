@@ -328,6 +328,25 @@ impl Player {
         self.character.life_max
     }
 
+    /// The character's current power (the super/special meter, `Power`).
+    ///
+    /// Power is built during the fight and **carries across the rounds** of a
+    /// match (it is not reset between rounds; see
+    /// [`Match::reset_for_next_round`]). A HUD can divide this by
+    /// [`Player::power_max`] for a proportional power bar.
+    #[must_use]
+    pub fn power(&self) -> i32 {
+        self.character.power
+    }
+
+    /// The character's maximum power (`PowerMax`, `[Data] power`; MUGEN's default
+    /// is `3000`). The denominator for a proportional power bar over
+    /// [`Player::power`].
+    #[must_use]
+    pub fn power_max(&self) -> i32 {
+        self.character.power_max
+    }
+
     /// Builds the [`PushBody`] used for player-push and bound clamping from the
     /// character's `size.ground.front`/`back` constants, current X, and facing.
     fn push_body(&self) -> PushBody {
@@ -2562,7 +2581,8 @@ time = 1
     }
 
     /// AC1: read accessors expose the renderer-facing state, and they reflect the
-    /// live character. anim/anim_elem/life/life_max/pos/facing all round-trip.
+    /// live character. anim/anim_elem/life/life_max/power/power_max/pos/facing all
+    /// round-trip.
     #[test]
     fn read_accessors_reflect_character_state() {
         let mut c = Character::with_constants(CharacterConstants::default());
@@ -2571,6 +2591,8 @@ time = 1
         c.anim = 42;
         c.anim_elem = 3;
         c.life = 777;
+        c.power = 1500;
+        c.power_max = 3000;
         let p = Player::new(c, defender_loaded());
         assert_eq!(p.pos(), Vec2::new(12.0, -34.0));
         assert_eq!(p.facing(), Facing::Left);
@@ -2578,6 +2600,42 @@ time = 1
         assert_eq!(p.anim_elem(), 3);
         assert_eq!(p.life(), 777);
         assert_eq!(p.life_max(), 1000);
+        assert_eq!(p.power(), 1500, "power accessor reflects the live character");
+        assert_eq!(p.power_max(), 3000, "power_max accessor reflects the live character");
+    }
+
+    /// PR-C (audit #26): the power accessor surfaces the meter the simulation
+    /// tracks, and that meter carries across a round reset (power is intentionally
+    /// not zeroed between the rounds of a match) so a HUD power bar keeps its fill.
+    #[test]
+    fn power_accessor_surfaces_meter_and_carries_across_rounds() {
+        let p1 = Player::new(Character::new(), defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::default());
+
+        // Build some meter on P1 directly (as a super/PowerAdd would), then drive
+        // a full round to a decision and the next-round reset.
+        m.p1.character.power = 1234;
+        let built = m.p1().power();
+        assert_eq!(built, 1234, "accessor reflects the meter the sim tracks");
+        assert!(m.p1().power_max() > 0, "power_max is a sane denominator");
+
+        // KO P2 immediately so the round decides on the next Fight tick, then run
+        // far enough to pass through Ko -> Win -> next-round reset.
+        m.p2.character.life = 0;
+        for _ in 0..(INTRO_FRAMES + KO_FRAMES + 4) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.round_number(),
+            2,
+            "the match advanced into the next round (reset ran)"
+        );
+        assert_eq!(
+            m.p1().power(),
+            built,
+            "power carries across the round reset (not zeroed) and stays visible"
+        );
     }
 
     /// AC1: pressing both left and right (or neither) yields no net horizontal
