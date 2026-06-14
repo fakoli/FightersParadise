@@ -221,7 +221,12 @@ impl CnsCharacter {
         //    position integration from velocity, applying the facing sign to X
         //    (`pos.x += vel.x * facing_sign`, task 6.2c) so a left-facing
         //    character walks the correct way. The app must NOT integrate again.
-        let _ = self.entity.tick(&self.loaded);
+        //    This single-character viewer/driver has no opponent, so it passes
+        //    `None` + a default stage view: opponent-dependent triggers
+        //    (`P2Dist`, `p2, ...`, …) read the safe default `0`.
+        let _ = self
+            .entity
+            .tick(&self.loaded, None, fp_character::StageView::default());
 
         // 5. Clamp to the stage ground plane (y = 0) so the character never
         //    sinks. The ground plane is a stage concern, so it stays here rather

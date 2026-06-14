@@ -199,6 +199,17 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   between rounds (life→max, start positions/facing, clear transient state + timer). Deps: 7.1.
   *(via fp-loop-batch wn2xh1py6)*
 
+### ⭐ Audit-driven roadmap — see [08-faithfulness-audit.md](08-faithfulness-audit.md)
+The ultracode multi-agent audit verified **65 gaps** → **39-item prioritized roadmap** (full list +
+rationale in 08). Drive these top-down; they supersede ad-hoc probing.
+- **A.P1+P2** DONE — **Cross-entity eval context** (keystone): thread the opponent (+ stage bounds)
+  into `Character::tick` so redirects (`p2`/`enemy`/`root`), `P2Dist`/`P2BodyDist`/`p2,life`/`p2,stateno`,
+  and edge-distance triggers resolve (today all read 0 → AI/spacing/throws dead). `EvalCtx` wrapper;
+  cross-crate (fp-character tick sig + fp-engine Match::tick + fp-app). Unblocks ~1/3 of the audit.
+  *(direct Agent `a8f74496277caa12c`)*
+- Next per 08: P3 SelfState, P4 jump/run velocities, P5 Const720p, P6 AnimElemTime(n), P7
+  GetHitVar(animtype), P8 throw system (needs P1/P2), P9 NotHitBy/HitBy i-frames, …
+
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).
 - ~~**AABB collision** in `fp-physics`~~ ✅ DONE (task P6.1: `collision::{Clsn, Facing, rects_overlap, place_clsn, any_overlap, any_clsn_overlap}` — the Clsn1×Clsn2 hit-detection primitive). Critic PASS; orchestrator fixed a false `to_rect` doc claim.
@@ -300,6 +311,8 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   route `common=true` requests to it. *(added 8.3b)*
 - **CB38** fp-storyboard BG-group layer matching re-scans all sections per group (O(n*groups)) and couples grouping to naming; a layer could attach to two overlapping-prefix groups. Refactor to assign each "[<name> <layer>]" to its single nearest-preceding "[<name>Def]" in file order. *(added 11.1, Critic SHOULD_FIX)*
 - **CB39** Pin the `persistent = n` + `ignorehitpause` interaction during frozen ticks: a flagged controller fires every nth qualifying tick, and frozen ticks DO count (plausibly MUGEN-correct but untested). Add a test locking the chosen semantics. *(added 6.5, Critic SHOULD_FIX)*
+- **CB40** Get-hit state ENTRY exprs lose the opponent: resolve_attack -> change_state uses EvalEnv::self_only(), so a [Statedef 5xxx] header that references p2dist/enemy reads 0. Harmless for stock common1/KFM (static headers); thread the attacker as the defender opponent into the get-hit enter_state (a `change_state_vs`). *(added by audit-keystone Critic; 3-lens)*
+- **CB41** `enemynear(n)` with n>0 silently resolves to the single opponent (1-v-1 model); add a debug log/note so a future multi-enemy impl does not inherit a wrong-target bug. *(audit-keystone nit)*
 
 ### ✅ Locomotion-shim debt — RESOLVED by 7.3
 ~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,

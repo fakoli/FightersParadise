@@ -84,7 +84,7 @@ pub use loader::{
 };
 
 use fp_core::Vec2;
-use fp_vm::{EvalContext, Value};
+use fp_vm::{EvalContext, Redirect, Value};
 
 /// Number of integer variables (`var(0)`..=`var(59)`) every player owns.
 pub const NUM_VARS: usize = 60;
@@ -1310,10 +1310,14 @@ impl EvalContext for Character {
         // * Round / match state (engine, Phase 5+): `RoundState`, `RoundNo`,
         //   `RoundsExisted`, `MatchOver`, `GameTime`. These live on the round
         //   coordinator (`fp-engine`), not on a single `Character`.
-        // * Cross-entity geometry (Phase 7 redirection): `P2BodyDist`,
-        //   `P2Dist`, `FrontEdgeBodyDist`, `BackEdgeBodyDist`, `BackEdgeDist`.
-        //   These need the opponent and stage, reached via `redirect` (which is
-        //   currently single-entity / `None`).
+        // * Cross-entity geometry: `P2Dist`, `P2BodyDist`, the screen-edge
+        //   distances (`FrontEdgeDist`/`BackEdgeDist`/`FrontEdgeBodyDist`/
+        //   `BackEdgeBodyDist`/`ScreenPos`), and opponent reads via `p2, ...` /
+        //   `enemy, ...` redirects are NOT answered here on the self-only
+        //   `Character` — they need the opponent and stage. They are computed by
+        //   the per-tick cross-entity wrapper [`EvalCtx`], which delegates the
+        //   self-only triggers back to this impl. A bare `Character` evaluated on
+        //   its own still reports `0` for them (no opponent in view).
         // * Animation table queries: `SelfAnimExist`. Needs the loaded `.air`
         //   action set, which the executor owns rather than `Character`.
 
@@ -1356,8 +1360,323 @@ impl EvalContext for Character {
     }
 
     fn redirect(&self, _target: fp_vm::Redirect) -> Option<&dyn EvalContext> {
-        // Single-entity for now; multi-entity redirection is Phase 7.
+        // A bare `Character` is a *self-only* evaluation context with no view of
+        // its relations, so every redirect resolves to `None` here. The
+        // cross-entity context is supplied per tick by [`EvalCtx`], which wraps a
+        // `Character` together with its opponent and the stage and overrides
+        // `redirect` (and the opponent-dependent triggers) to see the other
+        // entity. `Character`'s own impl stays self-only so that a redirect
+        // target's *nested* redirects (e.g. the inner level of `p2, ...`) bottom
+        // out rather than looping.
         None
+    }
+}
+
+/// A horizontal slice of the stage the fighters are pinned to, in world X.
+///
+/// This is the minimal stage view the cross-entity evaluation context
+/// ([`EvalCtx`]) needs to answer the screen-edge distance triggers
+/// (`FrontEdgeDist`, `BackEdgeDist`, …). It is a small `Copy` value so it can be
+/// threaded through the per-tick eval path cheaply.
+///
+/// It lives in `fp-character` (rather than `fp-engine`, which owns the richer
+/// `StageBounds`) because `fp-engine` depends on `fp-character`; putting the type
+/// here lets `Character::tick` take it as a parameter without a dependency cycle.
+/// `fp-engine` converts its own bounds into a `StageView` when ticking a match.
+///
+/// `left`/`right` are the world X of the playfield's left/right edges. **Approximation:**
+/// `fp-engine` currently populates these from the static **stage bounds**
+/// (`boundleft`/`boundright`), so the edge-distance triggers (`FrontEdgeDist` etc.)
+/// measure to the fixed stage boundary, not the *scrolling camera/screen* edge that
+/// MUGEN uses. The two coincide while the camera is centred (the only case modelled
+/// today); once a scrolling camera lands, thread the camera's world-X window here
+/// instead. A well-formed view has `left <= right`, but a reversed pair still yields
+/// finite, deterministic distances (never a panic).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StageView {
+    /// World X of the left playfield edge (currently the stage `boundleft`).
+    pub left: f32,
+    /// World X of the right playfield edge (currently the stage `boundright`).
+    pub right: f32,
+}
+
+impl StageView {
+    /// Creates a stage view from the left and right screen-edge world X values.
+    #[must_use]
+    pub const fn new(left: f32, right: f32) -> Self {
+        Self { left, right }
+    }
+}
+
+impl Default for StageView {
+    /// A symmetric default view matching `fp-engine`'s default stage bounds
+    /// (`[-200, 200]`), used by the single-character / no-stage driver paths.
+    fn default() -> Self {
+        Self {
+            left: -200.0,
+            right: 200.0,
+        }
+    }
+}
+
+/// A per-tick **cross-entity** evaluation context: a [`Character`] (`me`) viewed
+/// together with its opponent and the stage.
+///
+/// `Character` on its own is a *self-only* [`EvalContext`] — it can answer
+/// `Life`, `Pos X`, `var(0)`, … about itself, but the opponent-dependent triggers
+/// (`P2Dist`, `P2BodyDist`, `p2, life`, …) and every redirect resolve to the safe
+/// default because a lone character has no view of the other entity. `EvalCtx`
+/// supplies that missing view for the duration of one [`Character::tick_with`]:
+///
+/// - **Self-only reads delegate** to `me`'s [`EvalContext`] impl: `trigger_str`,
+///   `command_active`, `random`, the variable banks, and every non-opponent
+///   `trigger` name fall straight through to the wrapped `Character`.
+/// - **Opponent-dependent triggers are computed here** from `me`, the opponent,
+///   and the stage: `P2Dist`/`P2BodyDist` (facing-relative on X), `P2Life`/
+///   `P2LifeMax`/`P2StateNo`/`P2MoveType`/`P2StateType`, and the screen-edge
+///   distances (`FrontEdgeDist`/`BackEdgeDist`/`FrontEdgeBodyDist`/
+///   `BackEdgeBodyDist`/`ScreenPos`).
+/// - **`redirect` resolves the opponent targets** (`p2`/`enemy`/`enemynear(_)`)
+///   to the opponent context and `root` to self; the remaining targets
+///   (`parent`/`target`/`helper`/`partner`/`playerid`) are `None` for now (this
+///   crate models a flat 1-v-1 with no helpers — documented, never a panic).
+///
+/// ## Borrow / lifetime shape
+///
+/// `opponent` is itself an `EvalCtx` (built once near the top of the tick with
+/// *its* opponent set to `None`), so a single level of `p2, ...` works while the
+/// opponent's own nested redirects bottom out — exactly MUGEN's behavior for a
+/// non-helper's view of the other player. The opponent context borrows the
+/// opponent `Character` immutably and is **not** mutated during `me`'s tick, so
+/// `me`'s mutable controller dispatch and the immutable opponent view never
+/// conflict. At each eval site the executor reborrows `&*self` into a fresh
+/// `EvalCtx { me, .. }` that lives only for that one `eval` call and drops before
+/// any `&mut self` mutation — so the whole thing type-checks with no `unsafe`.
+pub struct EvalCtx<'a> {
+    /// The character this context evaluates self-triggers against.
+    me: &'a Character,
+    /// The opponent's context, or `None` when there is no opponent.
+    opponent: Option<&'a EvalCtx<'a>>,
+    /// The stage edges, for the screen-edge distance triggers.
+    stage: StageView,
+}
+
+impl<'a> EvalCtx<'a> {
+    /// Builds a cross-entity context wrapping `me`, with `opponent` and `stage`.
+    #[must_use]
+    pub fn new(me: &'a Character, opponent: Option<&'a EvalCtx<'a>>, stage: StageView) -> Self {
+        Self {
+            me,
+            opponent,
+            stage,
+        }
+    }
+
+    /// The opponent `Character`, if any (the entity behind the opponent context).
+    fn opponent_char(&self) -> Option<&'a Character> {
+        self.opponent.map(|o| o.me)
+    }
+
+    /// `P2Dist X` — the **facing-relative** horizontal distance to the opponent:
+    /// `(opponent.pos.x - me.pos.x) * facing_sign(me)`. Positive means the
+    /// opponent is in front of `me`. With no opponent the safe default `0`.
+    fn p2dist_x(&self) -> f32 {
+        match self.opponent_char() {
+            Some(o) => (o.pos.x - self.me.pos.x) * self.me.facing.sign() as f32,
+            None => 0.0,
+        }
+    }
+
+    /// `P2Dist Y` — the vertical distance to the opponent (`opponent.pos.y -
+    /// me.pos.y`, no facing flip on Y). With no opponent the safe default `0`.
+    fn p2dist_y(&self) -> f32 {
+        match self.opponent_char() {
+            Some(o) => o.pos.y - self.me.pos.y,
+            None => 0.0,
+        }
+    }
+
+    /// `P2BodyDist X` — the facing-relative edge-to-edge horizontal distance:
+    /// `P2Dist X` shrunk (toward zero, preserving sign) by each fighter's
+    /// half-width on the side facing the gap. When the opponent is in front
+    /// (`P2Dist X >= 0`) that is `me`'s `size.ground.front`; when crossed up
+    /// (behind, `P2Dist X < 0`) it is `me`'s `size.ground.back`. The opponent
+    /// normally faces `me`, so its `front` width is used. With no opponent the
+    /// safe default `0`.
+    fn p2bodydist_x(&self) -> f32 {
+        match self.opponent_char() {
+            Some(o) => {
+                let d = self.p2dist_x();
+                let my_w = if d >= 0.0 {
+                    self.me.constants.size.ground_front
+                } else {
+                    self.me.constants.size.ground_back
+                } as f32;
+                let opp_w = o.constants.size.ground_front as f32;
+                let widths = my_w + opp_w;
+                // Shrink the gap toward zero by both widths, preserving sign; the
+                // result may be negative when the bodies overlap (MUGEN-faithful).
+                if d >= 0.0 {
+                    d - widths
+                } else {
+                    d + widths
+                }
+            }
+            None => 0.0,
+        }
+    }
+
+    /// `FrontEdgeDist` — distance from `me` to the screen edge it faces (positive
+    /// when inside the playfield). Facing right ⇒ the right edge; facing left ⇒
+    /// the left edge.
+    fn front_edge_dist(&self) -> f32 {
+        match self.me.facing {
+            Facing::Right => self.stage.right - self.me.pos.x,
+            Facing::Left => self.me.pos.x - self.stage.left,
+        }
+    }
+
+    /// `BackEdgeDist` — distance from `me` to the screen edge behind it.
+    fn back_edge_dist(&self) -> f32 {
+        match self.me.facing {
+            Facing::Right => self.me.pos.x - self.stage.left,
+            Facing::Left => self.stage.right - self.me.pos.x,
+        }
+    }
+
+    /// Resolves an opponent-dependent trigger by (case-insensitive) name to a
+    /// [`Value`], or [`None`] if `name` is not one this context computes (so the
+    /// caller can delegate to the wrapped `Character`).
+    ///
+    /// Every value here is the safe default `0` when there is no opponent; none
+    /// of these ever panics. `P2*` reads of the opponent's own state route
+    /// through the opponent context's [`EvalContext::trigger`] so they report the
+    /// opponent's value (and stay correct if the opponent's own reporting
+    /// changes).
+    fn cross_entity_trigger(&self, name: &str, args: &[Value]) -> Option<Value> {
+        // Axis helper: X = 0 (or absent), Y = 1, per the evaluator's coding.
+        let is_y = || matches!(args.first().map(|v| v.to_int()), Some(AXIS_Y));
+
+        if name.eq_ignore_ascii_case("P2Dist") {
+            return Some(Value::Float(if is_y() {
+                self.p2dist_y()
+            } else {
+                self.p2dist_x()
+            }));
+        }
+        if name.eq_ignore_ascii_case("P2BodyDist") {
+            // BodyDist Y has no width adjustment; it equals P2Dist Y.
+            return Some(Value::Float(if is_y() {
+                self.p2dist_y()
+            } else {
+                self.p2bodydist_x()
+            }));
+        }
+        if name.eq_ignore_ascii_case("FrontEdgeDist") {
+            return Some(Value::Float(self.front_edge_dist()));
+        }
+        if name.eq_ignore_ascii_case("BackEdgeDist") {
+            return Some(Value::Float(self.back_edge_dist()));
+        }
+        if name.eq_ignore_ascii_case("FrontEdgeBodyDist") {
+            // Edge-to-body: subtract this player's front half-width.
+            let w = self.me.constants.size.ground_front as f32;
+            return Some(Value::Float(self.front_edge_dist() - w));
+        }
+        if name.eq_ignore_ascii_case("BackEdgeBodyDist") {
+            let w = self.me.constants.size.ground_back as f32;
+            return Some(Value::Float(self.back_edge_dist() - w));
+        }
+        if name.eq_ignore_ascii_case("ScreenPos") {
+            // ScreenPos X/Y: position relative to the left/top screen edge. Only X
+            // is meaningful from a `StageView`; Y mirrors the world Y (no vertical
+            // camera modeled), matching the single-camera assumption.
+            return Some(Value::Float(if is_y() {
+                self.me.pos.y
+            } else {
+                self.me.pos.x - self.stage.left
+            }));
+        }
+
+        // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
+        // These resolve through the opponent context's `trigger` (so they report
+        // the opponent's value and stay correct if its reporting changes); with no
+        // opponent they read the safe default `0`. `enemy, <field>` (a redirect)
+        // is the more general written form; these single-token aliases are the
+        // few P2* fields MUGEN exposes directly.
+        if let Some(opp_field) = name
+            .strip_prefix("p2")
+            .or_else(|| name.strip_prefix("P2"))
+            .filter(|f| {
+                f.eq_ignore_ascii_case("life")
+                    || f.eq_ignore_ascii_case("lifemax")
+                    || f.eq_ignore_ascii_case("stateno")
+                    || f.eq_ignore_ascii_case("movetype")
+                    || f.eq_ignore_ascii_case("statetype")
+            })
+        {
+            return Some(match self.opponent {
+                Some(opp) => opp.trigger(opp_field, args),
+                None => Value::DEFAULT,
+            });
+        }
+
+        None
+    }
+}
+
+impl EvalContext for EvalCtx<'_> {
+    fn trigger(&self, name: &str, args: &[Value]) -> Value {
+        // Opponent-dependent / stage triggers are computed here; everything else
+        // delegates to the wrapped character's self-only impl.
+        if let Some(v) = self.cross_entity_trigger(name, args) {
+            return v;
+        }
+        self.me.trigger(name, args)
+    }
+
+    fn trigger_str(&self, name: &str, key: &str) -> Value {
+        self.me.trigger_str(name, key)
+    }
+
+    fn var(&self, index: i32) -> Value {
+        self.me.var(index)
+    }
+
+    fn fvar(&self, index: i32) -> Value {
+        self.me.fvar(index)
+    }
+
+    fn sysvar(&self, index: i32) -> Value {
+        self.me.sysvar(index)
+    }
+
+    fn command_active(&self, name: &str) -> bool {
+        self.me.command_active(name)
+    }
+
+    fn random(&self) -> i32 {
+        self.me.random()
+    }
+
+    fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
+        match target {
+            // The opposing player. In standard 1-v-1 play `p2`, `enemy`, and the
+            // nearest `enemynear(_)` all resolve to the single opponent.
+            Redirect::Enemy | Redirect::EnemyNear(_) => {
+                self.opponent.map(|o| o as &dyn EvalContext)
+            }
+            // A non-helper entity's `root` is itself.
+            Redirect::Root => Some(self),
+            // No helper graph / teams / targeting modeled in this flat 1-v-1, so
+            // these resolve to `None` (the redirected sub-expression → 0). This is
+            // a documented deferral, not a silent error.
+            Redirect::Parent
+            | Redirect::Helper(_)
+            | Redirect::Target(_)
+            | Redirect::Partner
+            | Redirect::PlayerId(_) => None,
+        }
     }
 }
 
@@ -3087,5 +3406,283 @@ mod tests {
         // gate at minimum (the task's core scenario).
         assert!(saw_negated, "expected a `!alive` death gate in common1.cns");
         assert!(saw_plain, "expected an `alive` recovery guard in common1.cns");
+    }
+
+    // =====================================================================
+    // Cross-entity evaluation context (EvalCtx): P2Dist / P2BodyDist / p2,...
+    // redirects / screen-edge distances. These drive REAL trigger expressions
+    // through the VM eval path against an EvalCtx, so the redirect/VM seam (not
+    // just an internal helper) is exercised — exactly how the executor calls it.
+    // =====================================================================
+
+    /// Evaluates a trigger expression string against `me` viewed with `opponent`
+    /// (or `None`) and the given stage, through the same VM eval path the
+    /// executor uses. Panics only in test code on a parse error.
+    fn ev_cross(expr: &str, me: &Character, opponent: Option<&Character>, stage: StageView) -> Value {
+        let ast = parse_str(expr).expect("test expression should parse");
+        // Build the opponent context one level deep (its own opponent is None),
+        // mirroring `Character::tick_with`.
+        let opp_ctx = opponent.map(|o| EvalCtx::new(o, None, stage));
+        let ctx = EvalCtx::new(me, opp_ctx.as_ref(), stage);
+        eval(&ast, &ctx)
+    }
+
+    /// Two facing-opposed characters at x=0 (me) and x=60 (opponent), each with a
+    /// distinct life/state so opponent reads are unambiguous.
+    fn two_chars() -> (Character, Character) {
+        let mut me = Character::new();
+        me.pos = Vec2::new(0.0, 0.0);
+        me.facing = Facing::Right;
+        me.life = 700;
+        me.state_no = 200;
+        // KFM-default widths (ground_front = 16) on both via Character::new().
+
+        let mut opp = Character::new();
+        opp.pos = Vec2::new(60.0, 10.0);
+        opp.facing = Facing::Left;
+        opp.life = 450;
+        opp.state_no = 1300;
+        opp.move_type = MoveType::Attack;
+        opp.state_type = StateType::Air;
+        (me, opp)
+    }
+
+    #[test]
+    fn p2dist_x_is_facing_relative() {
+        let (mut me, opp) = two_chars();
+        let stage = StageView::default();
+        // Facing Right: opponent 60px ahead → P2Dist X == 60 (positive = in front).
+        me.facing = Facing::Right;
+        assert_eq!(
+            ev_cross("P2Dist X", &me, Some(&opp), stage),
+            Value::Float(60.0)
+        );
+        // Facing Left: the same world gap is now BEHIND, so the sign flips.
+        me.facing = Facing::Left;
+        assert_eq!(
+            ev_cross("P2Dist X", &me, Some(&opp), stage),
+            Value::Float(-60.0)
+        );
+    }
+
+    #[test]
+    fn p2dist_y_has_no_facing_flip() {
+        let (me, opp) = two_chars(); // opp.y = 10, me.y = 0
+        let stage = StageView::default();
+        assert_eq!(
+            ev_cross("P2Dist Y", &me, Some(&opp), stage),
+            Value::Float(10.0)
+        );
+        // Facing does not affect the Y axis.
+        let mut me_left = me;
+        me_left.facing = Facing::Left;
+        assert_eq!(
+            ev_cross("P2Dist Y", &me_left, Some(&opp), stage),
+            Value::Float(10.0)
+        );
+    }
+
+    #[test]
+    fn p2bodydist_x_subtracts_both_front_widths() {
+        let (me, opp) = two_chars();
+        let stage = StageView::default();
+        // Edge-to-edge: 60 - (me.front 16 + opp.front 16) == 28.
+        let widths = (me.constants.size.ground_front + opp.constants.size.ground_front) as f32;
+        assert_eq!(
+            ev_cross("P2BodyDist X", &me, Some(&opp), stage),
+            Value::Float(60.0 - widths)
+        );
+        // BodyDist Y has no width adjustment; equals P2Dist Y.
+        assert_eq!(
+            ev_cross("P2BodyDist Y", &me, Some(&opp), stage),
+            Value::Float(10.0)
+        );
+    }
+
+    #[test]
+    fn enemy_redirect_reads_opponent_self_fields() {
+        let (me, opp) = two_chars();
+        let stage = StageView::default();
+        // `enemy, life` reads the OPPONENT's life (450), not me's (700). `enemy`
+        // is MUGEN's redirect keyword for the opposing player (the parser maps it
+        // to `Redirect::Enemy`, which EvalCtx resolves to the opponent context).
+        assert_eq!(ev_cross("enemy, Life", &me, Some(&opp), stage), Value::Int(450));
+        assert_eq!(ev_cross("Life", &me, Some(&opp), stage), Value::Int(700));
+        // `enemy, stateno` reads the opponent's state number.
+        assert_eq!(
+            ev_cross("enemy, StateNo = 1300", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        // Letter-coded opponent reads route through the opponent's own trigger.
+        assert_eq!(
+            ev_cross("enemy, MoveType = A", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_cross("enemy, StateType = A", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        // `enemynear(0), ...` resolves to the same single opponent.
+        assert_eq!(
+            ev_cross("enemynear(0), Life", &me, Some(&opp), stage),
+            Value::Int(450)
+        );
+    }
+
+    #[test]
+    fn standalone_p2_field_triggers_read_opponent() {
+        let (me, opp) = two_chars();
+        let stage = StageView::default();
+        // The single-token `P2<field>` aliases read the opponent's own fields.
+        assert_eq!(ev_cross("P2Life = 450", &me, Some(&opp), stage), Value::Int(1));
+        assert_eq!(
+            ev_cross("P2LifeMax = 1000", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_cross("P2StateNo = 1300", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_cross("P2MoveType = A", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_cross("P2StateType = A", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+        // With no opponent each reads the safe default 0.
+        assert_eq!(ev_cross("P2Life", &me, None, stage), Value::Int(0));
+        assert_eq!(ev_cross("P2StateNo", &me, None, stage), Value::Int(0));
+    }
+
+    #[test]
+    fn root_redirect_is_self() {
+        let (me, opp) = two_chars();
+        let stage = StageView::default();
+        // A non-helper's `root` is itself: `root, life` == own life.
+        assert_eq!(ev_cross("root, Life", &me, Some(&opp), stage), Value::Int(700));
+        assert_eq!(
+            ev_cross("root, StateNo = 200", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn no_opponent_cross_entity_reads_are_zero_and_never_panic() {
+        let (me, _opp) = two_chars();
+        let stage = StageView::default();
+        // With no opponent every opponent-dependent read is the safe default 0.
+        assert_eq!(ev_cross("P2Dist X", &me, None, stage), Value::Float(0.0));
+        assert_eq!(ev_cross("P2Dist Y", &me, None, stage), Value::Float(0.0));
+        assert_eq!(ev_cross("P2BodyDist X", &me, None, stage), Value::Float(0.0));
+        // An `enemy, ...` redirect resolves to None → the whole sub-expr is 0.
+        assert_eq!(ev_cross("enemy, Life", &me, None, stage), Value::Int(0));
+        assert_eq!(ev_cross("enemy, StateNo = 1300", &me, None, stage), Value::Int(0));
+        // A compound gated on a cross-entity read collapses to false, not a panic.
+        // (A redirect binds looser than every operator, so `enemy, EXPR` retargets
+        // the whole trailing compound; with no opponent it is 0.)
+        assert_eq!(
+            ev_cross("enemy, MoveType = A && Life > 0", &me, None, stage),
+            Value::Int(0)
+        );
+        assert_eq!(
+            ev_cross("P2BodyDist X < 30 && P2Life > 0", &me, None, stage),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn unsupported_redirects_are_none_through_evalctx() {
+        let (me, opp) = two_chars();
+        let stage = StageView::default();
+        // parent / partner / helper / target / playerid are not modeled in this
+        // flat 1-v-1: the redirected sub-expression collapses to 0 (never panics).
+        for expr in [
+            "parent, Life",
+            "partner, Life",
+            "helper(1), Life",
+            "target, Life",
+            "playerid(7), Life",
+        ] {
+            assert_eq!(
+                ev_cross(expr, &me, Some(&opp), stage),
+                Value::Int(0),
+                "`{expr}` should resolve to 0 (unsupported redirect)"
+            );
+        }
+    }
+
+    #[test]
+    fn screen_edge_distances_use_stage_and_facing() {
+        let mut me = Character::new();
+        me.pos = Vec2::new(50.0, 0.0);
+        let stage = StageView::new(-200.0, 200.0);
+        // Facing Right: front edge is the right edge → 200 - 50 = 150;
+        // back edge is the left edge → 50 - (-200) = 250.
+        me.facing = Facing::Right;
+        assert_eq!(
+            ev_cross("FrontEdgeDist", &me, None, stage),
+            Value::Float(150.0)
+        );
+        assert_eq!(
+            ev_cross("BackEdgeDist", &me, None, stage),
+            Value::Float(250.0)
+        );
+        // Facing Left swaps which edge is front vs back.
+        me.facing = Facing::Left;
+        assert_eq!(
+            ev_cross("FrontEdgeDist", &me, None, stage),
+            Value::Float(250.0)
+        );
+        assert_eq!(
+            ev_cross("BackEdgeDist", &me, None, stage),
+            Value::Float(150.0)
+        );
+        // ScreenPos X is the offset from the left edge.
+        assert_eq!(
+            ev_cross("ScreenPos X", &me, None, stage),
+            Value::Float(250.0)
+        );
+        // Body-edge variants subtract THIS player's facing-appropriate half-width:
+        // FrontEdgeBodyDist uses `front`, BackEdgeBodyDist uses `back` (the asymmetry
+        // a regression could silently swap). Facing Left: front edge dist = 250,
+        // back edge dist = 150.
+        let gf = me.constants.size.ground_front as f32;
+        let gb = me.constants.size.ground_back as f32;
+        assert_eq!(
+            ev_cross("FrontEdgeBodyDist", &me, None, stage),
+            Value::Float(250.0 - gf)
+        );
+        assert_eq!(
+            ev_cross("BackEdgeBodyDist", &me, None, stage),
+            Value::Float(150.0 - gb)
+        );
+        // ScreenPos Y is raw world Y (no vertical camera modeled).
+        assert_eq!(ev_cross("ScreenPos Y", &me, None, stage), Value::Float(me.pos.y));
+    }
+
+    #[test]
+    fn evalctx_delegates_self_only_triggers_to_character() {
+        // The wrapper must not perturb ordinary self-only reads: they pass straight
+        // through to the wrapped Character's impl, with or without an opponent.
+        let (mut me, opp) = two_chars();
+        me.vars[1] = 5;
+        me.fvars[0] = 1.5;
+        let stage = StageView::default();
+        for (expr, expected) in [
+            ("StateNo = 200", Value::Int(1)),
+            ("Life = 700", Value::Int(1)),
+            ("var(1) = 5", Value::Int(1)),
+            ("Facing = 1", Value::Int(1)),
+        ] {
+            assert_eq!(ev_cross(expr, &me, Some(&opp), stage), expected, "{expr}");
+            assert_eq!(ev_cross(expr, &me, None, stage), expected, "{expr} (no opp)");
+        }
+        // fvar reads through the typed seam too.
+        assert_eq!(
+            ev_cross("fvar(0) = 1.5", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
     }
 }

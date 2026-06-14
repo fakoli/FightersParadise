@@ -90,14 +90,53 @@ use std::collections::HashMap;
 
 use fp_core::Vec2;
 use fp_formats::air::AirFile;
-use fp_vm::{eval, EvalContext, Value};
+use fp_vm::{eval, Value};
 
 use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    Character, Facing, LoadedCharacter, MoveType, Physics, StateType, NUM_FVARS, NUM_VARS,
+    Character, EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType,
+    NUM_FVARS, NUM_VARS,
 };
+
+/// The per-tick **cross-entity evaluation environment**: the opponent's context
+/// and the stage, threaded through the executor so every expression the tick
+/// evaluates sees the other entity.
+///
+/// This is a tiny `Copy` bundle (an opponent reference plus two floats) carried
+/// alongside `&mut self` through the controller dispatch chain. At each eval site
+/// the executor reborrows `&*self` into a fresh
+/// [`EvalCtx`](crate::EvalCtx)`{ me, opponent, stage }` that lives only for that
+/// one `eval` call — the reborrow drops before any `&mut self` mutation, so the
+/// borrow checker is satisfied with no `unsafe`.
+///
+/// The opponent context is built **once** near the top of
+/// [`Character::tick_with`] (with its own opponent set to `None`), so a single
+/// level of `p2, ...` resolves while the opponent's nested redirects bottom out —
+/// matching MUGEN's view of the other player from a non-helper. The opponent
+/// `Character` is borrowed immutably and is not mutated during this character's
+/// tick.
+#[derive(Clone, Copy)]
+struct EvalEnv<'a> {
+    /// The opponent's evaluation context, or `None` when there is no opponent.
+    opponent: Option<&'a EvalCtx<'a>>,
+    /// The stage edges, for the screen-edge distance triggers.
+    stage: StageView,
+}
+
+impl EvalEnv<'_> {
+    /// An environment with no opponent and the default stage: every
+    /// opponent-dependent trigger reads the safe default `0`. Used by the
+    /// out-of-tick [`Character::change_state`] seam, which has no opponent
+    /// threaded.
+    fn self_only() -> Self {
+        Self {
+            opponent: None,
+            stage: StageView::default(),
+        }
+    }
+}
 
 /// Upper bound on `ChangeState` transitions resolved within a single tick.
 ///
@@ -188,8 +227,20 @@ impl Character {
     /// states and controllers degrade to safe no-ops, and a cyclic state graph
     /// is bounded by an internal per-tick transition cap (`512`), after which
     /// processing stops and [`TickReport::transition_cap_hit`] is set.
-    pub fn tick(&mut self, loaded: &LoadedCharacter) -> TickReport {
-        self.tick_with(&loaded.states, &loaded.air)
+    ///
+    /// `opponent` is the other player this character's triggers can read across
+    /// (`P2Dist`, `p2, life`, …); pass `None` for a single-character / no-opponent
+    /// tick, in which case the opponent-dependent triggers report the safe default
+    /// `0`. `stage` supplies the screen edges the screen-edge distance triggers
+    /// (`FrontEdgeDist`, …) read; use [`StageView::default`] when there is no
+    /// stage context.
+    pub fn tick(
+        &mut self,
+        loaded: &LoadedCharacter,
+        opponent: Option<&Character>,
+        stage: StageView,
+    ) -> TickReport {
+        self.tick_with(&loaded.states, &loaded.air, opponent, stage)
     }
 
     /// The executor core, parameterized over just the data it needs: the
@@ -203,8 +254,24 @@ impl Character {
         &mut self,
         states: &HashMap<i32, CompiledState>,
         air: &AirFile,
+        opponent: Option<&Character>,
+        stage: StageView,
     ) -> TickReport {
         let mut report = TickReport::default();
+
+        // Build the opponent's cross-entity context ONCE for this whole tick. Its
+        // own opponent is `None` (a single level of `p2, ...` is enough for KFM /
+        // common1; the opponent's nested redirects bottom out). The opponent is
+        // borrowed immutably here and is never mutated during this character's
+        // tick, so this shared borrow coexists with `&mut self` below: each eval
+        // site reborrows `&*self` into a short-lived `EvalCtx` that drops before
+        // any mutation.
+        let opp_ctx: Option<EvalCtx> =
+            opponent.map(|o| EvalCtx::new(o, None, stage));
+        let env = EvalEnv {
+            opponent: opp_ctx.as_ref(),
+            stage,
+        };
 
         // Hit-pause gate (task 6.5): while frozen by a connecting hit, the engine
         // holds the character still for the paused tick — it does NOT advance the
@@ -231,7 +298,7 @@ impl Character {
             // Run ONLY the `ignorehitpause`-flagged controllers, in the same
             // special-state-then-current-state order as a normal tick. Everything
             // else (anim/time/physics advance, non-flagged controllers) is frozen.
-            self.run_ignorehitpause_only(states, &mut report);
+            self.run_ignorehitpause_only(states, env, &mut report);
             return report;
         }
         if self.shaketime > 0 {
@@ -242,12 +309,12 @@ impl Character {
         // state. The current state number is re-read after each special state in
         // case one of them changed it via ChangeState.
         for special in [-3, -2, -1] {
-            self.run_state(states, special, &mut report);
+            self.run_state(states, special, env, &mut report);
         }
 
         // Then the current numbered state. ChangeState within it re-enters the
         // destination in the same tick (bounded by run_current_with_transitions).
-        self.run_current_with_transitions(states, &mut report);
+        self.run_current_with_transitions(states, env, &mut report);
 
         // ---- Per-tick physics, integration, time, and animation advance -----
         // MUGEN order: controllers set velocity, then `physics` modifies it
@@ -270,8 +337,14 @@ impl Character {
     /// uses to put a defender into its get-hit state. An unknown destination
     /// still updates the cursor (so `StateNo` reads the requested number) but
     /// applies no entry parameters — never panics.
+    ///
+    /// The destination statedef's entry expressions (`anim`/`ctrl`/`poweradd`) are
+    /// evaluated with **no opponent** in view and the default stage: this seam is
+    /// used outside the per-tick eval loop (it has no opponent threaded), and the
+    /// entry expressions KFM / common1 use here are self-only. A cross-entity
+    /// entry expression would read the safe default `0` rather than misfire.
     pub fn change_state(&mut self, states: &HashMap<i32, CompiledState>, target: i32) {
-        self.enter_state(states, target);
+        self.enter_state(states, target, EvalEnv::self_only());
     }
 
     /// Runs every controller of the state numbered `state_no` (if it exists),
@@ -282,6 +355,7 @@ impl Character {
         &mut self,
         states: &HashMap<i32, CompiledState>,
         state_no: i32,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
         let Some(state) = states.get(&state_no) else {
@@ -312,7 +386,7 @@ impl Character {
                 return;
             };
             let ctrl = ctrl.clone();
-            self.run_controller(states, &ctrl, idx, report);
+            self.run_controller(states, &ctrl, idx, env, report);
         }
     }
 
@@ -321,6 +395,7 @@ impl Character {
     fn run_current_with_transitions(
         &mut self,
         states: &HashMap<i32, CompiledState>,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
         let mut guard = 0u32;
@@ -348,7 +423,7 @@ impl Character {
                     break;
                 };
                 let ctrl = ctrl.clone();
-                self.run_controller(states, &ctrl, idx, report);
+                self.run_controller(states, &ctrl, idx, env, report);
             }
 
             // We are done with this state unless a ChangeState moved us to a
@@ -408,6 +483,7 @@ impl Character {
     fn run_ignorehitpause_only(
         &mut self,
         states: &HashMap<i32, CompiledState>,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
         for state_no in [-3, -2, -1, self.state_no] {
@@ -423,12 +499,12 @@ impl Character {
                     break;
                 };
                 let ctrl = ctrl.clone();
-                if !self.ignorehitpause_flag(&ctrl) {
+                if !self.ignorehitpause_flag(&ctrl, env) {
                     // A controller without `ignorehitpause` is skipped for the
                     // duration of the freeze.
                     continue;
                 }
-                self.run_controller(states, &ctrl, idx, report);
+                self.run_controller(states, &ctrl, idx, env, report);
             }
         }
     }
@@ -441,9 +517,9 @@ impl Character {
     /// returns `false` — matching MUGEN's default of `0` (the controller is paused
     /// during hit-pause). A fallback (failed-compile) expression evaluates to `0`
     /// and so returns `false`. Never panics.
-    fn ignorehitpause_flag(&self, ctrl: &CompiledController) -> bool {
+    fn ignorehitpause_flag(&self, ctrl: &CompiledController, env: EvalEnv) -> bool {
         match &ctrl.ignorehitpause {
-            Some(expr) => self.eval_bool(expr),
+            Some(expr) => self.eval_bool(expr, env),
             None => false,
         }
     }
@@ -455,9 +531,10 @@ impl Character {
         states: &HashMap<i32, CompiledState>,
         ctrl: &CompiledController,
         idx: usize,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
-        if !self.gating_passes(ctrl) {
+        if !self.gating_passes(ctrl, env) {
             return;
         }
 
@@ -478,21 +555,21 @@ impl Character {
         *qualifying_count += 1;
         let count = *qualifying_count;
 
-        if !persistent_allows(self.persistent_value(ctrl), count) {
+        if !persistent_allows(self.persistent_value(ctrl, env), count) {
             return;
         }
 
         report.controllers_fired += 1;
-        self.dispatch(states, ctrl, report);
+        self.dispatch(states, ctrl, env, report);
     }
 
     /// Returns `true` if the controller's gating passes: all `triggerall`
     /// conditions are true (AND) **and** at least one numbered trigger group is
     /// fully true (OR across groups), after applying the CB6 contiguity rule.
-    fn gating_passes(&self, ctrl: &CompiledController) -> bool {
+    fn gating_passes(&self, ctrl: &CompiledController, env: EvalEnv) -> bool {
         // triggerall: every condition must be true.
         for cond in &ctrl.triggerall {
-            if !self.eval_bool(cond) {
+            if !self.eval_bool(cond, env) {
                 return false;
             }
         }
@@ -506,7 +583,7 @@ impl Character {
         // CB6: consider groups in ascending number from 1, stopping at the first
         // gap. A controller fires if any *contiguous* group is fully true.
         for group in contiguous_groups(&ctrl.triggers) {
-            if self.group_is_true(group) {
+            if self.group_is_true(group, env) {
                 return true;
             }
         }
@@ -514,22 +591,38 @@ impl Character {
     }
 
     /// Returns `true` if every condition in a numbered group is true (AND).
-    fn group_is_true(&self, group: &CompiledTriggerGroup) -> bool {
+    fn group_is_true(&self, group: &CompiledTriggerGroup, env: EvalEnv) -> bool {
         // An empty group (no conditions) cannot be satisfied.
-        !group.conditions.is_empty() && group.conditions.iter().all(|c| self.eval_bool(c))
+        !group.conditions.is_empty() && group.conditions.iter().all(|c| self.eval_bool(c, env))
     }
 
-    /// Evaluates a compiled expression against this character as a boolean.
+    /// Builds the per-eval cross-entity context: this character viewed together
+    /// with `env`'s opponent and stage.
+    ///
+    /// The returned [`EvalCtx`] reborrows `&*self` (`me`) and lives only as long
+    /// as the caller keeps it — every eval helper builds one, runs a single
+    /// [`eval`], and drops it before any `&mut self` mutation. The opponent
+    /// reference comes from `env` (built once for the whole tick), so this is a
+    /// cheap reborrow + struct build, no allocation and no `unsafe`.
+    fn eval_ctx<'a>(&'a self, env: EvalEnv<'a>) -> EvalCtx<'a> {
+        EvalCtx::new(self, env.opponent, env.stage)
+    }
+
+    /// Evaluates a compiled expression against this character (with its opponent /
+    /// stage view) as a boolean.
     ///
     /// A fallback (const-`0`) expression is always false, so a controller whose
     /// trigger failed to compile can never fire.
-    fn eval_bool(&self, expr: &CompiledExpr) -> bool {
-        eval(&expr.expr, self as &dyn EvalContext).as_bool()
+    fn eval_bool(&self, expr: &CompiledExpr, env: EvalEnv) -> bool {
+        let ctx = self.eval_ctx(env);
+        eval(&expr.expr, &ctx).as_bool()
     }
 
-    /// Evaluates a compiled expression to a [`Value`].
-    fn eval_value(&self, expr: &CompiledExpr) -> Value {
-        eval(&expr.expr, self as &dyn EvalContext)
+    /// Evaluates a compiled expression to a [`Value`] against this character (with
+    /// its opponent / stage view).
+    fn eval_value(&self, expr: &CompiledExpr, env: EvalEnv) -> Value {
+        let ctx = self.eval_ctx(env);
+        eval(&expr.expr, &ctx)
     }
 
     /// Evaluates component `i` of a multi-component parameter, returning `None`
@@ -539,8 +632,13 @@ impl Character {
     /// a scalar parameter is read with `i == 0`; the second value of an `x, y`
     /// pair is read with `i == 1`. A missing component returns `None` so the
     /// caller can substitute its own documented default. Never panics.
-    fn eval_param_component(&self, param: &CompiledParam, i: usize) -> Option<Value> {
-        param.component(i).map(|expr| self.eval_value(expr))
+    fn eval_param_component(
+        &self,
+        param: &CompiledParam,
+        i: usize,
+        env: EvalEnv,
+    ) -> Option<Value> {
+        param.component(i).map(|expr| self.eval_value(expr, env))
     }
 
     /// Evaluates a parameter's scalar value: its first (index `0`) component.
@@ -548,8 +646,8 @@ impl Character {
     /// Most controllers read a single value (`value`, `x`, `y`, …); this is the
     /// shorthand for `eval_param_component(param, 0)`. Returns `None` only for
     /// the (in practice impossible) empty parameter.
-    fn eval_param(&self, param: &CompiledParam) -> Option<Value> {
-        self.eval_param_component(param, 0)
+    fn eval_param(&self, param: &CompiledParam, env: EvalEnv) -> Option<Value> {
+        self.eval_param_component(param, 0, env)
     }
 
     /// Evaluates every component of a parameter, in order, into [`Value`]s.
@@ -559,19 +657,19 @@ impl Character {
     /// this simply evaluates the pre-compiled components against `self`. An empty
     /// or whitespace-only authored component is the const-`0` fallback and
     /// evaluates to `0`. Never panics.
-    fn eval_param_components(&self, param: &CompiledParam) -> Vec<Value> {
+    fn eval_param_components(&self, param: &CompiledParam, env: EvalEnv) -> Vec<Value> {
         param
             .components
             .iter()
-            .map(|expr| self.eval_value(expr))
+            .map(|expr| self.eval_value(expr, env))
             .collect()
     }
 
     /// Resolves the controller's `persistent` value: the compiled expression if
     /// present, otherwise MUGEN's default of `1` (re-fire every qualifying tick).
-    fn persistent_value(&self, ctrl: &CompiledController) -> i32 {
+    fn persistent_value(&self, ctrl: &CompiledController, env: EvalEnv) -> i32 {
         match &ctrl.persistent {
-            Some(expr) => self.eval_value(expr).to_int(),
+            Some(expr) => self.eval_value(expr, env).to_int(),
             None => 1,
         }
     }
@@ -591,21 +689,22 @@ impl Character {
         &mut self,
         states: &HashMap<i32, CompiledState>,
         ctrl: &CompiledController,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
         let kind = ctrl.controller_type.as_deref().unwrap_or("");
         if kind.eq_ignore_ascii_case("ChangeState") {
-            self.ctrl_change_state(states, ctrl, report);
+            self.ctrl_change_state(states, ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("VelSet") {
-            self.ctrl_vel_set(ctrl);
+            self.ctrl_vel_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("VelAdd") {
-            self.ctrl_vel_add(ctrl);
+            self.ctrl_vel_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("CtrlSet") {
-            self.ctrl_ctrl_set(ctrl);
+            self.ctrl_ctrl_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PosSet") {
-            self.ctrl_pos_set(ctrl);
+            self.ctrl_pos_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PosAdd") {
-            self.ctrl_pos_add(ctrl);
+            self.ctrl_pos_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("ChangeAnim")
             || kind.eq_ignore_ascii_case("ChangeAnim2")
         {
@@ -613,25 +712,25 @@ impl Character {
             // the *opponent's* anim table during a custom-state throw; with a
             // single entity there is no distinct table yet, so it behaves as
             // ChangeAnim.)
-            self.ctrl_change_anim(ctrl);
+            self.ctrl_change_anim(ctrl, env);
         } else if kind.eq_ignore_ascii_case("VarSet") {
-            self.ctrl_var_set(ctrl);
+            self.ctrl_var_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("VarAdd") {
-            self.ctrl_var_add(ctrl);
+            self.ctrl_var_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("VarRangeSet") {
-            self.ctrl_var_range_set(ctrl);
+            self.ctrl_var_range_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PowerAdd") {
-            self.ctrl_power_add(ctrl);
+            self.ctrl_power_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PowerSet") {
-            self.ctrl_power_set(ctrl);
+            self.ctrl_power_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("StateTypeSet") {
             self.ctrl_state_type_set(ctrl);
         } else if kind.eq_ignore_ascii_case("Turn") {
             self.ctrl_turn();
         } else if kind.eq_ignore_ascii_case("PlaySnd") {
-            self.ctrl_play_snd(ctrl, report);
+            self.ctrl_play_snd(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("HitDef") {
-            self.ctrl_hit_def(ctrl);
+            self.ctrl_hit_def(ctrl, env);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -652,9 +751,10 @@ impl Character {
         &mut self,
         states: &HashMap<i32, CompiledState>,
         ctrl: &CompiledController,
+        env: EvalEnv,
         report: &mut TickReport,
     ) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
             tracing::debug!(
                 "tick: ChangeState in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -663,40 +763,40 @@ impl Character {
         };
         let target = value.to_int();
         // A self-transition still counts as a re-entry in MUGEN (resets time).
-        self.enter_state(states, target);
+        self.enter_state(states, target, env);
         report.transitions += 1;
 
         // ChangeState's optional `ctrl` parameter overrides the statedef ctrl.
-        if let Some(ctrl_val) = ctrl.params.get("ctrl").and_then(|p| self.eval_param(p)) {
+        if let Some(ctrl_val) = ctrl.params.get("ctrl").and_then(|p| self.eval_param(p, env)) {
             self.ctrl = ctrl_val.as_bool();
         }
     }
 
     /// `VelSet`: set x/y velocity components from the `x`/`y` parameters. A
     /// missing component leaves that axis unchanged.
-    fn ctrl_vel_set(&mut self, ctrl: &CompiledController) {
-        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+    fn ctrl_vel_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p, env)) {
             self.vel.x = v.to_float();
         }
-        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p, env)) {
             self.vel.y = v.to_float();
         }
     }
 
     /// `VelAdd`: add to the x/y velocity components from the `x`/`y` parameters.
     /// A missing component adds nothing on that axis.
-    fn ctrl_vel_add(&mut self, ctrl: &CompiledController) {
-        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+    fn ctrl_vel_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p, env)) {
             self.vel.x += v.to_float();
         }
-        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p, env)) {
             self.vel.y += v.to_float();
         }
     }
 
     /// `CtrlSet`: set the player control flag from the `value` parameter.
-    fn ctrl_ctrl_set(&mut self, ctrl: &CompiledController) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
+    fn ctrl_ctrl_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
             self.ctrl = v.as_bool();
         }
     }
@@ -709,11 +809,11 @@ impl Character {
     /// trigger, which also reports the absolute stage position). Only
     /// facing-relative motion (velocity integration and [`PosAdd`](Self::ctrl_pos_add))
     /// applies the facing sign.
-    fn ctrl_pos_set(&mut self, ctrl: &CompiledController) {
-        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+    fn ctrl_pos_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p, env)) {
             self.pos.x = v.to_float();
         }
-        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p, env)) {
             self.pos.y = v.to_float();
         }
     }
@@ -726,11 +826,11 @@ impl Character {
     /// `x` always nudges the character *forward* regardless of which way it
     /// faces. The Y delta is never mirrored. (Contrast [`PosSet`](Self::ctrl_pos_set),
     /// which is absolute.)
-    fn ctrl_pos_add(&mut self, ctrl: &CompiledController) {
-        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+    fn ctrl_pos_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p, env)) {
             self.pos.x += v.to_float() * self.facing.sign() as f32;
         }
-        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p, env)) {
             self.pos.y += v.to_float();
         }
     }
@@ -744,8 +844,8 @@ impl Character {
     /// and clamped to `>= 0` (the per-tick animation advance clamps it into the
     /// action's range, so an out-of-range value never panics). A missing `value`
     /// is a safe no-op.
-    fn ctrl_change_anim(&mut self, ctrl: &CompiledController) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+    fn ctrl_change_anim(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
             tracing::debug!(
                 "tick: ChangeAnim in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -755,7 +855,7 @@ impl Character {
         self.anim = value.to_int();
         // MUGEN's optional `elem` is one-based; store it zero-based. Default to
         // the first element when absent.
-        let start_elem = match ctrl.params.get("elem").and_then(|p| self.eval_param(p)) {
+        let start_elem = match ctrl.params.get("elem").and_then(|p| self.eval_param(p, env)) {
             Some(v) => v.to_int().saturating_sub(1).max(0),
             None => 0,
         };
@@ -774,21 +874,21 @@ impl Character {
     /// - `fv = i` + `value = expr` → float bank.
     ///
     /// An out-of-range index or an unrecognized form is a safe no-op.
-    fn ctrl_var_set(&mut self, ctrl: &CompiledController) {
+    fn ctrl_var_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         // Indexed-key forms: `var(i)`, `fvar(i)`, `sysvar(i)`, `sysfvar(i)`.
         for (key, param) in &ctrl.params {
             if let Some((bank, index)) = parse_var_bank_key(key) {
-                let value = self.eval_param(param).unwrap_or(Value::DEFAULT);
+                let value = self.eval_param(param, env).unwrap_or(Value::DEFAULT);
                 self.assign_var(bank, index, value);
                 // A VarSet sets exactly one variable; the first matching key wins.
                 return;
             }
         }
         // `v`/`fv` + `value` form.
-        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
-            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p)) {
+        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) {
                 self.assign_var(VarBank::Int, index.to_int(), value);
-            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p)) {
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env)) {
                 self.assign_var(VarBank::Float, index.to_int(), value);
             } else {
                 tracing::debug!(
@@ -803,18 +903,18 @@ impl Character {
     ///
     /// Accepts the same parameter forms as [`Self::ctrl_var_set`]. An
     /// out-of-range index or unrecognized form is a safe no-op.
-    fn ctrl_var_add(&mut self, ctrl: &CompiledController) {
+    fn ctrl_var_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         for (key, param) in &ctrl.params {
             if let Some((bank, index)) = parse_var_bank_key(key) {
-                let delta = self.eval_param(param).unwrap_or(Value::DEFAULT);
+                let delta = self.eval_param(param, env).unwrap_or(Value::DEFAULT);
                 self.add_var(bank, index, delta);
                 return;
             }
         }
-        if let Some(delta) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
-            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p)) {
+        if let Some(delta) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) {
                 self.add_var(VarBank::Int, index.to_int(), delta);
-            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p)) {
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env)) {
                 self.add_var(VarBank::Float, index.to_int(), delta);
             } else {
                 tracing::debug!(
@@ -831,8 +931,8 @@ impl Character {
     /// Mirrors MUGEN's `PowerAdd` state controller. A missing `value` is a
     /// safe debug-logged no-op (adds nothing). A garbage value can never panic:
     /// the addition saturates and the result is clamped.
-    fn ctrl_power_add(&mut self, ctrl: &CompiledController) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+    fn ctrl_power_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
             tracing::debug!(
                 "tick: PowerAdd in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -848,8 +948,8 @@ impl Character {
     /// Mirrors MUGEN's `PowerSet` state controller. A missing `value` is a
     /// safe debug-logged no-op (leaves power unchanged). A garbage value can
     /// never panic: the result is clamped into range.
-    fn ctrl_power_set(&mut self, ctrl: &CompiledController) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+    fn ctrl_power_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
             tracing::debug!(
                 "tick: PowerSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -866,28 +966,28 @@ impl Character {
     /// index range (both default to covering the whole bank when absent — MUGEN
     /// defaults `first` to `0` and `last` to the bank's maximum index). Indices
     /// outside the bank are skipped; the controller never panics.
-    fn ctrl_var_range_set(&mut self, ctrl: &CompiledController) {
+    fn ctrl_var_range_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         let first = ctrl
             .params
             .get("first")
-            .and_then(|p| self.eval_param(p))
+            .and_then(|p| self.eval_param(p, env))
             .map_or(0, |v| v.to_int());
         // `value` targets the int bank; `fvalue` targets the float bank.
-        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
+        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
             let last = ctrl
                 .params
                 .get("last")
-                .and_then(|p| self.eval_param(p))
+                .and_then(|p| self.eval_param(p, env))
                 .map_or(NUM_VARS as i32 - 1, |v| v.to_int());
             for index in first..=last {
                 self.assign_var(VarBank::Int, index, value);
             }
         }
-        if let Some(value) = ctrl.params.get("fvalue").and_then(|p| self.eval_param(p)) {
+        if let Some(value) = ctrl.params.get("fvalue").and_then(|p| self.eval_param(p, env)) {
             let last = ctrl
                 .params
                 .get("last")
-                .and_then(|p| self.eval_param(p))
+                .and_then(|p| self.eval_param(p, env))
                 .map_or(NUM_FVARS as i32 - 1, |v| v.to_int());
             for index in first..=last {
                 self.assign_var(VarBank::Float, index, value);
@@ -963,7 +1063,7 @@ impl Character {
     /// Robust to bad content: a missing `value`, or a `value` whose group or
     /// sample cannot be parsed as an integer, logs at `debug` and pushes **no**
     /// request. Never panics, unwraps, or expects.
-    fn ctrl_play_snd(&mut self, ctrl: &CompiledController, report: &mut TickReport) {
+    fn ctrl_play_snd(&mut self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
         // `value = group, sample`. Read the raw source: the group may be
         // `F`/`S`-prefixed (non-arithmetic), so it cannot go through the VM.
         let Some(raw) = raw_param(ctrl, "value") else {
@@ -1006,12 +1106,12 @@ impl Character {
         let channel = ctrl
             .params
             .get("channel")
-            .and_then(|p| self.eval_param(p))
+            .and_then(|p| self.eval_param(p, env))
             .map_or(-1, |v| v.to_int());
         let volume_scale = ctrl
             .params
             .get("volumescale")
-            .and_then(|p| self.eval_param(p))
+            .and_then(|p| self.eval_param(p, env))
             .map_or(100, |v| v.to_int());
 
         // `loop` is bool-ish: 1 / -1 / "true" all mean looping. Read the raw
@@ -1058,7 +1158,7 @@ impl Character {
     /// Any unspecified parameter falls back to [`fp_combat::HitDef::default`]'s
     /// MUGEN-faithful value. This never panics: a malformed string parses to its
     /// documented safe default and a malformed expression evaluates to `0`.
-    fn ctrl_hit_def(&mut self, ctrl: &CompiledController) {
+    fn ctrl_hit_def(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         let mut hd = fp_combat::HitDef::default();
 
         // ---- String / enum params (read from raw source) ------------------
@@ -1105,74 +1205,74 @@ impl Character {
         // value in MUGEN; we keep it simple and leave guard at its default (0)
         // when absent, matching `HitDef::default()`.
         if let Some(param) = ctrl.params.get("damage") {
-            if let Some(hit) = self.eval_param_component(param, 0) {
+            if let Some(hit) = self.eval_param_component(param, 0, env) {
                 hd.damage.hit = hit.to_int();
             }
-            if let Some(guard) = self.eval_param_component(param, 1) {
+            if let Some(guard) = self.eval_param_component(param, 1, env) {
                 hd.damage.guard = guard.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("ground.velocity") {
-            let comps = self.eval_param_components(param);
+            let comps = self.eval_param_components(param, env);
             hd.ground_velocity = pair_to_vec2(&comps, hd.ground_velocity);
         }
         if let Some(param) = ctrl.params.get("air.velocity") {
-            let comps = self.eval_param_components(param);
+            let comps = self.eval_param_components(param, env);
             hd.air_velocity = pair_to_vec2(&comps, hd.air_velocity);
         }
         if let Some(param) = ctrl.params.get("guard.velocity") {
             // Single X pushback (Y unused).
-            if let Some(x) = self.eval_param_component(param, 0) {
+            if let Some(x) = self.eval_param_component(param, 0, env) {
                 hd.guard_velocity = x.to_float();
             }
         }
         if let Some(param) = ctrl.params.get("pausetime") {
-            if let Some(p1) = self.eval_param_component(param, 0) {
+            if let Some(p1) = self.eval_param_component(param, 0, env) {
                 hd.pausetime.p1 = p1.to_int();
             }
-            if let Some(p2) = self.eval_param_component(param, 1) {
+            if let Some(p2) = self.eval_param_component(param, 1, env) {
                 hd.pausetime.p2 = p2.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("ground.hittime") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.hittimes.ground = v.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("air.hittime") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.hittimes.air = v.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("guard.hittime") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.hittimes.guard = v.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("p1stateno") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.p1stateno = Some(v.to_int());
             }
         }
         if let Some(param) = ctrl.params.get("p2stateno") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.p2stateno = Some(v.to_int());
             }
         }
         if let Some(param) = ctrl.params.get("fall") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.fall = v.as_bool();
             }
         }
         if let Some(param) = ctrl.params.get("fall.yvelocity") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.fall_yvelocity = v.to_float();
             }
         }
         if let Some(param) = ctrl.params.get("priority") {
             // `priority = value [, type]`. The numeric value is component 0; the
             // optional type token is a string/enum read from the raw source.
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.priority.value = v.to_int();
             }
             if let Some(kind) = parse_priority_type(param.raw()) {
@@ -1180,12 +1280,12 @@ impl Character {
             }
         }
         if let Some(param) = ctrl.params.get("id") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.id = v.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("chainid") {
-            if let Some(v) = self.eval_param_component(param, 0) {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.chainid = v.to_int();
             }
         }
@@ -1291,7 +1391,7 @@ impl Character {
     /// An unknown destination still updates the cursor (so triggers reading
     /// `StateNo` see the requested number) but applies no entry parameters and
     /// warns — never panics.
-    fn enter_state(&mut self, states: &HashMap<i32, CompiledState>, target: i32) {
+    fn enter_state(&mut self, states: &HashMap<i32, CompiledState>, target: i32, env: EvalEnv) {
         self.prev_state_no = self.state_no;
         self.state_no = target;
         self.state_time = 0;
@@ -1305,7 +1405,7 @@ impl Character {
             tracing::debug!("tick: ChangeState to unknown state {target}; cursor updated only");
             return;
         };
-        self.apply_state_entry(state);
+        self.apply_state_entry(state, env);
     }
 
     /// Applies a statedef's entry parameters: `type`/`movetype`/`physics`
@@ -1314,7 +1414,7 @@ impl Character {
     /// once per entry and clamped to `[0, power_max]`). An unrecognized or
     /// absent value leaves the field unchanged (MUGEN's "unchanged" semantics);
     /// an absent `poweradd` adds nothing.
-    fn apply_state_entry(&mut self, state: &CompiledState) {
+    fn apply_state_entry(&mut self, state: &CompiledState, env: EvalEnv) {
         if let Some(token) = state.state_type.as_deref() {
             if let Some(t) = StateType::from_token(token) {
                 if t != StateType::Unchanged {
@@ -1337,13 +1437,13 @@ impl Character {
             }
         }
         if let Some(anim_expr) = &state.anim {
-            self.anim = self.eval_value(anim_expr).to_int();
+            self.anim = self.eval_value(anim_expr, env).to_int();
             // A new animation restarts at the first element.
             self.anim_elem = 0;
             self.anim_elem_time = 0;
         }
         if let Some(ctrl_expr) = &state.ctrl {
-            self.ctrl = self.eval_value(ctrl_expr).as_bool();
+            self.ctrl = self.eval_value(ctrl_expr, env).as_bool();
         }
         if let Some(velset) = &state.velset {
             if let Some((x, y)) = parse_velset(velset) {
@@ -1355,7 +1455,7 @@ impl Character {
         // attack states fill the power bar toward the super threshold (e.g.
         // KFM's `[Statedef 200] poweradd = 10`). Clamped to `[0, power_max]`.
         if let Some(poweradd_expr) = &state.poweradd {
-            let delta = self.eval_value(poweradd_expr).to_int();
+            let delta = self.eval_value(poweradd_expr, env).to_int();
             self.add_power_clamped(delta);
         }
     }
@@ -1709,6 +1809,7 @@ mod tests {
     use fp_core::Vec2;
     use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode};
     use fp_formats::cns::CnsFile;
+    use fp_vm::EvalContext;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -1722,7 +1823,8 @@ mod tests {
 
     impl Synth {
         fn tick(&self, ch: &mut Character) -> TickReport {
-            ch.tick_with(&self.states, &self.air)
+            // The single-character synthetic harness: no opponent, default stage.
+            ch.tick_with(&self.states, &self.air, None, StageView::default())
         }
     }
 
@@ -2410,7 +2512,7 @@ mod tests {
         ch.ctrl = true;
         // Tick a few frames; must never panic and must keep a valid cursor.
         for _ in 0..30 {
-            let _ = ch.tick(&lc);
+            let _ = ch.tick(&lc, None, StageView::default());
             // state_time and anim cursors stay non-negative / in-range-ish.
             assert!(ch.state_time >= 0);
             assert!(ch.anim_elem >= 0);
@@ -2449,13 +2551,13 @@ mod tests {
         ch.state_no = 0;
         assert_eq!(ch.power, 0);
 
-        ch.enter_state(&lc.states, 1);
+        ch.enter_state(&lc.states, 1, EvalEnv::self_only());
         assert_eq!(ch.power, 10, "first entry into state 1 added 10");
 
-        ch.enter_state(&lc.states, 0);
+        ch.enter_state(&lc.states, 0, EvalEnv::self_only());
         assert_eq!(ch.power, 10, "state 0 has no poweradd");
 
-        ch.enter_state(&lc.states, 1);
+        ch.enter_state(&lc.states, 1, EvalEnv::self_only());
         assert_eq!(ch.power, 20, "re-entry adds another 10");
     }
 
@@ -2585,7 +2687,7 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.power = 300;
-        ch.enter_state(&lc.states, 7);
+        ch.enter_state(&lc.states, 7, EvalEnv::self_only());
         assert_eq!(ch.power, 0, "300 + (-1000) clamps to floor 0");
     }
 
@@ -2605,7 +2707,7 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.power = 0;
-        ch.enter_state(&lc.states, 3);
+        ch.enter_state(&lc.states, 3, EvalEnv::self_only());
         assert_eq!(ch.power, 50, "poweradd expression `30 + 20` adds 50");
     }
 
@@ -2627,7 +2729,7 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.power = 123;
-        ch.enter_state(&lc.states, 4);
+        ch.enter_state(&lc.states, 4, EvalEnv::self_only());
         assert_eq!(ch.power, 123, "malformed poweradd (const-0) adds nothing");
     }
 
@@ -2650,7 +2752,7 @@ mod tests {
         ch.state_no = 0;
         ch.power_max = 0;
         ch.power = 0;
-        ch.enter_state(&lc.states, 2);
+        ch.enter_state(&lc.states, 2, EvalEnv::self_only());
         assert_eq!(ch.power, 0, "power_max=0 -> power pinned to 0 on entry");
 
         // PowerSet with a negative power_max also pins to 0 (never panics).
@@ -2773,7 +2875,7 @@ mod tests {
         // poweradd. Power must rise monotonically and never leave [0, power_max].
         let mut last = ch.power;
         for _ in 0..200 {
-            ch.enter_state(&lc.states, 200);
+            ch.enter_state(&lc.states, 200, EvalEnv::self_only());
             assert!(ch.power >= last, "power never decreases across attack entries");
             assert!(
                 (0..=ch.power_max).contains(&ch.power),
@@ -2824,7 +2926,7 @@ mod tests {
         let mut ch = Character::with_constants(lc.constants);
         ch.power = 0;
         // Directly enter the attack state through the real executor path.
-        ch.enter_state(&lc.states, 200);
+        ch.enter_state(&lc.states, 200, EvalEnv::self_only());
         assert!(
             ch.power > 0,
             "entering KFM attack state 200 should fill the power meter (got {})",
@@ -5323,7 +5425,7 @@ mod tests {
         // the number of ticks so a non-firing trigger can't hang the test.
         let mut fired = false;
         for _ in 0..120 {
-            let _ = ch.tick(&lc);
+            let _ = ch.tick(&lc, None, StageView::default());
             if ch.active_hitdef.is_some() {
                 fired = true;
                 break;
@@ -5756,13 +5858,16 @@ mod tests {
         let mut ch = Character::new();
         ch.vars[2] = 8;
         // `var(2) * 2, var(2), ` → [16, 8, 0] (trailing empty component → 0).
-        let comps = ch.eval_param_components(&CompiledParam::compile("var(2) * 2, var(2), "));
+        let comps = ch.eval_param_components(
+            &CompiledParam::compile("var(2) * 2, var(2), "),
+            EvalEnv::self_only(),
+        );
         assert_eq!(comps.len(), 3);
         assert_eq!(comps[0].to_int(), 16);
         assert_eq!(comps[1].to_int(), 8);
         assert_eq!(comps[2].to_int(), 0, "empty trailing component → 0");
         // A single component yields a one-element vec.
-        let one = ch.eval_param_components(&CompiledParam::compile("42"));
+        let one = ch.eval_param_components(&CompiledParam::compile("42"), EvalEnv::self_only());
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].to_int(), 42);
     }
@@ -5773,11 +5878,12 @@ mod tests {
         // component returns None so callers can substitute their own default.
         let ch = Character::new();
         let p = CompiledParam::compile("-4, 0");
-        assert_eq!(ch.eval_param_component(&p, 0).map(|v| v.to_int()), Some(-4));
-        assert_eq!(ch.eval_param_component(&p, 1).map(|v| v.to_int()), Some(0));
-        assert!(ch.eval_param_component(&p, 2).is_none(), "no third component");
+        let env = EvalEnv::self_only();
+        assert_eq!(ch.eval_param_component(&p, 0, env).map(|v| v.to_int()), Some(-4));
+        assert_eq!(ch.eval_param_component(&p, 1, env).map(|v| v.to_int()), Some(0));
+        assert!(ch.eval_param_component(&p, 2, env).is_none(), "no third component");
         // eval_param is shorthand for component 0.
-        assert_eq!(ch.eval_param(&p).map(|v| v.to_int()), Some(-4));
+        assert_eq!(ch.eval_param(&p, env).map(|v| v.to_int()), Some(-4));
     }
 
     // ---- AC3: get-hit-state readiness — a synthetic 5000-range state runs -----
@@ -6286,7 +6392,7 @@ mod tests {
         ch.change_state(&states, SND_STATE);
 
         // The PlaySnd fires on the entry tick (Time = 0).
-        let report = ch.tick_with(&states, &air);
+        let report = ch.tick_with(&states, &air, None, StageView::default());
 
         // KFM authors `value = 0, 1` (own .snd) here: one request, group 0,
         // sample 1, common = false, with the emitter's MUGEN defaults for the

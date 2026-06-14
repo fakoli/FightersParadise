@@ -581,6 +581,13 @@ impl RedirectKeyword {
             "target" => RedirectKeyword::Target,
             "helper" => RedirectKeyword::Helper,
             "playerid" => RedirectKeyword::PlayerId,
+            // `p2`/`p1` are the most common opponent/self read-redirects in MUGEN
+            // content. In a 1-v-1 match `p2` is the opposing player (== `enemy`,
+            // the nearest enemy) and `p1` is the root player (== `root`, i.e. self
+            // from your own perspective). They take no id. (In team modes `p2` is a
+            // specific slot; that distinction is irrelevant in the 1-v-1 model.)
+            "p2" => RedirectKeyword::Enemy,
+            "p1" => RedirectKeyword::Root,
             _ => return None,
         };
         Some(kw)
@@ -1594,6 +1601,16 @@ mod tests {
         assert_eq!(
             parse_str("partner, life").unwrap(),
             redirected(Redirect::Partner, ident("life"))
+        );
+        // `p2`/`p1` are the common opponent/self read-redirects: in 1-v-1 they
+        // lower to `enemy`/`root` respectively.
+        assert_eq!(
+            parse_str("p2, stateno").unwrap(),
+            redirected(Redirect::Enemy, ident("stateno"))
+        );
+        assert_eq!(
+            parse_str("p1, life").unwrap(),
+            redirected(Redirect::Root, ident("life"))
         );
     }
 

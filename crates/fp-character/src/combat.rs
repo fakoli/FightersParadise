@@ -334,7 +334,7 @@ fn frame_at(action: &AnimAction, elem: i32) -> Option<&fp_formats::air::AnimFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Facing, MoveConnect, MoveType, StateType};
+    use crate::{Facing, MoveConnect, MoveType, StageView, StateType};
     use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime};
     use fp_formats::air::{AnimAction, AnimFrame, BlendMode};
     use std::collections::HashMap;
@@ -1011,7 +1011,7 @@ mod tests {
         let life_before = d.life;
         let state_before = d.state_no;
 
-        let report = d.tick_with(&states2, &d_air2);
+        let report = d.tick_with(&states2, &d_air2, None, StageView::default());
         assert!(report.hitpaused, "tick is gated by hit-pause");
         assert_eq!(d.hitpause, hp_before - 1, "hitpause counts down by one");
         assert_eq!(d.shaketime, shake_before - 1, "shaketime counts down too");
@@ -1030,7 +1030,7 @@ mod tests {
 
         assert_eq!(a.hitpause, 8);
         let states2: HashMap<i32, CompiledState> = HashMap::new();
-        let report = a.tick_with(&states2, &a_air);
+        let report = a.tick_with(&states2, &a_air, None, StageView::default());
         assert!(report.hitpaused);
         assert_eq!(a.hitpause, 7, "attacker hit-pause decremented");
     }
@@ -1269,17 +1269,17 @@ mod tests {
         assert_eq!(d.hitpause, 3);
 
         // Attacker: 2 frozen ticks, then resume.
-        assert!(a.tick_with(&states, &a_air).hitpaused);
+        assert!(a.tick_with(&states, &a_air, None, StageView::default()).hitpaused);
         assert_eq!(a.hitpause, 1);
-        assert!(a.tick_with(&states, &a_air).hitpaused);
+        assert!(a.tick_with(&states, &a_air, None, StageView::default()).hitpaused);
         assert_eq!(a.hitpause, 0);
-        assert!(!a.tick_with(&states, &a_air).hitpaused, "attacker resumes after 2 ticks");
+        assert!(!a.tick_with(&states, &a_air, None, StageView::default()).hitpaused, "attacker resumes after 2 ticks");
 
         // Defender: 3 frozen ticks, then resume.
-        assert!(d.tick_with(&states, &d_air).hitpaused);
-        assert!(d.tick_with(&states, &d_air).hitpaused);
-        assert!(d.tick_with(&states, &d_air).hitpaused);
+        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
+        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
+        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
         assert_eq!(d.hitpause, 0);
-        assert!(!d.tick_with(&states, &d_air).hitpaused, "defender resumes after 3 ticks");
+        assert!(!d.tick_with(&states, &d_air, None, StageView::default()).hitpaused, "defender resumes after 3 ticks");
     }
 }

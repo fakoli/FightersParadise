@@ -2731,7 +2731,7 @@ mod tests {
         for _ in 0..5 {
             // `holdfwd` is what KFM's real matcher produces while Forward is held.
             set_commands(&mut ch, &["holdfwd"]);
-            ch.tick(&loaded);
+            ch.tick(&loaded, None, crate::StageView::default());
             if ch.state_no == 20 {
                 reached_walk = true;
                 break;
@@ -2758,7 +2758,7 @@ mod tests {
         let mut visited = Vec::new();
         for _ in 0..20 {
             set_commands(&mut ch, &["holddown"]);
-            ch.tick(&loaded);
+            ch.tick(&loaded, None, crate::StageView::default());
             visited.push(ch.state_no);
             // Either the crouch start (10) or the crouch hold (11) proves the
             // built-in stand->crouch transition fired.
@@ -2790,7 +2790,7 @@ mod tests {
         let mut visited = Vec::new();
         for _ in 0..20 {
             set_commands(&mut ch, &["holdup"]);
-            ch.tick(&loaded);
+            ch.tick(&loaded, None, crate::StageView::default());
             visited.push(ch.state_no);
             // Either the jump start (40) or the air state (50) proves the built-in
             // stand->jump transition fired.
@@ -2813,7 +2813,7 @@ mod tests {
         // First walk.
         for _ in 0..5 {
             set_commands(&mut ch, &["holdfwd"]);
-            ch.tick(&loaded);
+            ch.tick(&loaded, None, crate::StageView::default());
             if ch.state_no == 20 {
                 break;
             }
@@ -2824,7 +2824,7 @@ mod tests {
         let mut returned = false;
         for _ in 0..5 {
             set_commands(&mut ch, &[]);
-            ch.tick(&loaded);
+            ch.tick(&loaded, None, crate::StageView::default());
             if ch.state_no == 0 {
                 returned = true;
                 break;

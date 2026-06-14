@@ -48,7 +48,7 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
+    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType, StageView,
     StateType,
 };
 use fp_core::Vec2;
@@ -76,6 +76,13 @@ impl StageBounds {
     #[must_use]
     pub const fn new(left: f32, right: f32) -> Self {
         Self { left, right }
+    }
+
+    /// Converts these bounds into the [`StageView`] the character executor's
+    /// cross-entity eval context consumes for the screen-edge distance triggers.
+    #[must_use]
+    pub const fn view(self) -> StageView {
+        StageView::new(self.left, self.right)
     }
 }
 
@@ -668,9 +675,25 @@ impl Match {
         //     controllers. Outside the Fight phase the command source is cleared
         //     to `NoCommands` above, so a `command`-gated PlaySnd cannot fire;
         //     whatever a still-running tick produces is surfaced as-is.
-        let p1_report = self.p1.character.tick(&self.p1.loaded);
+        //
+        //     Each player's tick is given the OTHER player as its opponent (so its
+        //     `P2Dist`/`p2, life`/… triggers see the other fighter) plus the stage
+        //     view (for the screen-edge distance triggers). `self.p1` and `self.p2`
+        //     are distinct fields, so the split borrow `(&mut self.p1.character,
+        //     &self.p2.character)` is allowed — the opponent is read-only during
+        //     this character's tick. P1 ticks first against P2's pre-tick state,
+        //     then P2 ticks against P1's just-updated state, matching MUGEN's
+        //     in-order per-player update.
+        let stage = self.bounds.view();
+        let p1_report = self
+            .p1
+            .character
+            .tick(&self.p1.loaded, Some(&self.p2.character), stage);
         self.p1_sound_requests = p1_report.sound_requests;
-        let p2_report = self.p2.character.tick(&self.p2.loaded);
+        let p2_report = self
+            .p2
+            .character
+            .tick(&self.p2.loaded, Some(&self.p1.character), stage);
         self.p2_sound_requests = p2_report.sound_requests;
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
@@ -1197,7 +1220,8 @@ fn hit_sound_request(s: fp_character::SoundId) -> fp_character::SoundRequest {
 mod tests {
     use super::*;
     use fp_character::{
-        CharacterConstants, Character, Facing, LoadedCharacter, MoveType, StateType,
+        CharacterConstants, Character, CompiledController, CompiledExpr, CompiledParam,
+        CompiledState, CompiledTriggerGroup, Facing, LoadedCharacter, MoveType, StateType,
     };
     use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime};
     use fp_core::{Rect, SpriteId, Vec2};
@@ -2744,14 +2768,20 @@ time = 1
     /// state 0 with the round about to start), or `None` (skip) when the fixture
     /// is absent. Mirrors the app's construction but lives in fp-engine so it
     /// exercises the engine's own command pipeline.
-    fn two_kfm_match() -> Option<Match> {
+    /// Loads two independent KFM [`LoadedCharacter`]s (or `None` to skip when the
+    /// fixture is absent). Lets a test inject a custom state into one before
+    /// building the [`Match`].
+    fn two_kfm_loaded() -> Option<(LoadedCharacter, LoadedCharacter)> {
         let def = test_asset("kfm/kfm.def");
         if !def.exists() {
             eprintln!("skipping: {} not present", def.display());
             return None;
         }
-        let lc1 = LoadedCharacter::load(&def).ok()?;
-        let lc2 = LoadedCharacter::load(&def).ok()?;
+        Some((LoadedCharacter::load(&def).ok()?, LoadedCharacter::load(&def).ok()?))
+    }
+
+    fn two_kfm_match() -> Option<Match> {
+        let (lc1, lc2) = two_kfm_loaded()?;
         let mut p1c = Character::with_constants(lc1.constants);
         p1c.pos = Vec2::new(-60.0, 0.0);
         p1c.state_no = 0;
@@ -2977,6 +3007,157 @@ time = 1
         assert!(
             m.p1_sound_requests().is_empty(),
             "a tick with no PlaySnd replaces the slice with empty (not appended)"
+        );
+    }
+
+    // ---- Cross-entity eval: Match::tick wires the opponent into each tick ----
+
+    /// A `VarSet var(idx) = <expr>` controller firing unconditionally
+    /// (`trigger1 = 1`). The `var(idx)` key form routes through the executor's
+    /// indexed-key VarSet path.
+    fn varset_controller(idx: i32, expr: &str) -> CompiledController {
+        CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("VarSet".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [(format!("var({idx})"), CompiledParam::compile(expr))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A state 0 that, every tick, records what this character's cross-entity
+    /// triggers see about its opponent into its integer var bank:
+    /// - `var(0)` = `p2dist X` (facing-relative gap to the opponent),
+    /// - `var(1)` = `p2bodydist X` (edge-to-edge gap),
+    /// - `var(2)` = `P2Life` (the opponent's life via the standalone alias).
+    ///
+    /// (The `enemy, life` redirect form is exercised at the unit level in
+    /// `fp-character`; it cannot be probed via a VarSet value here because a
+    /// controller parameter splits on the top-level comma, so `enemy, life` would
+    /// be read as two separate components rather than one redirected expression.)
+    fn cross_entity_probe_state() -> CompiledState {
+        CompiledState {
+            number: 0,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            anim: None,
+            ctrl: None,
+            velset: None,
+            poweradd: None,
+            controllers: vec![
+                varset_controller(0, "p2dist X"),
+                varset_controller(1, "p2bodydist X"),
+                varset_controller(2, "P2Life"),
+            ],
+        }
+    }
+
+    /// AC: a real two-KFM `Match` wires each player's opponent into its tick, so
+    /// P1's `p2dist`/`p2bodydist`/`P2Life` triggers all SEE P2. Proven by gating
+    /// VarSet controllers on those triggers and reading the resulting vars after
+    /// one tick — exercising the cross-entity seam through the real `Match::tick`,
+    /// not an internal helper.
+    #[test]
+    fn match_tick_wires_opponent_into_cross_entity_triggers() {
+        let Some((mut lc1, lc2)) = two_kfm_loaded() else { return };
+        // Replace P1's state 0 with the cross-entity probe.
+        lc1.states.insert(0, cross_entity_probe_state());
+
+        // P1 at x=-60 facing right, P2 at x=60 facing left, with a known life.
+        let mut p1c = Character::with_constants(lc1.constants);
+        p1c.pos = Vec2::new(-60.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        p1c.anim = 0;
+
+        let mut p2c = Character::with_constants(lc2.constants);
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.state_no = 0;
+        p2c.anim = 0;
+        p2c.life = 432; // a distinctive opponent life to read back
+
+        let front = p1c.constants.size.ground_front + p2c.constants.size.ground_front;
+        let mut m = Match::new(
+            Player::new(p1c, lc1),
+            Player::new(p2c, lc2),
+            StageBounds::new(-220.0, 220.0),
+        );
+
+        // One tick: P1's probe state records what it sees of P2. (Physics is N and
+        // the controllers do not move P1, so the recorded gap is the start gap.)
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        let p1 = &m.p1().character;
+        // p2dist X: P2 is 120px ahead of a right-facing P1 → +120 (positive = front).
+        assert_eq!(p1.vars[0], 120, "p1 must see p2dist X = 120 (opponent in front)");
+        // p2bodydist X: 120 minus both front half-widths.
+        assert_eq!(
+            p1.vars[1],
+            120 - front,
+            "p1 must see edge-to-edge p2bodydist X = 120 - widths"
+        );
+        // P2Life reads the opponent's distinctive life.
+        assert_eq!(p1.vars[2], 432, "P2Life must read the opponent's life");
+    }
+
+    /// AC (redirect path): the `p2`/`enemy` REDIRECT — not just the standalone
+    /// `P2*` triggers — resolves the opponent through a real `Match::tick`. A
+    /// controller TRIGGER (a full expression, unlike a param value which splits on
+    /// the top-level comma) gated on `(p2, life) = 432` fires only if the redirect
+    /// reads P2's life, exercising `EvalCtx::redirect` end-to-end.
+    #[test]
+    fn match_tick_resolves_redirect_through_a_trigger() {
+        let Some((mut lc1, lc2)) = two_kfm_loaded() else { return };
+        let gated = CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("VarSet".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("(p2, life) = 432")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [("var(3)".to_string(), CompiledParam::compile("1"))]
+                .into_iter()
+                .collect(),
+        };
+        let mut probe = cross_entity_probe_state();
+        probe.controllers.push(gated);
+        lc1.states.insert(0, probe);
+
+        let mut p1c = Character::with_constants(lc1.constants);
+        p1c.pos = Vec2::new(-60.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        p1c.anim = 0;
+        let mut p2c = Character::with_constants(lc2.constants);
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.state_no = 0;
+        p2c.anim = 0;
+        p2c.life = 432;
+        let mut m = Match::new(
+            Player::new(p1c, lc1),
+            Player::new(p2c, lc2),
+            StageBounds::new(-220.0, 220.0),
+        );
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.vars[3],
+            1,
+            "`(p2, life)` redirect must resolve the opponent through Match::tick"
         );
     }
 
