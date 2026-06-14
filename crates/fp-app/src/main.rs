@@ -42,7 +42,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fp_character::{Character, LoadedCharacter};
+use fp_audio::{AudioSystem, Sound};
+use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::SpriteId;
 use fp_engine::{Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
@@ -339,6 +340,152 @@ impl FighterRender {
             },
         );
         self.sprite_cache.get(&sprite_id)
+    }
+}
+
+/// A key into a fighter's decoded-sound cache: the SND file selector plus the
+/// `group`/`sample` pair from a [`SoundRequest`].
+///
+/// `common` distinguishes a request that asked for the common/fight sound file
+/// (`F`-prefixed `PlaySnd`) from one that asked for the character's own `.snd`.
+/// The two could collide on the same `group`/`sample` once a separate common SND
+/// is wired up, so the flag is part of the key today even though both currently
+/// resolve against the character's own SND (see [`FighterAudio::play_requests`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SoundKey {
+    /// `true` for a common/fight-file request, `false` for the character's own.
+    common: bool,
+    /// The sound group number.
+    group: i32,
+    /// The sound sample number within the group.
+    sample: i32,
+}
+
+/// Per-fighter decoded-sound cache for the two-player [`Match`] audio layer.
+///
+/// A [`fp_engine::Match`] owns each fighter's [`LoadedCharacter`] (and thus its
+/// optional [`fp_formats::snd::SndFile`]); this holds only the lazily-decoded
+/// [`Sound`]s, keyed by [`SoundKey`]. A decode *failure* (or a missing SND/sound
+/// entry) is cached as `None`, so a bad sound is looked up and logged once rather
+/// than re-decoded every frame it is requested. One [`FighterAudio`] is kept per
+/// side (P1, P2), mirroring the per-side [`FighterRender`] texture caches.
+#[derive(Default)]
+struct FighterAudio {
+    /// Decoded sounds keyed by selector + group/sample; `None` caches a decode
+    /// or lookup failure so it is not retried.
+    sound_cache: HashMap<SoundKey, Option<Sound>>,
+}
+
+impl FighterAudio {
+    /// Plays this fighter's [`SoundRequest`]s for the current frame through
+    /// `audio`, decoding from `player`'s own `.snd` (lazily, via the cache).
+    ///
+    /// For each request: resolve the SND file (the character's own — see the
+    /// common-fallback note below), look up/decode the `group`/`sample` WAV bytes
+    /// into a [`Sound`] (caching the result, including failures, by
+    /// [`SoundKey`]), then play it on the request's channel at a volume mapped
+    /// from `volume_scale` (`/100`, clamped to `[0, 4]`). Missing SND, missing
+    /// sound entry, or decode failure is skipped with a debug log — never a panic.
+    ///
+    /// `common` (an `F`-prefixed `PlaySnd`, the common/fight sound file) is not
+    /// yet backed by a separate common SND: such requests fall back to the
+    /// character's own SND with a debug log. `looping` is not yet supported by
+    /// [`AudioSystem::play_sound`]; the field is read but ignored this milestone.
+    fn play_requests(
+        &mut self,
+        audio: &mut AudioSystem,
+        player: &Player,
+        requests: &[SoundRequest],
+    ) {
+        for req in requests {
+            let key = SoundKey {
+                common: req.common,
+                group: req.group,
+                sample: req.sample,
+            };
+            // Emit the one-shot advisories only the first time a key is seen (the
+            // decode below caches it), so a per-tick-repeating PlaySnd does not
+            // flood the log at 60Hz.
+            if !self.sound_cache.contains_key(&key) {
+                if req.common {
+                    tracing::debug!(
+                        "PlaySnd common/fight sound (group {}, sample {}) has no dedicated \
+                         common SND yet; falling back to the character's own .snd",
+                        req.group,
+                        req.sample,
+                    );
+                }
+                if req.looping {
+                    tracing::debug!(
+                        "PlaySnd looping not yet supported (group {}, sample {}); playing once",
+                        req.group,
+                        req.sample,
+                    );
+                }
+            }
+
+            let sound = self.get_or_decode(player, key);
+            if let Some(sound) = sound {
+                let volume = (req.volume_scale as f32 / 100.0).clamp(0.0, 4.0);
+                audio.play_sound(sound, req.channel, volume);
+            }
+        }
+    }
+
+    /// Returns the decoded [`Sound`] for `key`, decoding from `player`'s `.snd`
+    /// on first use and caching the result (a failure is cached as `None` so it
+    /// is not retried). Returns `None` when the SND, the sound entry, or the
+    /// decode is missing/failed — each logged once at debug.
+    fn get_or_decode(&mut self, player: &Player, key: SoundKey) -> Option<&Sound> {
+        self.sound_cache
+            .entry(key)
+            .or_insert_with(|| Self::decode_sound(player, key))
+            .as_ref()
+    }
+
+    /// Decodes one sound from `player`'s own `.snd`, returning `None` (with a
+    /// debug log) when the SND is absent, the `group`/`sample` entry is missing,
+    /// or the WAV bytes fail to decode. Both own- and common-file requests use
+    /// the character's own SND today (no separate common SND is loaded yet).
+    fn decode_sound(player: &Player, key: SoundKey) -> Option<Sound> {
+        let Some(snd) = player.loaded.snd.as_ref() else {
+            tracing::debug!(
+                "no .snd for this fighter; skipping sound (group {}, sample {})",
+                key.group,
+                key.sample,
+            );
+            return None;
+        };
+        // `SndFile::sound` takes u32 selectors; a negative group/sample (which a
+        // SoundRequest permits) has no entry, so reject it with an honest log
+        // rather than wrapping to a huge u32 that misses with a misleading reason.
+        let (Ok(group), Ok(sample)) = (u32::try_from(key.group), u32::try_from(key.sample)) else {
+            tracing::debug!(
+                "negative sound selector (group {}, sample {}) has no .snd entry; skipping",
+                key.group,
+                key.sample,
+            );
+            return None;
+        };
+        let Some(bytes) = snd.sound(group, sample) else {
+            tracing::debug!(
+                "sound entry (group {}, sample {}) not found in .snd; skipping",
+                key.group,
+                key.sample,
+            );
+            return None;
+        };
+        match Sound::decode(bytes) {
+            Ok(sound) => Some(sound),
+            Err(e) => {
+                tracing::debug!(
+                    "failed to decode sound (group {}, sample {}): {e}; skipping",
+                    key.group,
+                    key.sample,
+                );
+                None
+            }
+        }
     }
 }
 
@@ -775,10 +922,32 @@ fn is_def_path(p: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("def"))
 }
 
+/// The two-player [`Match`] run state: the match plus the per-run rendering and
+/// audio resources held alongside it (per-side texture caches, the shared audio
+/// system, and per-side decoded-sound caches).
+///
+/// Bundled into one struct (rather than a wide enum tuple) so the audio layer
+/// sits next to the renderer caches without making the `match` arms unwieldy.
+struct MatchRun {
+    /// The two-player match coordinator.
+    m: Box<Match>,
+    /// P1's per-character GPU sprite cache.
+    p1_render: FighterRender,
+    /// P2's per-character GPU sprite cache.
+    p2_render: FighterRender,
+    /// The shared audio mixer (silent [`fp_audio::NullBackend`] when no device
+    /// exists).
+    audio: AudioSystem,
+    /// P1's per-character decoded-sound cache.
+    p1_audio: FighterAudio,
+    /// P2's per-character decoded-sound cache.
+    p2_audio: FighterAudio,
+}
+
 /// The selected run mode after parsing CLI args and loading assets.
 enum Mode {
-    /// Two-player [`Match`] (the playable demo): both fighters + per-side caches.
-    Match(Box<Match>, FighterRender, FighterRender),
+    /// Two-player [`Match`] (the playable demo): match + per-run render/audio.
+    Match(Box<MatchRun>),
     /// Legacy SFF+AIR animation viewer.
     Viewer(Box<AnimViewer>),
     /// Single static sprite.
@@ -850,7 +1019,17 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
 /// pattern on failure (so a bad/missing character never crashes the app).
 fn load_match_or_fallback(p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Mode {
     match build_two_player_match(p1_def, p2_def) {
-        Ok(m) => Mode::Match(Box::new(m), FighterRender::default(), FighterRender::default()),
+        Ok(m) => Mode::Match(Box::new(MatchRun {
+            m: Box::new(m),
+            p1_render: FighterRender::default(),
+            p2_render: FighterRender::default(),
+            // The default constructor opens a real device when present and falls
+            // back to a silent NullBackend otherwise — it never panics, so the
+            // app runs identically with or without audio hardware.
+            audio: AudioSystem::default(),
+            p1_audio: FighterAudio::default(),
+            p2_audio: FighterAudio::default(),
+        })),
         Err(e) => {
             tracing::warn!("match failed to load: {e}; showing test pattern");
             let (s, p) = generate_test_pattern(renderer);
@@ -942,11 +1121,19 @@ fn run() -> fp_core::FpResult<()> {
 
         while accumulator >= TICK_DURATION {
             match mode {
-                Mode::Match(ref mut m, ..) => {
+                Mode::Match(ref mut run) => {
                     // P1 from the keyboard; P2 is an idle dummy this milestone.
                     let keyboard = event_pump.keyboard_state();
                     let p1_input = match_input_from_keyboard(&keyboard);
-                    m.tick(p1_input, MatchInput::none());
+                    run.m.tick(p1_input, MatchInput::none());
+
+                    // AFTER the tick: play this frame's surfaced sound requests,
+                    // P1 then P2, each from its own decoded-sound cache. Graceful
+                    // throughout — a silent backend or a missing sound is a no-op.
+                    run.p1_audio
+                        .play_requests(&mut run.audio, run.m.p1(), run.m.p1_sound_requests());
+                    run.p2_audio
+                        .play_requests(&mut run.audio, run.m.p2(), run.m.p2_sound_requests());
                 }
                 Mode::Viewer(ref mut v) => v.tick(),
                 Mode::Static(..) | Mode::TestPattern(..) => {}
@@ -958,9 +1145,9 @@ fn run() -> fp_core::FpResult<()> {
         // Caching needs `&Renderer`, which a live `RenderFrame` would hold
         // borrowed, so it must happen before `begin_frame`.
         match mode {
-            Mode::Match(ref m, ref mut p1_cache, ref mut p2_cache) => {
-                cache_player_sprite(p1_cache, m.p1(), &renderer);
-                cache_player_sprite(p2_cache, m.p2(), &renderer);
+            Mode::Match(ref mut run) => {
+                cache_player_sprite(&mut run.p1_render, run.m.p1(), &renderer);
+                cache_player_sprite(&mut run.p2_render, run.m.p2(), &renderer);
             }
             Mode::Viewer(ref mut v) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
@@ -977,13 +1164,13 @@ fn run() -> fp_core::FpResult<()> {
         let (win_w, win_h) = window.size();
 
         match mode {
-            Mode::Match(ref m, ref p1_cache, ref p2_cache) => {
+            Mode::Match(ref run) => {
                 // Draw both fighters from their current AIR frame, each via its
                 // own per-character texture cache (populated above).
-                draw_player(&mut frame, p1_cache, m.p1(), win_w as f32, win_h as f32);
-                draw_player(&mut frame, p2_cache, m.p2(), win_w as f32, win_h as f32);
+                draw_player(&mut frame, &run.p1_render, run.m.p1(), win_w as f32, win_h as f32);
+                draw_player(&mut frame, &run.p2_render, run.m.p2(), win_w as f32, win_h as f32);
                 // Minimal HUD on top: life bars + KO/round indicator.
-                hud.draw(&mut frame, win_w as f32, m);
+                hud.draw(&mut frame, win_w as f32, &run.m);
             }
             Mode::Viewer(ref v) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -1367,6 +1554,79 @@ mod tests {
         assert!(
             m.p2().life() < p2_life_before,
             "P2 life must be strictly below its starting value after a connecting hit"
+        );
+    }
+
+    /// 8.3b AC (headless, gated): build the same two-KFM `Match` the app builds,
+    /// drive a PlaySnd-bearing action (KFM walks into range and throws light
+    /// punches — its attack states author `PlaySnd`), and assert P1's surfaced
+    /// `p1_sound_requests()` becomes non-empty at some tick — proving the request
+    /// reaches the app's play path. Each frame the requests are also pumped
+    /// through `FighterAudio::play_requests` over a silent `NullBackend`
+    /// `AudioSystem` (the same call the live app makes), proving the decode/play
+    /// path runs end to end without a device and never panics.
+    ///
+    /// We do not assert audio output (the `NullBackend` is silent and the
+    /// `RecordingBackend` is `#[cfg(test)]`-private to fp-audio); the surfaced
+    /// requests plus a panic-free play pump are the observable contract here.
+    #[test]
+    fn headless_two_player_attack_surfaces_and_plays_sound_requests() {
+        let Some(mut m) = build_kfm_match() else { return };
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+
+        // The exact audio layer the live app holds: a silent-fallback mixer plus
+        // a per-fighter decoded-sound cache. NullBackend forces silence so the
+        // test is deterministic and device-free.
+        let mut audio = AudioSystem::with_backend(Box::new(fp_audio::NullBackend));
+        let mut p1_audio = FighterAudio::default();
+        let mut p2_audio = FighterAudio::default();
+
+        // Pump P1+P2 requests through the play path for this frame.
+        let pump = |m: &Match,
+                    audio: &mut AudioSystem,
+                    p1_audio: &mut FighterAudio,
+                    p2_audio: &mut FighterAudio| {
+            p1_audio.play_requests(audio, m.p1(), m.p1_sound_requests());
+            p2_audio.play_requests(audio, m.p2(), m.p2_sound_requests());
+        };
+
+        // Phase 1: walk into punching range (holding "right" = forward for P1).
+        for _ in 0..240 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            pump(&m, &mut audio, &mut p1_audio, &mut p2_audio);
+            if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
+                break;
+            }
+        }
+
+        // Phase 2: throw light punches; KFM's attack states fire PlaySnd, so the
+        // surfaced P1 requests must become non-empty within the budget.
+        let mut saw_request = false;
+        for i in 0..400 {
+            let inp = if i % 3 == 0 {
+                MatchInput { x: true, ..MatchInput::none() }
+            } else {
+                MatchInput::none()
+            };
+            m.tick(inp, MatchInput::none());
+            if !m.p1_sound_requests().is_empty() {
+                saw_request = true;
+            }
+            // Pump every frame regardless, exercising the real play path.
+            pump(&m, &mut audio, &mut p1_audio, &mut p2_audio);
+            if saw_request {
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+
+        assert!(
+            saw_request,
+            "a PlaySnd-bearing KFM action must surface at least one P1 sound \
+             request over the frame budget (round state {:?})",
+            m.round_state()
         );
     }
 

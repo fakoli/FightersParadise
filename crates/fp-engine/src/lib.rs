@@ -337,6 +337,18 @@ pub struct Match {
     phase_timer: i32,
     /// The decided winner, set when the round reaches [`RoundState::Win`].
     winner: Option<Winner>,
+    /// Player 1's sound-play requests from the MOST RECENT [`Match::tick`].
+    ///
+    /// Captured (cloned) from P1's per-tick [`fp_character::TickReport`] and
+    /// REPLACED every tick, so it always reflects only the latest tick's
+    /// `PlaySnd` controllers (never accumulating across ticks). Empty on a tick
+    /// with no `PlaySnd`. Read it via [`Match::p1_sound_requests`]; a downstream
+    /// audio player (fp-app + fp-audio) consumes it to perform playback.
+    p1_sound_requests: Vec<fp_character::SoundRequest>,
+    /// Player 2's sound-play requests from the most recent [`Match::tick`].
+    /// See [`Match::p1_sound_requests`] for the capture/replace semantics; read
+    /// it via [`Match::p2_sound_requests`].
+    p2_sound_requests: Vec<fp_character::SoundRequest>,
 }
 
 impl Match {
@@ -372,6 +384,8 @@ impl Match {
             timer,
             phase_timer: 0,
             winner: None,
+            p1_sound_requests: Vec::new(),
+            p2_sound_requests: Vec::new(),
         }
     }
 
@@ -414,6 +428,26 @@ impl Match {
         self.winner
     }
 
+    /// Player 1's sound-play requests emitted by `PlaySnd` controllers during
+    /// the MOST RECENT [`Match::tick`], in fire order.
+    ///
+    /// The slice is REPLACED every tick (never accumulated), so it reflects only
+    /// the latest tick — empty whenever P1 ran no `PlaySnd` that tick. A
+    /// downstream audio player decodes each [`fp_character::SoundRequest`] from
+    /// the character's `.snd` and plays it; `fp-engine` itself produces no sound.
+    #[must_use]
+    pub fn p1_sound_requests(&self) -> &[fp_character::SoundRequest] {
+        &self.p1_sound_requests
+    }
+
+    /// Player 2's sound-play requests from the most recent [`Match::tick`], in
+    /// fire order. See [`Match::p1_sound_requests`] for the replace-each-tick
+    /// semantics.
+    #[must_use]
+    pub fn p2_sound_requests(&self) -> &[fp_character::SoundRequest] {
+        &self.p2_sound_requests
+    }
+
     /// Advances the whole match by one 60Hz frame.
     ///
     /// Performs, in order: input feed (facing-relative), both characters' state
@@ -439,9 +473,16 @@ impl Match {
                 .set_command_source(Box::new(fp_character::NoCommands));
         }
 
-        // (2) Tick both state machines.
-        let _ = self.p1.character.tick(&self.p1.loaded);
-        let _ = self.p2.character.tick(&self.p2.loaded);
+        // (2) Tick both state machines, capturing each player's per-tick sound
+        //     requests. These are REPLACED (not appended) every tick, so the
+        //     accessors always reflect only the most recent tick's `PlaySnd`
+        //     controllers. Outside the Fight phase the command source is cleared
+        //     to `NoCommands` above, so a `command`-gated PlaySnd cannot fire;
+        //     whatever a still-running tick produces is surfaced as-is.
+        let p1_report = self.p1.character.tick(&self.p1.loaded);
+        self.p1_sound_requests = p1_report.sound_requests;
+        let p2_report = self.p2.character.tick(&self.p2.loaded);
+        self.p2_sound_requests = p2_report.sound_requests;
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
         //     Each direction reads the attacker's Clsn1 and the defender's Clsn2
@@ -2271,6 +2312,104 @@ time = 1
             "a P1 attack on real commands must connect and drop P2's life; P2 stayed at {} ({:?})",
             m.p2().life(),
             m.round_state()
+        );
+    }
+
+    // ---- 8.3b AC: Match surfaces per-player PlaySnd SoundRequests -----------
+
+    /// Builds a [`CompiledController`] of type `PlaySnd` with the given `value`
+    /// pair (`group, sample`), firing unconditionally (`trigger1 = 1`).
+    fn play_snd_controller(value: &str) -> fp_character::CompiledController {
+        fp_character::CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("PlaySnd".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![fp_character::CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![fp_character::CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [(
+                "value".to_string(),
+                fp_character::CompiledParam::compile(value),
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// A [`CompiledState`] number 0 whose only controller is the given one.
+    fn state0_with(controller: fp_character::CompiledController) -> fp_character::CompiledState {
+        fp_character::CompiledState {
+            number: 0,
+            // No physics so the synthetic character never falls/moves.
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            anim: None,
+            ctrl: None,
+            velset: None,
+            controllers: vec![controller],
+        }
+    }
+
+    /// A [`LoadedCharacter`] in state 0 whose state graph fires a `PlaySnd`
+    /// (group/sample `7, 3`) every tick it runs.
+    fn play_snd_loaded() -> LoadedCharacter {
+        let mut loaded = loaded_with(air_with(0, Vec::new(), vec![Rect::new(-18.0, -70.0, 36.0, 70.0)]));
+        loaded
+            .states
+            .insert(0, state0_with(play_snd_controller("7, 3")));
+        loaded
+    }
+
+    /// A `Match` whose P1 fires a PlaySnd every tick and whose P2 is silent.
+    fn play_snd_match() -> Match {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, play_snd_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+    }
+
+    /// AC: a player's `PlaySnd` controller surfaces a [`fp_character::SoundRequest`]
+    /// onto `Match::pN_sound_requests()` after `tick`, carrying the authored
+    /// group/sample.
+    #[test]
+    fn play_snd_surfaces_on_p1_sound_requests() {
+        let mut m = play_snd_match();
+        // Even during the intro phase the character still ticks (idle animations),
+        // and this synthetic PlaySnd is gated only on `trigger1 = 1`, so it fires.
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        let reqs = m.p1_sound_requests();
+        assert_eq!(reqs.len(), 1, "P1's PlaySnd surfaces exactly one request");
+        assert_eq!(reqs[0].group, 7, "authored group is surfaced");
+        assert_eq!(reqs[0].sample, 3, "authored sample is surfaced");
+        // P2 fired no PlaySnd, so its requests stay empty.
+        assert!(m.p2_sound_requests().is_empty(), "silent P2 surfaces nothing");
+    }
+
+    /// AC: the per-player request slice is REPLACED each tick, not accumulated —
+    /// a tick with no PlaySnd leaves it empty again.
+    #[test]
+    fn sound_requests_are_replaced_each_tick() {
+        let mut m = play_snd_match();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.p1_sound_requests().len(), 1, "first tick surfaces the request");
+
+        // Swap P1 into an empty (no-PlaySnd) state, then tick again: the prior
+        // request must NOT persist — the slice reflects only the latest tick.
+        m.p1.character.state_no = 999; // unknown state → no controllers run
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p1_sound_requests().is_empty(),
+            "a tick with no PlaySnd replaces the slice with empty (not appended)"
         );
     }
 }

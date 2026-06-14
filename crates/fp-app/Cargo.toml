@@ -10,6 +10,7 @@ fp-core.workspace = true
 fp-formats.workspace = true
 fp-character.workspace = true
 fp-engine.workspace = true
+fp-audio.workspace = true
 fp-input.workspace = true
 fp-physics.workspace = true
 fp-render.workspace = true

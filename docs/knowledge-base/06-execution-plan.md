@@ -172,7 +172,7 @@ parallelizable once the core exists. Deps: Phase 7.
   cycle-guarded), real `kfm.snd` = 12 RIFF sounds. +18 tests. Critic PASS (fragile truncation test → CB13).
 - **8.2** DONE — **fp-audio playback core** (`fp-audio`, single-crate). Build the stub into: `Sound::decode(&[u8])` (rodio WAV→in-memory replayable PCM); object-safe `AudioBackend` seam + `RodioBackend` (graceful no-device), `NullBackend`, test `RecordingBackend`; `AudioSystem` with MUGEN channel cut-off (occupied channel stops previous; channel<0 always-new) + NullBackend fallback. Decoupled from fp-formats (operates on raw WAV bytes). rodio wired into Cargo.toml (orchestrator infra). Deps: S8.1. *(running via fp-loop-batch w7q1rehbq)*
 - **8.3a** DONE — `PlaySnd` controller emits `SoundRequest` into `TickReport` (`fp-character`, single-crate). Replace the logged no-op stub: parse `value=group,sample` (optional `F` group-prefix → `common` flag), `channel`, `volumescale`, `loop`; push a documented `SoundRequest{group,sample,channel,volume_scale,loop,common}` onto `TickReport.sound_requests` (cleared each tick). No audio dep — fp-character stays pure simulation; the request is data the engine/app plays. Deps: 8.2. *(via fp-loop-batch)*
-- **8.3b** TODO — surface + play (`fp-engine` exposes per-player `sound_requests` from `tick`; `fp-app` owns an `fp_audio::AudioSystem` + lazily decodes `LoadedCharacter` SndFile sounds → `Sound`, plays each request). Cross-crate → direct Agent. Deps: 8.3a.
+- **8.3b** DONE — surface + play (`fp-engine` exposes per-player `sound_requests` from `tick`; `fp-app` owns an `fp_audio::AudioSystem` + lazily decodes `LoadedCharacter` SndFile sounds → `Sound`, plays each request). Cross-crate → direct Agent `ac56ee167f6c6abe4`. Deps: 8.3a.
 - **8.4** TODO — HitDef `hitsound`/`guardsound` (fp-combat fields + combat resolution emits a `SoundRequest` on connect/guard). Deps: 8.3a.
 
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
@@ -268,6 +268,12 @@ parallelizable once the core exists. Deps: Phase 7.
   holdup-while-airborne) which 7.3 deferred. *(added 7.3, Critic CONSIDER #5)*
 - **CB35** `CommandMatcher::active_command_names_in` allocates a `Vec` per player per tick on the hot
   path; offer an iterator-returning variant if profiling ever flags it. Low priority. *(added 7.3)*
+- **CB36** Looping sound playback: `SoundRequest.looping` is parsed (8.3a) and carried but ignored at
+  playback (8.3b) — `AudioSystem::play_sound` is one-shot. Add a looping play path (rodio
+  `repeat_infinite`) + a way to stop looped channels. *(added 8.3b)*
+- **CB37** Common/fight sound file: PlaySnd `F`-prefixed groups (`common=true`) currently fall back to
+  the character's own SND (8.3b). Load the engine common SND (`data/common.snd`/fight motif) once and
+  route `common=true` requests to it. *(added 8.3b)*
 
 ### ✅ Locomotion-shim debt — RESOLVED by 7.3
 ~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,
