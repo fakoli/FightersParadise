@@ -541,6 +541,119 @@ impl Default for Priority {
     }
 }
 
+/// The decision of a priority *clash* between two simultaneously-connecting
+/// [`HitDef`]s, produced by [`resolve_clash`].
+///
+/// In MUGEN, when both fighters have an active `HitDef` whose attack boxes
+/// connect on the **same tick**, the engine does not simply let both land:
+/// it compares the two [`Priority`] values and resolves a trade. This enum is
+/// the verdict — which side(s) actually apply their hit this tick — from the
+/// point of view of the **first** [`HitDef`] argument to [`resolve_clash`].
+///
+/// The result is always symmetric: `resolve_clash(a, b)` and `resolve_clash(b, a)`
+/// agree about each side (the [`FirstWins`](Self::FirstWins) /
+/// [`SecondWins`](Self::SecondWins) pair simply swaps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClashOutcome {
+    /// Both hits land — a **trade**. Each attacker connects with the other.
+    /// Produced when the higher-priority side is itself a [`PriorityType::Hit`]
+    /// against another [`PriorityType::Hit`] at the *same* value, the
+    /// MUGEN "Hit vs Hit = trade" rule.
+    Trade,
+    /// Only the **first** `HitDef` lands; the second is cancelled this tick.
+    /// Produced when the first side has the strictly higher priority value, or
+    /// (at equal value) the type table favours the first side only.
+    FirstWins,
+    /// Only the **second** `HitDef` lands; the first is cancelled this tick.
+    /// The mirror of [`FirstWins`](Self::FirstWins).
+    SecondWins,
+    /// **Neither** hit lands this tick — both attacks whiff. Produced by the
+    /// equal-value type combinations that involve a [`PriorityType::Dodge`] or
+    /// two [`PriorityType::Miss`]es, where MUGEN suppresses both attacks.
+    NeitherHits,
+}
+
+/// Resolves a MUGEN priority *clash* between two simultaneously-connecting
+/// [`HitDef`]s, given each side's [`Priority`].
+///
+/// This is the pure decision the round coordinator consults when **both**
+/// fighters have an active `HitDef` whose boxes connect on the same tick (see
+/// [`detect_hit`]). It compares the two priorities and returns a
+/// [`ClashOutcome`] saying which side(s) apply their hit:
+///
+/// # Rules
+///
+/// 1. **Strictly higher [`Priority::value`] wins.** The side with the larger
+///    numeric value lands its hit; the loser's hit is cancelled this tick
+///    ([`FirstWins`](ClashOutcome::FirstWins) /
+///    [`SecondWins`](ClashOutcome::SecondWins)). The [`PriorityType`] is
+///    ignored when the values differ — value dominates.
+/// 2. **Equal values consult the [`PriorityType`] table.** With both
+///    [`Priority::value`]s equal, the combination of the two
+///    [`PriorityType`]s decides (symmetric in the two sides):
+///
+///    | first \ second | `Hit`         | `Miss`        | `Dodge`       |
+///    |----------------|---------------|---------------|---------------|
+///    | **`Hit`**      | `Trade`       | `FirstWins`   | `NeitherHits` |
+///    | **`Miss`**     | `SecondWins`  | `NeitherHits` | `NeitherHits` |
+///    | **`Dodge`**    | `NeitherHits` | `NeitherHits` | `NeitherHits` |
+///
+///    The intuition follows MUGEN: two `Hit`s **trade** (both connect); a
+///    `Hit` against a `Miss` lands while the `Miss` side is ignored; a
+///    `Dodge` makes **both** attacks whiff (a clean dodge avoids the trade);
+///    and two `Miss`es cancel each other out.
+///
+/// Pure, deterministic, total, and **never panics**.
+///
+/// # Examples
+///
+/// ```
+/// use fp_combat::{resolve_clash, ClashOutcome, Priority, PriorityType};
+///
+/// // Strictly higher value wins regardless of type.
+/// let hi = Priority { value: 6, kind: PriorityType::Hit };
+/// let lo = Priority { value: 3, kind: PriorityType::Hit };
+/// assert_eq!(resolve_clash(hi, lo), ClashOutcome::FirstWins);
+/// assert_eq!(resolve_clash(lo, hi), ClashOutcome::SecondWins);
+///
+/// // Equal value, both Hit -> a trade (both land).
+/// let a = Priority { value: 4, kind: PriorityType::Hit };
+/// let b = Priority { value: 4, kind: PriorityType::Hit };
+/// assert_eq!(resolve_clash(a, b), ClashOutcome::Trade);
+///
+/// // Equal value, Hit vs Dodge -> neither lands.
+/// let dodge = Priority { value: 4, kind: PriorityType::Dodge };
+/// assert_eq!(resolve_clash(a, dodge), ClashOutcome::NeitherHits);
+/// ```
+#[must_use]
+pub fn resolve_clash(a: Priority, b: Priority) -> ClashOutcome {
+    use std::cmp::Ordering;
+    use ClashOutcome::*;
+    use PriorityType::*;
+
+    // (1) Value dominates: a strictly higher numeric priority wins outright,
+    //     ignoring the types.
+    match a.value.cmp(&b.value) {
+        Ordering::Greater => return FirstWins,
+        Ordering::Less => return SecondWins,
+        Ordering::Equal => {}
+    }
+
+    // (2) Equal value: consult the symmetric PriorityType table.
+    match (a.kind, b.kind) {
+        (Hit, Hit) => Trade,
+        (Hit, Miss) => FirstWins,
+        (Miss, Hit) => SecondWins,
+        // Any combination involving a Dodge, or two Misses, suppresses both.
+        (Hit, Dodge)
+        | (Dodge, Hit)
+        | (Miss, Miss)
+        | (Miss, Dodge)
+        | (Dodge, Miss)
+        | (Dodge, Dodge) => NeitherHits,
+    }
+}
+
 /// A `(hit, guard)` pair of damage values: damage dealt on a clean hit vs. on block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Damage {
@@ -1771,6 +1884,130 @@ mod tests {
         assert_eq!(PriorityType::default(), PriorityType::Hit);
         assert_eq!(Priority::default(), Priority { value: 4, kind: PriorityType::Hit });
         assert_eq!(AttackAttr::default(), AttackAttr::parse("S, NA"));
+    }
+
+    // ---- Priority / trade clash resolution (audit #20) ----
+
+    /// Helper: build a [`Priority`] from a value and type.
+    fn prio(value: i32, kind: PriorityType) -> Priority {
+        Priority { value, kind }
+    }
+
+    /// Rule 1: a strictly higher numeric value wins outright, regardless of the
+    /// [`PriorityType`] on either side (value dominates).
+    #[test]
+    fn clash_higher_value_wins_ignoring_type() {
+        // First higher.
+        assert_eq!(
+            resolve_clash(prio(7, PriorityType::Hit), prio(4, PriorityType::Hit)),
+            ClashOutcome::FirstWins
+        );
+        // Second higher.
+        assert_eq!(
+            resolve_clash(prio(2, PriorityType::Hit), prio(5, PriorityType::Hit)),
+            ClashOutcome::SecondWins
+        );
+        // The loser's type does not rescue it: a higher Miss still beats a lower
+        // Hit, and a higher Dodge still beats a lower Hit (value dominates).
+        assert_eq!(
+            resolve_clash(prio(6, PriorityType::Miss), prio(3, PriorityType::Hit)),
+            ClashOutcome::FirstWins
+        );
+        assert_eq!(
+            resolve_clash(prio(3, PriorityType::Hit), prio(6, PriorityType::Dodge)),
+            ClashOutcome::SecondWins
+        );
+    }
+
+    /// Rule 2: equal value, both `Hit` -> a **trade** (both attacks land). This is
+    /// the KFM case (priority = 3, Hit on both sides).
+    #[test]
+    fn clash_equal_hit_vs_hit_is_a_trade() {
+        assert_eq!(
+            resolve_clash(prio(4, PriorityType::Hit), prio(4, PriorityType::Hit)),
+            ClashOutcome::Trade
+        );
+        // KFM authors priority = 3, Hit.
+        assert_eq!(
+            resolve_clash(prio(3, PriorityType::Hit), prio(3, PriorityType::Hit)),
+            ClashOutcome::Trade
+        );
+    }
+
+    /// Rule 2: equal value, `Hit` vs `Miss` -> the `Hit` side lands and the `Miss`
+    /// side is ignored (symmetric).
+    #[test]
+    fn clash_equal_hit_vs_miss_hit_lands() {
+        assert_eq!(
+            resolve_clash(prio(4, PriorityType::Hit), prio(4, PriorityType::Miss)),
+            ClashOutcome::FirstWins
+        );
+        assert_eq!(
+            resolve_clash(prio(4, PriorityType::Miss), prio(4, PriorityType::Hit)),
+            ClashOutcome::SecondWins
+        );
+    }
+
+    /// Rule 2: equal value, any combination involving a `Dodge`, or two `Miss`es,
+    /// suppresses **both** attacks (neither lands).
+    #[test]
+    fn clash_equal_dodge_and_double_miss_suppress_both() {
+        let cases = [
+            (PriorityType::Hit, PriorityType::Dodge),
+            (PriorityType::Dodge, PriorityType::Hit),
+            (PriorityType::Miss, PriorityType::Dodge),
+            (PriorityType::Dodge, PriorityType::Miss),
+            (PriorityType::Dodge, PriorityType::Dodge),
+            (PriorityType::Miss, PriorityType::Miss),
+        ];
+        for (ka, kb) in cases {
+            assert_eq!(
+                resolve_clash(prio(5, ka), prio(5, kb)),
+                ClashOutcome::NeitherHits,
+                "equal-value {ka:?} vs {kb:?} should suppress both"
+            );
+        }
+    }
+
+    /// `resolve_clash` is symmetric: swapping the two arguments swaps `FirstWins`
+    /// and `SecondWins` and leaves `Trade` / `NeitherHits` unchanged, for every
+    /// pair of priorities drawn from a small grid.
+    #[test]
+    fn clash_is_symmetric() {
+        fn mirror(o: ClashOutcome) -> ClashOutcome {
+            match o {
+                ClashOutcome::FirstWins => ClashOutcome::SecondWins,
+                ClashOutcome::SecondWins => ClashOutcome::FirstWins,
+                other => other,
+            }
+        }
+        let kinds = [PriorityType::Hit, PriorityType::Miss, PriorityType::Dodge];
+        let values = [3, 4, 5];
+        for &va in &values {
+            for &vb in &values {
+                for ka in kinds {
+                    for kb in kinds {
+                        let a = prio(va, ka);
+                        let b = prio(vb, kb);
+                        assert_eq!(
+                            resolve_clash(a, b),
+                            mirror(resolve_clash(b, a)),
+                            "resolve_clash must be symmetric for {a:?} / {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The default priority (`4, Hit`) clashed with itself is a trade — the
+    /// baseline both-default case both attacks should trade.
+    #[test]
+    fn clash_default_priority_self_is_trade() {
+        assert_eq!(
+            resolve_clash(Priority::default(), Priority::default()),
+            ClashOutcome::Trade
+        );
     }
 
     // ---- (3) AttackAttr::parse: tolerance + malformed safe-default ----

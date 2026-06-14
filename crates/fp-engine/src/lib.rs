@@ -59,7 +59,9 @@ use fp_character::{
     combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
     RoundView, StageView, StateType,
 };
-use fp_core::Vec2;
+use fp_combat::{detect_hit, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing};
+use fp_core::{Rect, Vec2};
+use fp_formats::air::AirFile;
 use fp_input::{
     logical_direction, Button, CommandDef, CommandMatcher, Direction, InputBuffer, InputState,
 };
@@ -861,6 +863,19 @@ impl Match {
         //     from the `SoundId` so a common-file hitsound (one authored with no
         //     `S` prefix) resolves against the fight.snd downstream.
         if fighting {
+            // (3a) Priority / trade clash arbitration (audit #20). BEFORE the two
+            //      independent resolve_attack passes, detect the SIMULTANEOUS-hit
+            //      case: both fighters have an active HitDef AND each direction's
+            //      attack boxes would connect this tick. When that happens MUGEN
+            //      does not let both land unconditionally — it compares the two
+            //      HitDefs' `priority` and applies the trade rules. The LOSER's
+            //      `active_hitdef` is cleared here so its resolve_attack pass below
+            //      sees no HitDef and connects nothing; the winner (or both, on a
+            //      trade) is left untouched and lands as usual. The single-attacker
+            //      case (only one side connecting) clears nothing and behaves
+            //      exactly as before.
+            self.resolve_priority_clash();
+
             let p2_states = &self.p2.loaded.states;
             let p1_attack = resolve_attack(
                 &mut self.p1.character,
@@ -913,6 +928,95 @@ impl Match {
 
         // (6) Advance the round state machine and timer.
         self.advance_round();
+    }
+
+    /// Arbitrates a MUGEN priority / trade clash between the two fighters'
+    /// active `HitDef`s for this tick (audit #20), cancelling the loser's
+    /// `active_hitdef` *before* the two `resolve_attack` passes run.
+    ///
+    /// A *clash* requires BOTH conditions:
+    ///
+    /// 1. each fighter has an [`active_hitdef`](Character::active_hitdef), and
+    /// 2. each direction's attack would geometrically connect this tick — P1's
+    ///    `Clsn1` overlaps P2's `Clsn2` AND P2's `Clsn1` overlaps P1's `Clsn2`,
+    ///    tested with the same pure [`fp_combat::detect_hit`] primitive
+    ///    `resolve_attack` uses, positioned by each character's `pos`/`facing`.
+    ///
+    /// When only one side connects (the common single-attacker case), this is a
+    /// no-op: nothing is cancelled and the subsequent passes behave exactly as
+    /// before. When both connect, the two priorities are compared with
+    /// [`fp_combat::resolve_clash`]:
+    ///
+    /// - [`ClashOutcome::Trade`] — leave both `HitDef`s active (both land).
+    /// - [`ClashOutcome::FirstWins`] — clear P2's `active_hitdef` (only P1 lands).
+    /// - [`ClashOutcome::SecondWins`] — clear P1's `active_hitdef` (only P2 lands).
+    /// - [`ClashOutcome::NeitherHits`] — clear BOTH (neither lands this tick).
+    ///
+    /// Clearing `active_hitdef` is exactly how the subsequent `resolve_attack`
+    /// returns [`None`] for the cancelled side (its `attacker.active_hitdef?`
+    /// short-circuits). This does not consume the move or mark a connection, so
+    /// a cancelled attack simply does not apply this tick. Honoring `hitonce`
+    /// already-connected moves: a side whose move already connected this combo
+    /// is skipped here too (it would not re-detect), so it never spuriously
+    /// cancels the other side. Pure field writes; never panics.
+    fn resolve_priority_clash(&mut self) {
+        // Both sides must have an active HitDef to clash at all.
+        let (Some(p1_hd), Some(p2_hd)) =
+            (self.p1.character.active_hitdef, self.p2.character.active_hitdef)
+        else {
+            return;
+        };
+
+        // A move that already connected this combo (hitonce) will not connect
+        // again, so it cannot be part of a fresh clash — bail to the unchanged
+        // single-/no-attacker path.
+        if self.p1.character.move_connect.contact() || self.p2.character.move_connect.contact() {
+            return;
+        }
+
+        // Each direction must geometrically connect for this to be a clash.
+        let p1_hits_p2 = directional_contact(&self.p1, &self.p2);
+        let p2_hits_p1 = directional_contact(&self.p2, &self.p1);
+        if !(p1_hits_p2 && p2_hits_p1) {
+            // Single-attacker (or neither) — behave exactly as today.
+            return;
+        }
+
+        // Both connect simultaneously: compare priorities and cancel the loser(s).
+        match resolve_clash(p1_hd.priority, p2_hd.priority) {
+            ClashOutcome::Trade => {
+                tracing::debug!(
+                    p1_priority = p1_hd.priority.value,
+                    p2_priority = p2_hd.priority.value,
+                    "priority clash: trade (both hits land)"
+                );
+            }
+            ClashOutcome::FirstWins => {
+                tracing::debug!(
+                    p1_priority = p1_hd.priority.value,
+                    p2_priority = p2_hd.priority.value,
+                    "priority clash: P1 wins, P2 HitDef cancelled"
+                );
+                self.p2.character.active_hitdef = None;
+            }
+            ClashOutcome::SecondWins => {
+                tracing::debug!(
+                    p1_priority = p1_hd.priority.value,
+                    p2_priority = p2_hd.priority.value,
+                    "priority clash: P2 wins, P1 HitDef cancelled"
+                );
+                self.p1.character.active_hitdef = None;
+            }
+            ClashOutcome::NeitherHits => {
+                tracing::debug!(
+                    p1_priority = p1_hd.priority.value,
+                    p2_priority = p2_hd.priority.value,
+                    "priority clash: neither hits (both HitDefs cancelled)"
+                );
+                self.p1.character.active_hitdef = None;
+                self.p2.character.active_hitdef = None;
+            }
+        }
     }
 
     /// Pushes overlapping bodies apart along X (mutual `PlayerPush`) and clamps
@@ -1371,6 +1475,89 @@ fn facings_toward(ax: f32, bx: f32) -> (Facing, Facing) {
     }
 }
 
+/// Tests whether `attacker`'s current-frame attack (`Clsn1`) boxes overlap
+/// `defender`'s current-frame hurt (`Clsn2`) boxes, positioned by each
+/// character's `pos`/`facing` (audit #20, the clash-detection probe).
+///
+/// This mirrors the geometric test inside
+/// [`fp_character::combat::resolve_attack`] — pulling each character's
+/// current AIR frame boxes and running [`fp_combat::detect_hit`] — but
+/// *without* requiring or consuming a `HitDef`, so the round coordinator can
+/// detect a simultaneous clash before deciding which side(s) apply. An absent
+/// action/frame or an empty box set yields `false` (no contact); never panics.
+fn directional_contact(attacker: &Player, defender: &Player) -> bool {
+    let clsn1 = current_frame_clsn1(
+        &attacker.loaded.air,
+        attacker.character.anim,
+        attacker.character.anim_elem,
+    );
+    let clsn2 = current_frame_clsn2(
+        &defender.loaded.air,
+        defender.character.anim,
+        defender.character.anim_elem,
+    );
+    if clsn1.is_empty() || clsn2.is_empty() {
+        return false;
+    }
+    detect_hit(
+        &clsn1,
+        attacker.character.pos,
+        to_clsn_facing(attacker.character.facing),
+        &clsn2,
+        defender.character.pos,
+        to_clsn_facing(defender.character.facing),
+    )
+}
+
+/// Converts a [`Character`] [`Facing`] into the [`ClsnFacing`] that
+/// [`fp_combat::detect_hit`] expects (distinct types in distinct crates).
+fn to_clsn_facing(facing: Facing) -> ClsnFacing {
+    match facing {
+        Facing::Right => ClsnFacing::Right,
+        Facing::Left => ClsnFacing::Left,
+    }
+}
+
+/// Converts an AIR-frame collision [`Rect`] (top-left + size) into the
+/// corner-pair [`ClsnBox`] the detection path uses.
+fn rect_to_clsn(r: &Rect) -> ClsnBox {
+    ClsnBox::new(r.x, r.y, r.right(), r.bottom())
+}
+
+/// Returns the `Clsn1` (attack) boxes for the current animation frame, or an
+/// empty vector if the action/frame/boxes are absent. Mirrors `fp-character`'s
+/// private frame-box extraction (which the engine cannot reach across crates).
+fn current_frame_clsn1(air: &AirFile, anim: i32, elem: i32) -> Vec<ClsnBox> {
+    current_frame_clsn(air, anim, elem, true)
+}
+
+/// Returns the `Clsn2` (hurt) boxes for the current animation frame, or an
+/// empty vector if the action/frame/boxes are absent.
+fn current_frame_clsn2(air: &AirFile, anim: i32, elem: i32) -> Vec<ClsnBox> {
+    current_frame_clsn(air, anim, elem, false)
+}
+
+/// Shared frame-box extraction: looks up the action, clamps the (zero-based)
+/// element index into range, and converts the selected box set (`attack` =
+/// `Clsn1`, else `Clsn2`). Any missing piece yields an empty vector — never a
+/// panic. A negative `elem` clamps to frame `0`; an over-large one to the last
+/// frame, matching `fp-character`'s detection semantics.
+fn current_frame_clsn(air: &AirFile, anim: i32, elem: i32, attack: bool) -> Vec<ClsnBox> {
+    let Some(action) = air.action(anim) else {
+        return Vec::new();
+    };
+    if action.frames.is_empty() {
+        return Vec::new();
+    }
+    let max = action.frames.len() - 1;
+    let idx = if elem < 0 { 0 } else { (elem as usize).min(max) };
+    let Some(frame) = action.frames.get(idx) else {
+        return Vec::new();
+    };
+    let rects = if attack { &frame.clsn1 } else { &frame.clsn2 };
+    rects.iter().map(rect_to_clsn).collect()
+}
+
 /// Builds the [`fp_character::SoundRequest`] for a `HitDef` impact sound (the
 /// hit or guard sound chosen by [`fp_character::AttackResolution::hit_sound`]).
 ///
@@ -1488,7 +1675,7 @@ mod tests {
         CharacterConstants, Character, CompiledController, CompiledExpr, CompiledParam,
         CompiledState, CompiledTriggerGroup, Facing, LoadedCharacter, MoveType, StateType,
     };
-    use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime};
+    use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime, Priority, PriorityType};
     use fp_core::{Rect, SpriteId, Vec2};
     use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode};
     use fp_formats::cmd::CmdFile;
@@ -1635,6 +1822,36 @@ time = 1
         loaded_with(air)
     }
 
+    /// A "brawler" loaded character whose action 200 carries BOTH a Clsn1 attack
+    /// box and a Clsn2 hurt box on the same frame, so two such characters posed on
+    /// action 200 facing each other mutually connect (each one's attack box
+    /// overlaps the other's hurt box). Used by the priority-clash tests, where the
+    /// clash requires *both* directions to geometrically connect this tick.
+    ///
+    /// The boxes are wide and centred about the axis so the connection is robust
+    /// to the small player-push separation a `Match::tick` applies.
+    fn brawler_loaded() -> LoadedCharacter {
+        loaded_with(air_with(
+            200,
+            // Attack box reaching out toward the opponent and across the axis.
+            vec![Rect::new(-60.0, -60.0, 120.0, 40.0)],
+            // Hurt box about the axis.
+            vec![Rect::new(-30.0, -70.0, 60.0, 70.0)],
+        ))
+    }
+
+    /// Poses a [`Player`]'s character on its action-200 brawler frame with a fresh
+    /// (un-connected) HitDef of the given priority, ready to clash this tick.
+    fn arm_brawler(p: &mut Player, hd: HitDef) {
+        p.character.anim = 200;
+        p.character.anim_elem = 0;
+        p.character.move_type = MoveType::Attack;
+        p.character.state_type = StateType::Standing;
+        p.character.holding_back = false;
+        p.character.active_hitdef = Some(hd);
+        p.character.move_connect.reset();
+    }
+
     /// A HitDef with concrete damage/knockback/stun (mirrors the combat tests).
     fn sample_hitdef() -> HitDef {
         HitDef {
@@ -1760,6 +1977,212 @@ time = 1
             m.round_state()
         );
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    // ---- Priority / trade clash resolution (audit #20) -------------------
+
+    /// Builds a fight-phase match between two brawlers posed to mutually connect
+    /// (both on action 200, overlapping boxes), each with a survivable life so a
+    /// single trade/hit keeps the round live. P1 sits left of P2.
+    fn clash_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(-20.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(20.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, brawler_loaded());
+        let p2 = Player::new(p2c, brawler_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Sanity: the brawler geometry actually produces a SIMULTANEOUS clash — with
+    /// both sides armed at EQUAL Hit priority both fighters take damage this tick
+    /// (a trade), proving both directions connect under the new arbitration.
+    #[test]
+    fn equal_hit_priority_trades_both_land() {
+        let mut m = clash_match();
+        // Equal value, both Hit (KFM's case: 3, Hit) -> Trade.
+        let hd = HitDef {
+            priority: Priority { value: 3, kind: PriorityType::Hit },
+            ..sample_hitdef()
+        };
+        arm_brawler(&mut m.p1, hd);
+        arm_brawler(&mut m.p2, hd);
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p1().life() < 1000, "P1 took the traded hit");
+        assert!(m.p2().life() < 1000, "P2 took the traded hit");
+    }
+
+    /// Strictly higher priority value wins: the higher side lands and the lower
+    /// side's HitDef is cancelled, so only the loser takes damage.
+    #[test]
+    fn higher_priority_value_cancels_lower() {
+        let mut m = clash_match();
+        // P1 priority 6, P2 priority 3 -> P1 wins, P2's HitDef cancelled.
+        arm_brawler(
+            &mut m.p1,
+            HitDef {
+                priority: Priority { value: 6, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+        arm_brawler(
+            &mut m.p2,
+            HitDef {
+                priority: Priority { value: 3, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // P1 won: P2 takes damage, P1 is untouched (its attacker HitDef cancelled
+        // P2's before P2's resolve_attack pass).
+        assert!(m.p2().life() < 1000, "the higher-priority attacker (P1) lands on P2");
+        assert_eq!(m.p1().life(), 1000, "the lower-priority attacker (P2) was cancelled");
+    }
+
+    /// The mirror case: P2 has the higher value, so P1 is cancelled and only P1
+    /// takes damage.
+    #[test]
+    fn higher_priority_value_wins_for_p2() {
+        let mut m = clash_match();
+        arm_brawler(
+            &mut m.p1,
+            HitDef {
+                priority: Priority { value: 2, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+        arm_brawler(
+            &mut m.p2,
+            HitDef {
+                priority: Priority { value: 7, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p1().life() < 1000, "the higher-priority attacker (P2) lands on P1");
+        assert_eq!(m.p2().life(), 1000, "the lower-priority attacker (P1) was cancelled");
+    }
+
+    /// Equal value with a `Dodge` on one side suppresses BOTH attacks: neither
+    /// fighter takes damage this tick.
+    #[test]
+    fn equal_value_dodge_suppresses_both() {
+        let mut m = clash_match();
+        arm_brawler(
+            &mut m.p1,
+            HitDef {
+                priority: Priority { value: 4, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+        arm_brawler(
+            &mut m.p2,
+            HitDef {
+                priority: Priority { value: 4, kind: PriorityType::Dodge },
+                ..sample_hitdef()
+            },
+        );
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(m.p1().life(), 1000, "a dodge clash lands nothing on P1");
+        assert_eq!(m.p2().life(), 1000, "a dodge clash lands nothing on P2");
+    }
+
+    /// The SINGLE-attacker path must be unchanged: when only one fighter has an
+    /// active HitDef, no clash arbitration runs and the lone attack lands exactly
+    /// as before this feature. P1 attacks; P2 has no HitDef.
+    #[test]
+    fn single_attacker_path_is_unchanged() {
+        let mut m = clash_match();
+        arm_brawler(
+            &mut m.p1,
+            HitDef {
+                // A LOW priority value that, IF a clash were (wrongly) detected
+                // against P2, could cancel P1 — proving no clash logic fires when
+                // P2 has no HitDef.
+                priority: Priority { value: 1, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+        // P2 is posed on the brawler frame (so its hurt box is present) but has NO
+        // active HitDef — it is purely a defender this tick.
+        m.p2.character.anim = 200;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.active_hitdef = None;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the lone attacker still lands");
+        assert_eq!(m.p1().life(), 1000, "the non-attacking P2 deals no damage");
+        // P1's HitDef was NOT spuriously cancelled by a phantom clash.
+        assert!(
+            m.p1().character.move_connect.contact(),
+            "the lone attacker's move registered a connection"
+        );
+    }
+
+    /// When the two attacks do NOT geometrically overlap simultaneously (only one
+    /// direction connects), arbitration must not fire even though both sides have
+    /// active HitDefs: the connecting side lands, the non-connecting side does
+    /// nothing, and neither HitDef is cancelled by a phantom clash.
+    #[test]
+    fn no_clash_when_only_one_direction_connects() {
+        // P1 is a brawler (action 200: attack + hurt boxes). P2 is armed with a
+        // HitDef but posed on an action with NO attack box, so P2 cannot connect
+        // while P1 can — a single-direction contact, not a clash.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(-20.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(20.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        // P2's loaded char only has hurt boxes on action 0 (defender_loaded).
+        let p1 = Player::new(p1c, brawler_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // P1 high-value attacker on its brawler frame.
+        arm_brawler(
+            &mut m.p1,
+            HitDef {
+                priority: Priority { value: 5, kind: PriorityType::Hit },
+                ..sample_hitdef()
+            },
+        );
+        // P2 armed with a HitDef but on action 0 (hurt boxes only -> cannot hit).
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.active_hitdef = Some(HitDef {
+            priority: Priority { value: 7, kind: PriorityType::Hit },
+            ..sample_hitdef()
+        });
+        m.p2.character.move_connect.reset();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // Only P1 connects (P2 has no attack box this tick); P2 takes damage.
+        // Crucially, P1's HitDef was NOT cancelled despite P2's higher *value* —
+        // because there was no simultaneous clash to arbitrate.
+        assert!(m.p2().life() < 1000, "P1's lone attack lands on P2");
+        assert_eq!(m.p1().life(), 1000, "P2 could not connect (no attack box)");
     }
 
     #[test]
