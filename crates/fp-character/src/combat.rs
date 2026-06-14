@@ -161,6 +161,24 @@ pub fn resolve_attack(
         return None;
     }
 
+    // (2b) Attack-attribute invulnerability — the defender's NotHitBy / HitBy
+    // windows (faithfulness audit P9). BEFORE resolving/applying the hit, consult
+    // the DEFENDER's active mask slots against the ATTACKER's HitDef `attr`. The
+    // mask blocks the hit when, for any active slot:
+    //
+    //   - NotHitBy (exclude): the attacker attr IS in the slot's attr set, or
+    //   - HitBy   (include): the attacker attr is NOT in the slot's attr set.
+    //
+    // A hit must pass BOTH active slots (either one blocking is enough to drop
+    // it). When blocked we return `None` — exactly like a geometric miss: no
+    // damage, no state change, no hit-pause, and the move is NOT marked connected
+    // (the attack simply passes through the invulnerable defender, as in MUGEN).
+    // An inactive/expired slot, or an empty NotHitBy set, blocks nothing; an
+    // empty HitBy set blocks everything (full invuln) — see [`crate::invuln`].
+    if defender.invuln.blocks(&hitdef.attr) {
+        return None;
+    }
+
     // (3) Resolve against the defender's situation (pure logic in fp-combat).
     let defender_state = DefenderState::new(
         stance_of(defender),
@@ -1313,6 +1331,350 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // Audit P9: NotHitBy / HitBy attack-attribute invulnerability windows.
+    // resolve_attack consults the DEFENDER's mask vs the ATTACKER HitDef attr
+    // before applying a hit; a blocked hit returns None (passes through).
+    // =====================================================================
+
+    use crate::invuln::{AttackAttrSet, InvulnMode, InvulnSlot};
+    use fp_combat::{AttackAttr, AttackKind, AttackPower, StateClass};
+
+    /// Sets the sample HitDef's `attr` so the mask tests can target a known
+    /// attacker attribute (the default sample_hitdef leaves `attr` at S, NA).
+    fn attacker_with_attr(a: &mut Character, s: &str) {
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.attr = AttackAttr::parse(s);
+        }
+    }
+
+    /// Builds an active NotHitBy/HitBy slot covering `value` for `time` ticks.
+    fn active_slot(value: &str, mode: InvulnMode, time: i32) -> InvulnSlot {
+        InvulnSlot {
+            attrs: AttackAttrSet::parse(value),
+            mode,
+            time_remaining: time,
+            ignore_hitpause: false,
+        }
+    }
+
+    /// P9 AC2/AC3: a defender with a NotHitBy slot covering the attacker's attr
+    /// is NOT hit (resolve_attack -> None), takes no damage, no state change, no
+    /// hit-pause, and the attacker move is not flagged connected.
+    #[test]
+    fn nothitby_covering_attr_blocks_the_hit() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA"); // standing normal attack
+        let (mut d, d_air) = make_defender();
+        // NotHitBy SCA blocks all classes/pairs -> covers S, NA.
+        d.invuln.slot1 = active_slot("SCA", InvulnMode::NotHitBy, 5);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_none(), "NotHitBy covering the attr drops the hit");
+        assert_eq!(d.life, 1000, "no damage while invulnerable");
+        assert_eq!(d.state_no, 0, "no get-hit state change");
+        assert_eq!(a.hitpause, 0, "a blocked hit pauses nobody");
+        assert!(!a.move_connect.contact(), "blocked hit does not connect the move");
+    }
+
+    /// P9 AC2/AC3: once the NotHitBy window EXPIRES (time_remaining hits 0) the
+    /// same attack lands normally.
+    #[test]
+    fn hit_lands_once_nothitby_window_expires() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("SCA", InvulnMode::NotHitBy, 1);
+        let states = HashMap::new();
+
+        // Active: blocked.
+        assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
+        assert_eq!(d.life, 1000);
+
+        // Expire the window and re-arm the (still active) move.
+        d.invuln.slot1.time_remaining = 0;
+        a.move_connect.reset();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "expired window lets the hit land");
+        assert_eq!(d.life, 1000 - 30, "full damage once invuln expired");
+    }
+
+    /// P9 AC2: NotHitBy that does NOT cover the attacker's attr does not block.
+    /// Defender has NotHitBy for throws only; a normal attack still lands.
+    #[test]
+    fn nothitby_not_covering_attr_allows_the_hit() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA"); // a normal attack, not a throw
+        let (mut d, d_air) = make_defender();
+        // "Can't be thrown" window: throws only.
+        d.invuln.slot1 = active_slot(", NT,ST,HT", InvulnMode::NotHitBy, 12);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "a normal attack is not a throw -> not blocked");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9 AC2: a NotHitBy throw window blocks a THROW HitDef.
+    #[test]
+    fn nothitby_throw_window_blocks_a_throw() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NT"); // a standing normal THROW
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot(", NT,ST,HT", InvulnMode::NotHitBy, 12);
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "the throw window blocks a throw"
+        );
+        assert_eq!(d.life, 1000);
+    }
+
+    /// P9 AC2: HitBy (include) blocks an attr that is NOT in the admitted set.
+    /// HitBy admits only throws; a normal attack is blocked.
+    #[test]
+    fn hitby_excluding_attr_blocks_the_hit() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA"); // a normal attack
+        let (mut d, d_air) = make_defender();
+        // Can ONLY be hit by throws -> a normal attack is excluded.
+        d.invuln.slot1 = active_slot(", NT,ST,HT", InvulnMode::HitBy, 10);
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "HitBy admitting only throws blocks a normal attack"
+        );
+        assert_eq!(d.life, 1000);
+    }
+
+    /// P9 AC2: HitBy admits an attr that IS in the set (the hit lands).
+    #[test]
+    fn hitby_including_attr_allows_the_hit() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        // Can be hit by standing normal attacks -> S, NA is admitted.
+        d.invuln.slot1 = active_slot("S, NA", InvulnMode::HitBy, 10);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "HitBy admitting S,NA lets a S,NA attack land");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9 AC1/AC2: BOTH slots are enforced — a hit must pass both. Slot 1 admits
+    /// the attr (would allow) but slot 2 (NotHitBy covering it) blocks: the hit
+    /// is dropped because either slot blocking is enough.
+    #[test]
+    fn both_slots_enforced_either_can_block() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        // Slot 1: HitBy admits S,NA (allows). Slot 2: NotHitBy SCA (blocks all).
+        d.invuln.slot1 = active_slot("S, NA", InvulnMode::HitBy, 10);
+        d.invuln.slot2 = active_slot("SCA", InvulnMode::NotHitBy, 10);
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "slot 2 blocks even though slot 1 would allow"
+        );
+        assert_eq!(d.life, 1000);
+    }
+
+    /// P9 AC2: attack-class matching by state-type AND pair. A NotHitBy limited
+    /// to AIR attacks does not block a STANDING attack of the same pair.
+    #[test]
+    fn attr_match_respects_statetype_class() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA"); // STANDING normal attack
+        let (mut d, d_air) = make_defender();
+        // Only air normal-attacks are excluded.
+        d.invuln.slot1 = active_slot("A, NA", InvulnMode::NotHitBy, 10);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "a standing attack is not in the air-only window");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9 AC3: an unparseable NotHitBy spec is the empty set -> blocks NOTHING
+    /// (the MUGEN-safe reading: a garbage NotHitBy never grants invulnerability).
+    #[test]
+    fn unparseable_nothitby_is_safe_blocks_nothing() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("garbage!!", InvulnMode::NotHitBy, 10);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "garbage NotHitBy is inert; the hit lands");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9 AC3: an unparseable HitBy spec is the empty set -> blocks EVERYTHING
+    /// (the MUGEN-safe reading: "can only be hit by <nothing>" = full invuln).
+    #[test]
+    fn unparseable_hitby_blocks_everything() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("garbage!!", InvulnMode::HitBy, 10);
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "garbage HitBy admits nothing -> blocks every hit"
+        );
+        assert_eq!(d.life, 1000);
+    }
+
+    /// P9 AC2: an inactive (expired) slot never blocks, even if it would cover
+    /// the attr. Default masks (all inactive) leave existing behavior intact.
+    #[test]
+    fn inactive_slot_does_not_block() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        // Covers the attr but time_remaining = 0 -> inactive.
+        d.invuln.slot1 = active_slot("SCA", InvulnMode::NotHitBy, 0);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "an inactive slot blocks nothing");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9: a wildcard NotHitBy (`*`) blocks any attr.
+    #[test]
+    fn wildcard_nothitby_blocks_any_attr() {
+        for spec in ["*", "SCA"] {
+            for attr_s in ["S, NA", "C, HP", "A, ST"] {
+                let (mut a, a_air) = make_attacker();
+                attacker_with_attr(&mut a, attr_s);
+                let (mut d, d_air) = make_defender();
+                d.invuln.slot1 = active_slot(spec, InvulnMode::NotHitBy, 5);
+                let states = HashMap::new();
+                assert!(
+                    resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+                    "NotHitBy {spec:?} should block attr {attr_s:?}"
+                );
+            }
+        }
+        // Verify the AttackAttr letters parse the way we expect.
+        assert_eq!(
+            AttackAttr::parse("A, ST").class,
+            StateClass::Air,
+            "sanity: A class parses"
+        );
+        assert_eq!(AttackAttr::parse("C, HP").power, AttackPower::Hyper);
+        assert_eq!(AttackAttr::parse("A, ST").kind, AttackKind::Throw);
+    }
+
+    // ---- Proctor (Audit P9): additional resolve_attack edge semantics -----
+    // Forge's block above covers NotHitBy/HitBy block-vs-allow, both-slots,
+    // statetype matching, expiry, unparseable, and inactive. These pin the
+    // pass-through invariants the spec calls out but no test asserted: a blocked
+    // hit establishes NO target and leaves the attacker move un-connected (so a
+    // later, vulnerable contact still lands), slot 1 blocking on its own, and a
+    // HitBy that excludes by STATETYPE only.
+
+    /// P9 (Proctor): a NotHitBy-blocked hit passes through cleanly — it sets NO
+    /// target on the attacker and does not flag the move connected, so an
+    /// IDENTICAL second contact (once the window expires) still lands. This is the
+    /// "the attack simply passes through" MUGEN rule: invulnerability is not a
+    /// connection.
+    #[test]
+    fn blocked_hit_sets_no_target_and_later_hit_still_lands() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("SCA", InvulnMode::NotHitBy, 1);
+        let states = HashMap::new();
+
+        // Blocked: no contact bookkeeping at all.
+        assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
+        assert!(!a.has_target, "an invuln-blocked hit establishes no target");
+        assert!(!a.move_connect.contact(), "blocked hit does not connect the move");
+
+        // Window expires; the SAME move (never marked connected, so hitonce does
+        // NOT forbid it) now lands on the no-longer-invulnerable defender.
+        d.invuln.slot1.time_remaining = 0;
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "the pass-through move still lands after expiry");
+        assert!(a.has_target, "the landing hit finally establishes the target");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
+    /// P9 (Proctor): slot 1 blocking on its own drops the hit even when slot 2 is
+    /// inactive. (Forge's `both_slots_enforced_either_can_block` proves slot 2
+    /// blocking; this proves the slot-1 side of "either slot blocking is enough".)
+    #[test]
+    fn slot1_blocks_alone_with_slot2_inactive() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("SCA", InvulnMode::NotHitBy, 6); // blocks
+        d.invuln.slot2 = active_slot("SCA", InvulnMode::NotHitBy, 0); // inactive
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "slot 1 alone blocks; the inactive slot 2 is irrelevant"
+        );
+        assert_eq!(d.life, 1000);
+    }
+
+    /// P9 (Proctor): HitBy admitting only AIR attacks blocks a STANDING attack of
+    /// the otherwise-admitted pair — the include filter is by state-type too, not
+    /// just the PK pair. (`A, NA` admits only air normal-attacks; a `S, NA`
+    /// attacker is excluded and therefore blocked.)
+    #[test]
+    fn hitby_excludes_by_statetype_not_just_pair() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA"); // STANDING normal attack
+        let (mut d, d_air) = make_defender();
+        d.invuln.slot1 = active_slot("A, NA", InvulnMode::HitBy, 10); // only air NA admitted
+        let states = HashMap::new();
+
+        assert!(
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none(),
+            "HitBy(air NA) excludes a standing NA -> blocked"
+        );
+        assert_eq!(d.life, 1000);
+
+        // The same HitBy admits the matching AIR attack (control: it is NOT a
+        // blanket block — the include filter genuinely lets the listed attr in).
+        let (mut a2, a_air2) = make_attacker();
+        attacker_with_attr(&mut a2, "A, NA"); // AIR normal attack (admitted)
+        let (mut d2, d_air2) = make_defender();
+        d2.invuln.slot1 = active_slot("A, NA", InvulnMode::HitBy, 10);
+        let res = resolve_attack(&mut a2, &a_air2, &mut d2, &d_air2, &states);
+        assert!(res.is_some(), "the admitted air NA attack lands");
+        assert_eq!(d2.life, 1000 - 30);
+    }
+
+    /// P9 (Proctor): an empty (default) mask never blocks — the existing combat
+    /// suite passes only because the default `InvulnMask` is inert. Pin it
+    /// explicitly so a future default change cannot silently grant invuln.
+    #[test]
+    fn default_mask_blocks_nothing() {
+        let (mut a, a_air) = make_attacker();
+        attacker_with_attr(&mut a, "S, NA");
+        let (mut d, d_air) = make_defender();
+        assert_eq!(d.invuln, crate::invuln::InvulnMask::default(), "fresh defender has the default mask");
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "the default (all-inactive) mask never blocks");
+        assert_eq!(d.life, 1000 - 30);
+    }
+
     // ---- AC4 (optional): gated real-KFM integration test -----------------
 
     fn test_asset(rel: &str) -> PathBuf {
@@ -1637,5 +1999,126 @@ mod tests {
         assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
         assert_eq!(d.hitpause, 0);
         assert!(!d.tick_with(&states, &d_air, None, StageView::default()).hitpaused, "defender resumes after 3 ticks");
+    }
+
+    /// P9 AC3 gated real-KFM: drive KFM's get-up state (`common1` `[Statedef 5120]`,
+    /// which carries `[State 5120, 3] type = NotHitBy / value = SCA / time = 1`),
+    /// tick the defender so the controller fires, confirm the NotHitBy slot is
+    /// active, then confirm a real connecting attack is **ignored** during the
+    /// window — and lands once the window expires. Skips cleanly when KFM assets
+    /// are absent or the expected state/boxes are missing.
+    #[test]
+    fn real_kfm_getup_nothitby_ignores_hit_during_window() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+
+        // Confirm the get-up state authors a NotHitBy controller; skip otherwise.
+        let Some(state_5120) = lc.states.get(&5120) else {
+            eprintln!("skipping: KFM common1 has no [Statedef 5120]");
+            return;
+        };
+        let has_nothitby = state_5120.controllers.iter().any(|c| {
+            c.controller_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("NotHitBy"))
+        });
+        if !has_nothitby {
+            eprintln!("skipping: KFM [Statedef 5120] has no NotHitBy controller");
+            return;
+        }
+
+        // The boxes resolve_attack needs: KFM punch Clsn1 (action 200 elem 2) and
+        // an idle Clsn2 (action 0). Skip if a future asset edit removes them.
+        let clsn1 = current_frame_clsn1(&lc.air, 200, 2);
+        let clsn2 = current_frame_clsn2(&lc.air, 0, 0);
+        if clsn1.is_empty() || clsn2.is_empty() {
+            eprintln!("skipping: KFM action 200/0 frames lack expected Clsn boxes");
+            return;
+        }
+
+        // Put the defender into the get-up state (5120) and tick once so its
+        // NotHitBy controller fires. The slot is decremented at the top of the
+        // tick (from 0, stays 0) THEN set to time=1 by the controller, so after
+        // the tick it is active.
+        let mut defender = Character::with_constants(lc.constants);
+        defender.change_state(&lc.states, 5120);
+        defender.anim = 0;
+        defender.anim_elem = 0;
+        defender.facing = Facing::Left;
+        defender.life = lc.constants.life_max;
+        let _ = defender.tick(&lc, None, StageView::default());
+        assert!(
+            defender.invuln.slot1.is_active() || defender.invuln.slot2.is_active(),
+            "KFM get-up state must arm a NotHitBy slot"
+        );
+
+        // A KFM stand-punch attacker (S, NA) — the SCA NotHitBy window covers it.
+        let mut attacker = Character::with_constants(lc.constants);
+        attacker.state_no = 200;
+        attacker.anim = 200;
+        attacker.anim_elem = 2;
+        attacker.facing = Facing::Right;
+        attacker.move_type = MoveType::Attack;
+        let mut hd = sample_hitdef();
+        hd.attr = AttackAttr::parse("S, NA");
+        attacker.active_hitdef = Some(hd);
+
+        // Sweep offsets until the real boxes overlap; assert the hit is IGNORED
+        // (None) while the NotHitBy window is active.
+        let mut overlapped = false;
+        for dx in 0..=120 {
+            let mut d = clone_for_offset(&defender, dx as f32, lc.constants.life_max);
+            attacker.move_connect.reset();
+            // Force boxes to the punch's active frame regardless of any anim
+            // advance during the single tick above.
+            d.anim = 0;
+            d.anim_elem = 0;
+            let res = resolve_attack(&mut attacker, &lc.air, &mut d, &lc.air, &lc.states);
+            // While invulnerable the boxes may overlap but the hit must be None.
+            if d.invuln.blocks(&AttackAttr::parse("S, NA")) {
+                // Detect overlap independently of the mask by clearing it.
+                let mut d_clear = clone_for_offset(&d, dx as f32, lc.constants.life_max);
+                d_clear.invuln = crate::invuln::InvulnMask::default();
+                d_clear.anim = 0;
+                d_clear.anim_elem = 0;
+                attacker.move_connect.reset();
+                if resolve_attack(&mut attacker, &lc.air, &mut d_clear, &lc.air, &lc.states)
+                    .is_some()
+                {
+                    overlapped = true;
+                    assert!(res.is_none(), "NotHitBy window ignores the connecting hit");
+                    assert_eq!(d.life, lc.constants.life_max, "no damage while invulnerable");
+                    break;
+                }
+            }
+        }
+        assert!(
+            overlapped,
+            "real KFM punch should geometrically overlap the get-up defender at some offset"
+        );
+    }
+
+    /// Test helper: clones `src` at a new x offset with reset life and a fresh
+    /// (un-paused) baseline, carrying over the invuln mask, for the box-sweep
+    /// gated tests.
+    fn clone_for_offset(src: &Character, x: f32, life: i32) -> Character {
+        let mut c = Character::with_constants(src.constants);
+        c.state_no = src.state_no;
+        c.state_type = src.state_type;
+        c.facing = src.facing;
+        c.invuln = src.invuln.clone();
+        c.pos = Vec2::new(x, 0.0);
+        c.life = life;
+        c
     }
 }

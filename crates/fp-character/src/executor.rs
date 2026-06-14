@@ -366,6 +366,10 @@ impl Character {
                 self.shaketime -= 1;
             }
             report.hitpaused = true;
+            // Decrement the NotHitBy/HitBy invuln windows. While hit-paused, only
+            // slots flagged `ignorehitpause` keep counting (the others freeze,
+            // like every other per-tick timer) — passing `hitpaused = true`.
+            self.invuln.tick(true);
             // Run ONLY the `ignorehitpause`-flagged controllers, in the same
             // special-state-then-current-state order as a normal tick. Everything
             // else (anim/time/physics advance, non-flagged controllers) is frozen.
@@ -375,6 +379,8 @@ impl Character {
         if self.shaketime > 0 {
             self.shaketime -= 1;
         }
+        // Not hit-paused: both invuln slots count down this tick.
+        self.invuln.tick(false);
 
         // Process the special states first, in MUGEN order, then the current
         // state. The current state number is re-read after each special state in
@@ -761,7 +767,9 @@ impl Character {
     /// `TargetFacing`, `TargetVelSet`, `TargetVelAdd`, `TargetPowerAdd`), which —
     /// like `PlaySnd` — *defer* their effect by pushing a [`TargetOp`] onto
     /// [`TickReport::target_ops`] for a downstream applier (`fp-engine`); they are
-    /// safe no-ops when this character has no target.
+    /// safe no-ops when this character has no target. Audit P9 adds `NotHitBy` /
+    /// `HitBy`, which set the character's attack-attribute invulnerability slots
+    /// (see [`ctrl_invuln`](Self::ctrl_invuln) and [`crate::invuln`]).
     /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -813,6 +821,10 @@ impl Character {
             self.ctrl_play_snd(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("HitDef") {
             self.ctrl_hit_def(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("NotHitBy") {
+            self.ctrl_invuln(ctrl, env, crate::invuln::InvulnMode::NotHitBy);
+        } else if kind.eq_ignore_ascii_case("HitBy") {
+            self.ctrl_invuln(ctrl, env, crate::invuln::InvulnMode::HitBy);
         } else if kind.eq_ignore_ascii_case("TargetState") {
             self.ctrl_target_state(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("TargetBind") {
@@ -1674,6 +1686,71 @@ impl Character {
             hd.damage
         );
         self.active_hitdef = Some(hd);
+    }
+
+    /// `NotHitBy` / `HitBy`: install an attack-attribute invulnerability window
+    /// (faithfulness audit P9).
+    ///
+    /// Both controllers share this implementation, differing only in the
+    /// [`InvulnMode`](crate::invuln::InvulnMode) passed in (`NotHitBy` = exclude
+    /// the listed attributes, `HitBy` = admit *only* the listed attributes).
+    ///
+    /// Parameters (MUGEN semantics):
+    ///
+    /// - `value` → **slot 1**, `value2` → **slot 2**: each an attack-attribute
+    ///   string (a state-type letter group `S`/`C`/`A` followed by 2-char
+    ///   attack-class pairs, e.g. `SCA` or `, NT,ST,HT`). Read from the **raw**
+    ///   source (it is not arithmetic) and parsed with
+    ///   [`AttackAttrSet::parse`](crate::invuln::AttackAttrSet::parse). A `*` or
+    ///   empty value is the "all attributes" wildcard.
+    /// - `time` (i32, evaluated): how many ticks the window stays active.
+    ///   **Default `1`** — MUGEN's documented default (the window covers just the
+    ///   current tick, the common `value = SCA / time = 1` per-frame form).
+    /// - `ignorehitpause`: when set, the slot keeps counting down during a
+    ///   hit-pause freeze; otherwise it freezes like every other per-tick timer.
+    ///   Read from the controller's universal `ignorehitpause` flag.
+    ///
+    /// A slot whose parameter is **present** is always (re)written, even if the
+    /// other slot's parameter is absent (the absent slot is left untouched — so a
+    /// `NotHitBy value2 = ...` does not clear a still-active slot 1). MUGEN
+    /// re-arms a slot each time the controller fires; a `time` of `0` or less sets
+    /// an immediately-inactive slot (blocks nothing). Never panics: a missing
+    /// `value` simply leaves slot 1 untouched; a malformed attr string parses to
+    /// its documented safe set (see [`crate::invuln`]).
+    fn ctrl_invuln(
+        &mut self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        mode: crate::invuln::InvulnMode,
+    ) {
+        // `time` (ticks): evaluated, MUGEN default 1.
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+
+        // `ignorehitpause` keeps the slot counting during a hit-pause freeze.
+        let ignore_hitpause = self.ignorehitpause_flag(ctrl, env);
+
+        // Slot 1 from `value`, slot 2 from `value2`. Only (re)write a slot whose
+        // raw source is present; an absent value leaves that slot untouched.
+        if let Some(src) = raw_param(ctrl, "value") {
+            self.invuln.slot1 = crate::invuln::InvulnSlot {
+                attrs: crate::invuln::AttackAttrSet::parse(src),
+                mode,
+                time_remaining: time,
+                ignore_hitpause,
+            };
+        }
+        if let Some(src) = raw_param(ctrl, "value2") {
+            self.invuln.slot2 = crate::invuln::InvulnSlot {
+                attrs: crate::invuln::AttackAttrSet::parse(src),
+                mode,
+                time_remaining: time,
+                ignore_hitpause,
+            };
+        }
     }
 
     // ---- Variable-bank helpers --------------------------------------------
@@ -7085,6 +7162,289 @@ mod tests {
         assert_eq!(hd.priority.value, 5, "priority value ← component 0");
         // `Miss` is NOT the default (`Hit`), so this proves the raw-token read.
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss, "type ← raw token");
+    }
+
+    // ---- Audit P9: NotHitBy / HitBy controller dispatch -------------------
+
+    #[test]
+    fn nothitby_controller_sets_slot1_attrs_mode_and_time() {
+        // `[State] type=NotHitBy / value=SCA / time=5` arms slot 1 as an exclude
+        // window covering all classes for 5 ticks.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\ntime = 5\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        // Slot 1 active for `time` ticks (the top-of-tick decrement was a no-op
+        // from 0, then the controller set it to 5).
+        assert_eq!(ch.invuln.slot1.mode, crate::invuln::InvulnMode::NotHitBy);
+        assert_eq!(ch.invuln.slot1.time_remaining, 5, "time -> slot1 remaining");
+        assert!(ch.invuln.slot1.is_active());
+        // Slot 2 was untouched (no `value2`).
+        assert!(!ch.invuln.slot2.is_active(), "value2 absent -> slot2 inactive");
+        // The SCA set covers a standing normal attack.
+        let attr = fp_combat::AttackAttr::parse("S, NA");
+        assert!(ch.invuln.slot1.blocks(&attr), "SCA NotHitBy blocks S,NA");
+    }
+
+    #[test]
+    fn nothitby_value2_arms_slot2_and_value_arms_slot1() {
+        // KFM's get-up shape: slot1 from `value`, slot2 from `value2`.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, a]\ntype = NotHitBy\ntrigger1 = 1\nvalue = , NT,ST,HT\ntime = 12\n\
+             [State 0, b]\ntype = NotHitBy\ntrigger1 = 1\nvalue2 = SCA\ntime = 3\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 12, "value -> slot1");
+        assert_eq!(ch.invuln.slot2.time_remaining, 3, "value2 -> slot2");
+        // Slot1 = throws only; slot2 = all.
+        let throw = fp_combat::AttackAttr::parse("S, NT");
+        let punch = fp_combat::AttackAttr::parse("S, NA");
+        assert!(ch.invuln.slot1.blocks(&throw), "slot1 blocks throws");
+        assert!(!ch.invuln.slot1.blocks(&punch), "slot1 allows punches");
+        assert!(ch.invuln.slot2.blocks(&punch), "slot2 (SCA) blocks punches");
+    }
+
+    #[test]
+    fn nothitby_time_defaults_to_one_when_absent() {
+        // MUGEN default `time = 1` — the common per-frame `value = SCA` form.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 1, "absent time defaults to 1");
+    }
+
+    #[test]
+    fn hitby_controller_sets_include_mode() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, hby]\ntype = HitBy\ntrigger1 = 1\nvalue = , NT,ST,HT\ntime = 8\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.mode, crate::invuln::InvulnMode::HitBy);
+        // HitBy admitting only throws blocks a normal attack.
+        let punch = fp_combat::AttackAttr::parse("S, NA");
+        let throw = fp_combat::AttackAttr::parse("S, NT");
+        assert!(ch.invuln.slot1.blocks(&punch), "HitBy(throws) blocks a punch");
+        assert!(!ch.invuln.slot1.blocks(&throw), "HitBy(throws) admits a throw");
+    }
+
+    #[test]
+    fn nothitby_window_decrements_each_tick_and_expires() {
+        // A NotHitBy fired once (persistent gating off after the first qualifying
+        // tick via a one-shot trigger) so the slot is NOT re-armed each tick and
+        // we can watch it count down. We fire it on tick 0 only (`time = 0`).
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = time = 0\nvalue = SCA\ntime = 3\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        // Tick 0: controller fires (Time = 0), slot set to 3.
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 3, "armed on tick 0");
+        // Tick 1: Time != 0, controller does not fire; slot decrements to 2.
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 2);
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 1);
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 0, "expired");
+        assert!(!ch.invuln.slot1.is_active());
+        // Further ticks keep it at 0 (saturating).
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 0);
+    }
+
+    #[test]
+    fn nothitby_ignorehitpause_counts_during_pause_others_freeze() {
+        // A NotHitBy with `ignorehitpause = 1` keeps counting during a hit-pause
+        // freeze; one without it is frozen. Arm both on tick 0, then enter a
+        // hit-pause and tick.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, frozen]\ntype = NotHitBy\ntrigger1 = time = 0\nvalue = SCA\ntime = 9\n\
+             [State 0, live]\ntype = NotHitBy\ntrigger1 = time = 0\nvalue2 = SCA\ntime = 9\n\
+             ignorehitpause = 1\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        // Tick 0: both slots armed to 9.
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 9);
+        assert_eq!(ch.invuln.slot2.time_remaining, 9);
+        assert!(!ch.invuln.slot1.ignore_hitpause, "slot1 has no ignorehitpause");
+        assert!(ch.invuln.slot2.ignore_hitpause, "slot2 carries ignorehitpause");
+
+        // Enter a hit-pause and tick: slot1 frozen, slot2 (ignorehitpause) counts.
+        ch.hitpause = 4;
+        let report = lc.tick(&mut ch);
+        assert!(report.hitpaused, "this tick was a hit-pause freeze");
+        assert_eq!(ch.invuln.slot1.time_remaining, 9, "frozen slot held during pause");
+        assert_eq!(ch.invuln.slot2.time_remaining, 8, "ignorehitpause slot counted");
+    }
+
+    // ---- Proctor (Audit P9): controller-dispatch edge cases ---------------
+    // Forge's tests above cover the happy path (value/value2 -> slot1/slot2,
+    // default time, HitBy mode, decrement/expiry, ignorehitpause). These pin the
+    // ctrl_invuln edges the doc-comment promises but that no test exercised:
+    // time<=0 -> inactive slot, re-arm of a live slot, an absent slot left
+    // untouched, and a `*` wildcard armed through the real loader split.
+
+    /// P9 (Proctor): `time = 0` arms an immediately-INACTIVE slot (blocks
+    /// nothing), per the doc-comment "a `time` of `0` or less sets an
+    /// immediately-inactive slot". The mask must not accidentally grant invuln.
+    #[test]
+    fn nothitby_time_zero_arms_inactive_slot() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\ntime = 0\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        // The slot was written (mode/attrs set) but is inactive at time 0.
+        assert_eq!(ch.invuln.slot1.mode, crate::invuln::InvulnMode::NotHitBy);
+        assert_eq!(ch.invuln.slot1.time_remaining, 0);
+        assert!(!ch.invuln.slot1.is_active(), "time=0 slot is inactive");
+        let attr = fp_combat::AttackAttr::parse("S, NA");
+        assert!(!ch.invuln.slot1.blocks(&attr), "an inactive slot blocks nothing");
+    }
+
+    /// P9 (Proctor): a NEGATIVE `time` also yields an inactive slot (the
+    /// `time_remaining > 0` activeness rule, never a panic on the negative).
+    #[test]
+    fn nothitby_negative_time_arms_inactive_slot() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\ntime = -5\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, -5);
+        assert!(!ch.invuln.slot1.is_active(), "negative time is inactive");
+    }
+
+    /// P9 (Proctor): re-arming a STILL-ACTIVE slot each time the controller fires
+    /// resets its time (MUGEN re-arms on every fire). A persistent (default)
+    /// NotHitBy refreshes the window so it never counts down toward expiry while
+    /// the controller keeps firing.
+    #[test]
+    fn nothitby_rearms_a_live_slot_each_tick() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\ntime = 3\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 3, "armed to 3 on the first fire");
+        // Next tick: top-of-tick decrement to 2, then the controller re-fires and
+        // resets it back to 3 — so a continuously-firing NotHitBy stays at `time`.
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 3, "re-armed back to 3, not decayed");
+        lc.tick(&mut ch);
+        assert_eq!(ch.invuln.slot1.time_remaining, 3, "still re-armed while firing");
+        assert!(ch.invuln.slot1.is_active());
+    }
+
+    /// P9 (Proctor): a controller that sets ONLY `value2` leaves slot 1 fully
+    /// untouched — it does not clear or overwrite an independently-armed slot 1.
+    /// (The doc: "an absent `value` simply leaves slot 1 untouched".) Here slot 1
+    /// is pre-armed by hand and a `value2`-only controller fires; slot 1 survives
+    /// unchanged including its mode.
+    #[test]
+    fn value2_only_controller_preserves_slot1() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, b]\ntype = NotHitBy\ntrigger1 = 1\nvalue2 = SCA\ntime = 4\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        // Pre-arm slot 1 by hand to a DISTINCT mode/attr/time so we can prove it
+        // is preserved. (time 7 so the top-of-tick decrement to 6 still leaves it
+        // active and clearly not overwritten by the controller's time=4.)
+        ch.invuln.slot1 = crate::invuln::InvulnSlot {
+            attrs: crate::invuln::AttackAttrSet::parse(", NT,ST,HT"),
+            mode: crate::invuln::InvulnMode::HitBy,
+            time_remaining: 7,
+            ignore_hitpause: false,
+        };
+
+        lc.tick(&mut ch);
+        // Slot 1 untouched by the value2-only controller (only the per-tick
+        // decrement applied: 7 -> 6); mode/attrs intact.
+        assert_eq!(ch.invuln.slot1.mode, crate::invuln::InvulnMode::HitBy, "slot1 mode preserved");
+        assert_eq!(ch.invuln.slot1.time_remaining, 6, "slot1 only decremented, not re-armed");
+        // Slot 2 was the one the controller armed.
+        assert_eq!(ch.invuln.slot2.mode, crate::invuln::InvulnMode::NotHitBy);
+        assert_eq!(ch.invuln.slot2.time_remaining, 4, "value2 armed slot2");
+    }
+
+    /// P9 (Proctor): a `value = *` wildcard armed through the real loader split
+    /// blocks EVERY attacker attr while active (NotHitBy `*` = blanket invuln).
+    #[test]
+    fn nothitby_wildcard_value_blocks_every_attr() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, nhb]\ntype = NotHitBy\ntrigger1 = 1\nvalue = *\ntime = 5\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert!(ch.invuln.slot1.attrs.any, "`*` parsed as the wildcard set");
+        for s in ["S, NA", "C, HP", "A, ST", "S, SP"] {
+            let attr = fp_combat::AttackAttr::parse(s);
+            assert!(ch.invuln.slot1.blocks(&attr), "wildcard NotHitBy blocks {s:?}");
+        }
+    }
+
+    /// P9 (Proctor): firing NotHitBy then HitBy in the same tick leaves slot 1 in
+    /// the LAST controller's mode (later controllers overwrite the slot). The two
+    /// dispatch arms share `ctrl_invuln`; this proves the mode argument is wired
+    /// per-arm and the second write wins.
+    #[test]
+    fn later_controller_overwrites_slot_mode() {
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, a]\ntype = NotHitBy\ntrigger1 = 1\nvalue = SCA\ntime = 5\n\
+             [State 0, b]\ntype = HitBy\ntrigger1 = 1\nvalue = SCA\ntime = 5\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(
+            ch.invuln.slot1.mode,
+            crate::invuln::InvulnMode::HitBy,
+            "the later HitBy controller overwrote slot1's mode"
+        );
     }
 
     #[test]

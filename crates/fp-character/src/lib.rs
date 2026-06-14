@@ -70,10 +70,12 @@
 
 pub mod combat;
 pub mod executor;
+pub mod invuln;
 pub mod loader;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{SoundRequest, TargetOp, TickReport};
+pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
 // Re-export the combat sound reference so downstream crates (e.g. fp-engine) can
 // name the type of [`AttackResolution::hit_sound`] without taking a direct
 // dependency on fp-combat.
@@ -962,6 +964,21 @@ pub struct Character {
     /// or an explicit `TargetState`/`Target` redirect change) is **deferred** —
     /// there is no per-target tracking here, only this single boolean.
     pub has_target: bool,
+
+    /// The character's attack-attribute invulnerability mask — the `NotHitBy` /
+    /// `HitBy` windows (faithfulness audit P9).
+    ///
+    /// Two independent slots (`value` → slot 1, `value2` → slot 2), each holding
+    /// a parsed attack-attribute set, an exclude/include [`mode`](crate::invuln::InvulnSlot::mode),
+    /// and a `time_remaining` countdown. The `NotHitBy`/`HitBy` controllers set
+    /// the slots; the executor decrements them each tick (respecting hit-pause /
+    /// `ignorehitpause`); and hit resolution ([`resolve_attack`]) consults the
+    /// **defender's** active slots against the **attacker's**
+    /// [`HitDef.attr`](fp_combat::HitDef::attr) before applying a hit, dropping
+    /// the hit (it passes through, like MUGEN) when any active slot blocks it.
+    /// Defaults to an all-inactive mask (`time_remaining = 0`), which blocks
+    /// nothing. See [`crate::invuln`].
+    pub invuln: InvulnMask,
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1041,6 +1058,7 @@ impl Default for Character {
             shaketime: 0,
             move_connect: MoveConnect::default(),
             has_target: false,
+            invuln: InvulnMask::default(),
         }
     }
 }
