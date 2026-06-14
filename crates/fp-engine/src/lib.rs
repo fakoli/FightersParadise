@@ -1732,6 +1732,7 @@ time = 1
             blend: BlendMode::Normal,
             clsn1,
             clsn2,
+            ..Default::default()
         };
         let mut actions = HashMap::new();
         actions.insert(
@@ -1815,6 +1816,7 @@ time = 1
                     blend: BlendMode::Normal,
                     clsn1: Vec::new(),
                     clsn2: vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+                    ..Default::default()
                 }],
                 loopstart: 0,
             },

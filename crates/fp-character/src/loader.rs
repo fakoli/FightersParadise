@@ -3533,6 +3533,7 @@ mod tests {
                     blend: BlendMode::Normal,
                     clsn1: Vec::new(),
                     clsn2: Vec::new(),
+                    ..Default::default()
                 }],
                 loopstart: 0,
             },

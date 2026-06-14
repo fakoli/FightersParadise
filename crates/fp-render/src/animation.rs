@@ -192,6 +192,7 @@ mod tests {
             blend: BlendMode::Normal,
             clsn1: vec![],
             clsn2: vec![],
+            ..Default::default()
         }
     }
 
