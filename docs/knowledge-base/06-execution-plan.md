@@ -170,6 +170,8 @@ parallelizable once the core exists. Deps: Phase 7.
 - **S8.1** ✅ DONE — **SND parser** (`fp-formats/src/snd.rs`): `SndFile{load, from_bytes,
   sound(group,sample)}`, validates `ElecbyteSnd`, walks the directory (count-terminated,
   cycle-guarded), real `kfm.snd` = 12 RIFF sounds. +18 tests. Critic PASS (fragile truncation test → CB13).
+- **8.2** DONE — **fp-audio playback core** (`fp-audio`, single-crate). Build the stub into: `Sound::decode(&[u8])` (rodio WAV→in-memory replayable PCM); object-safe `AudioBackend` seam + `RodioBackend` (graceful no-device), `NullBackend`, test `RecordingBackend`; `AudioSystem` with MUGEN channel cut-off (occupied channel stops previous; channel<0 always-new) + NullBackend fallback. Decoupled from fp-formats (operates on raw WAV bytes). rodio wired into Cargo.toml (orchestrator infra). Deps: S8.1. *(running via fp-loop-batch w7q1rehbq)*
+- **8.3** TODO — wire audio: `PlaySnd` controller (executor, currently logged no-op) + HitDef hit/guard sounds → `fp-audio`, bridging `SndFile`→`Sound`. Cross-crate (executor + engine/app) → direct Agent, not single-crate workflow. Deps: 8.2.
 
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).
