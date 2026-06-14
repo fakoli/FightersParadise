@@ -98,7 +98,7 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    Character, EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType,
+    AnimSet, Character, EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType,
     NUM_FVARS, NUM_VARS,
 };
 
@@ -125,17 +125,25 @@ struct EvalEnv<'a> {
     opponent: Option<&'a EvalCtx<'a>>,
     /// The stage edges, for the screen-edge distance triggers.
     stage: StageView,
+    /// The character's loaded animation action set, for `SelfAnimExist(n)`
+    /// (audit P22). Built once per tick in [`Character::tick_with`] from the
+    /// `air` param; empty (the [`AnimSet::default`]) in the out-of-tick seam so
+    /// `SelfAnimExist` degrades to `0` there. A shared reference keeps `EvalEnv`
+    /// `Copy`.
+    anim: AnimSet<'a>,
 }
 
 impl EvalEnv<'_> {
-    /// An environment with no opponent and the default stage: every
-    /// opponent-dependent trigger reads the safe default `0`. Used by the
-    /// out-of-tick [`Character::change_state`] seam, which has no opponent
-    /// threaded.
+    /// An environment with no opponent, the default stage, and an empty
+    /// animation action set: every opponent-dependent trigger reads the safe
+    /// default `0`, and `SelfAnimExist(n)` reports every action absent. Used by
+    /// the out-of-tick [`Character::change_state`] seam, which has neither an
+    /// opponent nor an `.air` table threaded.
     fn self_only() -> Self {
         Self {
             opponent: None,
             stage: StageView::default(),
+            anim: AnimSet::default(),
         }
     }
 }
@@ -367,9 +375,15 @@ impl Character {
         // any mutation.
         let opp_ctx: Option<EvalCtx> =
             opponent.map(|o| EvalCtx::new(o, None, stage));
+        // This character's own loaded animation action set, for `SelfAnimExist(n)`
+        // (audit P22). The opponent context above is built without an `.air` view
+        // (it carries the empty default), so `enemy, SelfAnimExist` degrades to
+        // `0` — a documented, acceptable approximation for a flat 1-v-1.
+        let anim = AnimSet::new(&air.actions);
         let env = EvalEnv {
             opponent: opp_ctx.as_ref(),
             stage,
+            anim,
         };
 
         // Hit-pause gate (task 6.5): while frozen by a connecting hit, the engine
@@ -794,7 +808,7 @@ impl Character {
     /// reference comes from `env` (built once for the whole tick), so this is a
     /// cheap reborrow + struct build, no allocation and no `unsafe`.
     fn eval_ctx<'a>(&'a self, env: EvalEnv<'a>) -> EvalCtx<'a> {
-        EvalCtx::new(self, env.opponent, env.stage)
+        EvalCtx::with_anim(self, env.opponent, env.stage, env.anim)
     }
 
     /// Evaluates a compiled expression against this character (with its opponent /
@@ -9404,5 +9418,126 @@ mod tests {
         assert!(anim_elem_time(&ch, 3) < 0, "element 3 future again after wrap");
         // Element 1 (current, offset 0) just restarted.
         assert_eq!(anim_elem_time(&ch, 1), 0, "current element restarted at 0");
+    }
+
+    // =====================================================================
+    // Proctor: SelfAnimExist end-to-end through the executor (audit P22).
+    // The lib.rs tests drive SelfAnimExist against a hand-built EvalCtx; these
+    // prove the AnimSet actually flows the *executor* path —
+    // tick_with(air) builds the AnimSet from `air.actions` and threads it via
+    // EvalEnv → eval_ctx → EvalCtx::with_anim to every controller eval site —
+    // so a `ChangeState` gated on SelfAnimExist fires (or not) correctly.
+    // =====================================================================
+
+    /// Inserts an extra (frameless) action `n` into an existing AIR file so the
+    /// action set contains it. Frames are irrelevant to `SelfAnimExist`.
+    fn with_action(mut air: AirFile, n: i32) -> AirFile {
+        air.actions.insert(
+            n,
+            AnimAction { action_number: n, frames: Vec::new(), loopstart: 0 },
+        );
+        air
+    }
+
+    #[test]
+    fn selfanimexist_gates_changestate_through_tick_with() {
+        // A ChangeState in state 0 gated on `SelfAnimExist(44)`. When action 44
+        // exists in the AIR the trigger is true and we transition to 20; when it
+        // is absent the controller never fires. This proves the AnimSet built
+        // from the `air` param inside tick_with reaches the controller eval.
+        let gated = ctrl(0, "ChangeState", &[], &[(1, &["SelfAnimExist(44)"])], None, &[("value", "20")]);
+
+        // Case A: action 44 present → ChangeState fires.
+        let lc_present = loaded(
+            vec![stand_n(0, vec![gated.clone()]), stand_n(20, vec![])],
+            with_action(tiny_air(0, &[5]), 44),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        let report = lc_present.tick(&mut ch);
+        assert_eq!(report.transitions, 1, "SelfAnimExist(44) true → transition");
+        assert_eq!(ch.state_no, 20, "transitioned because action 44 exists");
+
+        // Case B: action 44 absent → controller never fires, stays in state 0.
+        let lc_absent = loaded(
+            vec![stand_n(0, vec![gated]), stand_n(20, vec![])],
+            tiny_air(0, &[5]), // only action 0 — no 44
+        );
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        let report2 = lc_absent.tick(&mut ch2);
+        assert_eq!(report2.transitions, 0, "SelfAnimExist(44) false → no transition");
+        assert_eq!(ch2.state_no, 0, "stayed put because action 44 is absent");
+    }
+
+    #[test]
+    fn selfanimexist_common1_fallback_idiom_through_tick_with() {
+        // The common1 `[Statedef 50]` idiom: `SelfAnimExist(anim + 3)` picks the
+        // falling variant when present. Drive it through the full executor: with
+        // anim=41 and action 44 present, `anim + 3 == 44` is true → fire; flip
+        // the AIR to omit 44 and the same state stays put.
+        let fallback = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["SelfAnimExist(anim + 3)"])],
+            None,
+            &[("value", "20")],
+        );
+
+        // Present: 41 + 3 == 44 exists → transition.
+        let lc = loaded(
+            vec![
+                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("41"), ..Entry::default() }, vec![fallback.clone()]),
+                stand_n(20, vec![]),
+            ],
+            with_action(with_action(tiny_air(0, &[5]), 41), 44),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 41;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 20, "fallback taken: anim+3==44 exists");
+
+        // Absent: remove action 44 → 41 + 3 has no target → stays in state 0.
+        let lc2 = loaded(
+            vec![
+                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("41"), ..Entry::default() }, vec![fallback]),
+                stand_n(20, vec![]),
+            ],
+            with_action(tiny_air(0, &[5]), 41), // 41 present, 44 absent
+        );
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.anim = 41;
+        lc2.tick(&mut ch2);
+        assert_eq!(ch2.state_no, 0, "fallback not taken: anim+3==44 absent");
+    }
+
+    #[test]
+    fn change_state_seam_selfanimexist_is_zero_without_panic() {
+        // The out-of-tick `change_state` seam uses `EvalEnv::self_only()`, which
+        // carries an empty AnimSet. Entry-param expressions evaluated there see
+        // SelfAnimExist as 0 (no AIR in view) and must never panic. We drive a
+        // destination whose entry `anim` is gated via an expression that uses
+        // SelfAnimExist, then force entry through `change_state`.
+        //
+        // `anim = SelfAnimExist(44) + 7` resolves to 0 + 7 == 7 at the seam (no
+        // AIR), proving the degraded-but-safe path. (A normal in-tick entry would
+        // see the real AnimSet; the seam is the documented exception.)
+        let st0 = stand_n(0, vec![]);
+        let st9 = state(
+            9,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("SelfAnimExist(44) + 7"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(vec![st0, st9], with_action(tiny_air(0, &[5]), 44));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        // Force entry into 9 via the out-of-tick seam (uses EvalEnv::self_only()).
+        ch.change_state(&lc.states, 9);
+        assert_eq!(ch.state_no, 9, "seam performed the state entry");
+        // anim resolved with SelfAnimExist degraded to 0 at the seam → 0 + 7.
+        assert_eq!(ch.anim, 7, "SelfAnimExist degraded to 0 at the no-AIR seam");
     }
 }

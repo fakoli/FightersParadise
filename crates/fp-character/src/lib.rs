@@ -85,7 +85,10 @@ pub use loader::{
     LoadedCharacter,
 };
 
+use std::collections::HashMap;
+
 use fp_core::Vec2;
+use fp_formats::air::AnimAction;
 use fp_vm::{EvalContext, Redirect, Value};
 
 /// Number of integer variables (`var(0)`..=`var(59)`) every player owns.
@@ -1722,7 +1725,12 @@ impl EvalContext for Character {
         //   self-only triggers back to this impl. A bare `Character` evaluated on
         //   its own still reports `0` for them (no opponent in view).
         // * Animation table queries: `SelfAnimExist`. Needs the loaded `.air`
-        //   action set, which the executor owns rather than `Character`.
+        //   action set, which the executor owns rather than `Character`. It is
+        //   now answered by the per-tick cross-entity wrapper [`EvalCtx`] (audit
+        //   P22), which threads the `.air` actions in via [`AnimSet`]. A bare
+        //   `Character` evaluated on its own (no `.air` in view) still falls
+        //   through to `0` here — i.e. "action absent" — which is also what the
+        //   opponent context reports, since it carries an empty `AnimSet`.
 
         // Unknown trigger → safe default, never a panic.
         Value::DEFAULT
@@ -1822,6 +1830,51 @@ impl Default for StageView {
     }
 }
 
+/// A read-only view of a character's loaded **animation action set**, the
+/// minimum the cross-entity evaluation context ([`EvalCtx`]) needs to answer the
+/// `SelfAnimExist(n)` trigger (audit P22).
+///
+/// MUGEN's `SelfAnimExist(n)` reports whether action number `n` exists in the
+/// character's *own* `.air` table; `common1` uses it to pick anim fallbacks (e.g.
+/// `[Statedef 50]`'s `SelfAnimExist(anim + 3)` selects the falling variant when
+/// present, and `[Statedef 45]`'s `SelfAnimExist(44)` picks anim `44` over `41`
+/// for an air jump). The action set lives with the executor (which owns the
+/// [`AirFile`](fp_formats::air::AirFile)), not on [`Character`], so this thin
+/// borrow threads it into the eval path.
+///
+/// It is a `Copy` wrapper around an optional shared reference to the loaded
+/// `action → AnimAction` map, so it can ride along in the (also `Copy`)
+/// `EvalEnv`/[`EvalCtx`] without forcing an allocation. A [`default`](AnimSet::default)
+/// `AnimSet` holds **no** actions: contexts with no `.air` in hand (the opponent
+/// context, the out-of-tick `change_state` seam, and bare-`Character`
+/// evaluation) use it, so `SelfAnimExist` there degrades to `0` (action absent)
+/// rather than guessing — a documented, panic-free fallback.
+#[derive(Clone, Copy, Default)]
+pub struct AnimSet<'a> {
+    /// The loaded `action number → action` map, or `None` when no `.air` table
+    /// is in view (an empty set: every action is reported absent).
+    actions: Option<&'a HashMap<i32, AnimAction>>,
+}
+
+impl<'a> AnimSet<'a> {
+    /// Wraps a loaded animation action map for `SelfAnimExist` resolution.
+    #[must_use]
+    pub fn new(actions: &'a HashMap<i32, AnimAction>) -> Self {
+        Self {
+            actions: Some(actions),
+        }
+    }
+
+    /// Returns whether animation action `n` exists in this set.
+    ///
+    /// Always `false` for the empty ([`default`](AnimSet::default)) set. Never
+    /// panics.
+    #[must_use]
+    pub fn contains(&self, n: i32) -> bool {
+        self.actions.is_some_and(|a| a.contains_key(&n))
+    }
+}
+
 /// A per-tick **cross-entity** evaluation context: a [`Character`] (`me`) viewed
 /// together with its opponent and the stage.
 ///
@@ -1862,16 +1915,42 @@ pub struct EvalCtx<'a> {
     opponent: Option<&'a EvalCtx<'a>>,
     /// The stage edges, for the screen-edge distance triggers.
     stage: StageView,
+    /// `me`'s loaded animation action set, for `SelfAnimExist(n)`. Empty (the
+    /// [`AnimSet::default`]) when no `.air` is in view.
+    anim: AnimSet<'a>,
 }
 
 impl<'a> EvalCtx<'a> {
     /// Builds a cross-entity context wrapping `me`, with `opponent` and `stage`.
+    ///
+    /// `me`'s own animation action set defaults to **empty**, so `SelfAnimExist`
+    /// reports every action absent (`0`). Use [`EvalCtx::with_anim`] to supply the
+    /// loaded `.air` actions so `SelfAnimExist(n)` resolves against them.
     #[must_use]
     pub fn new(me: &'a Character, opponent: Option<&'a EvalCtx<'a>>, stage: StageView) -> Self {
         Self {
             me,
             opponent,
             stage,
+            anim: AnimSet::default(),
+        }
+    }
+
+    /// Builds a cross-entity context like [`EvalCtx::new`], additionally giving
+    /// `me`'s loaded animation action set so `SelfAnimExist(n)` resolves against
+    /// the real `.air` table instead of the empty default.
+    #[must_use]
+    pub fn with_anim(
+        me: &'a Character,
+        opponent: Option<&'a EvalCtx<'a>>,
+        stage: StageView,
+        anim: AnimSet<'a>,
+    ) -> Self {
+        Self {
+            me,
+            opponent,
+            stage,
+            anim,
         }
     }
 
@@ -1999,6 +2078,20 @@ impl<'a> EvalCtx<'a> {
             } else {
                 self.me.pos.x - self.stage.left
             }));
+        }
+
+        // `SelfAnimExist(n)` — does action number `n` exist in `me`'s loaded
+        // `.air` table? Resolved here because the action set lives with the
+        // executor's `AirFile`, not on the self-only `Character`. The VM parses
+        // it as a function-call trigger, so `n` arrives as the first argument.
+        // A missing or non-integer argument, or an empty action set (no `.air`
+        // in view — opponent context / out-of-tick seam / bare `Character`),
+        // yields `0` (action absent). Never panics.
+        if name.eq_ignore_ascii_case("SelfAnimExist") {
+            let exists = args
+                .first()
+                .is_some_and(|v| self.anim.contains(v.to_int()));
+            return Some(Value::from(exists));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -4594,6 +4687,298 @@ mod tests {
         // fvar reads through the typed seam too.
         assert_eq!(
             ev_cross("fvar(0) = 1.5", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
+    }
+
+    // =====================================================================
+    // SelfAnimExist(n) against the loaded AIR action set (audit P22).
+    // These drive REAL trigger expressions through the VM eval path against an
+    // `EvalCtx` carrying an `AnimSet`, exactly how the executor calls it.
+    // =====================================================================
+
+    /// Builds a synthetic `action number → action` map from a list of action
+    /// numbers (frames/loopstart are irrelevant to `SelfAnimExist`).
+    fn anim_actions(nums: &[i32]) -> HashMap<i32, AnimAction> {
+        nums.iter()
+            .map(|&n| {
+                (
+                    n,
+                    AnimAction {
+                        action_number: n,
+                        frames: Vec::new(),
+                        loopstart: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Evaluates `expr` against `me` viewed with the given animation action set
+    /// (and no opponent / default stage), through the same VM eval path the
+    /// executor uses. Panics only in test code on a parse error.
+    fn ev_with_anim(expr: &str, me: &Character, actions: &HashMap<i32, AnimAction>) -> Value {
+        let ast = parse_str(expr).expect("test expression should parse");
+        let ctx = EvalCtx::with_anim(me, None, StageView::default(), AnimSet::new(actions));
+        eval(&ast, &ctx)
+    }
+
+    #[test]
+    fn selfanimexist_resolves_against_loaded_air_actions() {
+        // An AIR table with exactly actions {0, 41, 44}.
+        let actions = anim_actions(&[0, 41, 44]);
+        let ch = Character::new();
+
+        // Present actions → 1; absent → 0; through the real trigger/eval path.
+        assert_eq!(ev_with_anim("SelfAnimExist(44)", &ch, &actions), Value::Int(1));
+        assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &actions), Value::Int(1));
+        assert_eq!(ev_with_anim("SelfAnimExist(41)", &ch, &actions), Value::Int(1));
+        assert_eq!(ev_with_anim("SelfAnimExist(99)", &ch, &actions), Value::Int(0));
+
+        // Case-insensitive trigger name.
+        assert_eq!(ev_with_anim("selfanimexist(44)", &ch, &actions), Value::Int(1));
+        assert_eq!(ev_with_anim("SELFANIMEXIST(99)", &ch, &actions), Value::Int(0));
+
+        // Direct trigger call with a missing arg → 0, never panics.
+        let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
+        assert_eq!(ctx.trigger("SelfAnimExist", &[]), Value::Int(0));
+        // A garbage (NaN) arg coerces to action 0 via `to_int` (NaN → 0) and never
+        // panics; here action 0 IS present, so it reports 1 — the point is that a
+        // non-integer arg resolves deterministically to a valid lookup, not a crash.
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Float(f32::NAN)]),
+            Value::Int(1)
+        );
+
+        // A garbage arg against a set WITHOUT action 0 → 0 (absent), no panic.
+        let no_zero = anim_actions(&[41, 44]);
+        let ctx2 = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&no_zero));
+        assert_eq!(
+            ctx2.trigger("SelfAnimExist", &[Value::Float(f32::NAN)]),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn selfanimexist_drives_common1_fallback_idiom() {
+        // common1 `[Statedef 50]` picks the falling variant via
+        // `SelfAnimExist(anim + 3)`; `[Statedef 45]` AirJump uses `SelfAnimExist(44)`.
+        // Action set has the base jump-related actions plus 44 but NOT 53.
+        let actions = anim_actions(&[40, 41, 44, 50]);
+        let mut ch = Character::new();
+
+        // anim = 50 → anim + 3 = 53, which is ABSENT → the fallback is not taken.
+        ch.anim = 50;
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(anim + 3)", &ch, &actions),
+            Value::Int(0)
+        );
+        // anim = 41 → anim + 3 = 44, which is PRESENT → the fallback IS taken.
+        ch.anim = 41;
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(anim + 3)", &ch, &actions),
+            Value::Int(1)
+        );
+        // The AirJump idiom: action 44 exists, so the air-jump anim is chosen.
+        assert_eq!(ev_with_anim("SelfAnimExist(44)", &ch, &actions), Value::Int(1));
+    }
+
+    #[test]
+    fn selfanimexist_with_no_air_in_view_is_zero_without_panic() {
+        // The opponent context / out-of-tick seam / bare-`Character` evaluation
+        // carry an EMPTY `AnimSet`: `SelfAnimExist(n)` reports every action
+        // absent (0) and never panics — the documented no-AIR fallback.
+        let ch = Character::new();
+        let stage = StageView::default();
+
+        // EvalCtx::new (no anim supplied) → empty default set.
+        let ctx = EvalCtx::new(&ch, None, stage);
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
+        assert_eq!(ev_cross("SelfAnimExist(44)", &ch, None, stage), Value::Int(0));
+
+        // A bare `Character` (self-only context) also has no AIR → 0.
+        assert_eq!(ch.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
+
+        // `enemy, SelfAnimExist(...)` degrades to 0: the opponent context is built
+        // without an `.air` view (documented approximation for a flat 1-v-1).
+        let (me, opp) = two_chars();
+        assert_eq!(
+            ev_cross("enemy, SelfAnimExist(0)", &me, Some(&opp), stage),
+            Value::Int(0)
+        );
+    }
+
+    // ---- Gated real-KFM test (skip-if-missing) --------------------------
+
+    /// With real KFM loaded, `SelfAnimExist` must report a known action present
+    /// and a bogus one absent, through the real trigger/eval path. Skips cleanly
+    /// (printed reason) when `test-assets/` is absent.
+    #[test]
+    fn real_kfm_selfanimexist_known_action_exists() {
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        // KFM ships a stand light punch as action 200; a 5-digit action like
+        // 99999 is never authored. Assert both through the eval path.
+        let actions = &lc.air.actions;
+        if !actions.contains_key(&200) {
+            eprintln!("skipping: KFM action 200 not present in this fixture");
+            return;
+        }
+        let ch = Character::with_constants(lc.constants);
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(200)", &ch, actions),
+            Value::Int(1),
+            "real KFM action 200 should exist"
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(99999)", &ch, actions),
+            Value::Int(0),
+            "bogus action 99999 should not exist"
+        );
+    }
+
+    // =====================================================================
+    // Proctor: additional SelfAnimExist / AnimSet edge cases (audit P22).
+    // These extend Forge's suite with the AnimSet unit API, signed/boundary
+    // action numbers, float-arg truncation, the empty-map (not just None)
+    // case, and Copy semantics — every path documented as "never panics".
+    // =====================================================================
+
+    #[test]
+    fn animset_contains_unit_api() {
+        // The thin AnimSet wrapper is the load-bearing primitive: `contains`
+        // must be exact on a populated set and uniformly false on the empty
+        // (default) set, never panicking on any input.
+        let actions = anim_actions(&[0, 41, 44]);
+        let set = AnimSet::new(&actions);
+        assert!(set.contains(0));
+        assert!(set.contains(41));
+        assert!(set.contains(44));
+        assert!(!set.contains(1));
+        assert!(!set.contains(-7));
+        assert!(!set.contains(i32::MAX));
+        assert!(!set.contains(i32::MIN));
+
+        // The default (no `.air` in view) set reports every action absent.
+        let empty = AnimSet::default();
+        assert!(!empty.contains(0));
+        assert!(!empty.contains(44));
+        assert!(!empty.contains(i32::MIN));
+    }
+
+    #[test]
+    fn animset_is_copy_and_shares_the_map() {
+        // AnimSet must stay `Copy` (it rides inside the `Copy` EvalEnv/EvalCtx).
+        // A bitwise copy observes the same backing map — no clone, no alloc.
+        let actions = anim_actions(&[5]);
+        let set = AnimSet::new(&actions);
+        let copy = set; // Copy, not move: `set` stays usable below.
+        assert!(set.contains(5));
+        assert!(copy.contains(5));
+        assert!(!copy.contains(6));
+    }
+
+    #[test]
+    fn selfanimexist_empty_air_table_is_zero() {
+        // A loaded-but-empty `.air` (`actions` map present yet empty) is distinct
+        // from the `None` default; both must report every action absent.
+        let empty: HashMap<i32, AnimAction> = HashMap::new();
+        let ch = Character::new();
+        assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &empty), Value::Int(0));
+        assert_eq!(ev_with_anim("SelfAnimExist(200)", &ch, &empty), Value::Int(0));
+    }
+
+    #[test]
+    fn selfanimexist_handles_negative_and_boundary_actions() {
+        // MUGEN action numbers can be negative; SelfAnimExist must resolve them
+        // exactly and never panic on the i32 extremes.
+        let actions = anim_actions(&[-1, 0, i32::MAX, i32::MIN]);
+        let ch = Character::new();
+        assert_eq!(ev_with_anim("SelfAnimExist(-1)", &ch, &actions), Value::Int(1));
+        assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &actions), Value::Int(1));
+        // Absent negative number → 0.
+        assert_eq!(ev_with_anim("SelfAnimExist(-2)", &ch, &actions), Value::Int(0));
+
+        // i32 boundaries through the direct trigger path (literal parsing of the
+        // extremes is brittle, so drive them as explicit Value args).
+        let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(i32::MAX)]), Value::Int(1));
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(i32::MIN)]), Value::Int(1));
+    }
+
+    #[test]
+    fn selfanimexist_float_arg_truncates_toward_zero() {
+        // The VM coerces a float arg via `to_int` (truncation toward zero). A
+        // fractional action number must look up the truncated integer, not round.
+        let actions = anim_actions(&[44]);
+        let ch = Character::new();
+        let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
+        // 44.9 → 44 (present); 45.9 → 45 (absent). Truncation, not rounding.
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(44.9)]), Value::Int(1));
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(45.9)]), Value::Int(0));
+        // Negative fractional truncates toward zero too: -0.9 → 0 (absent here).
+        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(-0.9)]), Value::Int(0));
+    }
+
+    #[test]
+    fn selfanimexist_extra_args_use_only_the_first() {
+        // MUGEN's SelfAnimExist takes one argument; a stray second arg must be
+        // ignored (the first decides the result) and never panic.
+        let actions = anim_actions(&[44]);
+        let ch = Character::new();
+        let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Int(44), Value::Int(99)]),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Int(99), Value::Int(44)]),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn selfanimexist_in_boolean_compounds_through_eval() {
+        // The common1 fallback idiom embeds SelfAnimExist in boolean logic
+        // (`trigger1 = SelfAnimExist(anim + 3)`), so it must compose with &&/||/!
+        // and comparisons through the real eval path, not just stand alone.
+        let actions = anim_actions(&[41, 44]);
+        let mut ch = Character::new();
+        ch.anim = 41; // anim + 3 == 44 (present)
+        // Present → the AND with a true self-read holds.
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(anim + 3) && Anim = 41", &ch, &actions),
+            Value::Int(1)
+        );
+        // Negation of a present action is false.
+        assert_eq!(
+            ev_with_anim("!SelfAnimExist(44)", &ch, &actions),
+            Value::Int(0)
+        );
+        // OR short-circuits to the present branch even when the first is absent.
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(999) || SelfAnimExist(44)", &ch, &actions),
+            Value::Int(1)
+        );
+        // SelfAnimExist used as an integer (compared to 1/0) also resolves.
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(44) = 1", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(999) = 0", &ch, &actions),
             Value::Int(1)
         );
     }
