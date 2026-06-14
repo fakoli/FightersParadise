@@ -9,4 +9,5 @@ license.workspace = true
 fp-core.workspace = true
 fp-formats.workspace = true
 fp-vm.workspace = true
+fp-combat.workspace = true
 tracing.workspace = true

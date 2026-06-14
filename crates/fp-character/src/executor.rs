@@ -42,14 +42,34 @@
 //! `CtrlSet`, and `Null`. Added in task 5.4: `ChangeAnim` (and the
 //! `ChangeAnim2` alias), `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`,
 //! `StateTypeSet`, `Turn`, and a `PlaySnd` stub (parsed and logged; real audio
-//! is Phase 8). Any other controller type is a safe no-op (debug-logged) and is
-//! deferred to a later task. The dispatch never panics; a malformed parameter
-//! resolves to its safe default.
+//! is Phase 8). Task 6.2 adds the `HitDef` controller (builds a
+//! [`fp_combat::HitDef`] into [`Character::active_hitdef`]). Any other controller
+//! type is a safe no-op (debug-logged) and is deferred to a later task. The
+//! dispatch never panics; a malformed parameter resolves to its safe default.
+//!
+//! ## Get-hit state readiness (task 6.2, part C)
+//!
+//! The common get-hit states (`5000`–`5xxx` from `common1.cns`) are *runnable*
+//! by this executor today: every standard trigger they read resolves, and
+//! `GetHitVar(<member>)` now resolves against [`Character::get_hit_vars`] (it
+//! previously deferred to a hard `0`). Their `ChangeState` / `ChangeAnim` /
+//! `VelSet` / `PosSet` / `VarSet` controllers are all handled by the dispatch.
+//!
+//! Two **documented gaps** remain — neither silently mis-runs:
+//!
+//! 1. The get-hit-specific controllers (`HitVelSet`, `HitFallSet`, `HitFallVel`,
+//!    `HitFallDamage`, `HitAdd`, `SelfState`, `LifeAdd`, …) are not yet
+//!    implemented; the dispatch routes them to its safe, **debug-logged** no-op
+//!    branch (visible, not silent) and they are deferred to task 6.3+.
+//! 2. [`Character::get_hit_vars`] stays at its default until hit *resolution*
+//!    (task 6.3) populates it, so a get-hit state run *before* 6.3 sees zeroed
+//!    hit effects. This is expected: 6.2 only wires the read path.
 //!
 //! [03 §3]: ../../../docs/knowledge-base/03-engine-architecture.md
 
 use std::collections::HashMap;
 
+use fp_core::Vec2;
 use fp_formats::air::AirFile;
 use fp_vm::{eval, EvalContext, Value};
 
@@ -336,7 +356,9 @@ impl Character {
     /// Handles the core MOVEMENT/CONTROL controllers: `ChangeState`, `VelSet`,
     /// `VelAdd`, `CtrlSet`, `Null` (task 5.3) plus `ChangeAnim`/`ChangeAnim2`,
     /// `PosSet`, `PosAdd`, `VarSet`, `VarAdd`, `VarRangeSet`, `StateTypeSet`,
-    /// `Turn`, and a `PlaySnd` stub (task 5.4). Every other type is a safe
+    /// `Turn`, and a `PlaySnd` stub (task 5.4). Task 6.2 adds the `HitDef`
+    /// controller, which builds a [`fp_combat::HitDef`] into
+    /// [`active_hitdef`](Character::active_hitdef). Every other type is a safe
     /// no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -377,6 +399,8 @@ impl Character {
             self.ctrl_turn();
         } else if kind.eq_ignore_ascii_case("PlaySnd") {
             self.ctrl_play_snd(ctrl);
+        } else if kind.eq_ignore_ascii_case("HitDef") {
+            self.ctrl_hit_def(ctrl);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -652,6 +676,190 @@ impl Character {
             "tick: PlaySnd {value:?} in state {} (audio is Phase 8; no-op)",
             ctrl.state_number
         );
+    }
+
+    /// `HitDef`: build a [`fp_combat::HitDef`] from the controller's parameters
+    /// and store it as this character's [`active_hitdef`](Character::active_hitdef).
+    ///
+    /// MUGEN's `HitDef` carries two *kinds* of parameter:
+    ///
+    /// - **String / enum** params (`attr`, `hitflag`, `guardflag`, `ground.type`,
+    ///   `air.type`, and the spark / sound ids which may carry an `S` prefix) are
+    ///   read from the controller's **raw parameter source** ([`CompiledExpr::source`])
+    ///   and parsed with [`fp_combat::AttackAttr::parse`] /
+    ///   [`fp_combat::HitFlags::parse`] / a small local type parser. Compiling
+    ///   these as numeric expressions would be wrong (`S, NA` is not arithmetic).
+    /// - **Numeric** params (`damage`, `ground.velocity`, `air.velocity`,
+    ///   `guard.velocity`, `pausetime`, `p1stateno`, `p2stateno`, the hit-times,
+    ///   `fall`, `priority`, `id`, `chainid`, `fall.yvelocity`) are obtained by
+    ///   **evaluating** the compiled parameter expression(s) against `self` (the
+    ///   attacker), so authored expressions like `damage = ceil(var(1)*1.5), 0`
+    ///   resolve correctly. Multi-component params (`x, y` or `hit, guard`) are
+    ///   split on commas and each component is compiled and evaluated on its own.
+    ///
+    /// Any unspecified parameter falls back to [`fp_combat::HitDef::default`]'s
+    /// MUGEN-faithful value. This never panics: a malformed string parses to its
+    /// documented safe default and a malformed expression evaluates to `0`.
+    fn ctrl_hit_def(&mut self, ctrl: &CompiledController) {
+        let mut hd = fp_combat::HitDef::default();
+
+        // ---- String / enum params (read from raw source) ------------------
+        if let Some(src) = raw_param(ctrl, "attr") {
+            hd.attr = fp_combat::AttackAttr::parse(src);
+        }
+        if let Some(src) = raw_param(ctrl, "hitflag") {
+            hd.hitflag = fp_combat::HitFlags::parse(src);
+        }
+        if let Some(src) = raw_param(ctrl, "guardflag") {
+            hd.guardflag = fp_combat::HitFlags::parse(src);
+        }
+        if let Some(src) = raw_param(ctrl, "ground.type") {
+            hd.ground_type = parse_hit_type(src);
+        }
+
+        // Spark / sound ids. These may carry a leading `S` (use the character's
+        // own AIR/SND set rather than the common set). The `S` prefix is not
+        // modelled in `fp_combat::HitResources` yet, so we strip it and keep the
+        // numeric id; an absent / non-numeric id keeps the default (`-1`).
+        if let Some(src) = raw_param(ctrl, "sparkno") {
+            hd.resources.sparkno = parse_resource_id(src, hd.resources.sparkno);
+        }
+        if let Some(src) = raw_param(ctrl, "hitsound") {
+            hd.resources.hitsound = parse_resource_id(src, hd.resources.hitsound);
+        }
+        if let Some(src) = raw_param(ctrl, "guardsound") {
+            hd.resources.guardsound = parse_resource_id(src, hd.resources.guardsound);
+        }
+
+        // ---- Numeric params (evaluated against self / the attacker) --------
+        // `damage = hit [, guard]`. A missing guard component mirrors the hit
+        // value in MUGEN; we keep it simple and leave guard at its default (0)
+        // when absent, matching `HitDef::default()`.
+        if let Some(expr) = ctrl.params.get("damage") {
+            let comps = self.eval_components(expr);
+            if let Some(hit) = comps.first() {
+                hd.damage.hit = hit.to_int();
+            }
+            if let Some(guard) = comps.get(1) {
+                hd.damage.guard = guard.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("ground.velocity") {
+            let comps = self.eval_components(expr);
+            hd.ground_velocity = pair_to_vec2(&comps, hd.ground_velocity);
+        }
+        if let Some(expr) = ctrl.params.get("air.velocity") {
+            let comps = self.eval_components(expr);
+            hd.air_velocity = pair_to_vec2(&comps, hd.air_velocity);
+        }
+        if let Some(expr) = ctrl.params.get("guard.velocity") {
+            // Single X pushback (Y unused).
+            if let Some(x) = self.eval_components(expr).first() {
+                hd.guard_velocity = x.to_float();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("pausetime") {
+            let comps = self.eval_components(expr);
+            if let Some(p1) = comps.first() {
+                hd.pausetime.p1 = p1.to_int();
+            }
+            if let Some(p2) = comps.get(1) {
+                hd.pausetime.p2 = p2.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("ground.hittime") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.hittimes.ground = v.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("air.hittime") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.hittimes.air = v.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("guard.hittime") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.hittimes.guard = v.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("p1stateno") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.p1stateno = Some(v.to_int());
+            }
+        }
+        if let Some(expr) = ctrl.params.get("p2stateno") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.p2stateno = Some(v.to_int());
+            }
+        }
+        if let Some(expr) = ctrl.params.get("fall") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.fall = v.as_bool();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("fall.yvelocity") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.fall_yvelocity = v.to_float();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("priority") {
+            // `priority = value [, type]`. The numeric value is evaluated; the
+            // optional type token is a string/enum read from the raw source.
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.priority.value = v.to_int();
+            }
+            if let Some(src) = raw_param(ctrl, "priority") {
+                if let Some(kind) = parse_priority_type(src) {
+                    hd.priority.kind = kind;
+                }
+            }
+        }
+        if let Some(expr) = ctrl.params.get("id") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.id = v.to_int();
+            }
+        }
+        if let Some(expr) = ctrl.params.get("chainid") {
+            if let Some(v) = self.eval_components(expr).first() {
+                hd.chainid = v.to_int();
+            }
+        }
+
+        tracing::debug!(
+            "tick: HitDef in state {} -> attr {:?}, damage {:?}",
+            ctrl.state_number,
+            hd.attr,
+            hd.damage
+        );
+        self.active_hitdef = Some(hd);
+    }
+
+    /// Evaluates a possibly multi-component numeric parameter into its component
+    /// [`Value`]s, in order.
+    ///
+    /// MUGEN parameters like `ground.velocity = x, y` are authored as a
+    /// comma-separated list where each component is its own expression. The
+    /// compiled parameter retains the verbatim source ([`CompiledExpr::source`]);
+    /// this splits that source on commas, compiles each component on its own, and
+    /// evaluates it against `self`. A single-component parameter yields a
+    /// one-element vector; an empty / whitespace component evaluates to `0`.
+    ///
+    /// Compiling per-component (rather than reusing the parameter's own compiled
+    /// expression) is necessary because the parameter expression compiler only
+    /// captures the first comma-separated value; the remaining components live in
+    /// the raw source. Never panics.
+    fn eval_components(&self, expr: &CompiledExpr) -> Vec<Value> {
+        expr.source
+            .split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    return Value::DEFAULT;
+                }
+                let compiled = CompiledExpr::compile(trimmed);
+                eval(&compiled.expr, self as &dyn EvalContext)
+            })
+            .collect()
     }
 
     // ---- Variable-bank helpers --------------------------------------------
@@ -945,6 +1153,87 @@ fn parse_var_bank_key(key: &str) -> Option<(VarBank, i32)> {
     let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
     let index = inner.parse::<i32>().ok()?;
     Some((bank, index))
+}
+
+/// Returns the verbatim raw source of a controller parameter (case-insensitive
+/// key lookup), or `None` if the parameter is absent.
+///
+/// Used by the `HitDef` controller to read string / enum parameters (`attr`,
+/// `hitflag`, …) that must be parsed as text rather than evaluated as
+/// arithmetic. Parameter keys are stored lowercased by the loader, so the
+/// common case is a direct lookup; the fallback scan tolerates any stray
+/// mixed-case key without panicking.
+fn raw_param<'a>(ctrl: &'a CompiledController, key: &str) -> Option<&'a str> {
+    if let Some(expr) = ctrl.params.get(key) {
+        return Some(expr.source.as_str());
+    }
+    ctrl.params
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.source.as_str())
+}
+
+/// Parses a MUGEN `ground.type` / `air.type` token (`High`/`Low`/`Trip`/`None`,
+/// case-insensitive) into a [`fp_combat::HitType`], defaulting to
+/// [`fp_combat::HitType::High`] (MUGEN's default) on an unrecognized token.
+fn parse_hit_type(raw: &str) -> fp_combat::HitType {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("High") {
+        fp_combat::HitType::High
+    } else if t.eq_ignore_ascii_case("Low") {
+        fp_combat::HitType::Low
+    } else if t.eq_ignore_ascii_case("Trip") {
+        fp_combat::HitType::Trip
+    } else if t.eq_ignore_ascii_case("None") {
+        fp_combat::HitType::None
+    } else {
+        tracing::debug!("HitDef: unrecognized hit type {raw:?}; defaulting to High");
+        fp_combat::HitType::High
+    }
+}
+
+/// Parses the optional `priority` *type* token (`Hit`/`Miss`/`Dodge`,
+/// case-insensitive), which follows the numeric priority value. Returns `None`
+/// when no type token is present (the caller keeps the default), and warns to
+/// `debug` on an unrecognized token (also `None`).
+fn parse_priority_type(raw: &str) -> Option<fp_combat::PriorityType> {
+    // `priority = value, type`: the type is the second comma-separated token.
+    let token = raw.split(',').nth(1)?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if token.eq_ignore_ascii_case("Hit") {
+        Some(fp_combat::PriorityType::Hit)
+    } else if token.eq_ignore_ascii_case("Miss") {
+        Some(fp_combat::PriorityType::Miss)
+    } else if token.eq_ignore_ascii_case("Dodge") {
+        Some(fp_combat::PriorityType::Dodge)
+    } else {
+        tracing::debug!("HitDef: unrecognized priority type {token:?}; keeping default");
+        None
+    }
+}
+
+/// Parses a spark / sound resource id from its raw source, tolerating a leading
+/// `S` prefix (MUGEN's "use my own AIR/SND set" marker, not yet modelled). The
+/// numeric id is taken from the first comma-separated component; an absent or
+/// non-numeric id keeps `fallback` (the field's current default).
+fn parse_resource_id(raw: &str, fallback: i32) -> i32 {
+    let first = raw.split(',').next().unwrap_or("").trim();
+    // Strip an optional leading `S` / `s` prefix.
+    let digits = first
+        .strip_prefix(['S', 's'])
+        .map(str::trim)
+        .unwrap_or(first);
+    digits.parse::<i32>().unwrap_or(fallback)
+}
+
+/// Maps the first two evaluated components to a [`Vec2`], falling back to the
+/// corresponding component of `default` when a component is missing.
+fn pair_to_vec2(comps: &[Value], default: Vec2<f32>) -> Vec2<f32> {
+    let x = comps.first().map_or(default.x, |v| v.to_float());
+    let y = comps.get(1).map_or(default.y, |v| v.to_float());
+    Vec2::new(x, y)
 }
 
 /// Parses a `velset` value (`"x, y"`) into `(x, y)`. A missing or non-numeric
@@ -3407,5 +3696,595 @@ mod tests {
         assert_eq!(report.controllers_fired, 1, "PlaySnd dispatched");
         assert_eq!(ch.life, 1000, "PlaySnd stub mutates nothing");
         assert_eq!(ch.vars, before_vars);
+    }
+
+    // ---- Task 6.2: HitDef controller ---------------------------------------
+
+    /// A synthetic `HitDef` controller builds the expected `active_hitdef`: a
+    /// **string** param (`attr`) is parsed from the raw source, and a **numeric**
+    /// param (`damage`) is evaluated against the attacker.
+    #[test]
+    fn hit_def_builds_active_hitdef_string_and_numeric() {
+        let hitdef = ctrl(
+            200,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[
+                ("attr", "S, NA"),
+                ("damage", "20, 5"),
+                ("hitflag", "MAF"),
+                ("guardflag", "MA"),
+                ("ground.type", "Low"),
+                ("ground.velocity", "-4, 0"),
+                ("air.velocity", "-3, -6"),
+                ("pausetime", "12, 12"),
+                ("p2stateno", "5050"),
+                ("fall", "1"),
+                ("priority", "5, Miss"),
+                ("sparkno", "S2"),
+                ("hitsound", "S5, 0"),
+            ],
+        );
+        let st = stand_n(200, vec![hitdef]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 200;
+        ch.physics = Physics::None;
+
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "HitDef dispatched");
+
+        let hd = ch.active_hitdef.expect("HitDef must populate active_hitdef");
+        // String param (attr) parsed from the raw source.
+        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("S, NA"));
+        assert_eq!(hd.attr.class, fp_combat::StateClass::Standing);
+        // Numeric param (damage) evaluated: hit=20, guard=5.
+        assert_eq!(hd.damage.hit, 20);
+        assert_eq!(hd.damage.guard, 5);
+        // Other string/enum params.
+        assert_eq!(hd.hitflag, fp_combat::HitFlags::parse("MAF"));
+        assert_eq!(hd.guardflag, fp_combat::HitFlags::parse("MA"));
+        assert_eq!(hd.ground_type, fp_combat::HitType::Low);
+        // Other numeric params.
+        assert!((hd.ground_velocity.x - (-4.0)).abs() < 1e-4);
+        assert!((hd.air_velocity.y - (-6.0)).abs() < 1e-4);
+        assert_eq!(hd.pausetime.p1, 12);
+        assert_eq!(hd.pausetime.p2, 12);
+        assert_eq!(hd.p2stateno, Some(5050));
+        assert!(hd.fall);
+        assert_eq!(hd.priority.value, 5);
+        assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss);
+        // `S`-prefixed resource ids: prefix stripped, numeric id kept.
+        assert_eq!(hd.resources.sparkno, 2);
+        assert_eq!(hd.resources.hitsound, 5);
+    }
+
+    /// Unspecified params fall back to `HitDef::default()`'s MUGEN sentinels.
+    #[test]
+    fn hit_def_unspecified_params_use_defaults() {
+        let hitdef = ctrl(
+            0,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", "C, HP")],
+        );
+        let st = stand_n(0, vec![hitdef]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        let _ = lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef populated");
+        let def = fp_combat::HitDef::default();
+        // Only attr was set; everything else equals the default.
+        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("C, HP"));
+        assert_eq!(hd.damage, def.damage);
+        assert_eq!(hd.hitflag, def.hitflag); // MAF sentinel
+        assert_eq!(hd.hittimes, def.hittimes); // ground=0, air=20, guard=0
+        assert_eq!(hd.priority, def.priority); // value 4, Hit
+        assert_eq!(hd.chainid, def.chainid); // -1 sentinel
+        assert_eq!(hd.p2stateno, None);
+    }
+
+    /// Numeric params are *evaluated*, not read literally: an expression that
+    /// references the attacker's state (`var(1)`) resolves against `self`.
+    #[test]
+    fn hit_def_numeric_params_are_evaluated_against_self() {
+        let hitdef = ctrl(
+            0,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            // damage = var(1) * 2, var(1); ground.hittime = var(1) + 5
+            &[
+                ("attr", "S, NA"),
+                ("damage", "var(1) * 2, var(1)"),
+                ("ground.hittime", "var(1) + 5"),
+            ],
+        );
+        let st = stand_n(0, vec![hitdef]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[1] = 30; // attacker state read by the expressions
+
+        let _ = lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef populated");
+        assert_eq!(hd.damage.hit, 60, "var(1)*2 evaluated against attacker");
+        assert_eq!(hd.damage.guard, 30, "var(1) evaluated against attacker");
+        assert_eq!(hd.hittimes.ground, 35, "var(1)+5 evaluated against attacker");
+    }
+
+    /// The full CNS authoring path: a `HitDef` block parsed by the real CNS
+    /// parser then compiled and dispatched produces the expected active_hitdef.
+    #[test]
+    fn hit_def_from_real_cns_text() {
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\ntype = S\nphysics = N\n\
+             [State 200, hit]\ntype = HitDef\ntrigger1 = 1\n\
+             attr = S, NA\ndamage = 23, 5\nground.type = Low\n\
+             animtype = Light\nguardflag = MA\nhitflag = MAF\n\
+             pausetime = 12, 12\nsparkno = 0\np2stateno = 5001\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 200;
+        ch.physics = Physics::None;
+
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1);
+        let hd = ch.active_hitdef.expect("active_hitdef from CNS HitDef");
+        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("S, NA"));
+        assert_eq!(hd.damage.hit, 23);
+        assert_eq!(hd.damage.guard, 5);
+        assert_eq!(hd.ground_type, fp_combat::HitType::Low);
+        assert_eq!(hd.p2stateno, Some(5001));
+    }
+
+    /// The HitDef controller never panics on malformed params: a bad attr falls
+    /// back to the default, a non-numeric damage evaluates to 0, and the
+    /// controller still populates `active_hitdef`.
+    #[test]
+    fn hit_def_malformed_params_never_panic() {
+        let hitdef = ctrl(
+            0,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[
+                ("attr", "totally bogus"),
+                ("damage", ","), // empty components -> 0, 0
+                ("priority", "not a number, Frobnicate"),
+            ],
+        );
+        let st = stand_n(0, vec![hitdef]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        let _ = lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef populated even on bad input");
+        assert_eq!(hd.attr, fp_combat::AttackAttr::default(), "bad attr -> default");
+        assert_eq!(hd.damage.hit, 0, "empty damage component -> 0");
+        // Unrecognized priority type keeps the default kind.
+        assert_eq!(hd.priority.kind, fp_combat::PriorityType::Hit);
+    }
+
+    // ---- AC4: gated real-KFM HitDef test (skips when test-assets absent) ----
+
+    /// Ticks real KFM into a state that contains a `HitDef` controller and
+    /// asserts `active_hitdef` becomes `Some` with a parsed `attr`. KFM's
+    /// standing light punch is state 200, whose first controller is a HitDef.
+    /// Skips cleanly when test-assets/ is absent.
+    #[test]
+    fn real_kfm_hit_def_populates_active_hitdef() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        // Find a state that actually contains a HitDef controller (KFM's
+        // attack states 200/210/... do). Skip gracefully if none is found.
+        let Some((&state_no, _)) = lc.states.iter().find(|(_, s)| {
+            s.controllers.iter().any(|c| {
+                c.controller_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("HitDef"))
+            })
+        }) else {
+            eprintln!("skipping: no HitDef-bearing state found in KFM");
+            return;
+        };
+
+        let mut ch = Character::with_constants(lc.constants);
+        ch.state_no = state_no;
+        ch.anim = state_no;
+        // Tick until the HitDef fires (its triggers may gate on AnimElem); cap
+        // the number of ticks so a non-firing trigger can't hang the test.
+        let mut fired = false;
+        for _ in 0..120 {
+            let _ = ch.tick(&lc);
+            if ch.active_hitdef.is_some() {
+                fired = true;
+                break;
+            }
+        }
+        if !fired {
+            eprintln!(
+                "skipping assertion: HitDef in state {state_no} did not fire within 120 ticks"
+            );
+            return;
+        }
+        let hd = ch
+            .active_hitdef
+            .expect("active_hitdef is Some after HitDef fired");
+        // A parsed attr is present (KFM attacks are standing/crouch/air normals).
+        assert!(matches!(
+            hd.attr.class,
+            fp_combat::StateClass::Standing
+                | fp_combat::StateClass::Crouching
+                | fp_combat::StateClass::Air
+        ));
+    }
+
+    // =====================================================================
+    // Proctor (task 6.2): additional HitDef-controller, GetHitVar, and
+    // get-hit-state-readiness coverage layered on top of Forge's tests.
+    // Each block is annotated with the acceptance criterion it exercises.
+    // All synthetic except the gated real-KFM tests above.
+    // =====================================================================
+
+    /// Convenience: builds a `HitDef` controller (trigger1 = 1, no triggerall,
+    /// default persistent) carrying the given params, dispatches it in state 0,
+    /// and returns the resulting `active_hitdef` (panics in test only if the
+    /// controller failed to populate it).
+    fn build_hitdef(params: &[(&str, &str)]) -> fp_combat::HitDef {
+        let hitdef = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, params);
+        let lc = loaded(vec![stand_n(0, vec![hitdef])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "HitDef must dispatch");
+        ch.active_hitdef.expect("HitDef must populate active_hitdef")
+    }
+
+    // ---- AC1: every numeric param is evaluated and mapped --------------------
+
+    #[test]
+    fn hit_def_all_numeric_params_mapped() {
+        // Cover the numeric params not exercised by Forge's happy-path test:
+        // p1stateno, guard.velocity, guard.hittime, air.hittime, fall.yvelocity,
+        // id, chainid, and the priority value-only form.
+        let hd = build_hitdef(&[
+            ("attr", "S, NA"),
+            ("p1stateno", "1100"),
+            ("p2stateno", "5000"),
+            ("guard.velocity", "-6"),
+            ("ground.hittime", "11"),
+            ("air.hittime", "22"),
+            ("guard.hittime", "9"),
+            ("fall.yvelocity", "-4.5"),
+            ("id", "7"),
+            ("chainid", "3"),
+            ("priority", "6"), // value only, no type token
+        ]);
+        assert_eq!(hd.p1stateno, Some(1100));
+        assert_eq!(hd.p2stateno, Some(5000));
+        assert!((hd.guard_velocity - (-6.0)).abs() < 1e-4);
+        assert_eq!(hd.hittimes.ground, 11);
+        assert_eq!(hd.hittimes.air, 22);
+        assert_eq!(hd.hittimes.guard, 9);
+        assert!((hd.fall_yvelocity - (-4.5)).abs() < 1e-4);
+        assert_eq!(hd.id, 7);
+        assert_eq!(hd.chainid, 3);
+        assert_eq!(hd.priority.value, 6);
+        // No type token after the value → the default kind (Hit) is preserved.
+        assert_eq!(hd.priority.kind, fp_combat::PriorityType::Hit);
+    }
+
+    // ---- AC1: velocity single-component fallback keeps the default axis -------
+
+    #[test]
+    fn hit_def_velocity_single_component_keeps_default_y() {
+        // `ground.velocity = -4` (x only) must leave y at the default's y (0.0)
+        // via pair_to_vec2's per-axis fallback, not zero it spuriously or panic.
+        let hd = build_hitdef(&[("attr", "S, NA"), ("ground.velocity", "-4")]);
+        assert!((hd.ground_velocity.x - (-4.0)).abs() < 1e-4);
+        assert!(
+            (hd.ground_velocity.y - fp_combat::HitDef::default().ground_velocity.y).abs() < 1e-4,
+            "missing y component falls back to the default y"
+        );
+    }
+
+    // ---- AC1: guardflag empty = unblockable ----------------------------------
+
+    #[test]
+    fn hit_def_empty_guardflag_is_unblockable() {
+        // An explicitly-empty guardflag must parse to the empty (unblockable) set,
+        // overriding HitDef::default()'s (also-empty) guardflag — and crucially it
+        // must NOT inherit the hitflag's MAF default.
+        let hd = build_hitdef(&[("attr", "S, NA"), ("guardflag", "")]);
+        assert!(hd.guardflag.is_empty(), "empty guardflag = unblockable");
+    }
+
+    // ---- AC1: fall = 0 yields false ------------------------------------------
+
+    #[test]
+    fn hit_def_fall_zero_is_false() {
+        let hd = build_hitdef(&[("attr", "S, NA"), ("fall", "0")]);
+        assert!(!hd.fall, "fall = 0 must be false");
+        // And an expression that evaluates to nonzero is true.
+        let hd2 = build_hitdef(&[("attr", "S, NA"), ("fall", "2 - 1")]);
+        assert!(hd2.fall, "fall = (2-1) evaluates truthy");
+    }
+
+    // ---- AC1: MUGEN single-active-HitDef — a later HitDef overwrites ----------
+
+    #[test]
+    fn hit_def_later_controller_overwrites_earlier() {
+        // Two HitDef controllers fire in one tick; MUGEN keeps a single active
+        // HitDef, so the SECOND one must win (overwrite the first).
+        let first = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "S, NA"), ("damage", "10, 0")]);
+        let second = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "C, HP"), ("damage", "99, 1")]);
+        let lc = loaded(vec![stand_n(0, vec![first, second])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 2, "both HitDefs dispatch");
+        let hd = ch.active_hitdef.expect("active_hitdef populated");
+        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("C, HP"), "second HitDef wins");
+        assert_eq!(hd.damage.hit, 99, "second HitDef's damage wins");
+    }
+
+    // ---- AC1: a gated HitDef that does not qualify leaves active_hitdef None --
+
+    #[test]
+    fn hit_def_not_firing_leaves_active_hitdef_none() {
+        // The HitDef's only trigger group is false → it never dispatches, so
+        // active_hitdef stays at its initial None (no spurious population).
+        let hitdef = ctrl(0, "HitDef", &[], &[(1, &["0"])], None, &[("attr", "S, NA")]);
+        let lc = loaded(vec![stand_n(0, vec![hitdef])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 0, "gated-off HitDef does not fire");
+        assert!(ch.active_hitdef.is_none(), "no fire → active_hitdef stays None");
+    }
+
+    // ---- AC1: a HitDef with NO params still builds a default-valued HitDef ----
+
+    #[test]
+    fn hit_def_no_params_is_full_default() {
+        // A bare `type = HitDef` (no params at all) must still populate
+        // active_hitdef with exactly HitDef::default() — the MUGEN sentinels.
+        let hd = build_hitdef(&[]);
+        assert_eq!(hd, fp_combat::HitDef::default());
+        // Spot-check the two non-zero sentinels survive.
+        assert_eq!(hd.hitflag, fp_combat::HitFlags::parse("MAF"));
+        assert_eq!(hd.chainid, -1);
+        assert_eq!(hd.hittimes.air, 20);
+    }
+
+    // ---- AC1: raw_param tolerates a mixed-case key (case-insensitive lookup) --
+
+    #[test]
+    fn raw_param_is_case_insensitive_fallback() {
+        // The loader lowercases keys, but raw_param's scan fallback must still
+        // find a stray mixed-case key without panicking. Build the controller's
+        // params map directly with a non-lowercased key.
+        let c = CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("HitDef".to_string()),
+            triggerall: vec![],
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [
+                ("AtTr".to_string(), CompiledExpr::compile("C, HP")),
+                ("Ground.Type".to_string(), CompiledExpr::compile("Low")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let _ = lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef populated");
+        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("C, HP"), "mixed-case attr key found");
+        assert_eq!(hd.ground_type, fp_combat::HitType::Low, "mixed-case ground.type key found");
+    }
+
+    // ---- helper-fn unit coverage: parse_resource_id --------------------------
+
+    #[test]
+    fn parse_resource_id_handles_prefix_and_garbage() {
+        // Plain numeric id.
+        assert_eq!(parse_resource_id("3", -1), 3);
+        // Upper- and lower-case `S` prefix stripped.
+        assert_eq!(parse_resource_id("S2", -1), 2);
+        assert_eq!(parse_resource_id("s7", -1), 7);
+        // Only the first comma-separated component is read.
+        assert_eq!(parse_resource_id("S5, 0", -1), 5);
+        // Non-numeric → fallback preserved (the field's current default).
+        assert_eq!(parse_resource_id("nope", -1), -1);
+        assert_eq!(parse_resource_id("", 42), 42);
+        // A bare `S` with no digits → fallback.
+        assert_eq!(parse_resource_id("S", -1), -1);
+    }
+
+    // ---- helper-fn unit coverage: parse_hit_type -----------------------------
+
+    #[test]
+    fn parse_hit_type_all_tokens_and_default() {
+        assert_eq!(parse_hit_type("High"), fp_combat::HitType::High);
+        assert_eq!(parse_hit_type("low"), fp_combat::HitType::Low);
+        assert_eq!(parse_hit_type("  Trip "), fp_combat::HitType::Trip);
+        assert_eq!(parse_hit_type("None"), fp_combat::HitType::None);
+        // Unrecognized → MUGEN's High default.
+        assert_eq!(parse_hit_type("sideways"), fp_combat::HitType::High);
+    }
+
+    // ---- helper-fn unit coverage: parse_priority_type ------------------------
+
+    #[test]
+    fn parse_priority_type_reads_second_token() {
+        // The type is the SECOND comma-separated token of the priority value.
+        assert_eq!(parse_priority_type("5, Hit"), Some(fp_combat::PriorityType::Hit));
+        assert_eq!(parse_priority_type("5, Miss"), Some(fp_combat::PriorityType::Miss));
+        assert_eq!(parse_priority_type("5, dodge"), Some(fp_combat::PriorityType::Dodge));
+        // No second token → None (keep the default kind).
+        assert_eq!(parse_priority_type("5"), None);
+        // Empty second token → None.
+        assert_eq!(parse_priority_type("5, "), None);
+        // Unrecognized second token → None.
+        assert_eq!(parse_priority_type("5, Frobnicate"), None);
+    }
+
+    // ---- helper-fn unit coverage: pair_to_vec2 -------------------------------
+
+    #[test]
+    fn pair_to_vec2_uses_default_per_missing_axis() {
+        let dflt = Vec2::new(1.0, 2.0);
+        // Both present → both used.
+        assert_eq!(pair_to_vec2(&[Value::Float(3.0), Value::Float(4.0)], dflt), Vec2::new(3.0, 4.0));
+        // Only x present → y falls back to default.y.
+        assert_eq!(pair_to_vec2(&[Value::Float(3.0)], dflt), Vec2::new(3.0, 2.0));
+        // Empty → both default.
+        assert_eq!(pair_to_vec2(&[], dflt), dflt);
+    }
+
+    // ---- AC1: eval_components splits and evaluates each component -------------
+
+    #[test]
+    fn eval_components_splits_and_evaluates_against_self() {
+        // eval_components is the multi-component numeric parameter splitter. It
+        // splits the raw source on commas and evaluates each part against self.
+        let mut ch = Character::new();
+        ch.vars[2] = 8;
+        // `var(2) * 2, var(2), ` → [16, 8, 0] (trailing empty component → 0).
+        let comps = ch.eval_components(&CompiledExpr::compile("var(2) * 2, var(2), "));
+        assert_eq!(comps.len(), 3);
+        assert_eq!(comps[0].to_int(), 16);
+        assert_eq!(comps[1].to_int(), 8);
+        assert_eq!(comps[2].to_int(), 0, "empty trailing component → 0");
+        // A single component yields a one-element vec.
+        let one = ch.eval_components(&CompiledExpr::compile("42"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].to_int(), 42);
+    }
+
+    // ---- AC3: get-hit-state readiness — a synthetic 5000-range state runs -----
+
+    #[test]
+    fn get_hit_state_reads_gethitvar_and_dispatches() {
+        // Part C readiness: a get-hit state (5000-range) that gates a ChangeState
+        // on a GetHitVar member must (a) resolve the GetHitVar read against the
+        // character's get_hit_vars, and (b) dispatch the ChangeState — proving the
+        // common get-hit states are runnable through the executor today.
+        //
+        // State 5000: ChangeState to 5001 when GetHitVar(fall) != 0.
+        let go = ctrl(
+            5000,
+            "ChangeState",
+            &[],
+            &[(1, &["GetHitVar(fall) != 0"])],
+            None,
+            &[("value", "5001")],
+        );
+        let lc = loaded(
+            vec![stand_n(5000, vec![go]), stand_n(5001, vec![])],
+            tiny_air(0, &[5]),
+        );
+
+        // With a default get_hit_vars (fall = 0), the trigger is false → no move.
+        let mut idle = Character::new();
+        idle.state_no = 5000;
+        idle.physics = Physics::None;
+        assert_eq!(lc.tick(&mut idle).transitions, 0, "fall=0 → stays put");
+        assert_eq!(idle.state_no, 5000);
+
+        // Populate get_hit_vars as hit resolution (task 6.3) eventually will; the
+        // get-hit state now reads it and transitions.
+        let mut hit = Character::new();
+        hit.state_no = 5000;
+        hit.physics = Physics::None;
+        hit.get_hit_vars = crate::GetHitVars { fall: 1, ..crate::GetHitVars::default() };
+        assert_eq!(lc.tick(&mut hit).transitions, 1, "fall=1 → get-hit state advances");
+        assert_eq!(hit.state_no, 5001);
+    }
+
+    #[test]
+    fn get_hit_state_velset_from_gethitvar_velocity() {
+        // A get-hit state commonly applies the imparted knockback via
+        // `VelSet x = GetHitVar(xvel)`. Confirm the executor evaluates the
+        // GetHitVar redirection inside a controller parameter expression.
+        let vset = ctrl(
+            5000,
+            "VelSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "GetHitVar(xvel)"), ("y", "GetHitVar(yvel)")],
+        );
+        let lc = loaded(vec![stand_n(5000, vec![vset])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 5000;
+        ch.physics = Physics::None;
+        ch.get_hit_vars = crate::GetHitVars {
+            xvel: -5.5,
+            yvel: -3.0,
+            ..crate::GetHitVars::default()
+        };
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - (-5.5)).abs() < 1e-4, "VelSet x from GetHitVar(xvel)");
+        assert!((ch.vel.y - (-3.0)).abs() < 1e-4, "VelSet y from GetHitVar(yvel)");
+    }
+
+    // ---- AC1: HitDef does NOT require ctrl / works in any move type ----------
+
+    #[test]
+    fn hit_def_fires_regardless_of_move_type() {
+        // A HitDef is an offensive controller; it must build active_hitdef even if
+        // the attacker is mid-attack (move_type Attack) — gating is purely by the
+        // trigger, not by move_type. (Smoke test that nothing in dispatch gates on
+        // move_type.)
+        let hitdef = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "A, SP")]);
+        let lc = loaded(vec![stand_n(0, vec![hitdef])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.move_type = MoveType::Attack;
+        let _ = lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef populated mid-attack");
+        assert_eq!(hd.attr.class, fp_combat::StateClass::Air);
+        assert_eq!(hd.attr.power, fp_combat::AttackPower::Special);
+        assert_eq!(hd.attr.kind, fp_combat::AttackKind::Projectile);
     }
 }

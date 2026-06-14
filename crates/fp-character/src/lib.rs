@@ -522,6 +522,146 @@ impl CommandSource for ActiveCommands {
     }
 }
 
+/// The numeric hit-effect variables a **defender** reads about the last hit it
+/// took, exposed to triggers via MUGEN's `GetHitVar(<member>)` redirection.
+///
+/// In MUGEN, when a `HitDef` connects, the engine copies the resolved hit
+/// parameters onto the defender so its get-hit states (`5000`–`5xxx`) can read
+/// them back with `GetHitVar(xvel)`, `GetHitVar(yvel)`, `GetHitVar(fall)`, etc.
+/// Every field is numeric (MUGEN's `GetHitVar` only ever yields a number), so a
+/// plain `i32`/`f32` record models it exactly.
+///
+/// This struct is **pure data**: it never runs game logic. It defaults to all
+/// zeros (no hit taken yet); populating it from a connecting [`fp_combat::HitDef`]
+/// is the job of hit *resolution* (task 6.3). [`GetHitVars::member`] resolves a
+/// member name (case-insensitive) to the matching field, returning the safe
+/// default ([`Value::DEFAULT`]) for any unknown member. The character exposes
+/// this to triggers as `GetHitVar(<member>)`.
+///
+/// # Examples
+///
+/// ```
+/// use fp_character::GetHitVars;
+///
+/// let mut g = GetHitVars::default();
+/// assert_eq!(g.damage, 0); // nothing taken yet
+/// g.damage = 30;
+/// g.xvel = -4.0;
+/// assert_eq!(g.damage, 30);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GetHitVars {
+    /// `GetHitVar(xvel)` — X velocity imparted by the hit (pixels/tick).
+    pub xvel: f32,
+    /// `GetHitVar(yvel)` — Y velocity imparted by the hit (pixels/tick).
+    pub yvel: f32,
+    /// `GetHitVar(yaccel)` — Y acceleration applied while in hit-stun.
+    pub yaccel: f32,
+    /// `GetHitVar(type)` — ground hit-reaction type code (`0` = none).
+    pub hit_type: i32,
+    /// `GetHitVar(animtype)` — hit-reaction animation type code.
+    pub animtype: i32,
+    /// `GetHitVar(damage)` — damage dealt by the hit.
+    pub damage: i32,
+    /// `GetHitVar(hitcount)` — running hit count of the current combo.
+    pub hitcount: i32,
+    /// `GetHitVar(fall)` — non-zero if the hit knocked the defender into a fall.
+    pub fall: i32,
+    /// `GetHitVar(hitshaketime)` — remaining hit-shake (pause) ticks.
+    pub hitshaketime: i32,
+    /// `GetHitVar(hittime)` — remaining hit-stun ticks.
+    pub hittime: i32,
+    /// `GetHitVar(slidetime)` — remaining ground-slide ticks.
+    pub slidetime: i32,
+    /// `GetHitVar(ctrltime)` — remaining ticks before control returns.
+    pub ctrltime: i32,
+    /// `GetHitVar(isbound)` — non-zero while the defender is in a bound state.
+    pub isbound: i32,
+    /// `GetHitVar(guarded)` — non-zero if the hit was guarded (blocked).
+    pub guarded: i32,
+    /// `GetHitVar(chainid)` — the chain id of the hit (`-1` = none / any).
+    pub chainid: i32,
+}
+
+impl Default for GetHitVars {
+    /// All fields default to `0`, except [`chainid`](GetHitVars::chainid) which
+    /// defaults to MUGEN's `-1` ("no chain") sentinel. A freshly-defaulted
+    /// `GetHitVars` describes "no hit taken".
+    fn default() -> Self {
+        Self {
+            xvel: 0.0,
+            yvel: 0.0,
+            yaccel: 0.0,
+            hit_type: 0,
+            animtype: 0,
+            damage: 0,
+            hitcount: 0,
+            fall: 0,
+            hitshaketime: 0,
+            hittime: 0,
+            slidetime: 0,
+            ctrltime: 0,
+            isbound: 0,
+            guarded: 0,
+            chainid: -1,
+        }
+    }
+}
+
+impl GetHitVars {
+    /// Resolves a `GetHitVar` member name to its value as an [`fp_vm::Value`].
+    ///
+    /// `member` is matched **case-insensitively** against the MUGEN member names
+    /// (`xvel`, `yvel`, `yaccel`, `type`, `animtype`, `damage`, `hitcount`,
+    /// `fall`, `hitshaketime`, `hittime`, `slidetime`, `ctrltime`, `isbound`,
+    /// `guarded`, `chainid`). Float-typed members yield a [`Value::Float`];
+    /// integer-typed members yield a [`Value::Int`]. An **unknown** member
+    /// resolves to [`Value::DEFAULT`] (`0`) — never a panic — matching MUGEN's
+    /// tolerance of unmodeled redirections.
+    #[must_use]
+    pub fn member(&self, member: &str) -> Value {
+        let m = member.trim();
+        // Float-typed members.
+        if m.eq_ignore_ascii_case("xvel") {
+            Value::Float(self.xvel)
+        } else if m.eq_ignore_ascii_case("yvel") {
+            Value::Float(self.yvel)
+        } else if m.eq_ignore_ascii_case("yaccel") {
+            Value::Float(self.yaccel)
+        // Integer-typed members.
+        } else if m.eq_ignore_ascii_case("type") {
+            Value::Int(self.hit_type)
+        } else if m.eq_ignore_ascii_case("animtype") {
+            Value::Int(self.animtype)
+        } else if m.eq_ignore_ascii_case("damage") {
+            Value::Int(self.damage)
+        } else if m.eq_ignore_ascii_case("hitcount") {
+            Value::Int(self.hitcount)
+        } else if m.eq_ignore_ascii_case("fall") {
+            Value::Int(self.fall)
+        } else if m.eq_ignore_ascii_case("hitshaketime") {
+            Value::Int(self.hitshaketime)
+        } else if m.eq_ignore_ascii_case("hittime") {
+            Value::Int(self.hittime)
+        } else if m.eq_ignore_ascii_case("slidetime") {
+            Value::Int(self.slidetime)
+        } else if m.eq_ignore_ascii_case("ctrltime") {
+            Value::Int(self.ctrltime)
+        } else if m.eq_ignore_ascii_case("isbound") {
+            Value::Int(self.isbound)
+        } else if m.eq_ignore_ascii_case("guarded") {
+            Value::Int(self.guarded)
+        } else if m.eq_ignore_ascii_case("chainid") {
+            Value::Int(self.chainid)
+        } else {
+            // Unknown member: safe default (0), debug-logged (not warn — many
+            // GetHitVar members are unmodeled and that is not an error).
+            tracing::debug!("GetHitVar: unknown member {member:?} -> 0");
+            Value::DEFAULT
+        }
+    }
+}
+
 /// A live MUGEN character entity: the runtime state the engine mutates each tick
 /// and that trigger expressions read through [`EvalContext`].
 ///
@@ -629,6 +769,25 @@ pub struct Character {
     /// is part of the public struct only because the entity is struct-based (no
     /// hidden state), but callers other than the executor should not touch it.
     pub fire_counts: std::collections::HashMap<(i32, usize), i32>,
+
+    // ---- Combat (Phase 6) -------------------------------------------------
+    /// The character's currently-active [`fp_combat::HitDef`], if any.
+    ///
+    /// The `HitDef` state controller (task 6.2) evaluates the character's
+    /// expressions and stores the resolved attack description here; hit
+    /// *resolution* (task 6.3) reads it to decide whether and how a contact
+    /// damages the defender. `None` means the character is not currently
+    /// offering a hit. MUGEN keeps a single active `HitDef` per player; a later
+    /// `HitDef` controller overwrites an earlier one in the same tick.
+    pub active_hitdef: Option<fp_combat::HitDef>,
+    /// The hit-effect variables describing the **last hit this character took**,
+    /// read by its get-hit states via `GetHitVar(<member>)`.
+    ///
+    /// Defaults to [`GetHitVars::default`] ("no hit taken"). Population from a
+    /// connecting attack's [`fp_combat::HitDef`] happens in hit resolution
+    /// (task 6.3); until then it stays at its default and every `GetHitVar`
+    /// member reads back its default.
+    pub get_hit_vars: GetHitVars,
 }
 
 impl Default for Character {
@@ -660,6 +819,8 @@ impl Default for Character {
             constants,
             commands: Box::new(NoCommands),
             fire_counts: std::collections::HashMap::new(),
+            active_hitdef: None,
+            get_hit_vars: GetHitVars::default(),
         }
     }
 }
@@ -855,6 +1016,21 @@ impl Character {
         tracing::debug!("const({member}): unmodeled member, defaulting to 0");
         Value::DEFAULT
     }
+
+    /// Resolves a MUGEN `GetHitVar(<member>)` read against this character's
+    /// [`get_hit_vars`](Character::get_hit_vars).
+    ///
+    /// `member` is the name written inside `GetHitVar(...)` (case-insensitive).
+    /// This delegates to [`GetHitVars::member`]: a known member returns its
+    /// field's value (float- or int-typed), an unknown member returns
+    /// [`Value::DEFAULT`] (`0`). Never panics.
+    ///
+    /// Populating the underlying [`GetHitVars`] is hit resolution's job
+    /// (task 6.3); until then every member reads back its default.
+    #[must_use]
+    fn get_hit_var(&self, member: &str) -> Value {
+        self.get_hit_vars.member(member)
+    }
 }
 
 impl EvalContext for Character {
@@ -1035,11 +1211,12 @@ impl EvalContext for Character {
             return self.resolve_const(key);
         }
 
-        // GetHitVar(member): real get-hit state is Phase 6. Until then every hit
-        // field reports its safe default (0). Recognize the trigger name so the
-        // intent is explicit, but still return the default for every member.
+        // GetHitVar(member): resolve the member against this character's
+        // get-hit variables (task 6.2). Population of those variables from a
+        // connecting hit is task 6.3; until then every field reads its default,
+        // but an unknown member still resolves to the safe default (0).
         if name.eq_ignore_ascii_case("GetHitVar") {
-            return Value::DEFAULT;
+            return self.get_hit_var(key);
         }
         Value::DEFAULT
     }
@@ -1228,11 +1405,208 @@ mod tests {
     }
 
     #[test]
-    fn gethitvar_returns_defaults_for_now() {
+    fn gethitvar_unknown_member_is_zero() {
         let ch = sample();
-        // Real get-hit state is Phase 6; every member reports 0 for now.
+        // Unknown / unmodeled members report 0 (the safe default).
         assert_eq!(ev("GetHitVar(xveladd) = 0", &ch), Value::Int(1));
         assert_eq!(ev("GetHitVar(fall.yvel) = 0", &ch), Value::Int(1));
+        // Resolved directly, too.
+        assert_eq!(ch.trigger_str("GetHitVar", "nosuchmember"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("GetHitVar", ""), Value::DEFAULT);
+    }
+
+    #[test]
+    fn gethitvar_resolves_populated_fields() {
+        // Populate the defender's get-hit variables and read them back through
+        // the trigger surface. (Population is normally task 6.3; here we set the
+        // fields directly to exercise the read path.)
+        let mut ch = sample();
+        ch.get_hit_vars = GetHitVars {
+            xvel: -4.0,
+            yvel: -7.5,
+            yaccel: 0.7,
+            hit_type: 1,
+            animtype: 2,
+            damage: 33,
+            hitcount: 3,
+            fall: 1,
+            hitshaketime: 6,
+            hittime: 14,
+            slidetime: 8,
+            ctrltime: 12,
+            isbound: 1,
+            guarded: 0,
+            chainid: 5,
+        };
+        // Integer members.
+        assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(33));
+        assert_eq!(ch.trigger_str("GetHitVar", "hittime"), Value::Int(14));
+        assert_eq!(ch.trigger_str("GetHitVar", "chainid"), Value::Int(5));
+        assert_eq!(ch.trigger_str("GetHitVar", "fall"), Value::Int(1));
+        assert_eq!(ch.trigger_str("GetHitVar", "type"), Value::Int(1));
+        // Float members.
+        assert_eq!(ch.trigger_str("GetHitVar", "xvel"), Value::Float(-4.0));
+        assert_eq!(ch.trigger_str("GetHitVar", "yvel"), Value::Float(-7.5));
+        // Case-insensitive member matching.
+        assert_eq!(ch.trigger_str("GetHitVar", "DAMAGE"), Value::Int(33));
+        assert_eq!(ch.trigger_str("getHitVar", "XVel"), Value::Float(-4.0));
+        // Whole-expression evaluation against a populated record.
+        assert_eq!(ev("GetHitVar(damage) = 33", &ch), Value::Int(1));
+        assert_eq!(ev("GetHitVar(xvel) < 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn gethitvars_default_is_no_hit() {
+        // Default record: all zero except chainid (-1 sentinel).
+        let g = GetHitVars::default();
+        assert_eq!(g.member("damage"), Value::Int(0));
+        assert_eq!(g.member("xvel"), Value::Float(0.0));
+        assert_eq!(g.member("chainid"), Value::Int(-1));
+        assert_eq!(g.member("unknown"), Value::DEFAULT);
+    }
+
+    // =====================================================================
+    // Proctor (task 6.2): exhaustive GetHitVars member coverage + edge cases.
+    // =====================================================================
+
+    /// A fully-populated `GetHitVars` with a distinct value per field, so a
+    /// member-routing bug (returning the wrong field) is caught. Float fields use
+    /// non-round values; int fields use distinct integers.
+    fn populated_get_hit_vars() -> GetHitVars {
+        GetHitVars {
+            xvel: -4.25,
+            yvel: -7.5,
+            yaccel: 0.55,
+            hit_type: 11,
+            animtype: 12,
+            damage: 13,
+            hitcount: 14,
+            fall: 15,
+            hitshaketime: 16,
+            hittime: 17,
+            slidetime: 18,
+            ctrltime: 19,
+            isbound: 20,
+            guarded: 21,
+            chainid: 22,
+        }
+    }
+
+    #[test]
+    fn gethitvar_every_member_routes_to_its_own_field() {
+        // AC2: each member name must resolve to its OWN field. A typo in the
+        // member()-dispatch (e.g. hittime/hitshaketime swapped) would surface here.
+        let g = populated_get_hit_vars();
+        // Float-typed members.
+        assert_eq!(g.member("xvel"), Value::Float(-4.25));
+        assert_eq!(g.member("yvel"), Value::Float(-7.5));
+        assert_eq!(g.member("yaccel"), Value::Float(0.55));
+        // Integer-typed members.
+        assert_eq!(g.member("type"), Value::Int(11));
+        assert_eq!(g.member("animtype"), Value::Int(12));
+        assert_eq!(g.member("damage"), Value::Int(13));
+        assert_eq!(g.member("hitcount"), Value::Int(14));
+        assert_eq!(g.member("fall"), Value::Int(15));
+        assert_eq!(g.member("hitshaketime"), Value::Int(16));
+        assert_eq!(g.member("hittime"), Value::Int(17));
+        assert_eq!(g.member("slidetime"), Value::Int(18));
+        assert_eq!(g.member("ctrltime"), Value::Int(19));
+        assert_eq!(g.member("isbound"), Value::Int(20));
+        assert_eq!(g.member("guarded"), Value::Int(21));
+        assert_eq!(g.member("chainid"), Value::Int(22));
+    }
+
+    #[test]
+    fn gethitvar_member_type_is_int_not_float() {
+        // The float vs. int distinction is load-bearing: GetHitVar(xvel) must be a
+        // Float while GetHitVar(damage) must be an Int, so downstream arithmetic
+        // and comparisons behave like MUGEN's.
+        let g = populated_get_hit_vars();
+        assert!(matches!(g.member("xvel"), Value::Float(_)));
+        assert!(matches!(g.member("yvel"), Value::Float(_)));
+        assert!(matches!(g.member("yaccel"), Value::Float(_)));
+        assert!(matches!(g.member("damage"), Value::Int(_)));
+        assert!(matches!(g.member("hittime"), Value::Int(_)));
+        assert!(matches!(g.member("chainid"), Value::Int(_)));
+    }
+
+    #[test]
+    fn gethitvar_member_trims_and_ignores_case() {
+        // MUGEN member names are case-insensitive; the resolver also trims
+        // surrounding whitespace (a redirection key can carry stray spaces).
+        let g = populated_get_hit_vars();
+        assert_eq!(g.member("  damage  "), Value::Int(13));
+        assert_eq!(g.member("\tXVEL\t"), Value::Float(-4.25));
+        assert_eq!(g.member("HitTime"), Value::Int(17));
+        assert_eq!(g.member("ChainID"), Value::Int(22));
+    }
+
+    #[test]
+    fn gethitvar_unknown_members_are_default_zero() {
+        // Members MUGEN defines but this struct does not model yet, plus pure
+        // garbage and empty, all resolve to the safe default (0) — never a panic.
+        let g = populated_get_hit_vars();
+        for unknown in [
+            "fall.yvel",     // modeled on HitDef but not GetHitVars
+            "fall.damage",
+            "xveladd",
+            "yveladd",
+            "groundtype",
+            "recovertime",
+            "",
+            "   ",
+            "xvelxvel",
+        ] {
+            assert_eq!(
+                g.member(unknown),
+                Value::DEFAULT,
+                "unknown GetHitVar member {unknown:?} must default to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn gethitvar_populated_resolves_through_character_trigger_str() {
+        // End-to-end: a populated record read back through the Character's
+        // trigger_str("GetHitVar", member) seam AND through a parsed expression.
+        let mut ch = Character::new();
+        ch.get_hit_vars = populated_get_hit_vars();
+        // Direct seam.
+        assert_eq!(ch.trigger_str("GetHitVar", "slidetime"), Value::Int(18));
+        assert_eq!(ch.trigger_str("GetHitVar", "guarded"), Value::Int(21));
+        assert_eq!(ch.trigger_str("GetHitVar", "yaccel"), Value::Float(0.55));
+        // Through the evaluator.
+        assert_eq!(ev("GetHitVar(hitcount) = 14", &ch), Value::Int(1));
+        assert_eq!(ev("GetHitVar(isbound) != 0", &ch), Value::Int(1));
+        assert_eq!(ev("GetHitVar(yvel) < 0", &ch), Value::Int(1));
+        // Unknown member through the evaluator → 0.
+        assert_eq!(ev("GetHitVar(nope) = 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn gethitvars_is_copy_and_debug() {
+        // GetHitVars is a public Copy/Debug struct; the executor copies it and
+        // diagnostics format it. Confirm those derives hold and survive a copy.
+        let g = populated_get_hit_vars();
+        let copied = g; // Copy, not move.
+        assert_eq!(g.member("damage"), copied.member("damage"));
+        let dbg = format!("{g:?}");
+        assert!(dbg.contains("damage"), "Debug must mention fields");
+        // Original still usable after the copy (proves Copy, not move).
+        assert_eq!(g.damage, 13);
+    }
+
+    #[test]
+    fn character_default_has_no_active_hitdef_and_default_get_hit_vars() {
+        // AC1/AC2: a freshly-built Character offers no hit and has the default
+        // (no-hit) get-hit record — the starting point before any HitDef fires or
+        // any hit lands.
+        let ch = Character::new();
+        assert!(ch.active_hitdef.is_none(), "no active HitDef on a fresh character");
+        assert_eq!(ch.get_hit_vars, GetHitVars::default());
+        // Every GetHitVar member reads its no-hit default through the seam.
+        assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(0));
+        assert_eq!(ch.trigger_str("GetHitVar", "chainid"), Value::Int(-1));
     }
 
     // ---- const(<member>) resolver (task 5.6e) ------------------------------
