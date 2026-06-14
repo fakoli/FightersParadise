@@ -696,6 +696,344 @@ pub fn detect_hit_contact(
     None
 }
 
+/// The defender's stance at the moment of a hit — which body height they occupy.
+///
+/// This maps to the MUGEN guardflag/hitflag height letters: standing -> `H`,
+/// crouching -> `L`, airborne -> `A`. (An `M` guardflag admits both ground stances.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stance {
+    /// Standing (matches the `H` flag letter).
+    Stand,
+    /// Crouching (matches the `L` flag letter).
+    Crouch,
+    /// Airborne (matches the `A` flag letter).
+    Air,
+}
+
+impl Default for Stance {
+    /// Defaults to [`Stance::Stand`] — the most common defender stance and a safe
+    /// fallback.
+    fn default() -> Self {
+        Stance::Stand
+    }
+}
+
+impl Stance {
+    /// The [`HitFlags`] bit-set this stance must be admitted by for a flag to apply.
+    ///
+    /// - [`Stance::Stand`] -> [`HitFlags::HIGH`] (`H`)
+    /// - [`Stance::Crouch`] -> [`HitFlags::LOW`] (`L`)
+    /// - [`Stance::Air`] -> [`HitFlags::AIR`] (`A`)
+    ///
+    /// A flag set "admits" the stance when it [`HitFlags::contains`] this single bit.
+    /// Note `M` is stored as `HIGH | LOW`, so it admits both ground stances.
+    fn flag(self) -> HitFlags {
+        match self {
+            Stance::Stand => HitFlags::from_bits_truncate(HitFlags::HIGH),
+            Stance::Crouch => HitFlags::from_bits_truncate(HitFlags::LOW),
+            Stance::Air => HitFlags::from_bits_truncate(HitFlags::AIR),
+        }
+    }
+
+    /// The common MUGEN get-hit state number for this stance, used as the suggested
+    /// defender state when the [`HitDef`] does not override it with `p2stateno`.
+    ///
+    /// - [`Stance::Stand`] -> `5000`
+    /// - [`Stance::Crouch`] -> `5010`
+    /// - [`Stance::Air`] -> `5020`
+    fn common_gethit_state(self) -> i32 {
+        match self {
+            Stance::Stand => 5000,
+            Stance::Crouch => 5010,
+            Stance::Air => 5020,
+        }
+    }
+}
+
+/// The defender's situation at the instant an attack connects.
+///
+/// This is everything the *pure* resolution logic ([`resolve_hit`]) needs to know about
+/// the defender. It is intentionally tiny and engine-agnostic: it carries no `Character`
+/// reference, so this crate stays a leaf. `fp-character` (task 6.3b) builds this from the
+/// live defender and then applies the returned [`HitOutcome`].
+///
+/// # Fields
+///
+/// - `stance` — the defender's body height ([`Stance::Stand`] / [`Stance::Crouch`] /
+///   [`Stance::Air`]). Used both to gate guard/hit (via the flag letters) and to pick the
+///   stance-based common get-hit state.
+/// - `holding_back` — whether the defender is holding the "back" direction (away from the
+///   attacker), i.e. attempting to guard. Guarding only succeeds if the guardflag also
+///   admits the stance.
+/// - `airborne` — whether the defender is off the ground. This selects ground vs. air
+///   knockback velocity. It is tracked separately from `stance` because a character can be
+///   knocked into the air yet still be processed as e.g. an air stance; in normal play
+///   `airborne == (stance == Stance::Air)`, but [`resolve_hit`] does not assume that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DefenderState {
+    /// The defender's body height / stance.
+    pub stance: Stance,
+    /// `true` if the defender is holding back (a guard attempt).
+    pub holding_back: bool,
+    /// `true` if the defender is airborne (selects air vs. ground knockback).
+    pub airborne: bool,
+}
+
+impl Default for DefenderState {
+    /// A standing, grounded defender who is **not** guarding — the simplest case.
+    fn default() -> Self {
+        Self {
+            stance: Stance::Stand,
+            holding_back: false,
+            airborne: false,
+        }
+    }
+}
+
+impl DefenderState {
+    /// Convenience constructor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::{DefenderState, Stance};
+    ///
+    /// // A crouching defender holding back, on the ground.
+    /// let d = DefenderState::new(Stance::Crouch, true, false);
+    /// assert_eq!(d.stance, Stance::Crouch);
+    /// assert!(d.holding_back);
+    /// assert!(!d.airborne);
+    /// ```
+    pub fn new(stance: Stance, holding_back: bool, airborne: bool) -> Self {
+        Self {
+            stance,
+            holding_back,
+            airborne,
+        }
+    }
+}
+
+/// The three possible outcomes of resolving an attack against a defender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HitResult {
+    /// The attack landed cleanly (the defender takes a hit reaction).
+    Hit,
+    /// The attack was blocked (the defender guarded successfully).
+    Guard,
+    /// The attack had no effect on this defender (the hitflag excluded their state).
+    Miss,
+}
+
+/// The fully-resolved effects of an attack on a defender — the output of [`resolve_hit`].
+///
+/// This is **pure data**: a recipe of what should happen, with no side effects applied.
+/// `fp-character` (task 6.3b) is responsible for actually mutating the defender (and
+/// attacker) from these values.
+///
+/// # Knockback orientation (important)
+///
+/// [`HitOutcome::knockback`] is expressed **attacker-facing-relative**: a positive `x`
+/// pushes the defender *away* from the attacker, in the attacker's forward direction; a
+/// negative `y` (MUGEN convention, Y points down) lifts the defender upward. Task 6.3b
+/// must **mirror this by the attacker's facing** before applying it to the defender — when
+/// the attacker faces left, negate the `x` component. The pure logic here cannot know the
+/// attacker's facing, so it leaves the value in this canonical, facing-relative frame.
+///
+/// # Empty outcome on [`HitResult::Miss`]
+///
+/// A miss produces a zeroed outcome: no damage, no knockback, no times, no fall, and the
+/// suggested get-hit state is left as the stance-based common state (callers should ignore
+/// effects when `result == HitResult::Miss`). Use [`HitOutcome::is_effective`] to check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitOutcome {
+    /// Which of [`HitResult::Hit`] / [`HitResult::Guard`] / [`HitResult::Miss`] occurred.
+    pub result: HitResult,
+    /// Damage to apply to the defender: the [`Damage::hit`] value on a hit, the
+    /// [`Damage::guard`] value on a guard, and `0` on a miss.
+    pub damage: i32,
+    /// Knockback velocity to apply to the defender, **attacker-facing-relative** (see the
+    /// type-level docs): positive `x` = away from the attacker in its forward direction.
+    /// On a guard this is `(guard_velocity, 0)`; on a hit it is the ground or air velocity
+    /// per [`DefenderState::airborne`]; on a miss it is `(0, 0)`.
+    pub knockback: Vec2<f32>,
+    /// Ticks the **attacker** (P1) is paused (`pausetime.p1`). `0` on a miss.
+    pub pausetime: i32,
+    /// Ticks the **defender** (P2) shakes (`pausetime.p2`). `0` on a miss.
+    pub shaketime: i32,
+    /// Hit-stun / guard-stun the defender stays in, in ticks. On a hit this is the
+    /// air or ground hittime per [`DefenderState::airborne`]; on a guard it is the guard
+    /// hittime; `0` on a miss.
+    pub hittime: i32,
+    /// Slide time — extra ticks the defender slides after stun. Modelled to mirror MUGEN's
+    /// `ground.slidetime` and `guard.slidetime`; this crate has no distinct slidetime
+    /// field on [`HitDef`] yet, so it defaults to the relevant hittime and `0` on a miss.
+    pub slidetime: i32,
+    /// Control time — ticks before the defender regains control (MUGEN `airHitCtrlTime` /
+    /// `guard.ctrltime`). Mirrors the relevant hittime here and is `0` on a miss.
+    pub ctrltime: i32,
+    /// Whether this hit knocks the defender into a falling state. Only ever `true` on a
+    /// [`HitResult::Hit`] when [`HitDef::fall`] is set; always `false` on guard/miss.
+    pub fall: bool,
+    /// Initial upward Y velocity for the falling state ([`HitDef::fall_yvelocity`]). Only
+    /// meaningful when `fall` is `true`; `0.0` otherwise.
+    pub fall_yvelocity: f32,
+    /// Suggested state number to put the **defender** into: [`HitDef::p2stateno`] if set,
+    /// otherwise the stance-based common get-hit state (`5000` standing / `5010` crouching
+    /// / `5020` air). On a miss this is the stance-based common state but should be ignored
+    /// (the defender's state does not change on a miss).
+    pub gethit_state: i32,
+}
+
+impl HitOutcome {
+    /// Builds the zeroed "no effect" outcome for a [`HitResult::Miss`].
+    ///
+    /// The suggested get-hit state is still the stance-based common state for
+    /// completeness, but callers must ignore all effects when the result is a miss.
+    fn miss(stance: Stance) -> Self {
+        Self {
+            result: HitResult::Miss,
+            damage: 0,
+            knockback: Vec2::new(0.0, 0.0),
+            pausetime: 0,
+            shaketime: 0,
+            hittime: 0,
+            slidetime: 0,
+            ctrltime: 0,
+            fall: false,
+            fall_yvelocity: 0.0,
+            gethit_state: stance.common_gethit_state(),
+        }
+    }
+
+    /// `true` when the outcome actually affects the defender (a hit or a guard); `false`
+    /// for a [`HitResult::Miss`].
+    pub fn is_effective(self) -> bool {
+        !matches!(self.result, HitResult::Miss)
+    }
+}
+
+/// Resolves a single attack against a defender, deciding the outcome and its effects.
+///
+/// This is the **pure** core of the combat system: given a fully-populated [`HitDef`] and
+/// the defender's [`DefenderState`], it computes a [`HitOutcome`] *recipe* without
+/// touching any `Character`. Applying that recipe (mutating health, velocity, state) is
+/// `fp-character`'s job in task 6.3b.
+///
+/// # Decision logic
+///
+/// 1. **Guard** when the defender is holding back **and** the [`HitDef::guardflag`] admits
+///    the defender's [`Stance`] (`H` for standing, `L` for crouching, `A` for air; `M`
+///    admits both ground heights). An **empty** guardflag means the attack is
+///    *unblockable* — it can never be guarded, so holding back does not help.
+/// 2. Otherwise it is a **Hit** if the [`HitDef::hitflag`] admits the defender's stance.
+/// 3. Otherwise it is a **Miss** (the hitflag excludes the defender's state) — an empty
+///    outcome with no effects.
+///
+/// # Effects
+///
+/// - On **Hit**: applies [`Damage::hit`]; knockback is [`HitDef::air_velocity`] when the
+///   defender is [`DefenderState::airborne`], else [`HitDef::ground_velocity`]; hit-stun is
+///   the air or ground hittime accordingly; [`HitOutcome::fall`] is set iff
+///   [`HitDef::fall`] is set, carrying [`HitDef::fall_yvelocity`].
+/// - On **Guard**: applies [`Damage::guard`]; knockback is `(guard_velocity, 0)`; stun is
+///   the guard hittime; never falls.
+/// - On **Miss**: a zeroed outcome (see [`HitOutcome`]).
+///
+/// The suggested defender get-hit state is [`HitDef::p2stateno`] when set, otherwise the
+/// stance-based common state (`5000` / `5010` / `5020`).
+///
+/// Knockback is **attacker-facing-relative** — see [`HitOutcome`]'s type docs; 6.3b mirrors
+/// it by the attacker's facing.
+///
+/// Pure, deterministic, and **never panics**.
+///
+/// # Examples
+///
+/// ```
+/// use fp_combat::{resolve_hit, DefenderState, HitDef, HitFlags, Damage, Stance, HitResult};
+///
+/// // A standing defender holding back blocks an `H`-guardable attack.
+/// let hd = HitDef {
+///     guardflag: HitFlags::parse("MA"),
+///     hitflag: HitFlags::parse("MAF"),
+///     damage: Damage { hit: 30, guard: 4 },
+///     ..HitDef::default()
+/// };
+/// let blocking = DefenderState::new(Stance::Stand, true, false);
+/// let out = resolve_hit(&hd, blocking);
+/// assert_eq!(out.result, HitResult::Guard);
+/// assert_eq!(out.damage, 4); // guard damage
+///
+/// // Not holding back -> the same attack lands.
+/// let open = DefenderState::new(Stance::Stand, false, false);
+/// assert_eq!(resolve_hit(&hd, open).result, HitResult::Hit);
+/// ```
+pub fn resolve_hit(hitdef: &HitDef, defender: DefenderState) -> HitOutcome {
+    let stance_flag = defender.stance.flag();
+
+    // (1) Guard? Only if the defender is holding back, the guardflag is non-empty
+    // (empty == unblockable), and the guardflag admits this stance.
+    let can_guard = defender.holding_back
+        && !hitdef.guardflag.is_empty()
+        && hitdef.guardflag.contains(stance_flag);
+
+    if can_guard {
+        return HitOutcome {
+            result: HitResult::Guard,
+            damage: hitdef.damage.guard,
+            // Guard pushback is purely horizontal in MUGEN.
+            knockback: Vec2::new(hitdef.guard_velocity, 0.0),
+            pausetime: hitdef.pausetime.p1,
+            shaketime: hitdef.pausetime.p2,
+            hittime: hitdef.hittimes.guard,
+            // No distinct guard slide/ctrl fields on HitDef yet; mirror guard hittime.
+            slidetime: hitdef.hittimes.guard,
+            ctrltime: hitdef.hittimes.guard,
+            // Guarding never triggers a fall.
+            fall: false,
+            fall_yvelocity: 0.0,
+            gethit_state: suggested_gethit_state(hitdef, defender.stance),
+        };
+    }
+
+    // (2) Hit? Only if the hitflag admits the defender's stance.
+    if !hitdef.hitflag.contains(stance_flag) {
+        // (3) Miss: the hit does not affect this defender state.
+        return HitOutcome::miss(defender.stance);
+    }
+
+    // Clean hit. Pick ground vs. air knockback + hittime per the defender's airborne-ness.
+    let (knockback, hittime) = if defender.airborne {
+        (hitdef.air_velocity, hitdef.hittimes.air)
+    } else {
+        (hitdef.ground_velocity, hitdef.hittimes.ground)
+    };
+
+    // Fall only applies on a clean hit, and only when the HitDef requests it.
+    let fall = hitdef.fall;
+
+    HitOutcome {
+        result: HitResult::Hit,
+        damage: hitdef.damage.hit,
+        knockback,
+        pausetime: hitdef.pausetime.p1,
+        shaketime: hitdef.pausetime.p2,
+        hittime,
+        // No distinct slide/ctrl fields on HitDef yet; mirror the applicable hittime.
+        slidetime: hittime,
+        ctrltime: hittime,
+        fall,
+        fall_yvelocity: if fall { hitdef.fall_yvelocity } else { 0.0 },
+        gethit_state: suggested_gethit_state(hitdef, defender.stance),
+    }
+}
+
+/// Picks the suggested defender get-hit state: the HitDef's `p2stateno` override if set,
+/// else the stance-based common get-hit state (`5000` / `5010` / `5020`).
+fn suggested_gethit_state(hitdef: &HitDef, stance: Stance) -> i32 {
+    hitdef.p2stateno.unwrap_or_else(|| stance.common_gethit_state())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1785,459 @@ mod tests {
         assert_eq!(AttackAttr::parse("S, SP").kind, AttackKind::Projectile);
         assert_eq!(AttackAttr::parse("S, HA").power, AttackPower::Hyper);
         assert_eq!(AttackAttr::parse("S, ST").kind, AttackKind::Throw);
+    }
+
+    // ---------------------------------------------------------------------
+    // (6.3a) resolve_hit: Guard / Hit / Miss decision + effects.
+    // ---------------------------------------------------------------------
+
+    /// A standing defender holding back, vs an attack whose guardflag admits high
+    /// (`H` via `M`) -> Guard with guard damage, guard velocity, no fall.
+    #[test]
+    fn resolve_standing_block_guards() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"), // admits H and L (standing & crouching)
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 50, guard: 7 },
+            guard_velocity: -3.0,
+            ground_velocity: Vec2::new(8.0, 0.0),
+            hittimes: HitTimes { ground: 12, air: 20, guard: 9 },
+            pausetime: PauseTime { p1: 11, p2: 11 },
+            fall: true,
+            fall_yvelocity: -5.0,
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Stand, true, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Guard);
+        assert_eq!(out.damage, 7); // guard damage, not hit damage
+        assert_eq!(out.knockback, Vec2::new(-3.0, 0.0)); // guard velocity, Y unused
+        assert_eq!(out.hittime, 9); // guard hittime
+        assert_eq!(out.slidetime, 9);
+        assert_eq!(out.ctrltime, 9);
+        assert_eq!(out.pausetime, 11);
+        assert_eq!(out.shaketime, 11);
+        assert!(!out.fall); // guarding never falls, even though hitdef.fall = true
+        assert_eq!(out.fall_yvelocity, 0.0);
+        assert_eq!(out.gethit_state, 5000); // standing common get-hit state
+        assert!(out.is_effective());
+    }
+
+    /// A non-blocking defender (not holding back) vs a normal attack -> Hit with hit
+    /// damage and ground knockback + ground hittime + fall (since hitdef.fall).
+    #[test]
+    fn resolve_non_blocking_hit() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"),
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 50, guard: 7 },
+            ground_velocity: Vec2::new(8.0, -2.0),
+            air_velocity: Vec2::new(6.0, -9.0),
+            hittimes: HitTimes { ground: 12, air: 25, guard: 9 },
+            pausetime: PauseTime { p1: 10, p2: 10 },
+            fall: true,
+            fall_yvelocity: -6.5,
+            ..HitDef::default()
+        };
+        // Not holding back -> no guard even though guardflag would admit the stance.
+        let d = DefenderState::new(Stance::Stand, false, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Hit);
+        assert_eq!(out.damage, 50); // hit damage
+        assert_eq!(out.knockback, Vec2::new(8.0, -2.0)); // GROUND velocity (not airborne)
+        assert_eq!(out.hittime, 12); // ground hittime
+        assert_eq!(out.slidetime, 12);
+        assert_eq!(out.ctrltime, 12);
+        assert!(out.fall);
+        assert_eq!(out.fall_yvelocity, -6.5);
+        assert_eq!(out.gethit_state, 5000);
+    }
+
+    /// An airborne defender selects AIR knockback + air hittime.
+    #[test]
+    fn resolve_airborne_hit_uses_air_velocity() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("A"),
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 40, guard: 6 },
+            ground_velocity: Vec2::new(8.0, 0.0),
+            air_velocity: Vec2::new(5.0, -8.0),
+            hittimes: HitTimes { ground: 12, air: 25, guard: 9 },
+            ..HitDef::default()
+        };
+        // Airborne, not holding back -> air hit.
+        let d = DefenderState::new(Stance::Air, false, true);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Hit);
+        assert_eq!(out.knockback, Vec2::new(5.0, -8.0)); // air velocity
+        assert_eq!(out.hittime, 25); // air hittime
+        assert_eq!(out.gethit_state, 5020); // air common get-hit state
+    }
+
+    /// An unblockable attack (empty guardflag) hits even when the defender holds back.
+    #[test]
+    fn resolve_unblockable_hits_even_holding_back() {
+        let hd = HitDef {
+            guardflag: HitFlags::empty(), // empty == unblockable
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 99, guard: 0 },
+            ground_velocity: Vec2::new(4.0, 0.0),
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Stand, true, false); // holding back, but...
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Hit); // ...unblockable -> still a hit
+        assert_eq!(out.damage, 99);
+    }
+
+    /// A hitflag that excludes the defender's stance -> Miss (empty outcome).
+    #[test]
+    fn resolve_hitflag_excludes_stance_misses() {
+        // hitflag admits only air; a grounded standing defender is excluded.
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"),
+            hitflag: HitFlags::parse("A"), // air-only
+            damage: Damage { hit: 30, guard: 5 },
+            ground_velocity: Vec2::new(7.0, 0.0),
+            fall: true,
+            fall_yvelocity: -4.0,
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Stand, false, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Miss);
+        assert_eq!(out.damage, 0);
+        assert_eq!(out.knockback, Vec2::new(0.0, 0.0));
+        assert_eq!(out.hittime, 0);
+        assert_eq!(out.slidetime, 0);
+        assert_eq!(out.ctrltime, 0);
+        assert_eq!(out.pausetime, 0);
+        assert_eq!(out.shaketime, 0);
+        assert!(!out.fall);
+        assert_eq!(out.fall_yvelocity, 0.0);
+        assert!(!out.is_effective());
+    }
+
+    /// Holding back but the guardflag does NOT admit the stance -> falls through to Hit
+    /// (guard requires a matching guardflag, per the KB).
+    #[test]
+    fn resolve_holding_back_wrong_guardflag_hits() {
+        // guardflag admits only HIGH (standing); a crouching defender holding back
+        // cannot block -> hit (hitflag admits low via M).
+        let hd = HitDef {
+            guardflag: HitFlags::from_bits_truncate(HitFlags::HIGH), // H only
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 33, guard: 4 },
+            ground_velocity: Vec2::new(6.0, 0.0),
+            hittimes: HitTimes { ground: 10, air: 20, guard: 8 },
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Crouch, true, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Hit);
+        assert_eq!(out.damage, 33);
+        assert_eq!(out.hittime, 10); // ground hittime
+        assert_eq!(out.gethit_state, 5010); // crouch common get-hit state
+    }
+
+    /// `p2stateno`, when set, overrides the stance-based common get-hit state, for
+    /// both Hit and Guard.
+    #[test]
+    fn resolve_p2stateno_overrides_common_state() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"),
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 20, guard: 3 },
+            p2stateno: Some(5050),
+            ..HitDef::default()
+        };
+        // Hit case.
+        let hit = resolve_hit(&hd, DefenderState::new(Stance::Crouch, false, false));
+        assert_eq!(hit.result, HitResult::Hit);
+        assert_eq!(hit.gethit_state, 5050); // override, not 5010
+        // Guard case.
+        let guard = resolve_hit(&hd, DefenderState::new(Stance::Crouch, true, false));
+        assert_eq!(guard.result, HitResult::Guard);
+        assert_eq!(guard.gethit_state, 5050);
+    }
+
+    /// `fall` is suppressed when the HitDef does not request it, even on a clean hit.
+    #[test]
+    fn resolve_no_fall_when_hitdef_fall_false() {
+        let hd = HitDef {
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 10, guard: 1 },
+            fall: false,
+            fall_yvelocity: -7.0, // present but must be ignored when fall = false
+            ..HitDef::default()
+        };
+        let out = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false));
+        assert_eq!(out.result, HitResult::Hit);
+        assert!(!out.fall);
+        assert_eq!(out.fall_yvelocity, 0.0);
+    }
+
+    /// `resolve_hit` is pure & deterministic: identical inputs yield identical outcomes.
+    #[test]
+    fn resolve_hit_is_deterministic() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("MA"),
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 25, guard: 4 },
+            ground_velocity: Vec2::new(5.0, -1.0),
+            air_velocity: Vec2::new(4.0, -7.0),
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Air, false, true);
+        let first = resolve_hit(&hd, d);
+        for _ in 0..16 {
+            assert_eq!(resolve_hit(&hd, d), first);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Proctor 6.3a gap-fill: M-guardflag crouch block, air block, guard
+    // velocity precedence, stance↔airborne decoupling, guard-before-
+    // hitflag ordering, per-stance common states, and value passthrough.
+    // ------------------------------------------------------------------
+
+    /// AC2 ("M = both ground"): a CROUCHING defender holding back vs a `M`
+    /// guardflag blocks — the low (`L`) bit of `M` admits the crouch stance.
+    /// This is the positive counterpart to `resolve_holding_back_wrong_guardflag_hits`.
+    #[test]
+    fn resolve_crouch_block_with_m_guardflag_guards() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"), // M = H | L, so admits crouch (L)
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 44, guard: 6 },
+            guard_velocity: -2.5,
+            hittimes: HitTimes { ground: 10, air: 20, guard: 7 },
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Crouch, true, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Guard);
+        assert_eq!(out.damage, 6); // guard damage
+        assert_eq!(out.knockback, Vec2::new(-2.5, 0.0));
+        assert_eq!(out.hittime, 7); // guard hittime
+        assert_eq!(out.gethit_state, 5010); // crouch common get-hit state
+    }
+
+    /// AC2/AC3: an AIRBORNE defender holding back vs a guardflag admitting `A`
+    /// blocks in the air — and crucially uses the GUARD velocity (horizontal
+    /// only), NOT the air knockback velocity, despite being airborne.
+    #[test]
+    fn resolve_air_block_uses_guard_velocity_not_air_velocity() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("A"), // air-guardable
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 60, guard: 9 },
+            air_velocity: Vec2::new(7.0, -10.0), // must NOT be used on a guard
+            guard_velocity: -4.0,
+            hittimes: HitTimes { ground: 12, air: 30, guard: 11 },
+            fall: true, // must be suppressed on guard
+            fall_yvelocity: -8.0,
+            ..HitDef::default()
+        };
+        let d = DefenderState::new(Stance::Air, true, true);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Guard);
+        assert_eq!(out.damage, 9);
+        // Guard pushback is purely horizontal; air_velocity is ignored entirely.
+        assert_eq!(out.knockback, Vec2::new(-4.0, 0.0));
+        assert_eq!(out.hittime, 11); // guard hittime, not air hittime (30)
+        assert!(!out.fall);
+        assert_eq!(out.fall_yvelocity, 0.0);
+        assert_eq!(out.gethit_state, 5020); // air common get-hit state
+    }
+
+    /// AC1/AC3: the documented decoupling of `airborne` from `stance`. The pure
+    /// logic selects knockback/hittime purely from `airborne`, and the get-hit
+    /// state purely from `stance` — they are not assumed to agree.
+    #[test]
+    fn resolve_airborne_flag_independent_of_stance() {
+        let hd = HitDef {
+            guardflag: HitFlags::empty(), // unblockable -> always a hit when admitted
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 20, guard: 2 },
+            ground_velocity: Vec2::new(3.0, 0.0),
+            air_velocity: Vec2::new(9.0, -9.0),
+            hittimes: HitTimes { ground: 5, air: 40, guard: 0 },
+            ..HitDef::default()
+        };
+
+        // Stance says Stand (gethit_state 5000) but airborne = true -> AIR knockback/hittime.
+        let stand_but_airborne = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, true));
+        assert_eq!(stand_but_airborne.result, HitResult::Hit);
+        assert_eq!(stand_but_airborne.knockback, Vec2::new(9.0, -9.0)); // air velocity
+        assert_eq!(stand_but_airborne.hittime, 40); // air hittime
+        assert_eq!(stand_but_airborne.gethit_state, 5000); // stance-driven (Stand)
+
+        // Stance says Air (gethit_state 5020) but airborne = false -> GROUND knockback/hittime.
+        let air_but_grounded = resolve_hit(&hd, DefenderState::new(Stance::Air, false, false));
+        assert_eq!(air_but_grounded.result, HitResult::Hit);
+        assert_eq!(air_but_grounded.knockback, Vec2::new(3.0, 0.0)); // ground velocity
+        assert_eq!(air_but_grounded.hittime, 5); // ground hittime
+        assert_eq!(air_but_grounded.gethit_state, 5020); // stance-driven (Air)
+    }
+
+    /// Decision ordering: guard is evaluated BEFORE the hitflag gate. A defender
+    /// whose stance the hitflag would EXCLUDE, but who is holding back with a
+    /// matching guardflag, still GUARDS (it does not fall through to Miss).
+    #[test]
+    fn resolve_guard_takes_precedence_over_excluding_hitflag() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("H"), // standing-guardable
+            hitflag: HitFlags::parse("A"),   // hitflag admits ONLY air
+            damage: Damage { hit: 50, guard: 5 },
+            guard_velocity: -1.0,
+            ..HitDef::default()
+        };
+        // Standing defender holding back: hitflag (A) excludes Stand, but the
+        // guardflag (H) admits it and the defender is holding back -> Guard.
+        let d = DefenderState::new(Stance::Stand, true, false);
+        let out = resolve_hit(&hd, d);
+        assert_eq!(out.result, HitResult::Guard);
+        assert_eq!(out.damage, 5); // guard damage, NOT a miss
+        assert!(out.is_effective());
+
+        // Same HitDef, NOT holding back: now the hitflag gate applies -> Miss.
+        let open = DefenderState::new(Stance::Stand, false, false);
+        assert_eq!(resolve_hit(&hd, open).result, HitResult::Miss);
+    }
+
+    /// Each stance maps to its own common get-hit state on a clean (non-override)
+    /// hit: 5000 / 5010 / 5020. Exercised in one place for the full mapping.
+    #[test]
+    fn resolve_per_stance_common_gethit_states() {
+        let hd = HitDef {
+            guardflag: HitFlags::empty(), // unblockable: holding-back is irrelevant
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 1, guard: 0 },
+            ..HitDef::default()
+        };
+        assert_eq!(
+            resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false)).gethit_state,
+            5000
+        );
+        assert_eq!(
+            resolve_hit(&hd, DefenderState::new(Stance::Crouch, false, false)).gethit_state,
+            5010
+        );
+        assert_eq!(
+            resolve_hit(&hd, DefenderState::new(Stance::Air, false, true)).gethit_state,
+            5020
+        );
+    }
+
+    /// A clean hit reports `is_effective() == true` (the Guard/Miss cases are
+    /// covered elsewhere; this closes the trio).
+    #[test]
+    fn resolve_hit_is_effective() {
+        let hd = HitDef {
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 5, guard: 1 },
+            ..HitDef::default()
+        };
+        let out = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false));
+        assert_eq!(out.result, HitResult::Hit);
+        assert!(out.is_effective());
+    }
+
+    /// `resolve_hit` is pure passthrough for numeric values: it never clamps,
+    /// rejects, or normalizes damage / velocities / times. Zero and negative
+    /// damage (e.g. a purely-knockback move) flow through verbatim, and it never
+    /// panics on extreme/non-finite velocity components.
+    #[test]
+    fn resolve_hit_passes_values_through_without_clamping() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("M"),
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: -10, guard: -3 }, // negative (heal-on-hit / odd content)
+            ground_velocity: Vec2::new(f32::INFINITY, f32::NEG_INFINITY),
+            hittimes: HitTimes { ground: -5, air: 20, guard: -2 },
+            ..HitDef::default()
+        };
+        // Hit path: negative hit damage and non-finite velocity pass through, no panic.
+        let hit = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false));
+        assert_eq!(hit.result, HitResult::Hit);
+        assert_eq!(hit.damage, -10);
+        assert_eq!(hit.hittime, -5);
+        assert!(hit.knockback.x.is_infinite() && hit.knockback.y.is_infinite());
+
+        // Guard path: negative guard damage passes through verbatim.
+        let guard = resolve_hit(&hd, DefenderState::new(Stance::Stand, true, false));
+        assert_eq!(guard.result, HitResult::Guard);
+        assert_eq!(guard.damage, -3);
+        assert_eq!(guard.hittime, -2);
+    }
+
+    /// On a Miss the suggested get-hit state is still the stance-based common
+    /// state (documented as "should be ignored by callers"), and remains
+    /// stance-specific. Locks the documented Miss-outcome contract per stance.
+    #[test]
+    fn resolve_miss_keeps_stance_common_state_but_no_effects() {
+        // hitflag admits only air -> a grounded crouch/stand defender misses.
+        let hd = HitDef {
+            guardflag: HitFlags::parse("A"), // does not admit ground stances
+            hitflag: HitFlags::parse("A"),
+            damage: Damage { hit: 30, guard: 5 },
+            p2stateno: None,
+            ..HitDef::default()
+        };
+        let stand = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false));
+        assert_eq!(stand.result, HitResult::Miss);
+        assert_eq!(stand.gethit_state, 5000); // stance common, even on miss
+        assert!(!stand.is_effective());
+
+        let crouch = resolve_hit(&hd, DefenderState::new(Stance::Crouch, true, false));
+        // Holding back, but guardflag A does not admit crouch, and hitflag A
+        // excludes crouch -> Miss (not Guard).
+        assert_eq!(crouch.result, HitResult::Miss);
+        assert_eq!(crouch.gethit_state, 5010);
+    }
+
+    /// Documented Miss contract: a Miss's suggested get-hit state is ALWAYS the
+    /// stance-based common state and does NOT honor `p2stateno` — per the
+    /// `HitOutcome::gethit_state` docs ("on a miss this is the stance-based common
+    /// state but should be ignored"). This distinguishes Miss from Hit/Guard,
+    /// which DO consult the `p2stateno` override (see
+    /// `resolve_p2stateno_overrides_common_state`).
+    #[test]
+    fn resolve_miss_ignores_p2stateno_override() {
+        let hd = HitDef {
+            guardflag: HitFlags::parse("A"),
+            hitflag: HitFlags::parse("A"), // excludes a grounded standing defender
+            p2stateno: Some(5070),
+            ..HitDef::default()
+        };
+        let out = resolve_hit(&hd, DefenderState::new(Stance::Stand, false, false));
+        assert_eq!(out.result, HitResult::Miss);
+        // p2stateno is NOT consulted on a miss: the field falls back to the
+        // stance common state (5000), which callers must ignore anyway.
+        assert_eq!(out.gethit_state, 5000);
+        assert_eq!(out.damage, 0);
+        assert!(!out.is_effective());
+    }
+
+    /// `DefenderState::default` is a standing, grounded, non-guarding defender —
+    /// the documented simplest case — and resolves to a plain ground hit.
+    #[test]
+    fn resolve_with_default_defender_state() {
+        assert_eq!(
+            DefenderState::default(),
+            DefenderState::new(Stance::Stand, false, false)
+        );
+        let hd = HitDef {
+            hitflag: HitFlags::parse("MAF"),
+            damage: Damage { hit: 12, guard: 2 },
+            ground_velocity: Vec2::new(4.0, 0.0),
+            ..HitDef::default()
+        };
+        let out = resolve_hit(&hd, DefenderState::default());
+        assert_eq!(out.result, HitResult::Hit);
+        assert_eq!(out.damage, 12);
+        assert_eq!(out.knockback, Vec2::new(4.0, 0.0));
+        assert_eq!(out.gethit_state, 5000);
     }
 }
