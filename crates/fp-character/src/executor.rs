@@ -189,13 +189,74 @@ pub struct SoundRequest {
     pub common: bool,
 }
 
+/// A deferred operation a `Target*` controller wants applied to this
+/// character's **target** (the opponent it established a hit on).
+///
+/// `fp-character` ticks one character at a time and only ever borrows the
+/// opponent immutably, so a `Target*` controller (which must *mutate* the
+/// opponent) cannot apply its effect inline. Instead it pushes the matching
+/// `TargetOp` onto [`TickReport::target_ops`] — exactly mirroring how `PlaySnd`
+/// defers a [`SoundRequest`] — and a downstream owner of both characters
+/// (`fp-engine`, task P8b) applies each op to the opponent after the tick. This
+/// keeps the executor single-entity, deterministic, and panic-free.
+///
+/// Each variant carries the parameters of its MUGEN controller. Velocity /
+/// position fields are `(x, y)` pairs in MUGEN's facing-relative convention; the
+/// applier (`fp-engine`) is responsible for any facing mirroring, just as
+/// `fp-character` does for its own velocity/position controllers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TargetOp {
+    /// `TargetState`: force the target into the given state number (`value`).
+    ///
+    /// Used by throws to drive the victim through the thrown-animation states
+    /// (KFM state 820). The applier performs the target's state entry.
+    State(i32),
+    /// `TargetBind`: hold the target at a position relative to this character for
+    /// `time` ticks. `pos` is the `(x, y)` offset (`TargetBind`'s `pos` param);
+    /// `time` is the bind duration in ticks (MUGEN default `1`).
+    ///
+    /// Used by throws to pin the victim to the thrower each tick (KFM state 810).
+    Bind {
+        /// Bind duration in ticks (`TargetBind`'s `time`).
+        time: i32,
+        /// `(x, y)` bind offset relative to this character (`TargetBind`'s `pos`).
+        pos: (f32, f32),
+    },
+    /// `TargetLifeAdd`: add `value` to the target's life (negative = damage).
+    /// `kill` mirrors MUGEN's `kill` flag: when `false`, the target's life is
+    /// floored at `1` (the hit cannot be lethal); when `true` it may reach `0`.
+    ///
+    /// Used by throws to apply the throw damage to the victim (KFM state 810).
+    LifeAdd {
+        /// Amount added to the target's life (negative subtracts / damages).
+        value: i32,
+        /// Whether this add may reduce the target to `0` life (`true`) or must
+        /// leave at least `1` (`false`).
+        kill: bool,
+    },
+    /// `TargetFacing`: set the target's facing relative to this character.
+    /// `1` = the target faces the **same** way as this character, `-1` = the
+    /// **opposite** way (MUGEN's `TargetFacing` value convention).
+    ///
+    /// Used by throws to orient the victim toward the thrower (KFM state 810).
+    Facing(i32),
+    /// `TargetVelSet`: set the target's velocity to `(x, y)` (`TargetVelSet`).
+    VelSet((f32, f32)),
+    /// `TargetVelAdd`: add `(x, y)` to the target's velocity (`TargetVelAdd`).
+    VelAdd((f32, f32)),
+    /// `TargetPowerAdd`: add `value` to the target's power / super meter
+    /// (`TargetPowerAdd`). The applier clamps the result into the target's
+    /// `[0, power_max]` range.
+    PowerAdd(i32),
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
 /// All counters are best-effort and never affect gameplay; they exist so a
 /// caller (or a test) can assert that the expected work happened without
 /// reaching into private executor state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TickReport {
     /// Number of controllers whose dispatch ran (gating passed and `persistent`
     /// allowed it to fire) this tick.
@@ -214,6 +275,14 @@ pub struct TickReport {
     /// per tick, so this never carries requests across ticks). Consumed by the
     /// downstream audio player; `fp-character` itself produces no sound.
     pub sound_requests: Vec<SoundRequest>,
+    /// Deferred operations emitted by `Target*` controllers this tick, in fire
+    /// order, to be applied to this character's target (the opponent). Empty on a
+    /// tick with no firing `Target*` controller, and (like `sound_requests`)
+    /// never carried across ticks because a fresh [`TickReport`] is built per
+    /// tick. `fp-character` only *describes* these; a downstream owner of both
+    /// characters (`fp-engine`, task P8b) applies each [`TargetOp`] to the
+    /// opponent after the tick.
+    pub target_ops: Vec<TargetOp>,
 }
 
 impl Character {
@@ -687,7 +756,12 @@ impl Character {
     /// Task 6.6 adds `PowerAdd`/`PowerSet`, which mutate the super meter
     /// (clamped to `[0, power_max]`). Audit P3+P11 adds `SelfState` (a
     /// self-`ChangeState` in this model; see [`ctrl_self_state`](Self::ctrl_self_state))
-    /// and `VelMul` (component-wise velocity multiply).
+    /// and `VelMul` (component-wise velocity multiply). Audit P8a adds the
+    /// `Target*` controllers (`TargetState`, `TargetBind`, `TargetLifeAdd`,
+    /// `TargetFacing`, `TargetVelSet`, `TargetVelAdd`, `TargetPowerAdd`), which —
+    /// like `PlaySnd` — *defer* their effect by pushing a [`TargetOp`] onto
+    /// [`TickReport::target_ops`] for a downstream applier (`fp-engine`); they are
+    /// safe no-ops when this character has no target.
     /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -739,6 +813,20 @@ impl Character {
             self.ctrl_play_snd(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("HitDef") {
             self.ctrl_hit_def(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("TargetState") {
+            self.ctrl_target_state(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetBind") {
+            self.ctrl_target_bind(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetLifeAdd") {
+            self.ctrl_target_life_add(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetFacing") {
+            self.ctrl_target_facing(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetVelSet") {
+            self.ctrl_target_vel_set(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetVelAdd") {
+            self.ctrl_target_vel_add(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("TargetPowerAdd") {
+            self.ctrl_target_power_add(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -1184,6 +1272,226 @@ impl Character {
              volscale={volume_scale} loop={looping} common={common} in state {}",
             ctrl.state_number
         );
+    }
+
+    // ---- Target controllers (deferred ops) --------------------------------
+    //
+    // Each `Target*` controller mutates this character's *target* (the opponent
+    // it established a hit on). The executor ticks a single character and only
+    // borrows the opponent immutably, so these controllers cannot apply their
+    // effect inline. Instead — exactly mirroring `PlaySnd`'s deferred
+    // `SoundRequest` — they push a [`TargetOp`] onto `report.target_ops`, and
+    // `fp-engine` (task P8b) applies each op to the opponent after the tick.
+    //
+    // When [`has_target`](Character::has_target) is `false` (no hit has been
+    // established) every `Target*` controller is a safe, debug-logged no-op that
+    // pushes nothing — matching MUGEN, where a `Target*` with no targets does
+    // nothing. None of these ever panic, unwrap, or expect.
+
+    /// `TargetState`: emit a [`TargetOp::State`] to send the target into the state
+    /// named by `value`. Throws use this to drive the victim through the
+    /// thrown-animation states (KFM state 820). A missing `value`, or no target,
+    /// pushes nothing.
+    fn ctrl_target_state(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetState in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: TargetState in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        report.target_ops.push(TargetOp::State(value.to_int()));
+    }
+
+    /// `TargetBind`: emit a [`TargetOp::Bind`] to hold the target at a position
+    /// relative to this character for `time` ticks. Throws use this to pin the
+    /// victim to the thrower each tick (KFM state 810).
+    ///
+    /// Params: `time` (i32, MUGEN default `1`) and `pos = x, y` (the bind offset;
+    /// each axis defaults to `0.0` when absent). No target → pushes nothing.
+    fn ctrl_target_bind(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetBind in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+        let pos = match ctrl.params.get("pos") {
+            Some(param) => {
+                let comps = self.eval_param_components(param, env);
+                (
+                    comps.first().map_or(0.0, |v| v.to_float()),
+                    comps.get(1).map_or(0.0, |v| v.to_float()),
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        report.target_ops.push(TargetOp::Bind { time, pos });
+    }
+
+    /// `TargetLifeAdd`: emit a [`TargetOp::LifeAdd`] to add `value` to the
+    /// target's life (negative = damage). Throws use this to apply throw damage to
+    /// the victim (KFM state 810).
+    ///
+    /// Params: `value` (i32, required — absent pushes nothing) and `kill`
+    /// (bool-ish, MUGEN default `true`): when `false` the add must leave the
+    /// target at `>= 1` life. No target → pushes nothing.
+    fn ctrl_target_life_add(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetLifeAdd in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: TargetLifeAdd in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        // MUGEN's `kill` defaults to 1 (true): a TargetLifeAdd may be lethal
+        // unless explicitly told not to kill.
+        let kill = ctrl
+            .params
+            .get("kill")
+            .and_then(|p| self.eval_param(p, env))
+            .is_none_or(Value::as_bool);
+        report.target_ops.push(TargetOp::LifeAdd {
+            value: value.to_int(),
+            kill,
+        });
+    }
+
+    /// `TargetFacing`: emit a [`TargetOp::Facing`] to orient the target relative
+    /// to this character (`1` = same facing, `-1` = opposite). Throws use this to
+    /// face the victim toward the thrower (KFM state 810). A missing `value`, or
+    /// no target, pushes nothing.
+    fn ctrl_target_facing(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetFacing in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: TargetFacing in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        report.target_ops.push(TargetOp::Facing(value.to_int()));
+    }
+
+    /// `TargetVelSet`: emit a [`TargetOp::VelSet`] to set the target's velocity to
+    /// `(x, y)`. An absent axis defaults to `0.0`. No target → pushes nothing.
+    fn ctrl_target_vel_set(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetVelSet in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let xy = self.target_vel_xy(ctrl, env);
+        report.target_ops.push(TargetOp::VelSet(xy));
+    }
+
+    /// `TargetVelAdd`: emit a [`TargetOp::VelAdd`] to add `(x, y)` to the target's
+    /// velocity. An absent axis defaults to `0.0`. No target → pushes nothing.
+    fn ctrl_target_vel_add(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetVelAdd in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let xy = self.target_vel_xy(ctrl, env);
+        report.target_ops.push(TargetOp::VelAdd(xy));
+    }
+
+    /// Shared `x`/`y` reader for [`TargetVelSet`](Self::ctrl_target_vel_set) and
+    /// [`TargetVelAdd`](Self::ctrl_target_vel_add): each axis evaluates against
+    /// `self` and defaults to `0.0` when its param is absent.
+    fn target_vel_xy(&self, ctrl: &CompiledController, env: EvalEnv) -> (f32, f32) {
+        let x = ctrl
+            .params
+            .get("x")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0.0, |v| v.to_float());
+        let y = ctrl
+            .params
+            .get("y")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0.0, |v| v.to_float());
+        (x, y)
+    }
+
+    /// `TargetPowerAdd`: emit a [`TargetOp::PowerAdd`] to add `value` to the
+    /// target's power meter. A missing `value`, or no target, pushes nothing.
+    fn ctrl_target_power_add(
+        &self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+    ) {
+        if !self.has_target {
+            tracing::debug!(
+                "tick: TargetPowerAdd in state {} with no target; no-op",
+                ctrl.state_number
+            );
+            return;
+        }
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: TargetPowerAdd in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        report.target_ops.push(TargetOp::PowerAdd(value.to_int()));
     }
 
     /// `HitDef`: build a [`fp_combat::HitDef`] from the controller's parameters
@@ -5268,6 +5576,334 @@ mod tests {
         assert!(!parse_loop_flag("false"));
         assert!(!parse_loop_flag(""));
         assert!(!parse_loop_flag("2"));
+    }
+
+    // ---- P8a: Target* controllers emit deferred TargetOps ----
+
+    /// Helper: run a single `Target*` controller for one tick with `has_target`
+    /// set as requested, returning the report's `target_ops`.
+    fn target_tick(kind: &str, params: &[(&str, &str)], has_target: bool) -> Vec<TargetOp> {
+        let c = ctrl(0, kind, &[], &[(1, &["1"])], None, params);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = has_target;
+        lc.tick(&mut ch).target_ops
+    }
+
+    #[test]
+    fn target_state_emits_state_op() {
+        let ops = target_tick("TargetState", &[("value", "820")], true);
+        assert_eq!(ops, vec![TargetOp::State(820)]);
+    }
+
+    #[test]
+    fn target_bind_emits_bind_op_with_time_and_pos() {
+        let ops = target_tick("TargetBind", &[("time", "3"), ("pos", "5, -2")], true);
+        assert_eq!(
+            ops,
+            vec![TargetOp::Bind {
+                time: 3,
+                pos: (5.0, -2.0)
+            }]
+        );
+    }
+
+    #[test]
+    fn target_bind_defaults_time_one_and_pos_zero() {
+        // Absent time defaults to MUGEN's 1; absent pos axes default to 0.0.
+        let ops = target_tick("TargetBind", &[], true);
+        assert_eq!(
+            ops,
+            vec![TargetOp::Bind {
+                time: 1,
+                pos: (0.0, 0.0)
+            }]
+        );
+    }
+
+    #[test]
+    fn target_life_add_emits_value_and_kill() {
+        let ops = target_tick(
+            "TargetLifeAdd",
+            &[("value", "-40"), ("kill", "1")],
+            true,
+        );
+        assert_eq!(
+            ops,
+            vec![TargetOp::LifeAdd {
+                value: -40,
+                kill: true
+            }]
+        );
+    }
+
+    #[test]
+    fn target_life_add_kill_defaults_true_and_honors_zero() {
+        // Absent kill defaults to MUGEN's true (lethal allowed).
+        let dflt = target_tick("TargetLifeAdd", &[("value", "-10")], true);
+        assert_eq!(
+            dflt,
+            vec![TargetOp::LifeAdd {
+                value: -10,
+                kill: true
+            }]
+        );
+        // Explicit kill = 0 → not lethal.
+        let no_kill = target_tick("TargetLifeAdd", &[("value", "-10"), ("kill", "0")], true);
+        assert_eq!(
+            no_kill,
+            vec![TargetOp::LifeAdd {
+                value: -10,
+                kill: false
+            }]
+        );
+    }
+
+    #[test]
+    fn target_facing_emits_facing_op() {
+        assert_eq!(
+            target_tick("TargetFacing", &[("value", "-1")], true),
+            vec![TargetOp::Facing(-1)]
+        );
+        assert_eq!(
+            target_tick("TargetFacing", &[("value", "1")], true),
+            vec![TargetOp::Facing(1)]
+        );
+    }
+
+    #[test]
+    fn target_vel_set_and_add_emit_pairs() {
+        assert_eq!(
+            target_tick("TargetVelSet", &[("x", "4"), ("y", "-6")], true),
+            vec![TargetOp::VelSet((4.0, -6.0))]
+        );
+        assert_eq!(
+            target_tick("TargetVelAdd", &[("x", "1.5")], true),
+            vec![TargetOp::VelAdd((1.5, 0.0))],
+            "absent y defaults to 0.0"
+        );
+    }
+
+    #[test]
+    fn target_power_add_emits_value() {
+        assert_eq!(
+            target_tick("TargetPowerAdd", &[("value", "500")], true),
+            vec![TargetOp::PowerAdd(500)]
+        );
+    }
+
+    #[test]
+    fn target_controllers_are_noops_without_target() {
+        // With has_target = false every Target* controller pushes nothing.
+        assert!(target_tick("TargetState", &[("value", "820")], false).is_empty());
+        assert!(target_tick("TargetBind", &[("time", "3"), ("pos", "5, -2")], false).is_empty());
+        assert!(target_tick("TargetLifeAdd", &[("value", "-40")], false).is_empty());
+        assert!(target_tick("TargetFacing", &[("value", "-1")], false).is_empty());
+        assert!(target_tick("TargetVelSet", &[("x", "4"), ("y", "-6")], false).is_empty());
+        assert!(target_tick("TargetVelAdd", &[("x", "1.5")], false).is_empty());
+        assert!(target_tick("TargetPowerAdd", &[("value", "500")], false).is_empty());
+    }
+
+    #[test]
+    fn target_controllers_with_missing_required_value_push_nothing() {
+        // value-less State/LifeAdd/Facing/PowerAdd are safe no-ops even WITH a target.
+        assert!(target_tick("TargetState", &[], true).is_empty());
+        assert!(target_tick("TargetLifeAdd", &[], true).is_empty());
+        assert!(target_tick("TargetFacing", &[], true).is_empty());
+        assert!(target_tick("TargetPowerAdd", &[], true).is_empty());
+    }
+
+    #[test]
+    fn target_ops_empty_on_tick_without_target_controller() {
+        // A fresh TickReport carries no target_ops when no Target* fired.
+        let c = ctrl(0, "Null", &[], &[(1, &["1"])], None, &[]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = true;
+        assert!(lc.tick(&mut ch).target_ops.is_empty());
+    }
+
+    // ---- P8a (Proctor): additional edge / MUGEN-semantics coverage ----------
+
+    /// A fresh `Character` has no target: the default is `false`, so every
+    /// `Target*` controller is a no-op until a hit establishes a target.
+    #[test]
+    fn fresh_character_has_no_target_by_default() {
+        let ch = Character::new();
+        assert!(!ch.has_target, "has_target defaults to false");
+        assert!(!Character::default().has_target);
+    }
+
+    /// AC2/AC3: the dispatch matches the controller type **case-insensitively**
+    /// (MUGEN controller names are not case-sensitive), so lowercase / uppercase
+    /// spellings still emit the right `TargetOp`.
+    #[test]
+    fn target_dispatch_is_case_insensitive() {
+        assert_eq!(
+            target_tick("targetstate", &[("value", "820")], true),
+            vec![TargetOp::State(820)]
+        );
+        assert_eq!(
+            target_tick("TARGETPOWERADD", &[("value", "300")], true),
+            vec![TargetOp::PowerAdd(300)]
+        );
+        assert_eq!(
+            target_tick("TargetVelAdd", &[("x", "2"), ("y", "3")], true),
+            vec![TargetOp::VelAdd((2.0, 3.0))]
+        );
+    }
+
+    /// AC2: params are evaluated through the expression VM, not parsed as raw
+    /// literals. A `TargetState` whose `value` is an arithmetic expression
+    /// resolves to the computed state number.
+    #[test]
+    fn target_state_value_is_an_evaluated_expression() {
+        let ops = target_tick("TargetState", &[("value", "800 + 20")], true);
+        assert_eq!(ops, vec![TargetOp::State(820)]);
+    }
+
+    /// AC2: param expressions read live character state. With `var(0) = 815` the
+    /// `TargetState` value expression `var(0)` resolves to that state number,
+    /// proving the existing `eval_param` helper is actually wired in.
+    #[test]
+    fn target_state_value_reads_character_var() {
+        let c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "var(0)")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = true;
+        ch.vars[0] = 815;
+        assert_eq!(lc.tick(&mut ch).target_ops, vec![TargetOp::State(815)]);
+    }
+
+    /// AC2: `TargetLifeAdd`'s `value` is evaluated, and a fractional float result
+    /// truncates toward zero (MUGEN life deltas are integers).
+    #[test]
+    fn target_life_add_value_truncates_float_expression() {
+        let ops = target_tick("TargetLifeAdd", &[("value", "-12.9")], true);
+        assert_eq!(
+            ops,
+            vec![TargetOp::LifeAdd {
+                value: -12,
+                kill: true
+            }]
+        );
+    }
+
+    /// MUGEN treats any non-zero `kill` as true, not only literal `1`. A
+    /// `kill = 2` expression is truthy → lethal allowed.
+    #[test]
+    fn target_life_add_kill_is_truthy_not_literal_one() {
+        let ops = target_tick("TargetLifeAdd", &[("value", "-10"), ("kill", "2")], true);
+        assert_eq!(
+            ops,
+            vec![TargetOp::LifeAdd {
+                value: -10,
+                kill: true
+            }]
+        );
+    }
+
+    /// `TargetVelSet`/`TargetVelAdd` with NEITHER axis given default both x and y
+    /// to `0.0` (rather than skipping the op): a vel controller with no params is
+    /// a real, zeroed emission.
+    #[test]
+    fn target_vel_set_defaults_both_axes_to_zero() {
+        assert_eq!(
+            target_tick("TargetVelSet", &[], true),
+            vec![TargetOp::VelSet((0.0, 0.0))]
+        );
+        assert_eq!(
+            target_tick("TargetVelAdd", &[], true),
+            vec![TargetOp::VelAdd((0.0, 0.0))]
+        );
+    }
+
+    /// `TargetBind` with only an `x` in `pos` leaves `y` at the `0.0` default;
+    /// `time` still defaults to MUGEN's `1`.
+    #[test]
+    fn target_bind_single_pos_component_defaults_y() {
+        let ops = target_tick("TargetBind", &[("pos", "7")], true);
+        assert_eq!(
+            ops,
+            vec![TargetOp::Bind {
+                time: 1, // absent `time` → MUGEN default
+                pos: (7.0, 0.0)
+            }]
+        );
+    }
+
+    /// AC2/AC3: multiple `Target*` controllers in one state emit their ops in
+    /// **fire order** onto the single per-tick `target_ops` vec — the exact KFM
+    /// throw (state 810) shape: Bind, then State, LifeAdd, Facing each tick.
+    #[test]
+    fn multiple_target_controllers_emit_in_fire_order() {
+        let bind = ctrl(0, "TargetBind", &[], &[(1, &["1"])], None, &[("time", "1"), ("pos", "10, 0")]);
+        let state_c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "820")]);
+        let life = ctrl(0, "TargetLifeAdd", &[], &[(1, &["1"])], None, &[("value", "-13"), ("kill", "0")]);
+        let face = ctrl(0, "TargetFacing", &[], &[(1, &["1"])], None, &[("value", "-1")]);
+        let lc = loaded(
+            vec![stand_n(0, vec![bind, state_c, life, face])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = true;
+        let ops = lc.tick(&mut ch).target_ops;
+        assert_eq!(
+            ops,
+            vec![
+                TargetOp::Bind { time: 1, pos: (10.0, 0.0) },
+                TargetOp::State(820),
+                TargetOp::LifeAdd { value: -13, kill: false },
+                TargetOp::Facing(-1),
+            ],
+            "ops preserve controller fire order"
+        );
+    }
+
+    /// AC1: `target_ops` is rebuilt empty each tick — emissions never carry
+    /// across ticks. A persistent `TargetState` pushes exactly one op on tick 1
+    /// AND exactly one (not two) on tick 2.
+    #[test]
+    fn target_ops_do_not_accumulate_across_ticks() {
+        let c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "820")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = true;
+        let t1 = lc.tick(&mut ch).target_ops;
+        assert_eq!(t1, vec![TargetOp::State(820)], "tick 1 emits one op");
+        let t2 = lc.tick(&mut ch).target_ops;
+        assert_eq!(t2, vec![TargetOp::State(820)], "tick 2 emits one op, not two");
+    }
+
+    /// A `Target*` controller gated off by its trigger never runs, so emits
+    /// nothing even with a target — confirming the op only fires when the
+    /// controller actually qualifies.
+    #[test]
+    fn gated_off_target_controller_emits_nothing() {
+        let c = ctrl(0, "TargetState", &[], &[(1, &["0"])], None, &[("value", "820")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.has_target = true;
+        assert!(lc.tick(&mut ch).target_ops.is_empty());
+    }
+
+    /// `TickReport::default()` (and a no-controller tick) leaves `target_ops`
+    /// empty — the field starts clear, like `sound_requests`.
+    #[test]
+    fn tick_report_default_target_ops_is_empty() {
+        assert!(TickReport::default().target_ops.is_empty());
     }
 
     // ---- 5.4 helper: parse_var_bank_key unit coverage ----

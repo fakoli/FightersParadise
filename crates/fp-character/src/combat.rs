@@ -63,6 +63,16 @@ pub struct AttackResolution {
     /// [`None`] when the relevant sound is unset on the `HitDef`. (A miss never
     /// produces an [`AttackResolution`], so this is keyed off `result`.)
     pub hit_sound: Option<fp_combat::SoundId>,
+    /// The state the **attacker** should be sent into on this connection — the
+    /// HitDef's `p1stateno` ([`None`] when the param was absent). Throws set this
+    /// (KFM `p1stateno = 810`) so the attacker enters its throw animation.
+    ///
+    /// [`resolve_attack`] does **not** change the attacker's state itself: the
+    /// attacker's state graph is not in hand here (only the *defender*'s states
+    /// are passed in), so applying `p1stateno` is deferred to a downstream owner
+    /// of both characters (`fp-engine`, task P8b), which has the attacker's
+    /// compiled states.
+    pub attacker_state: Option<i32>,
 }
 
 /// Performs one tick of attacker → defender combat: detect, resolve, and apply.
@@ -241,6 +251,12 @@ pub fn resolve_attack(
         attacker.move_connect.hit = true;
     }
 
+    // The defender the attacker just hit becomes the attacker's target: its
+    // `Target*` controllers now act on the opponent (throws use this — KFM state
+    // 810). In this flat 1-v-1 model the target is the opponent and stays set;
+    // MUGEN's per-target release (move end / explicit redirect) is deferred.
+    attacker.has_target = true;
+
     // Pick the impact sound from the attacker's HitDef: the guardsound when the
     // attack was guarded, the hitsound on a clean hit. Either may be `None`.
     let hit_sound = if guarded {
@@ -257,6 +273,9 @@ pub fn resolve_attack(
         attacker_hitpause: outcome.pausetime,
         defender_hitpause: outcome.shaketime,
         hit_sound,
+        // `p1stateno` is parsed onto the HitDef but applied to the attacker
+        // downstream (P8b), since the attacker's state graph is not in hand here.
+        attacker_state: hitdef.p1stateno,
     })
 }
 
@@ -914,6 +933,123 @@ mod tests {
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
         assert_eq!(res.defender_state, 1234);
         assert_eq!(d.state_no, 1234, "defender forced into p2stateno");
+    }
+
+    /// P8a: a connecting hit makes the defender the attacker's target — the
+    /// attacker's `has_target` flips true so its `Target*` controllers fire.
+    #[test]
+    fn connecting_hit_sets_attacker_has_target() {
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        assert!(!a.has_target, "no target before any hit");
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert!(a.has_target, "defender became the attacker's target on connect");
+    }
+
+    /// P8a: `AttackResolution.attacker_state` carries the HitDef's `p1stateno`
+    /// (the attacker's throw-anim state) on a connecting hit. fp-engine (P8b)
+    /// applies it; resolve_attack does not change the attacker's state here.
+    #[test]
+    fn connecting_hit_reports_p1stateno_as_attacker_state() {
+        let (mut a, a_air) = make_attacker();
+        let attacker_state_before = a.state_no;
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.p1stateno = Some(810);
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.attacker_state, Some(810));
+        assert_eq!(
+            a.state_no, attacker_state_before,
+            "resolve_attack does NOT move the attacker; p1stateno is applied downstream"
+        );
+    }
+
+    /// P8a: with no `p1stateno` on the HitDef, `attacker_state` is `None`.
+    #[test]
+    fn connecting_hit_without_p1stateno_reports_none() {
+        let (mut a, a_air) = make_attacker();
+        // sample_hitdef leaves p1stateno at its default (None).
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.attacker_state, None);
+    }
+
+    /// P8a (Proctor): a **guarded** connection — not only a clean hit — also
+    /// establishes the target. MUGEN's target set includes anyone the attacker's
+    /// HitDef contacted, blocked or not.
+    #[test]
+    fn guarded_hit_also_sets_attacker_has_target() {
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.holding_back = true; // guardflag MA admits a standing block
+        let states = HashMap::new();
+        assert!(!a.has_target);
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guards");
+        assert_eq!(res.result, HitResult::Guard);
+        assert!(a.has_target, "a guarded contact still makes the defender a target");
+    }
+
+    /// P8a (Proctor): the lifecycle simplification — once `has_target` is set it
+    /// **stays** set. A second `resolve_attack` blocked by `hitonce` returns
+    /// `None` yet does not clear the flag (no per-target release in this model).
+    #[test]
+    fn has_target_persists_after_hitonce_blocks_second_call() {
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("first connects");
+        assert!(a.has_target);
+
+        // hitonce blocks the second call (returns None) but the target stays set.
+        assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
+        assert!(a.has_target, "has_target is sticky; no release in the flat 1-v-1 model");
+    }
+
+    /// P8a (Proctor): `p1stateno` is independent of `p2stateno`. Setting both on
+    /// the HitDef routes the attacker (p1) and defender (p2) to their distinct
+    /// states — the exact KFM throw shape (p1stateno=810 thrower, p2stateno=820
+    /// victim).
+    #[test]
+    fn p1stateno_and_p2stateno_are_reported_independently() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.p1stateno = Some(810);
+            hd.p2stateno = Some(820);
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.attacker_state, Some(810), "p1stateno -> attacker_state");
+        assert_eq!(res.defender_state, 820, "p2stateno -> defender_state");
+        assert_eq!(d.state_no, 820, "defender actually moved to p2stateno");
+    }
+
+    /// P8a (Proctor): a **miss** establishes no target and reports no
+    /// `attacker_state` — `resolve_attack` returns `None` before any of the P8a
+    /// bookkeeping runs.
+    #[test]
+    fn miss_sets_no_target_and_no_attacker_state() {
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        // Move the defender far out of reach so the boxes never overlap.
+        d.pos = Vec2::new(10_000.0, 0.0);
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.p1stateno = Some(810);
+        }
+        let states = HashMap::new();
+
+        assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
+        assert!(!a.has_target, "a whiff establishes no target");
     }
 
     /// A `fall` hit overrides the defender's GetHitVar(yvel) with the HitDef's

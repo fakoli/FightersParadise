@@ -73,7 +73,7 @@ pub mod executor;
 pub mod loader;
 
 pub use combat::{resolve_attack, AttackResolution};
-pub use executor::{SoundRequest, TickReport};
+pub use executor::{SoundRequest, TargetOp, TickReport};
 // Re-export the combat sound reference so downstream crates (e.g. fp-engine) can
 // name the type of [`AttackResolution::hit_sound`] without taking a direct
 // dependency on fp-combat.
@@ -943,6 +943,25 @@ pub struct Character {
     /// its [`active_hitdef`](Character::active_hitdef) connects, and reset when a
     /// new move begins. See [`MoveConnect`].
     pub move_connect: MoveConnect,
+
+    /// Whether this character has a hit-established **target** (the opponent in
+    /// 1-v-1) that its `Target*` controllers act on.
+    ///
+    /// MUGEN's `Target*` controllers (`TargetState`, `TargetBind`,
+    /// `TargetLifeAdd`, `TargetFacing`, `TargetVelSet`, `TargetVelAdd`,
+    /// `TargetPowerAdd`) operate on the set of players this character has hit;
+    /// throws (KFM state 810) use them to drive the victim. Hit resolution
+    /// ([`resolve_attack`]) sets this `true` on the **attacker** when its
+    /// [`active_hitdef`](Character::active_hitdef) connects — the defender it just
+    /// hit becomes the target. While `true`, the `Target*` controllers emit
+    /// [`TargetOp`]s onto [`TickReport::target_ops`]; while `false` they are safe
+    /// no-ops.
+    ///
+    /// Lifecycle simplification: in this flat 1-v-1 model the target *is* the
+    /// opponent, so once set it stays set. MUGEN's target release (on move end,
+    /// or an explicit `TargetState`/`Target` redirect change) is **deferred** —
+    /// there is no per-target tracking here, only this single boolean.
+    pub has_target: bool,
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1021,6 +1040,7 @@ impl Default for Character {
             hitpause: 0,
             shaketime: 0,
             move_connect: MoveConnect::default(),
+            has_target: false,
         }
     }
 }
