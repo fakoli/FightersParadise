@@ -161,6 +161,136 @@ fn kfm_sff_v1_loads() {
 }
 
 #[test]
+fn kfm_sff_v1_loads_with_palettes() {
+    // intro.sff / ending.sff are SFF v1: each inline PCX image carries a trailing
+    // 256-colour VGA palette. The v1 loader must extract those into `palettes`
+    // (gap #25) so sprites render with real colours instead of invisibly.
+    let path = require("intro.sff").or_else(|| require("ending.sff"));
+    let Some(path) = path else {
+        return;
+    };
+
+    let sff = SffFile::load(&path).expect("an SFF v1 file should load");
+    assert_eq!(sff.version, SffVersion::V1, "fixture is an SFF v1 file");
+
+    // The trailing-PCX-palette extraction must populate the palette table.
+    assert!(
+        !sff.palettes.is_empty(),
+        "SFF v1 loader should extract per-sprite trailing PCX palettes"
+    );
+
+    // Every sprite's palette_index must resolve to a real palette, and the
+    // resolved RGBA must contain at least one non-transparent, non-black colour —
+    // i.e. genuine VGA palette data, not an all-zero default.
+    let mut saw_real_colour = false;
+    for sprite in &sff.sprites {
+        let rgba = sff
+            .palette(sprite.palette_index as usize)
+            .expect("each v1 sprite's palette_index must resolve");
+        // Look past index 0 (always transparent) for any opaque coloured entry.
+        if rgba
+            .chunks_exact(4)
+            .skip(1)
+            .any(|px| px[3] != 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0))
+        {
+            saw_real_colour = true;
+        }
+    }
+    assert!(
+        saw_real_colour,
+        "at least one extracted SFF v1 palette should carry real (non-black) colours"
+    );
+
+    // Regression guard for the inverted byte-18 shared-palette semantic
+    // (gap #25): SFF v1 sprites each carry their OWN distinct trailing VGA
+    // palette, even though real WinMUGEN content sets the byte-18 "shared" flag on
+    // nearly every sprite. The loader must therefore extract one DISTINCT palette
+    // per data-owning sprite — not collapse them onto a handful. (The previous,
+    // inverted code kept only the ~1-2 byte-18==0 sprites' palettes and forced all
+    // the rest onto a single wrong palette.)
+    //
+    // Count sprites that own pixel data and whose `palette_index` resolves to a
+    // *real* (non-empty) palette entry, then count how many DISTINCT resolved
+    // palettes those produce. The two counts must match: every such sprite has its
+    // own palette.
+    let mut data_owning_with_real_palette = 0usize;
+    let mut distinct_palette_colours: std::collections::HashSet<[u8; 1024]> =
+        std::collections::HashSet::new();
+    for sprite in &sff.sprites {
+        if sprite.data_length == 0 {
+            continue; // linked/data-less sprite: legitimately reuses a palette
+        }
+        let entry = &sff.palettes[sprite.palette_index as usize];
+        if entry.data_length == 0 {
+            continue; // resolved to the safe zeroed default, not a real palette
+        }
+        data_owning_with_real_palette += 1;
+        let rgba = sff
+            .palette(sprite.palette_index as usize)
+            .expect("data-owning v1 sprite's palette must resolve");
+        distinct_palette_colours.insert(rgba);
+    }
+
+    assert!(
+        data_owning_with_real_palette >= 2,
+        "the v1 fixture should have several data-owning sprites with real palettes \
+         (got {data_owning_with_real_palette})"
+    );
+    // The headline assertion: distinct palettes == data-owning sprites with real
+    // palettes. If the byte-18 semantic were inverted, this would be far smaller
+    // (a couple) than the sprite count.
+    assert_eq!(
+        distinct_palette_colours.len(),
+        data_owning_with_real_palette,
+        "each data-owning SFF v1 sprite must resolve to its OWN distinct trailing \
+         palette ({} distinct palettes for {data_owning_with_real_palette} sprites)",
+        distinct_palette_colours.len()
+    );
+
+    // Belt-and-braces: two specific sprites that each own pixel+palette data must
+    // resolve to DIFFERENT palette colours (they would be identical under the
+    // inverted semantic that forced both onto sprite 0's palette).
+    let data_owning_indices: Vec<usize> = (0..sff.sprites.len())
+        .filter(|&i| {
+            sff.sprites[i].data_length > 0
+                && sff.palettes[sff.sprites[i].palette_index as usize].data_length > 0
+        })
+        .collect();
+    assert!(
+        data_owning_indices.len() >= 2,
+        "need at least two data-owning sprites to compare palettes"
+    );
+    let pal_a = sff
+        .palette(sff.sprites[data_owning_indices[0]].palette_index as usize)
+        .expect("palette A resolves");
+    let pal_b = sff
+        .palette(sff.sprites[data_owning_indices[1]].palette_index as usize)
+        .expect("palette B resolves");
+    assert_ne!(
+        pal_a, pal_b,
+        "two distinct data-owning v1 sprites must resolve to different palettes \
+         (they were wrongly identical under the inverted byte-18 semantic)"
+    );
+    // Their palette_index values must also differ (each owns its own entry).
+    assert_ne!(
+        sff.sprites[data_owning_indices[0]].palette_index,
+        sff.sprites[data_owning_indices[1]].palette_index,
+        "two data-owning v1 sprites must point at distinct palette entries"
+    );
+
+    // End to end: at least one sprite must decode to RGBA pixels that are not
+    // entirely transparent, proving indices + palette combine into a visible
+    // sprite (the gap-#25 regression: previously every v1 sprite was invisible).
+    let any_visible = (0..sff.sprites.len())
+        .filter_map(|i| sff.decode_sprite_rgba(i).ok())
+        .any(|rgba| rgba.chunks_exact(4).any(|px| px[3] != 0));
+    assert!(
+        any_visible,
+        "at least one SFF v1 sprite should decode to visible (opaque) RGBA pixels"
+    );
+}
+
+#[test]
 fn kfm_air_loads_with_actions() {
     let Some(path) = require("kfm.air") else {
         return;
@@ -469,4 +599,250 @@ fn synthetic_rle5_sff_decodes_end_to_end() {
         vec![5, 3, 3, 7, 7, 7],
         "RLE5 stream must decode to the hand-traced palette indices"
     );
+}
+
+/// Builds a complete SFF v2 file holding a single PNG8 (indexed) sprite.
+///
+/// The TData block carries a real PNG datastream (encoded with the `png` crate):
+/// a 2x2 indexed image whose palette is `[black, red, green, blue]` and whose
+/// pixels are indices `[1, 2, 3, 1]`. The SFF palette table also carries a
+/// 768-byte LData palette, but PNG8 decoding uses the PNG's *embedded* `PLTE`.
+fn synthesize_png8_sff() -> Vec<u8> {
+    // Encode the indexed PNG payload.
+    let plte: [u8; 12] = [
+        0, 0, 0, // 0 transparent slot
+        255, 0, 0, // 1 red
+        0, 255, 0, // 2 green
+        0, 0, 255, // 3 blue
+    ];
+    let indices: [u8; 4] = [1, 2, 3, 1];
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_palette(plte.to_vec());
+        let mut writer = encoder.write_header().expect("write PNG header");
+        writer
+            .write_image_data(&indices)
+            .expect("write PNG indices");
+    }
+
+    let sprite_offset: u32 = 512;
+    let palette_offset: u32 = 540;
+    let ldata_offset: u32 = 556;
+    let ldata_length: u32 = 768;
+    let tdata_offset: u32 = ldata_offset + ldata_length;
+    let tdata_length: u32 = png_bytes.len() as u32;
+
+    let total = tdata_offset as usize + tdata_length as usize;
+    let mut buf = vec![0u8; total];
+
+    buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+    buf[14] = 1;
+    buf[15] = 2; // v2 container
+    buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes());
+    buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
+    buf[48..52].copy_from_slice(&1u32.to_le_bytes());
+    buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
+    buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
+    buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());
+    buf[64..68].copy_from_slice(&tdata_length.to_le_bytes());
+
+    // Sprite sub-header: 2x2 PNG8 living in TData.
+    let s = sprite_offset as usize;
+    buf[s + 4..s + 6].copy_from_slice(&2u16.to_le_bytes()); // width
+    buf[s + 6..s + 8].copy_from_slice(&2u16.to_le_bytes()); // height
+    buf[s + 14] = 10; // format = PNG8
+    buf[s + 15] = 8; // color_depth
+    buf[s + 16..s + 20].copy_from_slice(&0u32.to_le_bytes()); // data_offset in TData
+    buf[s + 20..s + 24].copy_from_slice(&tdata_length.to_le_bytes());
+    buf[s + 24..s + 26].copy_from_slice(&0u16.to_le_bytes()); // palette_index
+    buf[s + 26..s + 28].copy_from_slice(&1u16.to_le_bytes()); // flags: bit0 -> TData
+
+    // Palette sub-header (a valid SFF palette so palette(0) resolves too).
+    let p = palette_offset as usize;
+    buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes());
+    buf[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes());
+    buf[p + 12..p + 16].copy_from_slice(&ldata_length.to_le_bytes());
+
+    // TData: the PNG datastream.
+    let t = tdata_offset as usize;
+    buf[t..t + png_bytes.len()].copy_from_slice(&png_bytes);
+
+    buf
+}
+
+/// End-to-end PNG8 coverage (gap #35). Synthesizes an SFF v2 file containing one
+/// indexed PNG sprite and decodes it through the public on-disk API: indices via
+/// `decode_sprite`, and full RGBA (using the PNG's embedded PLTE) via
+/// `decode_sprite_rgba`. Always runs — the fixture is generated at runtime.
+#[test]
+fn synthetic_png8_sff_decodes_end_to_end() {
+    let bytes = synthesize_png8_sff();
+
+    let path = std::env::temp_dir().join(format!("fp_formats_png8_{}.sff", std::process::id()));
+    std::fs::write(&path, &bytes).expect("write synthetic PNG8 SFF fixture");
+    let loaded = SffFile::load(&path);
+    let _ = std::fs::remove_file(&path);
+    let sff = loaded.expect("synthetic PNG8 SFF should load");
+
+    assert_eq!(sff.version, SffVersion::V2);
+    assert_eq!(sff.sprites.len(), 1);
+    assert_eq!(sff.sprites[0].format, SpriteFormat::Png8);
+
+    // Indexed pixels flow through the standard index path.
+    let indices = sff.decode_sprite(0).expect("PNG8 sprite should decode to indices");
+    assert_eq!(indices, vec![1, 2, 3, 1]);
+
+    // RGBA uses the PNG's embedded palette: red, green, blue, red.
+    let rgba = sff
+        .decode_sprite_rgba(0)
+        .expect("PNG8 sprite should decode to RGBA");
+    assert_eq!(rgba.len(), 4 * 4);
+    assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "pixel 0 -> red");
+    assert_eq!(&rgba[4..8], &[0, 255, 0, 255], "pixel 1 -> green");
+    assert_eq!(&rgba[8..12], &[0, 0, 255, 255], "pixel 2 -> blue");
+    assert_eq!(&rgba[12..16], &[255, 0, 0, 255], "pixel 3 -> red");
+}
+
+/// Builds a complete SFF v2 file holding a single truecolor PNG sprite.
+///
+/// `format_byte` selects PNG24 (11, RGB source) or PNG32 (12, RGBA source). The
+/// TData block carries a real PNG datastream encoded with the `png` crate. This
+/// drives the `format byte 11/12 -> DecodedPng::TrueColor -> decode_sprite_rgba`
+/// wiring in `sff::mod` end to end (not just at the `decode_png` unit level).
+fn synthesize_truecolor_sff(format_byte: u8, rgba_in: bool) -> Vec<u8> {
+    // Encode a 1x2 truecolor PNG: a red pixel over a semi-transparent blue pixel.
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 1, 2);
+        if rgba_in {
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write PNG header");
+            writer
+                .write_image_data(&[255, 0, 0, 255, 0, 0, 255, 128])
+                .expect("write RGBA pixels");
+        } else {
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write PNG header");
+            writer
+                .write_image_data(&[255, 0, 0, 0, 0, 255])
+                .expect("write RGB pixels");
+        }
+    }
+
+    let sprite_offset: u32 = 512;
+    let palette_offset: u32 = 540;
+    let ldata_offset: u32 = 556;
+    let ldata_length: u32 = 768;
+    let tdata_offset: u32 = ldata_offset + ldata_length;
+    let tdata_length: u32 = png_bytes.len() as u32;
+
+    let total = tdata_offset as usize + tdata_length as usize;
+    let mut buf = vec![0u8; total];
+
+    buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+    buf[14] = 1;
+    buf[15] = 2; // v2 container
+    buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes());
+    buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
+    buf[48..52].copy_from_slice(&1u32.to_le_bytes());
+    buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
+    buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
+    buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());
+    buf[64..68].copy_from_slice(&tdata_length.to_le_bytes());
+
+    // Sprite sub-header: 1x2 truecolor PNG living in TData.
+    let s = sprite_offset as usize;
+    buf[s + 4..s + 6].copy_from_slice(&1u16.to_le_bytes()); // width
+    buf[s + 6..s + 8].copy_from_slice(&2u16.to_le_bytes()); // height
+    buf[s + 14] = format_byte; // 11 = PNG24, 12 = PNG32
+    buf[s + 15] = if rgba_in { 32 } else { 24 }; // color_depth (advisory)
+    buf[s + 16..s + 20].copy_from_slice(&0u32.to_le_bytes()); // data_offset in TData
+    buf[s + 20..s + 24].copy_from_slice(&tdata_length.to_le_bytes());
+    buf[s + 24..s + 26].copy_from_slice(&0u16.to_le_bytes()); // palette_index
+    buf[s + 26..s + 28].copy_from_slice(&1u16.to_le_bytes()); // flags: bit0 -> TData
+
+    // Palette sub-header (present but unused by truecolor sprites).
+    let p = palette_offset as usize;
+    buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes());
+    buf[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes());
+    buf[p + 12..p + 16].copy_from_slice(&ldata_length.to_le_bytes());
+
+    // TData: the PNG datastream.
+    let t = tdata_offset as usize;
+    buf[t..t + png_bytes.len()].copy_from_slice(&png_bytes);
+
+    buf
+}
+
+/// End-to-end PNG24 coverage (gap #35, truecolor). Synthesizes an SFF v2 file
+/// with one PNG24 (RGB) sprite and decodes it through the public on-disk
+/// `decode_sprite_rgba` path, asserting the `format byte 11 -> TrueColor` wiring
+/// in `sff::mod`. PNG24 has no alpha, so every pixel must come back fully opaque.
+#[test]
+fn synthetic_png24_sff_decodes_to_rgba_end_to_end() {
+    let bytes = synthesize_truecolor_sff(11, false);
+
+    let path = std::env::temp_dir().join(format!("fp_formats_png24_{}.sff", std::process::id()));
+    std::fs::write(&path, &bytes).expect("write synthetic PNG24 SFF fixture");
+    let loaded = SffFile::load(&path);
+    let _ = std::fs::remove_file(&path);
+    let sff = loaded.expect("synthetic PNG24 SFF should load");
+
+    assert_eq!(sff.version, SffVersion::V2);
+    assert_eq!(sff.sprites.len(), 1);
+    assert_eq!(sff.sprites[0].format, SpriteFormat::Png24);
+
+    // Truecolor sprites carry no palette indices: the index path must refuse them
+    // with a recoverable error (never silently mis-handle them).
+    assert!(
+        sff.decode_sprite(0).is_err(),
+        "PNG24 truecolor sprite has no indices for the index path"
+    );
+
+    // The RGBA path surfaces the truecolor pixels directly, with opaque alpha.
+    let rgba = sff
+        .decode_sprite_rgba(0)
+        .expect("PNG24 sprite should decode to RGBA");
+    // 1x2 sprite at 4 bytes/pixel (RGBA) = 8 bytes.
+    assert_eq!(rgba.len(), 8);
+    assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "pixel 0 -> opaque red");
+    assert_eq!(&rgba[4..8], &[0, 0, 255, 255], "pixel 1 -> opaque blue");
+}
+
+/// End-to-end PNG32 coverage (gap #35, truecolor + alpha). Mirrors the PNG24 test
+/// for the `format byte 12 -> TrueColor` path, preserving the source alpha.
+#[test]
+fn synthetic_png32_sff_decodes_to_rgba_end_to_end() {
+    let bytes = synthesize_truecolor_sff(12, true);
+
+    let path = std::env::temp_dir().join(format!("fp_formats_png32_{}.sff", std::process::id()));
+    std::fs::write(&path, &bytes).expect("write synthetic PNG32 SFF fixture");
+    let loaded = SffFile::load(&path);
+    let _ = std::fs::remove_file(&path);
+    let sff = loaded.expect("synthetic PNG32 SFF should load");
+
+    assert_eq!(sff.version, SffVersion::V2);
+    assert_eq!(sff.sprites.len(), 1);
+    assert_eq!(sff.sprites[0].format, SpriteFormat::Png32);
+
+    assert!(
+        sff.decode_sprite(0).is_err(),
+        "PNG32 truecolor sprite has no indices for the index path"
+    );
+
+    // The RGBA path preserves the source alpha (the blue pixel is semi-transparent).
+    let rgba = sff
+        .decode_sprite_rgba(0)
+        .expect("PNG32 sprite should decode to RGBA");
+    // 1x2 sprite at 4 bytes/pixel (RGBA) = 8 bytes.
+    assert_eq!(rgba.len(), 8);
+    assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "pixel 0 -> opaque red");
+    assert_eq!(&rgba[4..8], &[0, 0, 255, 128], "pixel 1 -> semi-transparent blue");
 }

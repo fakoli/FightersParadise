@@ -44,6 +44,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nom = "7"
+png = "0.17"
 wgpu = "24"
 sdl2 = { version = "0.37", features = ["raw-window-handle"] }
 bytemuck = { version = "1", features = ["derive"] }

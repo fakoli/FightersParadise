@@ -337,12 +337,221 @@ pub fn decompress_lz5(data: &[u8]) -> FpResult<Vec<u8>> {
     Ok(p)
 }
 
-/// Stub for PNG sprite decoding (not yet implemented).
-pub fn decompress_png(_data: &[u8]) -> FpResult<Vec<u8>> {
-    tracing::warn!("PNG sprite decoding not yet implemented");
-    Err(FpError::Unsupported(
-        "PNG sprite decoding".to_string(),
-    ))
+/// Upper bound on a single decoded PNG sprite, guarding against a maliciously
+/// large declared canvas before allocation (never-crash).
+const MAX_PNG_PIXELS: usize = 64 * 1024 * 1024;
+
+/// A fully decoded SFF v2 PNG sprite.
+///
+/// SFF v2 PNG sprites come in three flavours (format bytes 10/11/12). Indexed
+/// PNG8 sprites flow through the engine's 256-colour indexed render path; the
+/// truecolor PNG24/PNG32 variants have no palette and are surfaced as flat RGBA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedPng {
+    /// An 8-bit indexed (palette) PNG: one palette index per pixel plus the
+    /// embedded `PLTE`/`tRNS` palette expanded to 1024 bytes of RGBA (256 colours
+    /// * 4). Index 0 is forced transparent to match the MUGEN convention.
+    Indexed {
+        /// One palette index per pixel, row-major (`width * height` bytes).
+        pixels: Vec<u8>,
+        /// The embedded palette as 256 RGBA quads (1024 bytes); colours beyond the
+        /// `PLTE` count are zero, and index 0 is transparent.
+        palette: Vec<u8>,
+        /// Sprite width in pixels.
+        width: u32,
+        /// Sprite height in pixels.
+        height: u32,
+    },
+    /// A truecolor PNG (PNG24 / PNG32): pixels decoded directly to RGBA, with no
+    /// palette. PNG24 sources get a fully-opaque alpha channel.
+    TrueColor {
+        /// Pixels as RGBA quads, row-major (`width * height * 4` bytes).
+        rgba: Vec<u8>,
+        /// Sprite width in pixels.
+        width: u32,
+        /// Sprite height in pixels.
+        height: u32,
+    },
+}
+
+/// Decodes an SFF v2 PNG sprite into either palette indices (PNG8) or RGBA
+/// (PNG24 / PNG32).
+///
+/// SFF v2 embeds an ordinary PNG datastream as the sprite payload; this decodes
+/// it with the `png` crate. Indexed (palette) PNGs yield [`DecodedPng::Indexed`]
+/// — indices plus the embedded palette expanded to RGBA — so they slot straight
+/// into the indexed render path. Grayscale and truecolor PNGs yield
+/// [`DecodedPng::TrueColor`] RGBA.
+///
+/// Never panics on malformed input: a decode error becomes a recoverable
+/// [`FpError`] (warn + error), and an absurdly large declared canvas is rejected
+/// before allocation.
+pub fn decode_png(data: &[u8]) -> FpResult<DecodedPng> {
+    let decoder = png::Decoder::new(data);
+    let mut reader = decoder.read_info().map_err(|e| {
+        tracing::warn!(error = %e, "failed to read PNG header for SFF sprite");
+        FpError::parse("SFF", format!("PNG header decode failed: {e}"))
+    })?;
+
+    let info = reader.info();
+    let width = info.width;
+    let height = info.height;
+    let color_type = info.color_type;
+
+    // Reject an absurd canvas before allocating the output buffer.
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    if pixel_count > MAX_PNG_PIXELS {
+        return Err(FpError::parse(
+            "SFF",
+            format!("PNG sprite {width}x{height} exceeds sane pixel limit ({MAX_PNG_PIXELS})"),
+        ));
+    }
+
+    // For indexed PNGs, capture the embedded palette (and optional transparency)
+    // before consuming the reader so we can expand it to RGBA.
+    let indexed_palette = if color_type == png::ColorType::Indexed {
+        Some((
+            info.palette.as_ref().map(|p| p.clone().into_owned()),
+            info.trns.as_ref().map(|t| t.clone().into_owned()),
+        ))
+    } else {
+        None
+    };
+
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).map_err(|e| {
+        tracing::warn!(error = %e, "failed to decode PNG frame for SFF sprite");
+        FpError::parse("SFF", format!("PNG frame decode failed: {e}"))
+    })?;
+    // The `png` crate may emit a larger buffer than the actual frame; trim it.
+    buf.truncate(frame.buffer_size());
+
+    // The output color type/bit-depth after `next_frame` (the png crate may have
+    // expanded sub-byte depths to 8-bit samples).
+    let out_color = frame.color_type;
+    let out_depth = frame.bit_depth;
+
+    match out_color {
+        png::ColorType::Indexed => {
+            // Indexed output: `buf` already holds one index per pixel (the png
+            // crate expands sub-8-bit indices to one byte each).
+            let (plte, trns) = indexed_palette.unwrap_or((None, None));
+            let palette = expand_plte_to_rgba(plte.as_deref(), trns.as_deref());
+            Ok(DecodedPng::Indexed {
+                pixels: buf,
+                palette,
+                width,
+                height,
+            })
+        }
+        png::ColorType::Rgba => Ok(DecodedPng::TrueColor {
+            rgba: buf,
+            width,
+            height,
+        }),
+        png::ColorType::Rgb => Ok(DecodedPng::TrueColor {
+            rgba: rgb_to_rgba_pixels(&buf),
+            width,
+            height,
+        }),
+        png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => {
+            // Uncommon for SFF, but handle gracefully: expand to RGBA so the
+            // sprite is at least surfaced rather than mis-decoded.
+            let rgba = gray_to_rgba_pixels(&buf, out_color, out_depth);
+            Ok(DecodedPng::TrueColor {
+                rgba,
+                width,
+                height,
+            })
+        }
+    }
+}
+
+/// Decodes an SFF v2 PNG sprite to palette indices for the indexed render path.
+///
+/// This is the entry point used by [`crate::sff::SffFile::decode_sprite`], which
+/// returns one byte per pixel. Indexed PNG8 sprites decode to their palette
+/// indices directly. Truecolor PNG24/PNG32 sprites have *no* palette indices, so
+/// they cannot be represented here — callers wanting their pixels must use
+/// [`decode_png`] (or [`crate::sff::SffFile::decode_sprite_rgba`]) to obtain
+/// RGBA. Rather than silently emit bogus indices, this returns a recoverable
+/// [`FpError`] for truecolor sprites (warn + error).
+pub fn decompress_png(data: &[u8]) -> FpResult<Vec<u8>> {
+    match decode_png(data)? {
+        DecodedPng::Indexed { pixels, .. } => Ok(pixels),
+        DecodedPng::TrueColor { width, height, .. } => {
+            tracing::warn!(
+                width,
+                height,
+                "truecolor PNG (PNG24/PNG32) sprite has no palette indices; \
+                 use decode_sprite_rgba for its pixels"
+            );
+            Err(FpError::Unsupported(
+                "truecolor PNG sprite has no palette indices (use RGBA path)".to_string(),
+            ))
+        }
+    }
+}
+
+/// Expands a PNG `PLTE` chunk (plus optional `tRNS` alpha) into 256 RGBA quads
+/// (1024 bytes).
+///
+/// Colours beyond those declared in `PLTE` are left zero. Per the MUGEN
+/// convention, palette index 0 is forced fully transparent; other indices take
+/// their `tRNS` alpha if present, else fully opaque.
+fn expand_plte_to_rgba(plte: Option<&[u8]>, trns: Option<&[u8]>) -> Vec<u8> {
+    let mut rgba = vec![0u8; 1024];
+    let plte = plte.unwrap_or(&[]);
+    let entries = (plte.len() / 3).min(256);
+    for i in 0..entries {
+        let src = i * 3;
+        let dst = i * 4;
+        rgba[dst] = plte[src];
+        rgba[dst + 1] = plte[src + 1];
+        rgba[dst + 2] = plte[src + 2];
+        let alpha = if i == 0 {
+            0 // index 0 transparent (MUGEN convention)
+        } else {
+            trns.and_then(|t| t.get(i).copied()).unwrap_or(255)
+        };
+        rgba[dst + 3] = alpha;
+    }
+    rgba
+}
+
+/// Expands tightly-packed 8-bit RGB pixels to RGBA (fully opaque alpha).
+fn rgb_to_rgba_pixels(rgb: &[u8]) -> Vec<u8> {
+    let px = rgb.len() / 3;
+    let mut out = Vec::with_capacity(px * 4);
+    for i in 0..px {
+        out.extend_from_slice(&rgb[i * 3..i * 3 + 3]);
+        out.push(255);
+    }
+    out
+}
+
+/// Expands 8-bit grayscale / grayscale-alpha pixels to RGBA.
+///
+/// `depth` is ignored beyond the 8-bit case the png crate normalizes to; sub-8
+/// depths are expanded to 8-bit by the decoder, so each sample is one byte.
+fn gray_to_rgba_pixels(buf: &[u8], color: png::ColorType, _depth: png::BitDepth) -> Vec<u8> {
+    let mut out = Vec::new();
+    match color {
+        png::ColorType::Grayscale => {
+            out.reserve(buf.len() * 4);
+            for &g in buf {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            out.reserve((buf.len() / 2) * 4);
+            for ga in buf.chunks_exact(2) {
+                out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -651,8 +860,125 @@ mod tests {
     }
 
     #[test]
-    fn png_stub_returns_error() {
+    fn png_empty_input_errors_without_panicking() {
+        // Empty bytes are not a valid PNG datastream: a recoverable error, never a
+        // panic.
         let err = decompress_png(&[]).unwrap_err();
-        assert!(err.to_string().contains("PNG"));
+        assert!(err.to_string().contains("PNG") || err.to_string().contains("png"));
+    }
+
+    #[test]
+    fn png_garbage_input_errors_without_panicking() {
+        let err = decode_png(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]).unwrap_err();
+        // Malformed header -> recoverable parse error.
+        assert!(err.to_string().to_lowercase().contains("png"));
+    }
+
+    /// Encodes a tiny indexed PNG with the given dimensions, palette (RGB
+    /// triplets), and per-pixel indices, using the `png` crate's encoder.
+    fn encode_indexed_png(width: u32, height: u32, plte: &[u8], indices: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_palette(plte.to_vec());
+            let mut writer = encoder.write_header().expect("write PNG header");
+            writer.write_image_data(indices).expect("write PNG indices");
+        }
+        bytes
+    }
+
+    #[test]
+    fn png8_indexed_round_trips_to_indices_and_palette() {
+        // 2x2 indexed PNG: palette colour 1 = red, colour 2 = green; pixels use
+        // indices 1,2,1,2.
+        let plte = [
+            0, 0, 0, // colour 0 (transparent slot)
+            255, 0, 0, // colour 1 red
+            0, 255, 0, // colour 2 green
+        ];
+        let indices = [1u8, 2, 1, 2];
+        let png_bytes = encode_indexed_png(2, 2, &plte, &indices);
+
+        // `decompress_png` yields the raw indices for the indexed render path.
+        let decoded_indices = decompress_png(&png_bytes).unwrap();
+        assert_eq!(decoded_indices, vec![1, 2, 1, 2]);
+
+        // `decode_png` additionally surfaces the embedded palette as RGBA.
+        let decoded = decode_png(&png_bytes).unwrap();
+        match decoded {
+            DecodedPng::Indexed {
+                pixels,
+                palette,
+                width,
+                height,
+            } => {
+                assert_eq!(width, 2);
+                assert_eq!(height, 2);
+                assert_eq!(pixels, vec![1, 2, 1, 2]);
+                // Index 0 is forced transparent.
+                assert_eq!(&palette[0..4], &[0, 0, 0, 0]);
+                // Index 1 = red, opaque.
+                assert_eq!(&palette[4..8], &[255, 0, 0, 255]);
+                // Index 2 = green, opaque.
+                assert_eq!(&palette[8..12], &[0, 255, 0, 255]);
+            }
+            other => panic!("expected indexed PNG, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn png24_truecolor_decodes_to_rgba() {
+        // Encode a 1x2 RGB (truecolor, no alpha) PNG: red over blue.
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[255, 0, 0, 0, 0, 255])
+                .unwrap();
+        }
+
+        // decompress_png (index path) must NOT silently mis-handle truecolor: it
+        // returns a recoverable error.
+        let err = decompress_png(&bytes).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("truecolor"));
+
+        // decode_png surfaces the RGBA directly with opaque alpha.
+        match decode_png(&bytes).unwrap() {
+            DecodedPng::TrueColor {
+                rgba,
+                width,
+                height,
+            } => {
+                assert_eq!(width, 1);
+                assert_eq!(height, 2);
+                assert_eq!(rgba, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+            }
+            other => panic!("expected truecolor PNG, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn png32_truecolor_alpha_decodes_to_rgba() {
+        // 1x1 RGBA PNG with a semi-transparent pixel.
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[10, 20, 30, 128]).unwrap();
+        }
+
+        match decode_png(&bytes).unwrap() {
+            DecodedPng::TrueColor { rgba, .. } => {
+                assert_eq!(rgba, vec![10, 20, 30, 128]);
+            }
+            other => panic!("expected truecolor PNG, got {other:?}"),
+        }
     }
 }

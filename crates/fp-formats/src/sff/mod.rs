@@ -26,7 +26,9 @@ mod palette;
 mod sprite;
 mod v1;
 
-pub use compression::{decompress_rle5, decompress_rle8, decompress_lz5, decompress_png};
+pub use compression::{
+    decode_png, decompress_lz5, decompress_png, decompress_rle5, decompress_rle8, DecodedPng,
+};
 pub use header::SffHeader;
 pub use palette::{SffPalette, PALETTE_RGBA_SIZE};
 pub use sprite::{SffSprite, SpriteFormat};
@@ -63,8 +65,14 @@ pub struct SffFile {
     pub sprites: Vec<SffSprite>,
     /// All palette sub-headers, in file order.
     ///
-    /// SFF v1 stores per-sprite palettes inline with each PCX image and does not
-    /// expose a separate palette table here, so this is empty for v1 files.
+    /// For SFF v2 these come from the file's palette table. For SFF v1, where each
+    /// sprite carries its own 256-colour palette as the trailing bytes of its
+    /// inline PCX image, one entry is synthesized per sprite that owns pixel data
+    /// with an extractable trailing palette, and each sprite's `palette_index`
+    /// points at the entry it should use. Only data-less (linked) sprites — or
+    /// data-owning sprites whose PCX is too short/corrupt to yield a palette —
+    /// reuse the previous entry; the sub-header's byte-18 "shared" flag is **not**
+    /// consulted (see [`v1::parse_v1_sprites`]).
     pub palettes: Vec<SffPalette>,
     /// Raw literal data block (LData) — uncompressed palette and sprite data.
     /// For SFF v1 this holds the entire file (sprites are inline PCX images).
@@ -98,7 +106,7 @@ impl SffFile {
     /// Parses an SFF v1 file (inline PCX images) from raw bytes.
     fn from_bytes_v1(data: &[u8]) -> FpResult<Self> {
         let v1_header = v1::parse_v1_header(data)?;
-        let sprites = v1::parse_v1_sprites(data, &v1_header)?;
+        let (sprites, palettes) = v1::parse_v1_sprites(data, &v1_header)?;
 
         // Synthesize an `SffHeader` so the public `header` field stays valid.
         // SFF v1 has no separate LData/TData blocks, so those offsets are zero.
@@ -119,13 +127,18 @@ impl SffFile {
             tdata_length: 0,
         };
 
-        tracing::info!("SFF v1: loaded {} sprites", sprites.len());
+        tracing::info!(
+            "SFF v1: loaded {} sprites, {} palettes",
+            sprites.len(),
+            palettes.len()
+        );
 
         Ok(Self {
             version: SffVersion::V1,
             header,
             sprites,
-            palettes: Vec::new(),
+            // Per-sprite trailing PCX palettes, extracted by `parse_v1_sprites`.
+            palettes,
             // The whole file is the backing buffer; sprite offsets are absolute.
             ldata: data.to_vec(),
             tdata: Vec::new(),
@@ -228,6 +241,10 @@ impl SffFile {
     /// If the sprite is linked to another sprite, follows the link to obtain
     /// the actual pixel data. Returns the decompressed pixel data as a flat
     /// byte vector of palette indices (for 8-bit sprites).
+    ///
+    /// Truecolor PNG24/PNG32 sprites have no palette indices and so cannot be
+    /// represented here; this returns a recoverable error for them. Use
+    /// [`Self::decode_sprite_rgba`] to obtain their pixels as RGBA.
     pub fn decode_sprite(&self, index: usize) -> FpResult<Vec<u8>> {
         let sprite = self.sprites.get(index).ok_or_else(|| {
             FpError::not_found("sprite", format!("index {index}"))
@@ -239,7 +256,34 @@ impl SffFile {
             return self.decode_sprite_v1(index, sprite);
         }
 
-        // Follow link if this sprite doesn't have its own data
+        let (data_sprite, compressed) = self.sprite_compressed_bytes(index, sprite)?;
+
+        match data_sprite.format {
+            SpriteFormat::Raw => Ok(compressed.to_vec()),
+            SpriteFormat::Rle8 => compression::decompress_rle8(compressed),
+            SpriteFormat::Rle5 => compression::decompress_rle5(compressed),
+            SpriteFormat::Lz5 => compression::decompress_lz5(compressed),
+            SpriteFormat::Png8 | SpriteFormat::Png24 | SpriteFormat::Png32 => {
+                compression::decompress_png(compressed)
+            }
+            SpriteFormat::Invalid => Err(FpError::parse(
+                "SFF",
+                format!("sprite {index} has invalid format byte (1)"),
+            )),
+        }
+    }
+
+    /// Resolves a sprite's raw compressed bytes, following a data link if needed.
+    ///
+    /// Returns the (possibly linked) sprite that actually owns the data along with
+    /// a slice of its raw bytes within the appropriate data block (LData/TData).
+    /// SFF v1 sprites are handled separately and must not call this.
+    fn sprite_compressed_bytes<'a>(
+        &'a self,
+        index: usize,
+        sprite: &'a SffSprite,
+    ) -> FpResult<(&'a SffSprite, &'a [u8])> {
+        // Follow link if this sprite doesn't have its own data.
         let data_sprite = if sprite.linked_index as usize != index && sprite.data_length == 0 {
             let linked = sprite.linked_index as usize;
             self.sprites.get(linked).ok_or_else(|| {
@@ -252,7 +296,7 @@ impl SffFile {
             sprite
         };
 
-        // Get the raw compressed data from the appropriate data block
+        // Get the raw compressed data from the appropriate data block.
         let data_block = if data_sprite.uses_tdata() {
             &self.tdata
         } else {
@@ -271,20 +315,54 @@ impl SffFile {
             ));
         }
 
-        let compressed = &data_block[start..end];
+        Ok((data_sprite, &data_block[start..end]))
+    }
+
+    /// Decodes the sprite at `index` to flat RGBA pixels (`width * height * 4`).
+    ///
+    /// This resolves the sprite end to end, applying the appropriate palette:
+    /// - **Indexed sprites** (Raw/RLE8/RLE5/LZ5, SFF v1 PCX, and indexed PNG8):
+    ///   the decoded palette indices are mapped through the sprite's palette.
+    ///   PNG8 uses its *embedded* `PLTE` palette; all other indexed formats use
+    ///   the SFF palette table entry at the sprite's `palette_index`.
+    /// - **Truecolor PNG24 / PNG32**: returned directly as the PNG's RGBA (PNG24
+    ///   gets opaque alpha), since these carry no palette.
+    ///
+    /// Index 0 of an indexed palette is transparent (MUGEN convention). Never
+    /// panics; bad content yields a recoverable [`FpError`].
+    pub fn decode_sprite_rgba(&self, index: usize) -> FpResult<Vec<u8>> {
+        let sprite = self.sprites.get(index).ok_or_else(|| {
+            FpError::not_found("sprite", format!("index {index}"))
+        })?;
+
+        // SFF v1: indexed PCX through the sprite's extracted palette.
+        if self.version == SffVersion::V1 {
+            let indices = self.decode_sprite_v1(index, sprite)?;
+            let pal = self.palette(sprite.palette_index as usize)?;
+            return Ok(indices_to_rgba(&indices, &pal));
+        }
+
+        let (data_sprite, compressed) = self.sprite_compressed_bytes(index, sprite)?;
 
         match data_sprite.format {
-            SpriteFormat::Raw => Ok(compressed.to_vec()),
-            SpriteFormat::Rle8 => compression::decompress_rle8(compressed),
-            SpriteFormat::Rle5 => compression::decompress_rle5(compressed),
-            SpriteFormat::Lz5 => compression::decompress_lz5(compressed),
             SpriteFormat::Png8 | SpriteFormat::Png24 | SpriteFormat::Png32 => {
-                compression::decompress_png(compressed)
+                match compression::decode_png(compressed)? {
+                    compression::DecodedPng::Indexed {
+                        pixels, palette, ..
+                    } => Ok(indices_to_rgba(&pixels, &palette)),
+                    compression::DecodedPng::TrueColor { rgba, .. } => Ok(rgba),
+                }
             }
             SpriteFormat::Invalid => Err(FpError::parse(
                 "SFF",
                 format!("sprite {index} has invalid format byte (1)"),
             )),
+            // Raw/RLE8/RLE5/LZ5: decode indices, then apply the SFF palette.
+            _ => {
+                let indices = self.decode_sprite(index)?;
+                let pal = self.palette(data_sprite.palette_index as usize)?;
+                Ok(indices_to_rgba(&indices, &pal))
+            }
         }
     }
 
@@ -343,6 +421,13 @@ impl SffFile {
             pal
         };
 
+        // A zero-length palette is the synthesized safe default (e.g. an SFF v1
+        // sprite whose PCX carried no extractable palette). Resolve it to an
+        // all-black, fully-transparent palette rather than erroring.
+        if data_pal.data_length == 0 {
+            return Ok([0u8; PALETTE_RGBA_SIZE]);
+        }
+
         let start = data_pal.data_offset as usize;
         let end = start + data_pal.data_length as usize;
         if end > self.ldata.len() {
@@ -357,6 +442,24 @@ impl SffFile {
 
         palette::rgb_to_rgba(&self.ldata[start..end])
     }
+}
+
+/// Maps palette indices to RGBA using a 1024-byte (256 * RGBA) palette.
+///
+/// Each index selects four bytes from `palette`; out-of-range indices (palette
+/// shorter than 256 colours) fall back to transparent black. Used by
+/// [`SffFile::decode_sprite_rgba`].
+fn indices_to_rgba(indices: &[u8], palette: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(indices.len() * 4);
+    for &idx in indices {
+        let base = idx as usize * 4;
+        if base + 4 <= palette.len() {
+            rgba.extend_from_slice(&palette[base..base + 4]);
+        } else {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        }
+    }
+    rgba
 }
 
 /// The `ElecbyteSpr\0` signature shared by both SFF v1 and v2 files.
