@@ -357,6 +357,151 @@ impl Default for HitType {
     }
 }
 
+/// The MUGEN `animtype` / `air.animtype` of a hit — which **get-hit reaction
+/// animation** the defender plays.
+///
+/// This is distinct from [`HitType`] (`ground.type`, which gates *whether* a hit
+/// lands at a given height): `animtype` only selects the *reaction pose*. MUGEN's
+/// common1 get-hit states (`5000`-`5xxx`) branch on `GetHitVar(animtype)` ~20
+/// times to pick the right hurt animation, so authoring `animtype = Hard` on a
+/// HitDef is what makes a heavy attack produce a heavy reaction.
+///
+/// # Integer encoding (`GetHitVar(animtype)`)
+///
+/// [`AnimType::code`] returns the canonical MUGEN integer for each variant. The
+/// encoding is the standard documented in the MUGEN trigger reference (Elecbyte)
+/// and used by the common1 `5xxx` states:
+///
+/// | variant            | `code()` |
+/// |--------------------|----------|
+/// | [`Light`](Self::Light)       | `0` |
+/// | [`Medium`](Self::Medium)     | `1` |
+/// | [`Hard`](Self::Hard)         | `2` |
+/// | [`Back`](Self::Back)         | `3` |
+/// | [`Up`](Self::Up)             | `4` |
+/// | [`DiagUp`](Self::DiagUp)     | `5` |
+/// | [`DiagDown`](Self::DiagDown) | `6` |
+///
+/// `Light`/`Medium`/`Hard` are the three ordinary ground reactions; `Back` is the
+/// "flung backwards" reaction; `Up`/`DiagUp`/`DiagDown` are the launched
+/// reactions. Defaults to [`AnimType::Light`] (MUGEN's default, code `0`) — which
+/// is exactly the bug this fixes: an unset `animtype` previously made *every* hit
+/// read back as `Light`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnimType {
+    /// `Light` — a light hit reaction (MUGEN default; code `0`).
+    Light,
+    /// `Medium` (authored as `Med` or `Medium`) — a medium hit reaction (code `1`).
+    Medium,
+    /// `Hard` — a heavy hit reaction (code `2`).
+    Hard,
+    /// `Back` — a flung-backwards reaction (code `3`).
+    Back,
+    /// `Up` — a launched-straight-up reaction (code `4`).
+    Up,
+    /// `DiagUp` — a launched diagonally-up reaction (code `5`).
+    DiagUp,
+    /// `DiagDown` — a launched diagonally-down reaction (code `6`).
+    DiagDown,
+}
+
+impl Default for AnimType {
+    /// Defaults to [`AnimType::Light`] — MUGEN's default `animtype` and the safe
+    /// fallback for unrecognized / absent values.
+    fn default() -> Self {
+        AnimType::Light
+    }
+}
+
+impl AnimType {
+    /// Parses a MUGEN `animtype` / `air.animtype` token into an [`AnimType`].
+    ///
+    /// Matching is **case-insensitive** and whitespace-tolerant. Both the short
+    /// `Med` and the long `Medium` spellings map to [`AnimType::Medium`] (real
+    /// content uses both). The launched forms `DiagUp` / `DiagDown` are accepted.
+    ///
+    /// An **empty** token, or any **unrecognized** token, falls back to
+    /// [`AnimType::Light`] (MUGEN's default). A *non-empty* unrecognized token also
+    /// logs a [`tracing::warn!`]; an empty token is silent (it just means "use the
+    /// default"). Never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::AnimType;
+    ///
+    /// assert_eq!(AnimType::parse("Light"), AnimType::Light);
+    /// assert_eq!(AnimType::parse("Hard"), AnimType::Hard);
+    /// // Both Med spellings map to Medium.
+    /// assert_eq!(AnimType::parse("Med"), AnimType::Medium);
+    /// assert_eq!(AnimType::parse("medium"), AnimType::Medium);
+    /// // Launched forms.
+    /// assert_eq!(AnimType::parse("DiagUp"), AnimType::DiagUp);
+    /// assert_eq!(AnimType::parse("diagdown"), AnimType::DiagDown);
+    /// // Case / whitespace tolerant.
+    /// assert_eq!(AnimType::parse("  bAcK "), AnimType::Back);
+    /// // Unknown / empty -> Light (the default).
+    /// assert_eq!(AnimType::parse("nonsense"), AnimType::Light);
+    /// assert_eq!(AnimType::parse(""), AnimType::Light);
+    /// ```
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        let t = s.trim();
+        if t.is_empty() {
+            // Absent value: silently use the default (this is the common case
+            // when `air.animtype` is omitted and the caller substitutes "").
+            return AnimType::Light;
+        }
+        if t.eq_ignore_ascii_case("light") {
+            AnimType::Light
+        } else if t.eq_ignore_ascii_case("med") || t.eq_ignore_ascii_case("medium") {
+            AnimType::Medium
+        } else if t.eq_ignore_ascii_case("hard") {
+            AnimType::Hard
+        } else if t.eq_ignore_ascii_case("back") {
+            AnimType::Back
+        } else if t.eq_ignore_ascii_case("up") {
+            AnimType::Up
+        } else if t.eq_ignore_ascii_case("diagup") {
+            AnimType::DiagUp
+        } else if t.eq_ignore_ascii_case("diagdown") {
+            AnimType::DiagDown
+        } else {
+            tracing::warn!(input = %s, "unrecognized HitDef animtype; defaulting to Light");
+            AnimType::Light
+        }
+    }
+
+    /// Returns MUGEN's `GetHitVar(animtype)` integer encoding for this variant.
+    ///
+    /// See the [type-level table](AnimType#integer-encoding-gethitvaranimtype):
+    /// `Light=0`, `Medium=1`, `Hard=2`, `Back=3`, `Up=4`, `DiagUp=5`,
+    /// `DiagDown=6`. This is the value the defender's common1 get-hit states read
+    /// to branch to the correct reaction animation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::AnimType;
+    ///
+    /// assert_eq!(AnimType::Light.code(), 0);
+    /// assert_eq!(AnimType::Hard.code(), 2);
+    /// assert_eq!(AnimType::DiagDown.code(), 6);
+    /// ```
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            AnimType::Light => 0,
+            AnimType::Medium => 1,
+            AnimType::Hard => 2,
+            AnimType::Back => 3,
+            AnimType::Up => 4,
+            AnimType::DiagUp => 5,
+            AnimType::DiagDown => 6,
+        }
+    }
+}
+
 /// The MUGEN `priority` type, used to resolve simultaneous (trading) hits.
 ///
 /// Resolution itself is task 6.3; this enum is just the data.
@@ -606,6 +751,16 @@ pub struct HitDef {
     pub resources: HitResources,
     /// `ground.type` — the ground hit reaction type.
     pub ground_type: HitType,
+    /// `animtype` — the get-hit **reaction animation** for a grounded defender
+    /// (MUGEN default `Light`). Distinct from [`ground_type`](Self::ground_type):
+    /// this is what `GetHitVar(animtype)` reports and the common1 `5xxx` get-hit
+    /// states branch on to pick the hurt pose.
+    pub animtype: AnimType,
+    /// `air.animtype` — the get-hit reaction animation for an **airborne**
+    /// defender. At HitDef parse time MUGEN defaults this to whatever
+    /// [`animtype`](Self::animtype) was set to when the `air.animtype` key is
+    /// absent; the struct-level [`Default`] is [`AnimType::Light`].
+    pub air_animtype: AnimType,
     /// `ground.velocity` — `(x, y)` knockback applied to a grounded defender.
     pub ground_velocity: Vec2<f32>,
     /// `air.velocity` — `(x, y)` knockback applied to an airborne defender.
@@ -643,6 +798,8 @@ impl Default for HitDef {
             pausetime: PauseTime::default(),
             resources: HitResources::default(),
             ground_type: HitType::default(),
+            animtype: AnimType::default(),
+            air_animtype: AnimType::default(),
             ground_velocity: Vec2::default(),
             air_velocity: Vec2::default(),
             guard_velocity: 0.0,
@@ -1231,6 +1388,58 @@ mod tests {
         assert!(!HitFlags::parse("H").contains(HitFlags::parse("HL")));
     }
 
+    #[test]
+    fn anim_type_parses_all_known_spellings() {
+        // Canonical spellings, case-insensitive, whitespace-tolerant.
+        assert_eq!(AnimType::parse("Light"), AnimType::Light);
+        assert_eq!(AnimType::parse("light"), AnimType::Light);
+        assert_eq!(AnimType::parse("  hard  "), AnimType::Hard);
+        assert_eq!(AnimType::parse("BACK"), AnimType::Back);
+        assert_eq!(AnimType::parse("Up"), AnimType::Up);
+        assert_eq!(AnimType::parse("DiagUp"), AnimType::DiagUp);
+        assert_eq!(AnimType::parse("diagdown"), AnimType::DiagDown);
+
+        // BOTH `Med` and `Medium` map to Medium (real KFM content uses both).
+        assert_eq!(AnimType::parse("Med"), AnimType::Medium);
+        assert_eq!(AnimType::parse("med"), AnimType::Medium);
+        assert_eq!(AnimType::parse("Medium"), AnimType::Medium);
+        assert_eq!(AnimType::parse("MEDIUM"), AnimType::Medium);
+    }
+
+    #[test]
+    fn anim_type_unknown_and_empty_default_to_light() {
+        // Unknown non-empty token -> Light (and would log a warn).
+        assert_eq!(AnimType::parse("nonsense"), AnimType::Light);
+        // Empty / whitespace -> Light (silent: "use the default").
+        assert_eq!(AnimType::parse(""), AnimType::Light);
+        assert_eq!(AnimType::parse("   "), AnimType::Light);
+        // Default is Light.
+        assert_eq!(AnimType::default(), AnimType::Light);
+    }
+
+    #[test]
+    fn anim_type_code_mapping_is_mugen_standard() {
+        assert_eq!(AnimType::Light.code(), 0);
+        assert_eq!(AnimType::Medium.code(), 1);
+        assert_eq!(AnimType::Hard.code(), 2);
+        assert_eq!(AnimType::Back.code(), 3);
+        assert_eq!(AnimType::Up.code(), 4);
+        assert_eq!(AnimType::DiagUp.code(), 5);
+        assert_eq!(AnimType::DiagDown.code(), 6);
+        // Parse + code round-trips for the three ordinary ground reactions.
+        assert_eq!(AnimType::parse("Light").code(), 0);
+        assert_eq!(AnimType::parse("Med").code(), 1);
+        assert_eq!(AnimType::parse("Hard").code(), 2);
+    }
+
+    #[test]
+    fn hitdef_default_animtype_is_light() {
+        let hd = HitDef::default();
+        assert_eq!(hd.animtype, AnimType::Light);
+        assert_eq!(hd.air_animtype, AnimType::Light);
+        assert_eq!(hd.animtype.code(), 0);
+    }
+
     /// Two characters facing each other; attacker's punch box reaches the defender's
     /// hurt box. Mirroring (facing flip) must place the boxes correctly.
     #[test]
@@ -1372,6 +1581,8 @@ mod tests {
             hitflag: HitFlags::parse("MAF"),
             pausetime: PauseTime { p1: 12, p2: 12 },
             ground_type: HitType::Low,
+            animtype: AnimType::Hard,
+            air_animtype: AnimType::Up,
             ground_velocity: Vec2::new(-4.0, 0.0),
             air_velocity: Vec2::new(-3.0, -6.0),
             guard_velocity: -2.0,
@@ -1394,6 +1605,8 @@ mod tests {
         assert_eq!(copy.damage.hit, 90);
         assert_eq!(copy.p2stateno, Some(5050));
         assert_eq!(copy.ground_type, HitType::Low);
+        assert_eq!(copy.animtype, AnimType::Hard);
+        assert_eq!(copy.air_animtype, AnimType::Up);
         assert_eq!(copy.priority.kind, PriorityType::Miss);
     }
 
@@ -1404,6 +1617,7 @@ mod tests {
         assert_eq!(StateClass::default(), StateClass::Standing);
         assert_eq!(AttackPower::default(), AttackPower::Normal);
         assert_eq!(AttackKind::default(), AttackKind::Attack);
+        assert_eq!(AnimType::default(), AnimType::Light);
         assert_eq!(HitType::default(), HitType::High);
         assert_eq!(PriorityType::default(), PriorityType::Hit);
         assert_eq!(Priority::default(), Priority { value: 4, kind: PriorityType::Hit });

@@ -1192,11 +1192,13 @@ impl Character {
     /// MUGEN's `HitDef` carries two *kinds* of parameter:
     ///
     /// - **String / enum** params (`attr`, `hitflag`, `guardflag`, `ground.type`,
-    ///   and the spark / sound ids which may carry an `S` prefix) are read from
-    ///   the controller's **raw parameter source** ([`CompiledParam::raw`]) and
-    ///   parsed with [`fp_combat::AttackAttr::parse`] /
-    ///   [`fp_combat::HitFlags::parse`] / a small local type parser. Compiling
-    ///   these as numeric expressions would be wrong (`S, NA` is not arithmetic).
+    ///   `animtype`, `air.animtype`, and the spark / sound ids which may carry an
+    ///   `S` prefix) are read from the controller's **raw parameter source**
+    ///   ([`CompiledParam::raw`]) and parsed with [`fp_combat::AttackAttr::parse`]
+    ///   / [`fp_combat::HitFlags::parse`] / [`fp_combat::AnimType::parse`] / a
+    ///   small local type parser. Compiling these as numeric expressions would be
+    ///   wrong (`S, NA` is not arithmetic). `air.animtype` follows the MUGEN rule
+    ///   that it defaults to the parsed `animtype` when its key is absent.
     ///   (CB27: `air.type` is **not** parsed — there is no `air_type` field; MUGEN
     ///   defaults a HitDef's `air.type` to its `ground.type`, which is the only hit
     ///   type modelled here.)
@@ -1226,6 +1228,20 @@ impl Character {
         }
         if let Some(src) = raw_param(ctrl, "ground.type") {
             hd.ground_type = parse_hit_type(src);
+        }
+        // `animtype` selects the get-hit *reaction animation* (read back via
+        // `GetHitVar(animtype)`); `air.animtype` is the airborne variant. MUGEN
+        // rule: when `air.animtype` is absent it defaults to whatever `animtype`
+        // was set to, so parse `animtype` first and seed BOTH from it, then let an
+        // explicit `air.animtype` key override the air slot.
+        if let Some(src) = raw_param(ctrl, "animtype") {
+            hd.animtype = fp_combat::AnimType::parse(src);
+            // Keep the air default tracking the ground value until/unless an
+            // explicit `air.animtype` overrides it below.
+            hd.air_animtype = hd.animtype;
+        }
+        if let Some(src) = raw_param(ctrl, "air.animtype") {
+            hd.air_animtype = fp_combat::AnimType::parse(src);
         }
 
         // Spark id. `sparkno` may carry a leading `S` (use the character's own
@@ -6056,6 +6072,58 @@ mod tests {
         assert_eq!(hd.priority.value, 6);
         // No type token after the value → the default kind (Hit) is preserved.
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Hit);
+    }
+
+    // ---- P7: animtype / air.animtype parsing --------------------------------
+
+    #[test]
+    fn hit_def_parses_animtype() {
+        // Each authored spelling maps to the right AnimType, including BOTH `Med`
+        // and `Medium`.
+        let hard = build_hitdef(&[("attr", "S, NA"), ("animtype", "Hard")]);
+        assert_eq!(hard.animtype, fp_combat::AnimType::Hard);
+        let med = build_hitdef(&[("attr", "S, NA"), ("animtype", "Med")]);
+        assert_eq!(med.animtype, fp_combat::AnimType::Medium);
+        let medium = build_hitdef(&[("attr", "S, NA"), ("animtype", "Medium")]);
+        assert_eq!(medium.animtype, fp_combat::AnimType::Medium);
+        let up = build_hitdef(&[("attr", "S, NA"), ("animtype", "Up")]);
+        assert_eq!(up.animtype, fp_combat::AnimType::Up);
+        // Unknown -> Light (the default).
+        let bad = build_hitdef(&[("attr", "S, NA"), ("animtype", "wat")]);
+        assert_eq!(bad.animtype, fp_combat::AnimType::Light);
+    }
+
+    #[test]
+    fn hit_def_air_animtype_defaults_to_ground_animtype_when_absent() {
+        // No `air.animtype` key: MUGEN defaults it to the parsed `animtype`.
+        let hd = build_hitdef(&[("attr", "S, NA"), ("animtype", "Hard")]);
+        assert_eq!(hd.animtype, fp_combat::AnimType::Hard);
+        assert_eq!(
+            hd.air_animtype,
+            fp_combat::AnimType::Hard,
+            "absent air.animtype inherits the ground animtype"
+        );
+    }
+
+    #[test]
+    fn hit_def_explicit_air_animtype_overrides_ground() {
+        // An explicit `air.animtype` overrides the inherited ground value, while
+        // the ground `animtype` is untouched.
+        let hd = build_hitdef(&[
+            ("attr", "S, NA"),
+            ("animtype", "Light"),
+            ("air.animtype", "Up"),
+        ]);
+        assert_eq!(hd.animtype, fp_combat::AnimType::Light, "ground stays Light");
+        assert_eq!(hd.air_animtype, fp_combat::AnimType::Up, "air overridden to Up");
+    }
+
+    #[test]
+    fn hit_def_no_animtype_keys_leave_both_light() {
+        // Neither key present: both default to Light (the HitDef::default value).
+        let hd = build_hitdef(&[("attr", "S, NA")]);
+        assert_eq!(hd.animtype, fp_combat::AnimType::Light);
+        assert_eq!(hd.air_animtype, fp_combat::AnimType::Light);
     }
 
     // ---- AC1: velocity single-component fallback keeps the default axis -------

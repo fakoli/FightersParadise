@@ -87,7 +87,9 @@ pub struct AttackResolution {
 ///    - the defender is sent into the outcome's get-hit state via
 ///      [`Character::change_state`];
 ///    - the defender's [`GetHitVars`](crate::GetHitVars) are populated from the
-///      outcome;
+///      outcome, including `GetHitVar(animtype)` — set from the HitDef's
+///      `air_animtype` when the defender is airborne, else its ground `animtype`
+///      (so common1 get-hit states pick the correct reaction, not always Light);
 ///    - hit-pause (the impact freeze) is set on the attacker (`pausetime.p1`) and
 ///      the defender (`pausetime.p2`) via `max(current, new)` so a re-armed move
 ///      never shortens an active freeze; the defender's shake timer is set the
@@ -187,6 +189,17 @@ pub fn resolve_attack(
         defender.constants.movement.yaccel
     };
     gh.damage = outcome.damage;
+    // GetHitVar(animtype): the reaction-animation code the defender's common1
+    // get-hit states (5000-5xxx) branch on. The DEFENDER's airborne state is
+    // known here (it built `defender_state.airborne` above), so pick the HitDef's
+    // `air_animtype` when the defender is airborne, else its ground `animtype`.
+    // (Previously never set, so it was always 0 = Light — the P7 bug.)
+    let reaction_animtype = if defender_state.airborne {
+        hitdef.air_animtype
+    } else {
+        hitdef.animtype
+    };
+    gh.animtype = reaction_animtype.code();
     gh.hitshaketime = outcome.shaketime;
     gh.hittime = outcome.hittime;
     gh.slidetime = outcome.slidetime;
@@ -335,7 +348,8 @@ fn frame_at(action: &AnimAction, elem: i32) -> Option<&fp_formats::air::AnimFram
 mod tests {
     use super::*;
     use crate::{Facing, MoveConnect, MoveType, StageView, StateType};
-    use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime};
+    use fp_combat::{AnimType, Damage, HitDef, HitFlags, HitTimes, PauseTime};
+    use fp_vm::{eval, parse_str, EvalContext, Value};
     use fp_formats::air::{AnimAction, AnimFrame, BlendMode};
     use std::collections::HashMap;
 
@@ -945,6 +959,109 @@ mod tests {
         assert_eq!(gh.hitshaketime, 8, "shaketime from pausetime.p2");
     }
 
+    // ---- P7: GetHitVar(animtype) populated from the HitDef ----------------
+
+    /// Evaluates an expression string against a character (the same eval path
+    /// MUGEN's common1 get-hit states use to read `GetHitVar(animtype)`). Panics
+    /// only on a test-author parse error.
+    fn ev_against(expr: &str, ch: &Character) -> Value {
+        let ast = parse_str(expr).expect("test expression should parse");
+        eval(&ast, ch as &dyn EvalContext)
+    }
+
+    /// P7: a HitDef authored `animtype = Hard` connecting on a GROUNDED defender
+    /// sets `gh.animtype == 2` (the Hard code), readable back through the real
+    /// `GetHitVar(animtype)` evaluation path the get-hit states use.
+    #[test]
+    fn ground_hard_animtype_sets_gethitvar_to_two() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.animtype = AnimType::Hard;
+        }
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Standing; // grounded -> ground animtype
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+
+        // Direct field: Hard -> 2.
+        assert_eq!(d.get_hit_vars.animtype, 2, "Hard ground animtype code");
+        // And via the evaluator (proves the get-hit state will pick non-Light).
+        assert_eq!(ev_against("GetHitVar(animtype)", &d), Value::Int(2));
+        assert_eq!(ev_against("GetHitVar(animtype) = 2", &d), Value::Int(1));
+        assert_ne!(d.get_hit_vars.animtype, 0, "not the always-Light bug value");
+    }
+
+    /// P7: a Light HitDef on a grounded defender reads back as 0, and a `Med`
+    /// HitDef as 1 — covering the ordinary ground reactions either side of Hard.
+    #[test]
+    fn ground_light_and_med_animtype_codes() {
+        // Light -> 0.
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.animtype = AnimType::Light;
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(d.get_hit_vars.animtype, 0, "Light ground animtype code");
+        assert_eq!(ev_against("GetHitVar(animtype)", &d), Value::Int(0));
+
+        // Medium -> 1.
+        let (mut a2, a_air2) = make_attacker();
+        if let Some(hd) = a2.active_hitdef.as_mut() {
+            hd.animtype = AnimType::Medium;
+        }
+        let (mut d2, d_air2) = make_defender();
+        resolve_attack(&mut a2, &a_air2, &mut d2, &d_air2, &states).expect("connects");
+        assert_eq!(d2.get_hit_vars.animtype, 1, "Medium ground animtype code");
+        assert_eq!(ev_against("GetHitVar(animtype)", &d2), Value::Int(1));
+    }
+
+    /// P7: an AIRBORNE defender uses the HitDef's `air_animtype` (not the ground
+    /// `animtype`) — here ground = Light(0) but air = Up(4), and the air value is
+    /// the one that lands in `GetHitVar(animtype)`.
+    #[test]
+    fn airborne_defender_uses_air_animtype() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.animtype = AnimType::Light; // ground reaction
+            hd.air_animtype = AnimType::Up; // distinct air reaction (code 4)
+        }
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Air; // airborne -> air_animtype path
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects air target");
+        assert_eq!(d.get_hit_vars.animtype, 4, "air defender uses air_animtype (Up=4)");
+        assert_eq!(ev_against("GetHitVar(animtype)", &d), Value::Int(4));
+    }
+
+    /// P7: when `air.animtype` is absent it defaults to the ground `animtype` (the
+    /// MUGEN rule). The executor seeds `air_animtype = animtype` on parse; this
+    /// asserts the resolve side honors that — an airborne defender hit by a
+    /// `animtype = Hard` HitDef whose `air_animtype` was left equal to `animtype`
+    /// still reads Hard(2) in the air.
+    #[test]
+    fn airborne_defaults_to_ground_animtype_when_air_absent() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            // Mirror what ctrl_hit_def does when `air.animtype` is absent: both
+            // slots carry the parsed ground value.
+            hd.animtype = AnimType::Hard;
+            hd.air_animtype = AnimType::Hard;
+        }
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Air;
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(
+            d.get_hit_vars.animtype, 2,
+            "absent air.animtype defaults to the ground animtype (Hard=2)"
+        );
+    }
+
     /// Guard knockback Y is always zero and the defender does NOT fall on a block,
     /// regardless of a `fall` flag on the HitDef.
     #[test]
@@ -1156,6 +1273,109 @@ mod tests {
             connected,
             "real KFM punch Clsn1 should overlap idle Clsn2 at some offset"
         );
+    }
+
+    /// P7 gated real-KFM: find a real HitDef state that authors a non-Light
+    /// `animtype` (KFM's heavy attacks use `animtype = Hard`), parse that real
+    /// authored token through the SAME [`fp_combat::AnimType::parse`] the HitDef
+    /// controller uses, drive a connect on a grounded defender, and assert
+    /// `GetHitVar(animtype) != 0` — proving the defender's common1 get-hit state
+    /// will branch to a non-Light reaction. Skips cleanly when test-assets/ is
+    /// absent or no non-Light HitDef is found.
+    ///
+    /// We read the controller's raw `animtype` and build the HitDef directly
+    /// (rather than firing the controller) because KFM's heavy HitDefs gate on
+    /// `p2bodydist`, which needs an opponent handle this single-entity resolve
+    /// path does not thread — but the *authoring → AnimType → gh.animtype* chain
+    /// under test is exactly the same.
+    #[test]
+    fn real_kfm_hard_animtype_drives_nonlight_gethitvar() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+
+        // Find a HitDef controller whose authored `animtype` parses to a
+        // non-Light reaction (KFM uses `animtype = Hard` on its heavy attacks).
+        let mut found: Option<fp_combat::AnimType> = None;
+        'scan: for state in lc.states.values() {
+            for c in &state.controllers {
+                let is_hitdef = c
+                    .controller_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("HitDef"));
+                if !is_hitdef {
+                    continue;
+                }
+                if let Some(p) = c.params.get("animtype") {
+                    let at = fp_combat::AnimType::parse(p.raw());
+                    if at != fp_combat::AnimType::Light {
+                        found = Some(at);
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let Some(animtype) = found else {
+            eprintln!("skipping: no non-Light HitDef animtype found in KFM");
+            return;
+        };
+        assert_ne!(animtype.code(), 0, "found a non-Light authored animtype");
+
+        // Verify the real fixture carries the boxes we need for a connection.
+        let clsn1 = current_frame_clsn1(&lc.air, 200, 2);
+        let clsn2 = current_frame_clsn2(&lc.air, 0, 0);
+        if clsn1.is_empty() || clsn2.is_empty() {
+            eprintln!("skipping: KFM action 200/0 frames lack expected Clsn boxes");
+            return;
+        }
+
+        // Build a HitDef carrying the REAL authored ground animtype, on the
+        // punch's active frame, and connect it on a grounded KFM defender.
+        let mut attacker = Character::with_constants(lc.constants);
+        attacker.anim = 200;
+        attacker.anim_elem = 2;
+        attacker.pos = Vec2::new(0.0, 0.0);
+        attacker.facing = Facing::Right;
+        attacker.move_type = MoveType::Attack;
+        let mut hd = sample_hitdef();
+        hd.animtype = animtype; // the real authored reaction (e.g. Hard)
+        attacker.active_hitdef = Some(hd);
+
+        let mut connected = false;
+        for dx in 0..=120 {
+            let mut defender = Character::with_constants(lc.constants);
+            defender.anim = 0;
+            defender.anim_elem = 0;
+            defender.facing = Facing::Left;
+            defender.pos = Vec2::new(dx as f32, 0.0);
+            defender.life = lc.constants.life_max;
+            defender.state_type = StateType::Standing; // grounded -> ground animtype
+            attacker.move_connect.reset();
+
+            if resolve_attack(&mut attacker, &lc.air, &mut defender, &lc.air, &lc.states).is_some() {
+                assert_ne!(
+                    defender.get_hit_vars.animtype, 0,
+                    "real KFM Hard HitDef must set a non-Light GetHitVar(animtype)"
+                );
+                assert_eq!(
+                    defender.get_hit_vars.animtype,
+                    animtype.code(),
+                    "gh.animtype matches the authored reaction code"
+                );
+                connected = true;
+                break;
+            }
+        }
+        assert!(connected, "real KFM punch should connect at some offset");
     }
 
     // =====================================================================
