@@ -829,6 +829,10 @@ impl Character {
             self.ctrl_power_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("PowerSet") {
             self.ctrl_power_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AttackMulSet") {
+            self.ctrl_attack_mul_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("DefenceMulSet") {
+            self.ctrl_defence_mul_set(ctrl, env);
         } else if kind.eq_ignore_ascii_case("StateTypeSet") {
             self.ctrl_state_type_set(ctrl);
         } else if kind.eq_ignore_ascii_case("Turn") {
@@ -1126,6 +1130,34 @@ impl Character {
             return;
         };
         self.set_power_clamped(value.to_int());
+    }
+
+    /// `AttackMulSet`: set the runtime attack multiplier (damage this character
+    /// *deals* is scaled by it in `resolve_attack`; default `1.0`). A missing
+    /// `value` is a safe debug-logged no-op; never panics.
+    fn ctrl_attack_mul_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: AttackMulSet in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.attack_mul = value.to_float();
+    }
+
+    /// `DefenceMulSet`: set the runtime defence multiplier (damage this character
+    /// *receives* is scaled by it in `resolve_attack`; default `1.0`). A missing
+    /// `value` is a safe debug-logged no-op; never panics.
+    fn ctrl_defence_mul_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: DefenceMulSet in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.defence_mul = value.to_float();
     }
 
     /// `VarRangeSet`: set a contiguous range of variables to one value.
@@ -3456,6 +3488,37 @@ mod tests {
         ch2.power = 500;
         lc_lo.tick(&mut ch2);
         assert_eq!(ch2.power, 0, "PowerSet -7 clamped to floor 0");
+    }
+
+    /// A.P19: AttackMulSet / DefenceMulSet set the runtime damage multipliers;
+    /// a missing `value` is a safe no-op (multiplier unchanged).
+    #[test]
+    fn attack_defence_mul_set_controllers() {
+        let mk = |kind: &str, params: &[(&str, &str)]| {
+            let c = ctrl(0, kind, &[], &[(1, &["1"])], Some("0"), params);
+            let st = state(
+                0,
+                Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+                vec![c],
+            );
+            loaded(vec![st], tiny_air(0, &[5]))
+        };
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        mk("AttackMulSet", &[("value", "2.5")]).tick(&mut ch);
+        assert!((ch.attack_mul - 2.5).abs() < 1e-6, "AttackMulSet sets attack_mul");
+
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        mk("DefenceMulSet", &[("value", "0.5")]).tick(&mut ch2);
+        assert!((ch2.defence_mul - 0.5).abs() < 1e-6, "DefenceMulSet sets defence_mul");
+
+        // No `value` -> no-op, multiplier stays the default 1.0.
+        let mut ch3 = Character::new();
+        ch3.state_no = 0;
+        mk("AttackMulSet", &[]).tick(&mut ch3);
+        assert!((ch3.attack_mul - 1.0).abs() < 1e-6, "no value -> attack_mul unchanged");
     }
 
     /// AC2/AC3: `PowerAdd`/`PowerSet` with a missing `value` is a safe no-op

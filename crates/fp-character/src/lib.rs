@@ -965,6 +965,16 @@ pub struct Character {
     /// there is no per-target tracking here, only this single boolean.
     pub has_target: bool,
 
+    /// Runtime attack multiplier (MUGEN `AttackMulSet`). Damage this character
+    /// *deals* is scaled by this; default `1.0`. Persists until changed or the
+    /// round resets.
+    pub attack_mul: f32,
+
+    /// Runtime defence multiplier (MUGEN `DefenceMulSet`). Damage this character
+    /// *receives* is scaled by this; default `1.0` (`<1` = armor, `>1` = takes
+    /// more). Persists until changed or the round resets.
+    pub defence_mul: f32,
+
     /// The character's attack-attribute invulnerability mask — the `NotHitBy` /
     /// `HitBy` windows (faithfulness audit P9).
     ///
@@ -1059,6 +1069,8 @@ impl Default for Character {
             move_connect: MoveConnect::default(),
             has_target: false,
             invuln: InvulnMask::default(),
+            attack_mul: 1.0,
+            defence_mul: 1.0,
         }
     }
 }

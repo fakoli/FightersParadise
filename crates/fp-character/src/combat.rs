@@ -200,7 +200,14 @@ pub fn resolve_attack(
     let attacker_sign = attacker.facing.sign() as f32;
     let knockback = Vec2::new(outcome.knockback.x * attacker_sign, outcome.knockback.y);
 
-    defender.life = (defender.life - outcome.damage).max(0);
+    // Scale damage by the attacker's attack multiplier and the defender's defence
+    // multiplier (MUGEN AttackMulSet / DefenceMulSet; both default 1.0, so the base
+    // damage is unchanged when neither is set). final = round(base * atk * def).
+    let applied_damage = (outcome.damage as f32 * attacker.attack_mul * defender.defence_mul)
+        .round()
+        .clamp(0.0, i32::MAX as f32) as i32;
+
+    defender.life = (defender.life - applied_damage).max(0);
     defender.vel = knockback;
 
     // Populate the defender's GetHitVars from the resolved outcome before the
@@ -216,7 +223,7 @@ pub fn resolve_attack(
     } else {
         defender.constants.movement.yaccel
     };
-    gh.damage = outcome.damage;
+    gh.damage = applied_damage;
     // GetHitVar(animtype): the reaction-animation code the defender's common1
     // get-hit states (5000-5xxx) branch on. The DEFENDER's airborne state is
     // known here (it built `defender_state.airborne` above), so pick the HitDef's
@@ -285,7 +292,7 @@ pub fn resolve_attack(
 
     Some(AttackResolution {
         result: outcome.result,
-        damage: outcome.damage,
+        damage: applied_damage,
         knockback,
         defender_state: outcome.gethit_state,
         attacker_hitpause: outcome.pausetime,
@@ -506,6 +513,37 @@ mod tests {
         // Attacker move flagged connected (MoveHit / MoveContact).
         assert!(a.move_connect.hit);
         assert!(a.move_connect.contact());
+    }
+
+    #[test]
+    fn attack_and_defence_multipliers_scale_damage() {
+        // base hit damage = 30 (make_attacker HitDef); multipliers default 1.0.
+        let states = HashMap::new();
+
+        // AttackMul 2.0 -> doubled.
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        a.attack_mul = 2.0;
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 60, "attack_mul 2.0 doubles damage");
+        assert_eq!(d.life, 1000 - 60);
+        assert_eq!(d.get_hit_vars.damage, 60);
+
+        // DefenceMul 0.5 -> halved (attack default 1.0).
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.defence_mul = 0.5;
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 15, "defence_mul 0.5 halves damage");
+        assert_eq!(d.life, 1000 - 15);
+
+        // Combined 2.0 * 0.5 = base (30, unchanged).
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        a.attack_mul = 2.0;
+        d.defence_mul = 0.5;
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 30, "2.0 * 0.5 leaves base damage");
     }
 
     #[test]
