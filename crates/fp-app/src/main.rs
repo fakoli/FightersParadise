@@ -49,6 +49,7 @@ use fp_engine::{Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
+use fp_stage::{BgLayer, Stage};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, KeyboardState, Scancode};
 
@@ -820,10 +821,16 @@ fn cache_player_sprite(cache: &mut FighterRender, player: &Player, renderer: &Re
 /// Draws one fighter from its current AIR frame at its world position and facing,
 /// reading the already-populated per-character texture cache (see
 /// [`cache_player_sprite`]). A missing frame or uncached sprite is skipped.
+///
+/// `camera_x` is the camera's world X; the fighter's world position is offset by
+/// it before mapping to screen, so the playfield scrolls with the camera. With no
+/// stage (`camera_x = 0`) this reduces to the original centered mapping, so the
+/// flat-background path is unchanged.
 fn draw_player(
     frame: &mut fp_render::RenderFrame<'_>,
     cache: &FighterRender,
     player: &Player,
+    camera_x: f32,
     win_w: f32,
     win_h: f32,
 ) {
@@ -836,7 +843,7 @@ fn draw_player(
 
     let ground_y = win_h * 0.8;
     let facing_right = player.facing() == fp_character::Facing::Right;
-    let screen_x = world_to_screen_x(player.pos().x, win_w);
+    let screen_x = world_to_screen_x(player.pos().x - camera_x, win_w);
 
     let draw_x = screen_x - cached.axis_x as f32 + anim_frame.offset.x as f32;
     let draw_y = ground_y + player.pos().y - cached.axis_y as f32 + anim_frame.offset.y as f32;
@@ -871,10 +878,16 @@ fn draw_player(
 /// [`draw_player`] uses for the sprite (X from [`world_to_screen_x`], Y from the
 /// ground plane plus the fighter's vertical offset), so boxes computed from it
 /// line up with the drawn sprite. `ground_y` is the same `win_h * 0.8` fraction
-/// used there.
-fn player_screen_anchor(pos: fp_core::Vec2<f32>, win_w: f32, win_h: f32) -> (f32, f32) {
+/// used there. `camera_x` is the camera's world X, subtracted before mapping so
+/// the boxes scroll with the sprite (matching [`draw_player`]).
+fn player_screen_anchor(
+    pos: fp_core::Vec2<f32>,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
+) -> (f32, f32) {
     let ground_y = win_h * 0.8;
-    (world_to_screen_x(pos.x, win_w), ground_y + pos.y)
+    (world_to_screen_x(pos.x - camera_x, win_w), ground_y + pos.y)
 }
 
 /// Maps one character-local Clsn rect (Y-down, relative to the axis, as stored
@@ -922,13 +935,14 @@ const CLSN2_COLOR: [f32; 4] = [0.3, 0.55, 1.0, 1.0];
 fn draw_player_clsn(
     frame: &mut fp_render::RenderFrame<'_>,
     player: &Player,
+    camera_x: f32,
     win_w: f32,
     win_h: f32,
 ) {
     let Some(anim_frame) = player_current_frame(player) else {
         return;
     };
-    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), win_w, win_h);
+    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), camera_x, win_w, win_h);
     let facing = player.facing();
 
     for hurt in &anim_frame.clsn2 {
@@ -941,6 +955,215 @@ fn draw_player_clsn(
             attack, anchor_x, anchor_y, facing, CLSN1_COLOR,
         ));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage background rendering (audit #29)
+// ---------------------------------------------------------------------------
+
+/// A loaded stage plus the GPU resources to draw its background layers: the
+/// parsed [`fp_stage::Stage`] model, the stage's sprite (SFF) file, and a
+/// lazily-populated per-sprite texture cache.
+///
+/// One [`StageRender`] is held per [`MatchRun`] when a stage is available; when
+/// absent the app keeps its flat clear color (no regression). Drawing is split by
+/// layer so the back layers render before the fighters and the front layers after
+/// (see [`StageRender::draw_layer`]).
+struct StageRender {
+    /// The parsed stage definition (camera bounds, BG elements, …).
+    stage: Stage,
+    /// The stage's decoded sprite file (`[BGdef] spr`), used to draw BG elements.
+    sff: SffFile,
+    /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
+    sprite_cache: HashMap<SpriteId, CachedSprite>,
+}
+
+impl StageRender {
+    /// Loads a stage from `path`: parses the `.def`, then loads its `[BGdef] spr`
+    /// SFF. Returns `None` (with a log) when the stage cannot be parsed, declares
+    /// no sprite file, or the SFF fails to load — the caller degrades to a flat
+    /// clear color rather than failing the whole app. Never panics.
+    fn load(path: &Path) -> Option<Self> {
+        let stage = match Stage::load(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("stage {} failed to parse: {e}; using flat background", path.display());
+                return None;
+            }
+        };
+        let Some(spr_path) = stage.bgdef.sprite_path.clone() else {
+            tracing::warn!(
+                "stage {} has no [BGdef] spr sprite file; using flat background",
+                path.display()
+            );
+            return None;
+        };
+        let sff = match SffFile::load(&spr_path) {
+            Ok(sff) => sff,
+            Err(e) => {
+                tracing::warn!(
+                    "stage SFF {} failed to load: {e}; using flat background",
+                    spr_path.display()
+                );
+                return None;
+            }
+        };
+        tracing::info!(
+            "stage loaded: {:?} ({} BG elements, {} stage sprites)",
+            stage.info.name,
+            stage.backgrounds.len(),
+            sff.sprites.len(),
+        );
+        Some(Self {
+            stage,
+            sff,
+            sprite_cache: HashMap::new(),
+        })
+    }
+
+    /// Pre-decodes every BG element's sprite into the GPU cache. Run once per
+    /// frame **before** `begin_frame` (decoding needs `&Renderer`, which a live
+    /// [`fp_render::RenderFrame`] holds borrowed). Missing/oversized sprites are
+    /// skipped (logged once via the cache), never fatal.
+    fn cache_sprites(&mut self, renderer: &Renderer) {
+        // Collect the sprite ids first to avoid borrowing `self.stage` while
+        // `self.sprite_cache`/`self.sff` are mutated.
+        let ids: Vec<SpriteId> = self
+            .stage
+            .backgrounds
+            .iter()
+            .filter_map(|bg| bg_sprite_id(bg.sprite.x, bg.sprite.y))
+            .collect();
+        for sprite_id in ids {
+            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+        }
+    }
+
+    /// Draws every BG element on `layer`, in file order, applying each element's
+    /// parallax against the camera. A missing/uncached sprite is skipped.
+    ///
+    /// `camera_x` is the camera's world X (from [`Stage::camera_follow_x`]).
+    /// Each element's world X after parallax is
+    /// [`fp_stage::parallax_screen_x`]`(start.x, delta.x, camera_x)`, mapped into
+    /// the window with the same [`world_to_screen_x`] the fighters use so the
+    /// background and fighters share one coordinate frame. Vertical follow is not
+    /// yet implemented, so `camera_y` is `0` and `start.y` is anchored to the same
+    /// ground line the fighters stand on.
+    fn draw_layer(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        layer: BgLayer,
+        camera_x: f32,
+        win_w: f32,
+        win_h: f32,
+    ) {
+        let ground_y = win_h * 0.8;
+        for bg in self.stage.backgrounds.iter().filter(|b| b.layer == layer) {
+            let Some(sprite_id) = bg_sprite_id(bg.sprite.x, bg.sprite.y) else {
+                continue;
+            };
+            let Some(cached) = self.sprite_cache.get(&sprite_id) else {
+                continue;
+            };
+
+            // World X after parallax, then into screen space (shared frame).
+            let world_x = fp_stage::parallax_screen_x(bg.start.x, bg.delta.x, camera_x);
+            let screen_x = world_to_screen_x(world_x, win_w);
+            // Vertical follow is unimplemented (camera_y = 0); anchor start.y to
+            // the ground line, Y down (matching the fighter draw convention).
+            let screen_y = ground_y + fp_stage::parallax_screen_y(bg.start.y, bg.delta.y, 0.0);
+
+            // Anchor by the sprite's axis like the fighters do.
+            let draw_x = screen_x - cached.axis_x as f32;
+            let draw_y = screen_y - cached.axis_y as f32;
+            let params = SpriteDrawParams {
+                x: draw_x,
+                y: draw_y,
+                ..Default::default()
+            };
+            frame.draw_sprite(&cached.texture, &cached.palette, &params);
+        }
+    }
+}
+
+/// Converts a BG element's `(group, image)` (stored as `i32` in the stage model)
+/// into a [`SpriteId`], warning and returning `None` when either falls outside
+/// the SFF `u16` range rather than wrapping to a wrong sprite.
+fn bg_sprite_id(group: i32, image: i32) -> Option<SpriteId> {
+    match (u16::try_from(group), u16::try_from(image)) {
+        (Ok(g), Ok(i)) => Some(SpriteId::new(g, i)),
+        _ => {
+            tracing::warn!(
+                "stage BG spriteno ({group}, {image}) is out of SFF range; skipping element"
+            );
+            None
+        }
+    }
+}
+
+/// Ensures the GPU textures for `sprite_id` are cached, decoding from `sff` on
+/// first use. Shared by the stage background cache; mirrors
+/// [`FighterRender::get_or_create_sprite`] but standalone so it can borrow a
+/// cache map directly (the stage owns its own `HashMap`). Missing or undecodable
+/// sprites are skipped with a warning, never a panic.
+fn cache_sff_sprite(
+    cache: &mut HashMap<SpriteId, CachedSprite>,
+    sff: &SffFile,
+    sprite_id: SpriteId,
+    renderer: &Renderer,
+) {
+    if cache.contains_key(&sprite_id) {
+        return;
+    }
+    let Some((index, sff_sprite)) = sff
+        .sprites
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
+    else {
+        tracing::warn!("stage sprite {sprite_id} not found in stage SFF; skipping");
+        return;
+    };
+    let axis_x = sff_sprite.axis_x;
+    let axis_y = sff_sprite.axis_y;
+    let width = sff_sprite.width;
+    let height = sff_sprite.height;
+    let pal_idx = sff_sprite.palette_index as usize;
+    if width == 0 || height == 0 {
+        tracing::warn!("stage sprite {sprite_id} has zero dimensions; skipping");
+        return;
+    }
+    let pixels = match sff.decode_sprite(index) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to decode stage sprite {sprite_id}: {e}");
+            return;
+        }
+    };
+    let palette_data = match sff.palette(pal_idx) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to load palette {pal_idx} for stage sprite {sprite_id}: {e}");
+            return;
+        }
+    };
+    let texture = SpriteTexture::new(
+        renderer.device(),
+        renderer.queue(),
+        width as u32,
+        height as u32,
+        &pixels,
+    );
+    let palette = PaletteTexture::new(renderer.device(), renderer.queue(), &palette_data);
+    cache.insert(
+        sprite_id,
+        CachedSprite {
+            texture,
+            palette,
+            axis_x,
+            axis_y,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1314,10 @@ struct MatchRun {
     p1_audio: FighterAudio,
     /// P2's per-character decoded-sound cache.
     p2_audio: FighterAudio,
+    /// The loaded stage, when one is available. `None` keeps the flat clear-color
+    /// background (no regression); `Some` renders parallax background layers
+    /// behind/in front of the fighters with a camera following their midpoint.
+    stage: Option<StageRender>,
 }
 
 /// The selected run mode after parsing CLI args and loading assets.
@@ -1110,14 +1337,19 @@ enum Mode {
 /// - no args → two-player [`Match`] of two KFMs (default), if KFM assets exist.
 /// - `<p1.def>` → two-player match, P1 and P2 both that character.
 /// - `<p1.def> <p2.def>` → two-player match with the two given characters.
+/// - `<p1.def> <p2.def> <stage.def>` → as above, over that stage's background.
 /// - `<file.sff> <file.air>` → legacy animation viewer.
 /// - `<file.sff>` → legacy static sprite.
 /// - anything missing/unloadable → falls back to the test pattern (no panic).
+///
+/// An optional 4th `.def` argument is taken as the stage; a missing/unloadable
+/// stage degrades to the flat clear-color background, never failing the match.
 fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
     match args.len() {
-        // <p1.def> <p2.def> → two-player match from two characters.
+        // <p1.def> <p2.def> [stage.def] → two-player match from two characters.
         n if n >= 3 && is_def_path(&args[1]) && is_def_path(&args[2]) => {
-            load_match_or_fallback(Path::new(&args[1]), Path::new(&args[2]), renderer)
+            let stage = stage_arg(args, 3);
+            load_match_or_fallback(Path::new(&args[1]), Path::new(&args[2]), stage, renderer)
         }
         // <sff> <air> [..] → legacy viewer (first arg is NOT a .def).
         n if n >= 3 && !is_def_path(&args[1]) => {
@@ -1134,10 +1366,11 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
                 }
             }
         }
-        // <p1.def> → two-player match, the same character on both sides.
+        // <p1.def> [stage.def] → two-player match, the same character both sides.
         n if n >= 2 && is_def_path(&args[1]) => {
             let def = Path::new(&args[1]);
-            load_match_or_fallback(def, def, renderer)
+            let stage = stage_arg(args, 2);
+            load_match_or_fallback(def, def, stage, renderer)
         }
         // <sff> → legacy static sprite.
         2 => match load_sff_sprite(renderer, Path::new(&args[1])) {
@@ -1153,7 +1386,9 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
             let def = PathBuf::from(DEFAULT_DEF);
             if def.exists() {
                 tracing::info!("No files provided; loading two-KFM match from {DEFAULT_DEF}");
-                load_match_or_fallback(&def, &def, renderer)
+                // No default stage ships (clean-room / asset-blocked), so the
+                // default match renders over the flat clear color.
+                load_match_or_fallback(&def, &def, None, renderer)
             } else {
                 tracing::info!("No files and no default character; showing test pattern");
                 tracing::info!("Usage: fp-app [p1.def [p2.def]] | <file.sff> [file.air]");
@@ -1164,21 +1399,43 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
     }
 }
 
-/// Builds a two-player [`Match`] from two `.def` paths, falling back to the test
-/// pattern on failure (so a bad/missing character never crashes the app).
-fn load_match_or_fallback(p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Mode {
+/// Returns the `i`th CLI argument as a stage `.def` path, if present and ending
+/// in `.def`. A non-`.def` extra argument is ignored (the stage stays absent),
+/// which keeps the flat-background fallback.
+fn stage_arg(args: &[String], i: usize) -> Option<&Path> {
+    args.get(i)
+        .filter(|a| is_def_path(a))
+        .map(|a| Path::new(a.as_str()))
+}
+
+/// Builds a two-player [`Match`] from two `.def` paths, optionally over a stage,
+/// falling back to the test pattern on a character-load failure (so a bad/missing
+/// character never crashes the app). A bad/missing `stage_def` only drops the
+/// background to the flat clear color — the match still runs.
+fn load_match_or_fallback(
+    p1_def: &Path,
+    p2_def: &Path,
+    stage_def: Option<&Path>,
+    renderer: &Renderer,
+) -> Mode {
     match build_two_player_match(p1_def, p2_def) {
-        Ok(m) => Mode::Match(Box::new(MatchRun {
-            m: Box::new(m),
-            p1_render: FighterRender::default(),
-            p2_render: FighterRender::default(),
-            // The default constructor opens a real device when present and falls
-            // back to a silent NullBackend otherwise — it never panics, so the
-            // app runs identically with or without audio hardware.
-            audio: AudioSystem::default(),
-            p1_audio: FighterAudio::default(),
-            p2_audio: FighterAudio::default(),
-        })),
+        Ok(m) => {
+            // Loading the stage is best-effort: `None` (no path, bad parse, or
+            // missing SFF) keeps today's flat clear color (no regression).
+            let stage = stage_def.and_then(StageRender::load);
+            Mode::Match(Box::new(MatchRun {
+                m: Box::new(m),
+                p1_render: FighterRender::default(),
+                p2_render: FighterRender::default(),
+                // The default constructor opens a real device when present and
+                // falls back to a silent NullBackend otherwise — it never panics,
+                // so the app runs identically with or without audio hardware.
+                audio: AudioSystem::default(),
+                p1_audio: FighterAudio::default(),
+                p2_audio: FighterAudio::default(),
+                stage,
+            }))
+        }
         Err(e) => {
             tracing::warn!("match failed to load: {e}; showing test pattern");
             let (s, p) = generate_test_pattern(renderer);
@@ -1322,6 +1579,11 @@ fn run() -> fp_core::FpResult<()> {
             Mode::Match(ref mut run) => {
                 cache_player_sprite(&mut run.p1_render, run.m.p1(), &renderer);
                 cache_player_sprite(&mut run.p2_render, run.m.p2(), &renderer);
+                // Decode the stage's background sprites too (also needs `&Renderer`
+                // before the frame borrows it). A no-op when there is no stage.
+                if let Some(stage) = run.stage.as_mut() {
+                    stage.cache_sprites(&renderer);
+                }
             }
             Mode::Viewer(ref mut v) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
@@ -1339,18 +1601,42 @@ fn run() -> fp_core::FpResult<()> {
 
         match mode {
             Mode::Match(ref run) => {
+                let win_wf = win_w as f32;
+                let win_hf = win_h as f32;
+
+                // Camera follows the fighters' midpoint, clamped to the stage's
+                // horizontal bounds. With no stage the camera stays at 0, so the
+                // fighters render exactly as before (flat-background path).
+                let camera_x = run
+                    .stage
+                    .as_ref()
+                    .map(|s| s.stage.camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x))
+                    .unwrap_or(0.0);
+
+                // Back background layers first (behind the fighters).
+                if let Some(stage) = run.stage.as_ref() {
+                    stage.draw_layer(&mut frame, BgLayer::Back, camera_x, win_wf, win_hf);
+                }
+
                 // Draw both fighters from their current AIR frame, each via its
-                // own per-character texture cache (populated above).
-                draw_player(&mut frame, &run.p1_render, run.m.p1(), win_w as f32, win_h as f32);
-                draw_player(&mut frame, &run.p2_render, run.m.p2(), win_w as f32, win_h as f32);
+                // own per-character texture cache (populated above), offset by the
+                // camera so the playfield scrolls.
+                draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+                draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+
+                // Front background layers, over the fighters but under the HUD.
+                if let Some(stage) = run.stage.as_ref() {
+                    stage.draw_layer(&mut frame, BgLayer::Front, camera_x, win_wf, win_hf);
+                }
+
                 // Optional Clsn debug overlay (F1): both fighters' attack (red)
                 // and hurt (blue) boxes, drawn over the sprites but under the HUD.
                 if overlay_enabled {
-                    draw_player_clsn(&mut frame, run.m.p1(), win_w as f32, win_h as f32);
-                    draw_player_clsn(&mut frame, run.m.p2(), win_w as f32, win_h as f32);
+                    draw_player_clsn(&mut frame, run.m.p1(), camera_x, win_wf, win_hf);
+                    draw_player_clsn(&mut frame, run.m.p2(), camera_x, win_wf, win_hf);
                 }
                 // Minimal HUD on top: life bars + KO/round indicator.
-                hud.draw(&mut frame, win_w as f32, &run.m);
+                hud.draw(&mut frame, win_wf, &run.m);
             }
             Mode::Viewer(ref v) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -1591,6 +1877,74 @@ mod tests {
         assert!((world_to_screen_x(0.0, win_w) - 320.0).abs() < 1e-6, "origin at center");
         assert!(world_to_screen_x(-60.0, win_w) < 320.0, "negative world X is left of center");
         assert!(world_to_screen_x(60.0, win_w) > 320.0, "positive world X is right of center");
+    }
+
+    // =====================================================================
+    // PR-L — stage background wiring (audit #29)
+    // =====================================================================
+
+    /// A fighter's screen anchor scrolls opposite the camera: with the camera at
+    /// 0 it matches the no-stage mapping; moving the camera right (+) shifts the
+    /// fighter left on screen by the same amount (`pos.x - camera_x`).
+    #[test]
+    fn player_anchor_scrolls_with_camera() {
+        let win_w = 640.0;
+        let win_h = 480.0;
+        let pos = fp_core::Vec2::new(60.0, 0.0);
+
+        let (no_cam, _) = player_screen_anchor(pos, 0.0, win_w, win_h);
+        assert!(
+            (no_cam - world_to_screen_x(60.0, win_w)).abs() < 1e-6,
+            "camera 0 reduces to the original centered mapping (no regression)"
+        );
+
+        let (with_cam, _) = player_screen_anchor(pos, 100.0, win_w, win_h);
+        assert!(
+            (with_cam - world_to_screen_x(-40.0, win_w)).abs() < 1e-6,
+            "camera +100 maps pos.x-100 (the world scrolls under the camera)"
+        );
+        assert!(with_cam < no_cam, "panning the camera right pushes the fighter left");
+    }
+
+    /// `bg_sprite_id` accepts in-range group/image and rejects (with `None`) any
+    /// component outside the SFF `u16` range rather than wrapping to a wrong id.
+    #[test]
+    fn bg_sprite_id_validates_u16_range() {
+        assert_eq!(bg_sprite_id(0, 0), Some(SpriteId::new(0, 0)));
+        assert_eq!(bg_sprite_id(65535, 65535), Some(SpriteId::new(65535, 65535)));
+        assert_eq!(bg_sprite_id(-1, 0), None, "negative group is out of range");
+        assert_eq!(bg_sprite_id(0, 70000), None, "image > u16::MAX is out of range");
+    }
+
+    /// `stage_arg` picks up a `.def` extra argument as the stage and ignores a
+    /// non-`.def` one (keeping the flat background).
+    #[test]
+    fn stage_arg_selects_def_extra_only() {
+        let args = vec![
+            "fp-app".to_string(),
+            "p1.def".to_string(),
+            "p2.def".to_string(),
+            "ringside.def".to_string(),
+        ];
+        assert_eq!(stage_arg(&args, 3), Some(Path::new("ringside.def")));
+        // Out-of-range index → no stage.
+        assert_eq!(stage_arg(&args, 9), None);
+
+        let non_def = vec![
+            "fp-app".to_string(),
+            "p1.def".to_string(),
+            "p2.def".to_string(),
+            "notes.txt".to_string(),
+        ];
+        assert_eq!(stage_arg(&non_def, 3), None, "a non-.def extra arg is not a stage");
+    }
+
+    /// A missing stage path degrades to no stage (the flat-background fallback)
+    /// rather than panicking — `StageRender::load` returns `None`.
+    #[test]
+    fn stage_load_missing_file_is_none_not_panic() {
+        let missing = Path::new("/no/such/stage/definitely-not-here.def");
+        assert!(StageRender::load(missing).is_none());
     }
 
     /// Builds the same two-KFM [`Match`] the app builds (default both KFM), or
@@ -3177,7 +3531,8 @@ mod tests {
         let win_w = 640.0;
         let win_h = 480.0;
         let pos = fp_core::Vec2::new(40.0, -30.0);
-        let (ax, ay) = player_screen_anchor(pos, win_w, win_h);
+        // Camera at 0: the anchor reduces to the original (un-scrolled) mapping.
+        let (ax, ay) = player_screen_anchor(pos, 0.0, win_w, win_h);
         assert!((ax - world_to_screen_x(pos.x, win_w)).abs() < 1e-4);
         assert!((ay - (win_h * 0.8 + pos.y)).abs() < 1e-4);
     }
