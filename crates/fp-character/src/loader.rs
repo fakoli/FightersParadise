@@ -542,7 +542,12 @@ impl LoadedCharacter {
         // These groups live in the `cns` file (KFM puts them in kfm.cns). The
         // CnsFile parser drops non-state sections, so re-read them with the
         // generic INI parser. The first constants file that parses wins.
-        let constants = load_constants(&def, def_path, &state_refs);
+        let mut constants = load_constants(&def, def_path, &state_refs);
+        // Thread the parsed `[Info] localcoord` onto the constants too (it is
+        // already on `LoadedCharacter.localcoord` below). The EvalContext reaches
+        // the character only via `me.constants`, so the coordinate-scaling
+        // triggers `Const720p`/`Const1280p` read the localcoord from here.
+        constants.localcoord = localcoord;
 
         let compiled_states = states.len();
         tracing::info!(

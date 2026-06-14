@@ -351,6 +351,17 @@ pub struct CharacterConstants {
     pub velocity: VelocityConstants,
     /// `[Movement]` group: gravity and friction coefficients.
     pub movement: MovementConstants,
+    /// `[Info] localcoord` — the character's authoring coordinate space
+    /// `(width, height)` in pixels. Defaults to MUGEN's `(320, 240)`.
+    ///
+    /// This mirrors [`LoadedCharacter::localcoord`](crate::LoadedCharacter) onto
+    /// the constants so the [`EvalContext`] (which reaches the character only via
+    /// `me.constants`) can read it. It is the divisor source for the
+    /// coordinate-scaling triggers `Const720p` and `Const1280p`, which scale a
+    /// value authored in a high-resolution space down to this character's space
+    /// by the **width ratio** (`localcoord.0 / reference_width`, where the
+    /// reference width is `1280` for `Const720p` and `2560` for `Const1280p`).
+    pub localcoord: (i32, i32),
 }
 
 impl Default for CharacterConstants {
@@ -363,6 +374,11 @@ impl Default for CharacterConstants {
             size: SizeConstants::default(),
             velocity: VelocityConstants::default(),
             movement: MovementConstants::default(),
+            // MUGEN's de-facto baseline authoring space (KFM and most stock
+            // content). A character that omits `[Info] localcoord` is treated as
+            // authored in this space, so coordinate-scaling triggers
+            // (`Const720p`/`Const1280p`) downscale relative to (320, 240).
+            localcoord: (320, 240),
         }
     }
 }
@@ -1215,6 +1231,47 @@ impl Character {
         Value::DEFAULT
     }
 
+    /// Scales a value authored in a high-resolution coordinate space down to this
+    /// character's [`localcoord`](CharacterConstants::localcoord) space, for the
+    /// MUGEN `Const720p` / `Const1280p` triggers.
+    ///
+    /// # MUGEN formula and reasoning
+    ///
+    /// MUGEN's coordinate model scales assets authored in one space into another
+    /// **by the ratio of the target width to the source width** (the source's
+    /// `localcoord` *height* is not used for this scale — see the engine
+    /// architecture KB and Elecbyte's `coordspace.html`). `Const720p(v)` says "I
+    /// authored `v` in the 720p space", and the engine converts it to the
+    /// player's space:
+    ///
+    /// ```text
+    /// Const720p(v)  = v * (localcoord.width / 1280)   // 720p  space is 1280 wide
+    /// Const1280p(v) = v * (localcoord.width / 2560)   // 1280p space is 2560 wide
+    /// ```
+    ///
+    /// The reference is the **width** of each named space: "720p" is 1280×720
+    /// (width 1280) and "1280p" is the next tier, 2560×1440 (width 2560). Using
+    /// the width ratio — not the height ratio — is what makes KFM's `(320, 240)`
+    /// yield exactly `320 / 1280 = 0.25` for `Const720p` (so `Const720p(-8) =
+    /// -2.0`), matching MUGEN; the height ratio `240 / 720 ≈ 0.333` would give the
+    /// wrong `-2.667`. For `Const1280p` the KFM factor is `320 / 2560 = 0.125`
+    /// (so `Const1280p(-8) = -1.0`).
+    ///
+    /// `reference_width` is the source space's width (`1280` for `Const720p`,
+    /// `2560` for `Const1280p`). The arithmetic is done in `f32` and the sign of
+    /// `value` is preserved (the scale is non-negative for any sane positive
+    /// `localcoord`). A non-positive `reference_width` (never produced internally)
+    /// yields `0.0` rather than dividing by zero, so the result is always finite
+    /// and this never panics.
+    #[must_use]
+    fn const_coord_scale(&self, value: f32, reference_width: f32) -> f32 {
+        if reference_width <= 0.0 {
+            return 0.0;
+        }
+        let local_width = self.constants.localcoord.0 as f32;
+        value * (local_width / reference_width)
+    }
+
     /// Resolves a MUGEN `GetHitVar(<member>)` read against this character's
     /// [`get_hit_vars`](Character::get_hit_vars).
     ///
@@ -1321,6 +1378,27 @@ impl EvalContext for Character {
         }
         if name.eq_ignore_ascii_case("Vel") {
             return Value::Float(Self::axis_component(self.vel, args));
+        }
+
+        // Coordinate-scaling triggers (MUGEN 1.1). `Const720p(v)` / `Const1280p(v)`
+        // take a value authored in a high-resolution space (720p = 1280 wide,
+        // 1280p = 2560 wide) and scale it to this character's `localcoord` space
+        // by the WIDTH ratio. They yield a float, sign-preserving. A missing/
+        // garbage argument resolves to the safe default 0 rather than panicking.
+        // common1.cns gates landing/air-anim/sprpriority and p2dist thresholds on
+        // these (e.g. `Vel y > Const720p(-8)`); with them returning 0 (the old
+        // behavior) such gates degenerated to `> 0`. See [`const_coord_scale`].
+        if name.eq_ignore_ascii_case("Const720p") {
+            return match args.first() {
+                Some(v) => Value::Float(self.const_coord_scale(v.to_float(), 1280.0)),
+                None => Value::DEFAULT,
+            };
+        }
+        if name.eq_ignore_ascii_case("Const1280p") {
+            return match args.first() {
+                Some(v) => Value::Float(self.const_coord_scale(v.to_float(), 2560.0)),
+                None => Value::DEFAULT,
+            };
         }
 
         // Variable banks (also reachable via the typed var/fvar/sysvar methods,
@@ -2177,6 +2255,7 @@ mod tests {
                 stand_friction: 0.83,
                 crouch_friction: 0.81,
             },
+            localcoord: (320, 240),
         };
         Character::with_constants(consts)
     }
@@ -2838,6 +2917,240 @@ mod tests {
         assert_eq!(ev("const(VELOCITY.WALK.FWD.X) = 2.4", &ch), Value::Int(1));
         // An unknown member against a real character still defaults to 0.
         assert_eq!(ev("const(no.such.member) = 0", &ch), Value::Int(1));
+    }
+
+    // ---- Const720p / Const1280p coordinate-scaling triggers (Audit P5) -------
+
+    /// Builds a character whose `localcoord` is set to `(w, h)`, leaving all other
+    /// constants at their defaults. Used by the coordinate-scaling trigger tests.
+    fn char_with_localcoord(w: i32, h: i32) -> Character {
+        let consts = CharacterConstants {
+            localcoord: (w, h),
+            ..CharacterConstants::default()
+        };
+        Character::with_constants(consts)
+    }
+
+    #[test]
+    fn const720p_scales_by_width_ratio_through_eval() {
+        // Chosen MUGEN formula: Const720p(v) = v * (localcoord.width / 1280).
+        // For a 320-wide character the factor is 320/1280 = 0.25 exactly, so
+        // Const720p(-8) = -2.0 (NOT 0, NOT the height-based -2.667). Routed through
+        // the real fp_vm parse+eval path, the trigger yields a Float.
+        let ch = char_with_localcoord(320, 240);
+        assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-2.0)); // negative arg, sign preserved
+        assert_eq!(ev("Const720p(20)", &ch), Value::Float(5.0));
+        assert_eq!(ev("Const720p(56)", &ch), Value::Float(14.0));
+        assert_eq!(ev("Const720p(4)", &ch), Value::Float(1.0));
+        // The headline behavior fix: `Vel y > Const720p(-8)` is now `> -2.0`, so a
+        // small downward velocity below the HD threshold reads false (it used to
+        // collapse to `> 0`).
+        let mut moving = char_with_localcoord(320, 240);
+        moving.vel = Vec2::new(0.0, -1.0); // descending slower than the -2.0 gate
+        assert_eq!(ev("Vel y > Const720p(-8)", &moving), Value::Int(1));
+        assert_eq!(ev("Vel y > 0", &moving), Value::Int(0));
+    }
+
+    #[test]
+    fn const1280p_scales_by_2560_reference_width() {
+        // Const1280p(v) = v * (localcoord.width / 2560). For 320 wide the factor is
+        // 320/2560 = 0.125, so Const1280p(-8) = -1.0 and Const1280p(16) = 2.0.
+        let ch = char_with_localcoord(320, 240);
+        assert_eq!(ev("Const1280p(-8)", &ch), Value::Float(-1.0)); // negative arg
+        assert_eq!(ev("Const1280p(16)", &ch), Value::Float(2.0));
+        // The two triggers differ by exactly the reference-width ratio (1280:2560),
+        // i.e. Const720p is twice Const1280p for the same arg.
+        assert_eq!(ev("Const720p(8) = 2 * Const1280p(8)", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_coord_scale_at_native_hd_localcoord_is_identity() {
+        // A character authored natively at 1280x720 (the 720p space) gets factor
+        // 1280/1280 = 1.0 for Const720p: the value passes through unchanged.
+        let ch = char_with_localcoord(1280, 720);
+        assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-8.0));
+        assert_eq!(ev("Const720p(100)", &ch), Value::Float(100.0));
+        // The same character at Const1280p downscales by 1280/2560 = 0.5.
+        assert_eq!(ev("Const1280p(-8)", &ch), Value::Float(-4.0));
+    }
+
+    #[test]
+    fn const_coord_scale_default_character_uses_mugen_baseline() {
+        // CharacterConstants::default() carries the MUGEN baseline (320, 240), so a
+        // bare Character::new() already scales like KFM without any loader step.
+        let ch = Character::new();
+        assert_eq!(ch.constants.localcoord, (320, 240));
+        assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-2.0));
+    }
+
+    #[test]
+    fn const720p_missing_or_garbage_arg_is_safe_default_no_panic() {
+        let ch = char_with_localcoord(320, 240);
+        // No argument -> safe default 0 (the parenless / empty-arg degenerate form
+        // reaches the trigger with an empty arg slice). Never panics.
+        assert_eq!(ch.trigger("Const720p", &[]), Value::DEFAULT);
+        assert_eq!(ch.trigger("Const1280p", &[]), Value::DEFAULT);
+        // A zero localcoord width would make the scale 0 (degenerate but defined),
+        // and is still finite — exercise it so the path is covered.
+        let zero = char_with_localcoord(0, 0);
+        assert_eq!(zero.trigger("Const720p", &[Value::Int(-8)]), Value::Float(0.0));
+        // Case-insensitive dispatch through the trigger seam.
+        assert_eq!(ch.trigger("const720P", &[Value::Int(20)]), Value::Float(5.0));
+        assert_eq!(ch.trigger("CONST1280P", &[Value::Int(16)]), Value::Float(2.0));
+    }
+
+    #[test]
+    fn const720p_real_kfm_localcoord_makes_threshold_nonzero() {
+        // Gated real-fixture test (skip-if-missing): load KFM, confirm its loaded
+        // localcoord threads into the constants, and assert Const720p(-8) is the
+        // expected nonzero -2.0 -- so `Vel y > Const720p(-8)` no longer means
+        // `> 0`. Routed through fp_vm parse+eval against the real character.
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        // The loader threads [Info] localcoord onto the constants (not just onto
+        // LoadedCharacter.localcoord).
+        assert_eq!(loaded.constants.localcoord, (320, 240));
+        let ch = Character::with_constants(loaded.constants);
+        // The fix: a real nonzero HD threshold instead of the old collapsed 0.
+        assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-2.0));
+        assert!(ev("Const720p(-8) < 0", &ch).as_bool());
+        assert_eq!(ev("Const1280p(-8)", &ch), Value::Float(-1.0));
+    }
+
+    // ---- Proctor: additional Const720p/Const1280p edge & semantics coverage --
+
+    #[test]
+    fn const720p_scale_tracks_arbitrary_localcoord_widths() {
+        // The factor is localcoord.width / 1280, independent of height. Pick widths
+        // that yield clean ratios so the assertion is exact, and vary the height to
+        // prove HEIGHT is irrelevant to the scale (the documented width-only rule).
+        // 640 wide -> 0.5; height 240 vs 480 must not change the result.
+        let w640_h240 = char_with_localcoord(640, 240);
+        let w640_h480 = char_with_localcoord(640, 480);
+        assert_eq!(ev("Const720p(8)", &w640_h240), Value::Float(4.0));
+        assert_eq!(
+            ev("Const720p(8)", &w640_h240),
+            ev("Const720p(8)", &w640_h480),
+            "height must not affect Const720p scaling"
+        );
+        // 2560 wide -> 2.0 (a value authored in 720p is doubled into a 2x space).
+        let w2560 = char_with_localcoord(2560, 1440);
+        assert_eq!(ev("Const720p(8)", &w2560), Value::Float(16.0));
+        // 1920 wide -> 1.5.
+        let w1920 = char_with_localcoord(1920, 1080);
+        assert_eq!(ev("Const720p(100)", &w1920), Value::Float(150.0));
+    }
+
+    #[test]
+    fn const1280p_native_localcoord_is_identity_and_height_independent() {
+        // A character authored natively in the 1280p space (2560 wide) gets factor
+        // 2560/2560 = 1.0 for Const1280p: identity. Height varied to confirm it is
+        // unused.
+        let native = char_with_localcoord(2560, 1440);
+        assert_eq!(ev("Const1280p(-80)", &native), Value::Float(-80.0));
+        let native_tall = char_with_localcoord(2560, 9999);
+        assert_eq!(
+            ev("Const1280p(-80)", &native),
+            ev("Const1280p(-80)", &native_tall),
+        );
+    }
+
+    #[test]
+    fn const_coord_triggers_preserve_fractional_argument() {
+        // The argument is read as a float (v.to_float()), so a fractional authored
+        // value must NOT be truncated before scaling. 320/1280 = 0.25; 2.5 -> 0.625.
+        let ch = char_with_localcoord(320, 240);
+        assert_eq!(ev("Const720p(2.5)", &ch), Value::Float(0.625));
+        // Negative fractional arg keeps its sign through the float multiply.
+        assert_eq!(ev("Const720p(-2.5)", &ch), Value::Float(-0.625));
+        // Const1280p: 320/2560 = 0.125; 2.5 -> 0.3125.
+        assert_eq!(ev("Const1280p(2.5)", &ch), Value::Float(0.3125));
+    }
+
+    #[test]
+    fn const_coord_triggers_always_yield_float_even_for_whole_results() {
+        // Even when the scaled result is a whole number, the trigger yields a
+        // Value::Float (not Value::Int) — MUGEN's Const720p/Const1280p are
+        // float-typed. A whole-number Int would compare equal numerically but the
+        // TYPE must be Float so downstream float arithmetic/printing is faithful.
+        let ch = char_with_localcoord(1280, 720); // factor 1.0
+        let v = ch.trigger("Const720p", &[Value::Int(7)]);
+        assert_eq!(v, Value::Float(7.0));
+        assert!(matches!(v, Value::Float(_)), "Const720p must be float-typed, got {v:?}");
+    }
+
+    #[test]
+    fn const_coord_scale_helper_guards_nonpositive_reference_width() {
+        // Unit-cover the private helper's defensive branch directly: a non-positive
+        // reference width (never produced internally, but the guard must hold) gives
+        // exactly 0.0 rather than NaN/inf/panic from a divide-by-zero.
+        let ch = char_with_localcoord(320, 240);
+        assert_eq!(ch.const_coord_scale(-8.0, 0.0), 0.0);
+        assert_eq!(ch.const_coord_scale(100.0, -1280.0), 0.0);
+        // And the normal path still computes value * (width / reference).
+        assert_eq!(ch.const_coord_scale(-8.0, 1280.0), -2.0);
+        assert!(ch.const_coord_scale(-8.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn const720p_resolves_all_common1_landing_thresholds() {
+        // The exact Const720p args common1.cns authors for landing / air-anim /
+        // sprpriority / p2dist gates (per the task brief): -8, -20, -80, 4, 20, 56.
+        // For KFM's (320,240) the factor is 0.25, so each must scale to a*0.25 and
+        // none collapse to 0 — the whole point of the fix.
+        let ch = char_with_localcoord(320, 240);
+        let cases = [(-8, -2.0), (-20, -5.0), (-80, -20.0), (4, 1.0), (20, 5.0), (56, 14.0)];
+        for (arg, want) in cases {
+            let got = ev(&format!("Const720p({arg})"), &ch);
+            assert_eq!(got, Value::Float(want), "Const720p({arg})");
+            assert_ne!(got, Value::Float(0.0), "Const720p({arg}) must not collapse to 0");
+        }
+    }
+
+    #[test]
+    fn const_coord_triggers_resolve_through_cross_entity_evalctx() {
+        // The executor evaluates triggers through EvalCtx (the cross-entity wrapper),
+        // which delegates self-only triggers to the wrapped Character. Const720p/
+        // Const1280p must resolve identically via that seam, with or without an
+        // opponent present, since they read only `me`'s localcoord.
+        let me = char_with_localcoord(320, 240);
+        let (_, opp) = two_chars();
+        let stage = StageView::default();
+        assert_eq!(ev_cross("Const720p(-8)", &me, Some(&opp), stage), Value::Float(-2.0));
+        assert_eq!(ev_cross("Const720p(-8)", &me, None, stage), Value::Float(-2.0));
+        assert_eq!(ev_cross("Const1280p(16)", &me, Some(&opp), stage), Value::Float(2.0));
+        // The headline behavior gate, evaluated through the real executor seam.
+        let mut moving = char_with_localcoord(320, 240);
+        moving.vel = Vec2::new(0.0, -1.0);
+        assert_eq!(ev_cross("Vel y > Const720p(-8)", &moving, Some(&opp), stage), Value::Int(1));
+    }
+
+    #[test]
+    fn const720p_real_kfm_landing_gate_no_longer_degenerates_to_zero() {
+        // Gated real-fixture (skip-if-missing): on the real KFM character, the
+        // landing-style gate `Vel y > Const720p(-8)` must behave as `Vel y > -2.0`,
+        // NOT the old `Vel y > 0`. Prove the discriminating case: a character
+        // descending at -1.0 (between -2.0 and 0) reads TRUE under the fixed
+        // threshold but FALSE under the old collapsed `> 0`.
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        let mut ch = Character::with_constants(loaded.constants);
+        ch.vel = Vec2::new(0.0, -1.0);
+        assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-2.0));
+        assert_eq!(ev("Vel y > Const720p(-8)", &ch), Value::Int(1), "fixed: > -2.0");
+        assert_eq!(ev("Vel y > 0", &ch), Value::Int(0), "old collapsed gate would be false");
     }
 
     #[test]
