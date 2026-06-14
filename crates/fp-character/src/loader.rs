@@ -749,6 +749,20 @@ fn merge_cmd_statedefs(states: &mut HashMap<i32, CompiledState>, path: &Path, re
 /// - walk(20)  not holdfwd/holdback/holdup/holddown        -> 0  (back to stand)
 /// - crouch(11) not holddown                               -> 12 (crouch->stand)
 ///
+/// In addition, the engine-built-in AUTO-LAND (task A.P15b) is appended as a
+/// final `type=ChangeState` controller:
+///
+/// - (stateno=50 || stateno=51) && pos y >= 0 && vel y >= 0 -> 52 (Jump Land)
+///
+/// MUGEN's basic jump (states 50/51) carries NO land transition in common1, so
+/// the engine supplies it: once the P15a ground clamp pins `pos.y` back at the
+/// floor (`pos y >= 0`) with a downward/zero velocity (`vel y >= 0`), the basic
+/// jump transitions to Jump Land 52 (which common1 then carries 52 -> 0 Stand).
+/// Unlike the locomotion controllers above it carries NO `ctrl` triggerall —
+/// landing is unconditional — and is gated STRICTLY to states 50/51 so it never
+/// hijacks get-hit / custom air states (e.g. 5040), which carry their own land
+/// logic.
+///
 /// The 10->11, 12->0, and 40->50 transitions already exist in common1 via
 /// AnimTime, so they are deliberately NOT duplicated here. Air movement / airjump
 /// are deferred. Walk *velocity* is the character's concern (common1's
@@ -803,6 +817,11 @@ type = ChangeState
 value = 12
 triggerall = ctrl
 trigger1 = stateno = 11 && command != \"holddown\"
+
+[State -1, engine: auto-land 50/51->52]
+type = ChangeState
+value = 52
+trigger1 = (stateno = 50 || stateno = 51) && pos y >= 0 && vel y >= 0
 ";
 
 /// Appends the engine-built-in ground locomotion controllers (task 7.3 part B)
@@ -3141,13 +3160,17 @@ mod tests {
             "engine built-ins (first at {first_builtin}) must come AFTER all authored \
              controllers (last at {last_authored}), preserving character priority"
         );
-        // Exactly the seven built-in controllers we synthesize.
+        // Exactly the eight built-in controllers we synthesize: the seven
+        // ground-locomotion command-states plus the A.P15b auto-land (50/51->52).
         let builtin_count = minus_one
             .controllers
             .iter()
             .filter(|c| c.label.starts_with("engine:"))
             .count();
-        assert_eq!(builtin_count, 7, "exactly the seven built-in locomotion controllers");
+        assert_eq!(
+            builtin_count, 8,
+            "exactly the eight built-ins (seven locomotion + one auto-land)"
+        );
     }
 
     /// Part B (synthetic, no fixture): a character with no `.cmd` (so no authored
@@ -3183,5 +3206,464 @@ mod tests {
         });
         assert!(walks, "the built-in stand->walk command-state must be present");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ====================================================================
+    // Task A.P15b (Proctor): engine built-in AUTO-LAND.
+    //
+    // MUGEN's basic jump (states 50/51) has NO land transition in common1
+    // (verified: `[Statedef 50]` carries only VarSet/ChangeAnim). The engine
+    // supplies the land as a hardcoded built-in: a `[Statedef -1]` ChangeState
+    //   value = 52
+    //   trigger1 = (stateno = 50 || stateno = 51) && pos y >= 0 && vel y >= 0
+    // with NO `ctrl` triggerall (landing is unconditional), gated STRICTLY to
+    // states 50/51 so it never hijacks get-hit / custom air states (5040 etc.)
+    // which carry their own land logic.
+    //
+    // These tests are injection- and behavior-level: they build a tiny state
+    // graph, run the SAME loader built-in injection (`append_builtin_ground_
+    // locomotion`), and drive `Character::tick_with` to assert the land fires
+    // exactly when MUGEN says it should — and never otherwise.
+    // ====================================================================
+
+    use crate::{Character, Physics, StageView};
+    use fp_formats::air::{AnimAction, AnimFrame, BlendMode};
+
+    /// World Y of the floor (ground plane). Mirrors the executor's private
+    /// `GROUND_Y` (the world origin, `Y = 0`); kept local because that constant
+    /// is module-private. Y increases downward, so `pos.y >= 0` means "at or
+    /// below the floor line" — i.e. the landing condition.
+    const FLOOR_Y: f32 = 0.0;
+
+    /// A one-action AIR file so the executor's `advance_animation` has something
+    /// to advance (action 0, a single 5-tick frame). Keeps the synthetic
+    /// auto-land tests from depending on any binary fixture.
+    fn tiny_air_p15b() -> AirFile {
+        let mut actions = HashMap::new();
+        actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![AnimFrame {
+                    sprite: fp_core::SpriteId::new(0, 0),
+                    offset: Vec2::new(0, 0),
+                    ticks: 5,
+                    flip_h: false,
+                    flip_v: false,
+                    blend: BlendMode::Normal,
+                    clsn1: Vec::new(),
+                    clsn2: Vec::new(),
+                }],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// Builds the minimal state graph the auto-land tests drive: the basic air
+    /// jump states 50 (`type=A, physics=A`) and 51 (an alternate basic jump),
+    /// the get-hit air-fall state 5040 (`type=A, physics=A`), and the grounded
+    /// Jump Land 52 (`type=S`). The graph deliberately authors NO land
+    /// transition of its own on 50/51 — exactly like KFM's common1 — so any
+    /// transition to 52 must come from the engine built-in under test.
+    ///
+    /// State 5040 carries its OWN land rule (common1's `Vel Y > 0 && Pos Y >= 0`
+    /// → 52) so the "the built-in must not hijack get-hit states" assertion can
+    /// distinguish "the BUILTIN fired" (it must not, for 5040) from "5040's own
+    /// authored rule fired" (allowed). To make that distinction crisp, 5040 here
+    /// authors NO land rule at all: if it ever reaches 52, only the (incorrectly
+    /// ungated) built-in could have done it.
+    fn p15b_graph() -> HashMap<i32, CompiledState> {
+        let cns = CnsFile::from_str(
+            "[Statedef 50]\n\
+             type = A\n\
+             physics = A\n\
+             anim = 0\n\
+             \n\
+             [Statedef 51]\n\
+             type = A\n\
+             physics = A\n\
+             anim = 0\n\
+             \n\
+             [Statedef 52]\n\
+             type = S\n\
+             physics = N\n\
+             anim = 0\n\
+             \n\
+             [Statedef 5040]\n\
+             type = A\n\
+             physics = A\n\
+             anim = 0\n",
+        )
+        .expect("synthetic A.P15b CNS compiles");
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        for d in &cns.statedefs {
+            states.insert(d.number, CompiledState::from_parsed(d));
+        }
+        // Run the REAL loader built-in injection path (the same call site the
+        // loader uses at load time). This is what is supposed to add the
+        // auto-land controller to [Statedef -1].
+        append_builtin_ground_locomotion(&mut states);
+        states
+    }
+
+    /// Locate the auto-land built-in controller in `[Statedef -1]`: an
+    /// `engine:`-labelled ChangeState whose `value` resolves to `52`.
+    fn find_auto_land(states: &HashMap<i32, CompiledState>) -> Option<&CompiledController> {
+        states.get(&-1)?.controllers.iter().find(|c| {
+            c.label.starts_with("engine:")
+                && c.controller_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"))
+                && c.params
+                    .get("value")
+                    .is_some_and(|p| p.component(0).is_some_and(|e| e.source.trim() == "52"))
+        })
+    }
+
+    /// AC1 (injection): the loader built-in path injects an auto-land ChangeState
+    /// (value 52) into the synthesized `[Statedef -1]`. It must be `engine:`-
+    /// labelled (so the idempotency guard covers it) and must NOT carry a `ctrl`
+    /// triggerall (landing is unconditional).
+    #[test]
+    fn p15b_auto_land_builtin_is_injected_value_52_not_ctrl_gated() {
+        let states = p15b_graph();
+        let land = find_auto_land(&states)
+            .expect("auto-land built-in (engine: ChangeState value=52) must be injected into [-1]");
+        // Landing is unconditional: no `ctrl` in any triggerall component.
+        let ctrl_gated = land
+            .triggerall
+            .iter()
+            .any(|e| e.source.to_ascii_lowercase().contains("ctrl"));
+        assert!(
+            !ctrl_gated,
+            "auto-land must NOT be ctrl-gated (landing is unconditional); triggerall = {:?}",
+            land.triggerall.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+    }
+
+    /// AC1 (idempotency): re-running the built-in injection on an already-injected
+    /// graph must not duplicate the auto-land controller (the `engine:` label
+    /// guard still holds). Exactly one auto-land ChangeState(52) controller.
+    #[test]
+    fn p15b_auto_land_injection_is_idempotent() {
+        let mut states = p15b_graph();
+        let count_52 = |s: &HashMap<i32, CompiledState>| -> usize {
+            s.get(&-1)
+                .map(|m| {
+                    m.controllers
+                        .iter()
+                        .filter(|c| {
+                            c.label.starts_with("engine:")
+                                && c.controller_type
+                                    .as_deref()
+                                    .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"))
+                                && c.params.get("value").is_some_and(|p| {
+                                    p.component(0).is_some_and(|e| e.source.trim() == "52")
+                                })
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(count_52(&states), 1, "exactly one auto-land controller after first inject");
+        // Second inject must be a no-op (idempotency guard).
+        append_builtin_ground_locomotion(&mut states);
+        assert_eq!(
+            count_52(&states),
+            1,
+            "re-injecting must not duplicate the auto-land controller (idempotency guard)"
+        );
+    }
+
+    /// AC3 (positive, state 50): a character in basic jump state 50 sitting AT
+    /// the floor (`pos.y >= 0`) with a downward/zero velocity (`vel.y >= 0`) is
+    /// carried to Jump Land 52 by the built-in within a tick. This is the exact
+    /// post-clamp landing frame (P15a pins pos.y=0 and leaves vel.y downward).
+    #[test]
+    fn p15b_state_50_at_floor_falling_lands_to_52() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 50);
+        ch.pos = Vec2::new(0.0, FLOOR_Y); // at the floor
+        ch.physics = Physics::None; // isolate from gravity; vel set explicitly
+        ch.vel = Vec2::new(0.0, 1.0); // moving downward (vel.y >= 0)
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.state_no, 52,
+            "basic jump state 50 at the floor with downward velocity must land to 52"
+        );
+    }
+
+    /// AC3 (positive, state 51): the OTHER basic jump state lands to 52 too — the
+    /// built-in is gated to 50 OR 51, not just 50.
+    #[test]
+    fn p15b_state_51_at_floor_falling_lands_to_52() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 51);
+        ch.pos = Vec2::new(0.0, FLOOR_Y);
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 0.0); // exactly zero is still >= 0 → lands
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(ch.state_no, 52, "basic jump state 51 at the floor must also land to 52");
+    }
+
+    /// AC2 (negative, still rising): a character in state 50 with upward velocity
+    /// (`vel.y < 0`) must NOT land — it is still going up. Even at pos.y = 0
+    /// (the launch frame) a rising character keeps jumping.
+    #[test]
+    fn p15b_state_50_rising_does_not_land() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 50);
+        ch.pos = Vec2::new(0.0, FLOOR_Y); // at floor height...
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, -8.0); // ...but moving UP (vel.y < 0)
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.state_no, 50,
+            "a rising character (vel.y < 0) must NOT land prematurely; stayed airborne"
+        );
+    }
+
+    /// AC2 (negative, airborne): a character in state 50 above the ground
+    /// (`pos.y < 0`) must NOT land even while falling (`vel.y > 0`) — it has not
+    /// reached the floor yet.
+    #[test]
+    fn p15b_state_50_airborne_does_not_land() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 50);
+        ch.pos = Vec2::new(0.0, -40.0); // well above the floor
+        ch.physics = Physics::None; // freeze position so it stays at -40
+        ch.vel = Vec2::new(0.0, 2.0); // falling, but not yet landed
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.state_no, 50,
+            "an airborne character (pos.y < 0) must NOT land before reaching the floor"
+        );
+    }
+
+    /// AC2 (gating): the auto-land built-in must be strictly gated to states
+    /// 50/51 and must NOT hijack a get-hit / custom air state (here 5040, which
+    /// authors NO land rule of its own in this graph). A character dumped at the
+    /// floor while falling in state 5040 must STAY in 5040 — only the basic-jump
+    /// states 50/51 auto-land.
+    #[test]
+    fn p15b_gethit_air_state_5040_is_not_hijacked() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 5040);
+        ch.pos = Vec2::new(0.0, FLOOR_Y); // at floor, the landing-frame condition
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 3.0); // falling
+        // Run several ticks: the built-in must never fire for 5040.
+        for _ in 0..5 {
+            ch.tick_with(&states, &air, None, StageView::default());
+            assert_eq!(
+                ch.state_no, 5040,
+                "get-hit air state 5040 must NOT be auto-landed by the basic-jump built-in"
+            );
+        }
+    }
+
+    /// AC2/AC3 (full synthetic arc, no fixture): drive the basic jump end to end
+    /// under the REAL physics path. Enter state 50 with a real upward launch and
+    /// air physics; gravity (yaccel) reverses it, the P15a clamp pins pos.y = 0
+    /// while leaving vel.y downward, and the auto-land built-in then carries the
+    /// character into Jump Land 52 — proving the jump → land loop completes
+    /// without any data land rule on 50.
+    #[test]
+    fn p15b_synthetic_full_jump_50_reaches_land_52() {
+        let states = p15b_graph();
+        let air = tiny_air_p15b();
+        let yaccel = CharacterConstants::default().movement.yaccel;
+        assert!(yaccel > 0.0, "gravity must be downward (positive, Y increases downward)");
+
+        let mut ch = Character::new();
+        ch.change_state(&states, 50); // sets physics = Air via the statedef header
+        assert_eq!(ch.physics, Physics::Air, "state 50 entry must set air physics");
+        ch.pos = Vec2::new(0.0, FLOOR_Y);
+        ch.vel = Vec2::new(0.0, -8.4); // launch upward (negative Y)
+
+        let mut peaked_airborne = false;
+        let mut landed = false;
+        for _ in 0..240 {
+            ch.tick_with(&states, &air, None, StageView::default());
+            assert!(
+                ch.pos.y <= FLOOR_Y + 1e-4,
+                "character must never sink below the floor; pos.y = {}",
+                ch.pos.y
+            );
+            if ch.pos.y < -1.0 {
+                peaked_airborne = true; // genuinely left the ground on the way up
+            }
+            if ch.state_no == 52 {
+                landed = true;
+                break;
+            }
+        }
+        assert!(peaked_airborne, "the jump should lift the character off the floor first");
+        assert!(
+            landed,
+            "the basic jump (50) must auto-land to Jump Land (52) once it returns to the floor; \
+             ended in state {} at pos.y = {}",
+            ch.state_no, ch.pos.y
+        );
+    }
+
+    /// AC3 (gated real KFM, skip-if-missing): drive a FULL real-KFM jump from
+    /// jumpstart (40) through the air state (50) with KFM's real jump velocity +
+    /// gravity + the P15a clamp, and assert the character ends GROUNDED (Jump
+    /// Land 52, then common1's 52 → 0 Stand). Proves the jump → land → stand loop
+    /// completes on real content. Skips cleanly when test-assets/ is absent.
+    #[test]
+    fn p15b_real_kfm_full_jump_reaches_grounded_state() {
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+
+        // Hold Up from stand: the built-in stand->jump (40) fires, common1
+        // carries 40 -> 50 with KFM's jump velocity, then gravity + the P15a
+        // clamp return the character to the floor and the auto-land built-in
+        // takes 50 -> 52 -> (common1) 0.
+        let mut left_ground = false;
+        let mut grounded_after_jump = false;
+        let mut visited: Vec<i32> = Vec::new();
+        for tick in 0..360 {
+            // Hold Up only for the first few ticks to initiate the jump; release
+            // afterwards so the character is free to land and settle.
+            if tick < 3 {
+                set_commands(&mut ch, &["holdup"]);
+            } else {
+                set_commands(&mut ch, &[]);
+            }
+            ch.tick(&loaded, None, crate::StageView::default());
+            visited.push(ch.state_no);
+            assert!(
+                ch.pos.y <= FLOOR_Y + 1e-3,
+                "KFM must never sink below the floor; pos.y = {}",
+                ch.pos.y
+            );
+            if ch.pos.y < -1.0 {
+                left_ground = true;
+            }
+            // A grounded state reached AFTER leaving the ground proves the loop
+            // closed: Jump Land 52 or back to Stand 0 (or walk 20 if still held).
+            if left_ground && (ch.state_no == 52 || ch.state_no == 0) {
+                grounded_after_jump = true;
+                break;
+            }
+        }
+        assert!(
+            left_ground,
+            "holding Up should lift KFM off the floor; visited states = {visited:?}"
+        );
+        assert!(
+            grounded_after_jump,
+            "the full KFM jump must complete the jump -> land -> stand loop and end grounded \
+             (52 then 0); visited states = {visited:?}, ended in {} at pos.y = {}",
+            ch.state_no, ch.pos.y
+        );
+    }
+
+    /// AC1/AC2 (structural): the auto-land trigger must encode the EXACT MUGEN
+    /// semantics — gated to states 50 AND 51, AND a floor bound (`pos y >= 0`),
+    /// AND a downward/zero velocity bound (`vel y >= 0`). A behavior test can pass
+    /// while one clause silently rots (e.g. dropping `vel y >= 0` would still
+    /// land a falling char); this guards the trigger text directly. We inspect
+    /// the raw trigger sources (lower-cased, whitespace-collapsed) so a refactor
+    /// that re-spaces the expression still passes.
+    #[test]
+    fn p15b_auto_land_trigger_encodes_state_floor_and_velocity_bounds() {
+        let states = p15b_graph();
+        let land = find_auto_land(&states).expect("auto-land built-in must be injected");
+        // Concatenate every trigger condition (all numbered groups) into one
+        // normalized haystack: lowercase, all whitespace stripped.
+        let haystack: String = land
+            .triggers
+            .iter()
+            .flat_map(|g| g.conditions.iter())
+            .map(|c| c.source.to_ascii_lowercase().split_whitespace().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("&&");
+        assert!(
+            haystack.contains("stateno=50"),
+            "auto-land must gate on stateno=50; trigger = {haystack:?}"
+        );
+        assert!(
+            haystack.contains("stateno=51"),
+            "auto-land must gate on stateno=51; trigger = {haystack:?}"
+        );
+        assert!(
+            haystack.contains("posy>=0"),
+            "auto-land must require pos y >= 0 (at/below floor); trigger = {haystack:?}"
+        );
+        assert!(
+            haystack.contains("vely>=0"),
+            "auto-land must require vel y >= 0 (downward/zero); trigger = {haystack:?}"
+        );
+    }
+
+    /// AC2 (condition-gated, NOT command-gated): unlike the seven locomotion
+    /// built-ins (which all hinge on `command = "..."`), the auto-land must carry
+    /// NO `command` reference anywhere in its triggerall or numbered triggers —
+    /// landing depends only on state + position + velocity. This is the explicit
+    /// "condition-gated, not command-gated" distinction in the task: it is why
+    /// the auto-land can sit at the very end of `[Statedef -1]` without being
+    /// shadowed by (nor shadowing) the character's command-driven controllers.
+    #[test]
+    fn p15b_auto_land_is_condition_gated_not_command_gated() {
+        let states = p15b_graph();
+        let land = find_auto_land(&states).expect("auto-land built-in must be injected");
+        let mentions_command = |e: &CompiledExpr| e.source.to_ascii_lowercase().contains("command");
+        assert!(
+            !land.triggerall.iter().any(mentions_command),
+            "auto-land triggerall must not reference `command` (it is condition-gated)"
+        );
+        assert!(
+            !land.triggers.iter().flat_map(|g| g.conditions.iter()).any(mentions_command),
+            "auto-land triggers must not reference `command` (landing is unconditional on input)"
+        );
+    }
+
+    /// AC2 (strict gating, second air state): the "must not hijack air states"
+    /// guarantee is not specific to 5040. A different custom air state (here 5050,
+    /// type=A, authoring no land rule) dumped at the floor while falling must also
+    /// stay put — proving the built-in is gated to the literal set {50, 51}, not
+    /// to "any airborne char at the floor".
+    #[test]
+    fn p15b_custom_air_state_5050_is_not_hijacked() {
+        // Extend the standard graph with an extra custom air state 5050.
+        let cns = CnsFile::from_str(
+            "[Statedef 50]\ntype = A\nphysics = A\nanim = 0\n\n\
+             [Statedef 51]\ntype = A\nphysics = A\nanim = 0\n\n\
+             [Statedef 52]\ntype = S\nphysics = N\nanim = 0\n\n\
+             [Statedef 5050]\ntype = A\nphysics = A\nanim = 0\n",
+        )
+        .expect("synthetic 5050 CNS compiles");
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        for d in &cns.statedefs {
+            states.insert(d.number, CompiledState::from_parsed(d));
+        }
+        append_builtin_ground_locomotion(&mut states);
+
+        let air = tiny_air_p15b();
+        let mut ch = Character::new();
+        ch.change_state(&states, 5050);
+        ch.pos = Vec2::new(0.0, FLOOR_Y); // at the floor, the landing-frame condition
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 4.0); // falling
+        for _ in 0..5 {
+            ch.tick_with(&states, &air, None, StageView::default());
+            assert_eq!(
+                ch.state_no, 5050,
+                "custom air state 5050 must NOT be auto-landed by the 50/51-only built-in"
+            );
+        }
     }
 }
