@@ -376,6 +376,16 @@ pub struct CharacterConstants {
     /// Starting defence scaling (`[Data] defence`), as a percentage. Defaults
     /// to `100`.
     pub defence: i32,
+    /// Air-juggle point allowance (`[Data] airjuggle`). Defaults to MUGEN's
+    /// `15` (KFM's value).
+    ///
+    /// This is the per-defender pool of juggle points refilled whenever the
+    /// character returns to the ground (or a fresh combo begins). Each hit a move
+    /// lands on an airborne / falling defender costs that move's `[Statedef]
+    /// juggle` points; when the pool can no longer pay the cost the hit is
+    /// dropped (the juggle limit). See [`Character::juggle_points`] and
+    /// [`combat::resolve_attack`](crate::combat::resolve_attack).
+    pub airjuggle: i32,
     /// `[Size]` group: player dimensions.
     pub size: SizeConstants,
     /// `[Velocity]` group: walk and jump velocities.
@@ -402,6 +412,9 @@ impl Default for CharacterConstants {
             power_max: 3000,
             attack: 100,
             defence: 100,
+            // MUGEN's de-facto baseline (KFM's `[Data] airjuggle = 15`); a
+            // character that omits the key gets this allowance.
+            airjuggle: 15,
             size: SizeConstants::default(),
             velocity: VelocityConstants::default(),
             movement: MovementConstants::default(),
@@ -1300,6 +1313,55 @@ pub struct Character {
     /// more). Persists until changed or the round resets.
     pub defence_mul: f32,
 
+    /// Current sprite-draw priority (MUGEN `[Statedef] sprpriority` and the
+    /// `SprPriority` controller; faithfulness audit #16).
+    ///
+    /// Higher values draw **in front of** lower ones; equal priorities keep their
+    /// player order. Set from the destination statedef's `sprpriority` header on
+    /// every state entry (when present) and overwritten mid-state by the
+    /// `SprPriority` controller. The renderer (`fp-app`) orders the two fighters
+    /// by this field each frame so a thrower / attacker can pull in front of (or
+    /// behind) the opponent. Defaults to `0`. KFM drives it dynamically
+    /// (common1's [Statedef 5120] etc.).
+    pub cur_sprpriority: i32,
+
+    /// Remaining air-juggle points for hits **this character takes** while
+    /// airborne (MUGEN's juggle system; faithfulness audit #16).
+    ///
+    /// Seeded from [`CharacterConstants::airjuggle`] (KFM's `15`) and refilled
+    /// whenever the character is grounded. Each attack that connects on this
+    /// character while it is airborne / falling spends the attacker's move
+    /// `[Statedef] juggle` cost from this pool; once the pool can no longer pay,
+    /// the hit is dropped (the juggle limit prevents an infinite air combo). A
+    /// grounded defender is never gated on juggle. See
+    /// [`combat::resolve_attack`](crate::combat::resolve_attack).
+    pub juggle_points: i32,
+
+    /// The air-juggle points the character's **current move** costs when it lands
+    /// on an airborne defender (MUGEN `[Statedef] juggle`; faithfulness audit #16).
+    ///
+    /// Set from the destination statedef's `juggle` header on every state entry
+    /// (`0` when the header is absent — the state is not a juggle-costing move).
+    /// Hit resolution ([`combat::resolve_attack`](crate::combat::resolve_attack))
+    /// reads it as the cost to charge the **defender's**
+    /// [`juggle_points`](Self::juggle_points) pool on an airborne hit. Kept on the
+    /// attacker (rather than passed as an argument) so the cross-crate
+    /// `resolve_attack` signature stays stable. Public only because the entity is
+    /// struct-based; callers other than the executor should not touch it.
+    pub cur_juggle_cost: i32,
+
+    /// Whether the `HitDef` controller fired this tick (executor bookkeeping for
+    /// `hitdefpersist`, faithfulness audit #16).
+    ///
+    /// Reset to `false` at the start of each [`Character::tick`] and set `true`
+    /// when the `HitDef` controller runs. A same-tick `ChangeState` consults this
+    /// so it does **not** clear a HitDef that was just established this frame —
+    /// preserving MUGEN's "the HitDef is live for this frame's detection" rule —
+    /// while a HitDef carried over from a *prior* tick is still cleared on a state
+    /// change (unless `hitdefpersist`). Public only because the entity is
+    /// struct-based; callers other than the executor should not touch it.
+    pub hitdef_set_this_tick: bool,
+
     /// The character's attack-attribute invulnerability mask — the `NotHitBy` /
     /// `HitBy` windows (faithfulness audit P9).
     ///
@@ -1465,6 +1527,12 @@ impl Default for Character {
             hit_overrides: HitOverrides::default(),
             attack_mul: 1.0,
             defence_mul: 1.0,
+            cur_sprpriority: 0,
+            // Seed the juggle pool from the character's `[Data] airjuggle`
+            // allowance; refilled whenever the character touches the ground.
+            juggle_points: constants.airjuggle,
+            cur_juggle_cost: 0,
+            hitdef_set_this_tick: false,
             // Deterministic fixed seed (never wall-clock); the cell is kept in
             // the generator's valid range via `Rng::new`. See `DEFAULT_RNG_SEED`.
             rng_seed: Cell::new(Rng::new(DEFAULT_RNG_SEED).seed()),
@@ -1493,6 +1561,9 @@ impl Character {
             life: constants.life_max,
             life_max: constants.life_max,
             power_max: constants.power_max,
+            // Seed the juggle pool from THIS character's `[Data] airjuggle`
+            // (not the default), so each fighter starts with its own allowance.
+            juggle_points: constants.airjuggle,
             constants,
             ..Self::default()
         }
@@ -2424,6 +2495,16 @@ impl<'a> EvalCtx<'a> {
         self.opponent.map(|o| o.me)
     }
 
+    /// The world X position of this context's own character (`me`).
+    ///
+    /// Used by the executor's `facep2` state-entry handling: an entering
+    /// character reads its *opponent's* `me_pos_x()` (the opponent context's own
+    /// character) to decide which way to face. Crate-internal because the `me`
+    /// field is private to this module.
+    pub(crate) fn me_pos_x(&self) -> f32 {
+        self.me.pos.x
+    }
+
     /// `P2Dist X` — the **facing-relative** horizontal distance to the opponent:
     /// `(opponent.pos.x - me.pos.x) * facing_sign(me)`. Positive means the
     /// opponent is in front of `me`. With no opponent the safe default `0`.
@@ -3069,6 +3150,7 @@ mod tests {
             power_max: 4321,
             attack: 111,
             defence: 222,
+            airjuggle: 24,
             size: SizeConstants {
                 ground_front: 17,
                 ground_back: 19,

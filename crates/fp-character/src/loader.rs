@@ -330,7 +330,13 @@ impl CompiledController {
 /// parser; the executor interprets them. The `anim` and `poweradd` entry
 /// expressions are compiled, and the `velset` initial velocity is preserved,
 /// where present.
-#[derive(Debug, Clone)]
+///
+/// [`Default`] yields the empty state (number `0`, every header `None`, no
+/// controllers); construct a real state via [`CompiledState::from_parsed`] or
+/// fill the fields explicitly. The `Default` impl lets downstream code build a
+/// minimal `CompiledState` with struct-update syntax (`..Default::default()`)
+/// so adding a new optional header field does not force every literal to change.
+#[derive(Debug, Clone, Default)]
 pub struct CompiledState {
     /// The state number.
     pub number: i32,
@@ -354,6 +360,31 @@ pub struct CompiledState {
     /// param (e.g. KFM's `[Statedef 200] poweradd = 10`), which is how supers
     /// gated on `power >= 1000` become reachable.
     pub poweradd: Option<CompiledExpr>,
+    /// `sprpriority` — sprite-draw priority set on state entry, compiled
+    /// expression (faithfulness audit #16). Higher draws in front. Applied by the
+    /// executor to [`Character::cur_sprpriority`](crate::Character::cur_sprpriority);
+    /// absent leaves the current priority unchanged.
+    pub sprpriority: Option<CompiledExpr>,
+    /// `juggle` — the air-juggle points this move costs when it lands on an
+    /// airborne defender, compiled expression (faithfulness audit #16). Read by
+    /// hit resolution off the **attacker's current state**; absent means the move
+    /// costs no juggle (it is not juggle-gated). KFM's attack states author
+    /// `juggle = N` (e.g. ~30).
+    pub juggle: Option<CompiledExpr>,
+    /// `facep2` — when truthy, the entering character turns to face the opponent
+    /// (faithfulness audit #16). Throw states use it (KFM state 810). Applied on
+    /// state entry by the executor using the opponent in view; a self-only entry
+    /// (no opponent) is a no-op. Absent never turns.
+    pub facep2: Option<CompiledExpr>,
+    /// `hitdefpersist` — when truthy, the active `HitDef` is **kept** across this
+    /// state entry instead of being cleared (faithfulness audit #16). Absent /
+    /// falsy clears the active `HitDef` on entry (the MUGEN default).
+    pub hitdefpersist: Option<CompiledExpr>,
+    /// `movehitpersist` — when truthy, the move-hit / move-contact flags
+    /// ([`Character::move_connect`](crate::Character::move_connect)) are **kept**
+    /// across this state entry instead of being reset (faithfulness audit #16).
+    /// Absent / falsy resets them on entry (the MUGEN default).
+    pub movehitpersist: Option<CompiledExpr>,
     /// The controllers belonging to this state, in file order, compiled.
     pub controllers: Vec<CompiledController>,
 }
@@ -370,6 +401,11 @@ impl CompiledState {
             ctrl: def.ctrl.as_deref().map(CompiledExpr::compile),
             velset: def.velset.clone(),
             poweradd: def.poweradd.as_deref().map(CompiledExpr::compile),
+            sprpriority: def.sprpriority.as_deref().map(CompiledExpr::compile),
+            juggle: def.juggle.as_deref().map(CompiledExpr::compile),
+            facep2: def.facep2.as_deref().map(CompiledExpr::compile),
+            hitdefpersist: def.hitdefpersist.as_deref().map(CompiledExpr::compile),
+            movehitpersist: def.movehitpersist.as_deref().map(CompiledExpr::compile),
             controllers: def.controllers.iter().map(CompiledController::from_parsed).collect(),
         }
     }
@@ -964,6 +1000,11 @@ fn read_data_group(ini: &DefFile, consts: &mut CharacterConstants) {
     if let Some(v) = ini.get_parsed::<i32>("Data", "defence") {
         consts.defence = v;
     }
+    // `airjuggle` is the air-juggle point allowance (KFM authors `15`); it seeds
+    // each defender's per-combo juggle pool. Absent/malformed keeps the default.
+    if let Some(v) = ini.get_parsed::<i32>("Data", "airjuggle") {
+        consts.airjuggle = v;
+    }
     // `power` lives in [Data] as `power` on some characters; KFM omits it and
     // MUGEN defaults to 3000. Honor an explicit value when present.
     if let Some(v) = ini.get_parsed::<i32>("Data", "power") {
@@ -1289,6 +1330,74 @@ mod tests {
         let pa = state.poweradd.as_ref().expect("poweradd present even when malformed");
         assert!(pa.is_fallback, "malformed `1 +` -> const-0 fallback");
         assert_eq!(pa.expr, Expr::Int(0));
+    }
+
+    // ---- #16: the five previously-dropped Statedef headers carry into
+    // CompiledState (sprpriority / juggle / facep2 / hitdefpersist /
+    // movehitpersist). ----
+
+    #[test]
+    fn from_parsed_carries_all_five_audit16_headers() {
+        // All five headers, KFM's throw-state shape (facep2 + sprpriority +
+        // persists), plus a juggle cost. Each must compile onto CompiledState
+        // (previously every one was silently dropped at compile).
+        let cns = CnsFile::from_str(
+            "[Statedef 810]\n\
+             type = S\n\
+             anim = 810\n\
+             sprpriority = 3\n\
+             juggle = 4\n\
+             facep2 = 1\n\
+             hitdefpersist = 1\n\
+             movehitpersist = 1\n",
+        )
+        .unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        assert_eq!(
+            state.sprpriority.as_ref().expect("sprpriority carried").expr,
+            Expr::Int(3)
+        );
+        assert_eq!(state.juggle.as_ref().expect("juggle carried").expr, Expr::Int(4));
+        assert_eq!(state.facep2.as_ref().expect("facep2 carried").expr, Expr::Int(1));
+        assert_eq!(
+            state.hitdefpersist.as_ref().expect("hitdefpersist carried").expr,
+            Expr::Int(1)
+        );
+        assert_eq!(
+            state.movehitpersist.as_ref().expect("movehitpersist carried").expr,
+            Expr::Int(1)
+        );
+    }
+
+    #[test]
+    fn from_parsed_audit16_headers_absent_are_none() {
+        // A plain state with none of the five headers leaves each as `None`, so
+        // the executor applies the MUGEN default (clear HitDef / reset move-hit,
+        // no sprpriority/juggle/facep2 effect).
+        let cns = CnsFile::from_str("[Statedef 0]\ntype = S\nanim = 0\n").unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        assert!(state.sprpriority.is_none());
+        assert!(state.juggle.is_none());
+        assert!(state.facep2.is_none());
+        assert!(state.hitdefpersist.is_none());
+        assert!(state.movehitpersist.is_none());
+    }
+
+    #[test]
+    fn read_data_group_reads_airjuggle() {
+        // `[Data] airjuggle` seeds the defender's juggle pool. An explicit value
+        // is honored; the default (15, KFM) holds when the key is absent.
+        let mut consts = CharacterConstants::default();
+        assert_eq!(consts.airjuggle, 15, "default airjuggle is MUGEN/KFM's 15");
+        let ini = DefFile::from_str("[Data]\nlife = 1000\nairjuggle = 24\n").unwrap();
+        read_data_group(&ini, &mut consts);
+        assert_eq!(consts.airjuggle, 24, "explicit [Data] airjuggle is read");
+
+        // Absent key keeps the prior value (here the default).
+        let mut consts2 = CharacterConstants::default();
+        let ini2 = DefFile::from_str("[Data]\nlife = 1000\n").unwrap();
+        read_data_group(&ini2, &mut consts2);
+        assert_eq!(consts2.airjuggle, 15, "absent airjuggle -> default 15");
     }
 
     // ---- 6.2b: multi-component param model (top-level comma split) ----

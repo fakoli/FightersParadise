@@ -230,6 +230,32 @@ pub fn resolve_attack(
         return None;
     }
 
+    // (3b) Air-juggle limit (#16). MUGEN gates a hit against an AIRBORNE defender
+    // on the juggle system: the attacker's current move costs `[Statedef] juggle`
+    // points, charged to the defender's per-combo juggle pool (seeded from the
+    // defender's `[Data] airjuggle`, refilled when it lands). When the pool can no
+    // longer pay the move's cost, the hit is dropped — exactly like a geometric
+    // miss: no damage, no state change, no hit-pause, and the move is NOT marked
+    // connected (so the attacker can retry once the juggle refills). A grounded
+    // defender is never juggle-gated, and a move with `juggle = 0` (the default,
+    // or a non-attack state) costs nothing and so is never blocked.
+    //
+    // Simplification: MUGEN draws the per-hit cost from the HitDef-bearing move's
+    // statedef; we read it off the attacker's CURRENT state (`cur_juggle_cost`,
+    // set on entry). This is the common case (a HitDef fires from the attack state
+    // whose header carries `juggle`). The pool is decremented only on a hit that
+    // actually lands (passing this gate), so a dropped juggle does not over-charge.
+    if defender_state.airborne {
+        let cost = attacker.cur_juggle_cost;
+        if cost > 0 {
+            if defender.juggle_points < cost {
+                // Out of juggle: the hit does not combo. Pass through like a miss.
+                return None;
+            }
+            defender.juggle_points -= cost;
+        }
+    }
+
     // (4) Apply the outcome to the defender.
     //
     // Knockback is attacker-facing-relative; mirror its x by the ATTACKER's
@@ -841,6 +867,11 @@ mod tests {
             ctrl: None,
             velset: None,
             poweradd: None,
+            sprpriority: None,
+            juggle: None,
+            facep2: None,
+            hitdefpersist: None,
+            movehitpersist: None,
             controllers: Vec::new(),
         }
     }
@@ -1419,6 +1450,11 @@ mod tests {
             ctrl: None,
             velset: None,
             poweradd: None,
+            sprpriority: None,
+            juggle: None,
+            facep2: None,
+            hitdefpersist: None,
+            movehitpersist: None,
             controllers: vec![controller],
         };
         let mut states = HashMap::new();
@@ -2508,5 +2544,77 @@ mod tests {
         c.pos = Vec2::new(x, 0.0);
         c.life = life;
         c
+    }
+
+    // ====================================================================
+    // #16: air-juggle limit. The attacker's `cur_juggle_cost` (set on entry
+    // from the move's `[Statedef] juggle`) is charged to the AIRBORNE defender's
+    // `juggle_points` pool; an exhausted pool drops the hit.
+    // ====================================================================
+
+    /// An airborne defender's juggle pool is decremented by the attacker's
+    /// per-move juggle cost on a connecting hit.
+    #[test]
+    fn airborne_hit_decrements_juggle_points() {
+        let (mut a, a_air) = make_attacker();
+        a.cur_juggle_cost = 4;
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Air; // airborne defender
+        d.juggle_points = 15;
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "first juggle hit lands while the pool can pay");
+        assert_eq!(d.juggle_points, 11, "pool charged the move's juggle cost (15 - 4)");
+    }
+
+    /// When the pool can no longer pay the move's juggle cost, the hit is dropped
+    /// (no damage, no connection) — the juggle limit.
+    #[test]
+    fn airborne_hit_blocked_when_juggle_exhausted() {
+        let (mut a, a_air) = make_attacker();
+        a.cur_juggle_cost = 4;
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Air;
+        d.juggle_points = 3; // less than the 4-point cost
+        let life_before = d.life;
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_none(), "insufficient juggle drops the hit");
+        assert_eq!(d.life, life_before, "no damage applied on a juggle-dropped hit");
+        assert_eq!(d.juggle_points, 3, "pool not charged when the hit is dropped");
+        assert!(!a.move_connect.contact(), "a dropped juggle hit does not connect");
+    }
+
+    /// A GROUNDED defender is never juggle-gated, even with an empty pool and a
+    /// costly move.
+    #[test]
+    fn grounded_hit_ignores_juggle_pool() {
+        let (mut a, a_air) = make_attacker();
+        a.cur_juggle_cost = 30;
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Standing; // grounded
+        d.juggle_points = 0; // empty pool must not matter on the ground
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "a grounded hit lands regardless of juggle points");
+        assert_eq!(d.juggle_points, 0, "grounded hit does not spend juggle");
+    }
+
+    /// A move with `juggle = 0` (no cost) is never juggle-blocked, even airborne
+    /// with an empty pool.
+    #[test]
+    fn zero_cost_move_is_never_juggle_blocked() {
+        let (mut a, a_air) = make_attacker();
+        a.cur_juggle_cost = 0; // non-attack / cost-free move
+        let (mut d, d_air) = make_defender();
+        d.state_type = StateType::Air;
+        d.juggle_points = 0;
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_some(), "a zero-cost move lands even with an empty pool");
     }
 }

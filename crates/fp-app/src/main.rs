@@ -818,6 +818,22 @@ fn cache_player_sprite(cache: &mut FighterRender, player: &Player, renderer: &Re
     }
 }
 
+/// Decides the two-fighter draw order from their MUGEN sprite-draw priorities
+/// (`sprpriority`, audit #16).
+///
+/// Returns `true` when P1 should be drawn **first** (i.e. *behind* P2), `false`
+/// when P2 should be drawn first (P1 in front). The fighter with the **lower**
+/// priority draws first (behind); the higher priority draws over it. Equal
+/// priorities keep P1 behind P2 — a stable, deterministic default so the order
+/// never flickers on a tie.
+///
+/// Pure decision split out from the draw loop so the ordering rule is unit-
+/// testable without an SDL2 window or GPU.
+#[must_use]
+fn p1_draws_behind_p2(p1_sprpriority: i32, p2_sprpriority: i32) -> bool {
+    p1_sprpriority <= p2_sprpriority
+}
+
 /// Draws one fighter from its current AIR frame at its world position and facing,
 /// reading the already-populated per-character texture cache (see
 /// [`cache_player_sprite`]). A missing frame or uncached sprite is skipped.
@@ -1620,9 +1636,20 @@ fn run() -> fp_core::FpResult<()> {
 
                 // Draw both fighters from their current AIR frame, each via its
                 // own per-character texture cache (populated above), offset by the
-                // camera so the playfield scrolls.
-                draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
-                draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+                // camera so the playfield scrolls. The two are ordered by their
+                // sprite-draw priority (MUGEN `sprpriority`, audit #16): the lower
+                // priority is drawn FIRST (behind), the higher one OVER it. A tie
+                // keeps P1 behind P2 (stable, deterministic order).
+                if p1_draws_behind_p2(
+                    run.m.p1().character.cur_sprpriority,
+                    run.m.p2().character.cur_sprpriority,
+                ) {
+                    draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+                    draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+                } else {
+                    draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+                    draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+                }
 
                 // Front background layers, over the fighters but under the HUD.
                 if let Some(stage) = run.stage.as_ref() {
@@ -3584,5 +3611,25 @@ mod tests {
         assert!((b.w - 30.0).abs() < 1e-4, "width magnitude preserved");
         // Mirrored edges: anchor - 15 .. anchor + 15 => 35..65, so x = 35.
         assert!((b.x - 35.0).abs() < 1e-4);
+    }
+
+    // ---- #16: two-fighter draw-order decision from `sprpriority` ----
+
+    #[test]
+    fn p1_draws_behind_p2_orders_by_sprpriority() {
+        // Lower priority draws first (behind). P1 lower -> P1 behind (true).
+        assert!(p1_draws_behind_p2(0, 2), "lower P1 priority draws behind P2");
+        // P1 higher -> P1 in front -> P2 drawn first (false).
+        assert!(!p1_draws_behind_p2(5, 1), "higher P1 priority draws in front of P2");
+        // Negative priorities order the same way (lower behind).
+        assert!(p1_draws_behind_p2(-3, 0), "more-negative P1 draws behind");
+        assert!(!p1_draws_behind_p2(1, -1), "P1 above a negative P2 draws in front");
+    }
+
+    #[test]
+    fn p1_draws_behind_p2_tie_keeps_p1_behind() {
+        // Equal priorities: stable, deterministic default — P1 behind P2.
+        assert!(p1_draws_behind_p2(2, 2), "a tie keeps P1 behind P2 (stable order)");
+        assert!(p1_draws_behind_p2(0, 0), "default-priority tie keeps P1 behind");
     }
 }
