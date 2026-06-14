@@ -73,7 +73,9 @@ use fp_core::Vec2;
 use fp_formats::air::AirFile;
 use fp_vm::{eval, EvalContext, Value};
 
-use crate::loader::{CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup};
+use crate::loader::{
+    CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
+};
 use crate::{
     Character, Facing, LoadedCharacter, MoveType, Physics, StateType, NUM_FVARS, NUM_VARS,
 };
@@ -342,6 +344,41 @@ impl Character {
         eval(&expr.expr, self as &dyn EvalContext)
     }
 
+    /// Evaluates component `i` of a multi-component parameter, returning `None`
+    /// when the parameter has no such component.
+    ///
+    /// This is the component accessor every controller uses to read a parameter:
+    /// a scalar parameter is read with `i == 0`; the second value of an `x, y`
+    /// pair is read with `i == 1`. A missing component returns `None` so the
+    /// caller can substitute its own documented default. Never panics.
+    fn eval_param_component(&self, param: &CompiledParam, i: usize) -> Option<Value> {
+        param.component(i).map(|expr| self.eval_value(expr))
+    }
+
+    /// Evaluates a parameter's scalar value: its first (index `0`) component.
+    ///
+    /// Most controllers read a single value (`value`, `x`, `y`, …); this is the
+    /// shorthand for `eval_param_component(param, 0)`. Returns `None` only for
+    /// the (in practice impossible) empty parameter.
+    fn eval_param(&self, param: &CompiledParam) -> Option<Value> {
+        self.eval_param_component(param, 0)
+    }
+
+    /// Evaluates every component of a parameter, in order, into [`Value`]s.
+    ///
+    /// Replaces the old `eval_components` raw-source re-split: the loader already
+    /// split the parameter on top-level commas and compiled each component, so
+    /// this simply evaluates the pre-compiled components against `self`. An empty
+    /// or whitespace-only authored component is the const-`0` fallback and
+    /// evaluates to `0`. Never panics.
+    fn eval_param_components(&self, param: &CompiledParam) -> Vec<Value> {
+        param
+            .components
+            .iter()
+            .map(|expr| self.eval_value(expr))
+            .collect()
+    }
+
     /// Resolves the controller's `persistent` value: the compiled expression if
     /// present, otherwise MUGEN's default of `1` (re-fire every qualifying tick).
     fn persistent_value(&self, ctrl: &CompiledController) -> i32 {
@@ -423,72 +460,72 @@ impl Character {
         ctrl: &CompiledController,
         report: &mut TickReport,
     ) {
-        let Some(value_expr) = ctrl.params.get("value") else {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
             tracing::debug!(
                 "tick: ChangeState in state {} has no `value`; ignored",
                 ctrl.state_number
             );
             return;
         };
-        let target = self.eval_value(value_expr).to_int();
+        let target = value.to_int();
         // A self-transition still counts as a re-entry in MUGEN (resets time).
         self.enter_state(states, target);
         report.transitions += 1;
 
         // ChangeState's optional `ctrl` parameter overrides the statedef ctrl.
-        if let Some(ctrl_expr) = ctrl.params.get("ctrl") {
-            self.ctrl = self.eval_value(ctrl_expr).as_bool();
+        if let Some(ctrl_val) = ctrl.params.get("ctrl").and_then(|p| self.eval_param(p)) {
+            self.ctrl = ctrl_val.as_bool();
         }
     }
 
     /// `VelSet`: set x/y velocity components from the `x`/`y` parameters. A
     /// missing component leaves that axis unchanged.
     fn ctrl_vel_set(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("x") {
-            self.vel.x = self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+            self.vel.x = v.to_float();
         }
-        if let Some(expr) = ctrl.params.get("y") {
-            self.vel.y = self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+            self.vel.y = v.to_float();
         }
     }
 
     /// `VelAdd`: add to the x/y velocity components from the `x`/`y` parameters.
     /// A missing component adds nothing on that axis.
     fn ctrl_vel_add(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("x") {
-            self.vel.x += self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+            self.vel.x += v.to_float();
         }
-        if let Some(expr) = ctrl.params.get("y") {
-            self.vel.y += self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+            self.vel.y += v.to_float();
         }
     }
 
     /// `CtrlSet`: set the player control flag from the `value` parameter.
     fn ctrl_ctrl_set(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("value") {
-            self.ctrl = self.eval_value(expr).as_bool();
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
+            self.ctrl = v.as_bool();
         }
     }
 
     /// `PosSet`: set the x/y position components from the `x`/`y` parameters. A
     /// missing component leaves that axis unchanged.
     fn ctrl_pos_set(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("x") {
-            self.pos.x = self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+            self.pos.x = v.to_float();
         }
-        if let Some(expr) = ctrl.params.get("y") {
-            self.pos.y = self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+            self.pos.y = v.to_float();
         }
     }
 
     /// `PosAdd`: add to the x/y position components from the `x`/`y` parameters.
     /// A missing component adds nothing on that axis.
     fn ctrl_pos_add(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("x") {
-            self.pos.x += self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("x").and_then(|p| self.eval_param(p)) {
+            self.pos.x += v.to_float();
         }
-        if let Some(expr) = ctrl.params.get("y") {
-            self.pos.y += self.eval_value(expr).to_float();
+        if let Some(v) = ctrl.params.get("y").and_then(|p| self.eval_param(p)) {
+            self.pos.y += v.to_float();
         }
     }
 
@@ -502,18 +539,18 @@ impl Character {
     /// action's range, so an out-of-range value never panics). A missing `value`
     /// is a safe no-op.
     fn ctrl_change_anim(&mut self, ctrl: &CompiledController) {
-        let Some(value_expr) = ctrl.params.get("value") else {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
             tracing::debug!(
                 "tick: ChangeAnim in state {} has no `value`; ignored",
                 ctrl.state_number
             );
             return;
         };
-        self.anim = self.eval_value(value_expr).to_int();
+        self.anim = value.to_int();
         // MUGEN's optional `elem` is one-based; store it zero-based. Default to
         // the first element when absent.
-        let start_elem = match ctrl.params.get("elem") {
-            Some(expr) => self.eval_value(expr).to_int().saturating_sub(1).max(0),
+        let start_elem = match ctrl.params.get("elem").and_then(|p| self.eval_param(p)) {
+            Some(v) => v.to_int().saturating_sub(1).max(0),
             None => 0,
         };
         self.anim_elem = start_elem;
@@ -533,23 +570,20 @@ impl Character {
     /// An out-of-range index or an unrecognized form is a safe no-op.
     fn ctrl_var_set(&mut self, ctrl: &CompiledController) {
         // Indexed-key forms: `var(i)`, `fvar(i)`, `sysvar(i)`, `sysfvar(i)`.
-        for (key, expr) in &ctrl.params {
+        for (key, param) in &ctrl.params {
             if let Some((bank, index)) = parse_var_bank_key(key) {
-                let value = self.eval_value(expr);
+                let value = self.eval_param(param).unwrap_or(Value::DEFAULT);
                 self.assign_var(bank, index, value);
                 // A VarSet sets exactly one variable; the first matching key wins.
                 return;
             }
         }
         // `v`/`fv` + `value` form.
-        if let Some(value_expr) = ctrl.params.get("value") {
-            let value = self.eval_value(value_expr);
-            if let Some(index_expr) = ctrl.params.get("v") {
-                let index = self.eval_value(index_expr).to_int();
-                self.assign_var(VarBank::Int, index, value);
-            } else if let Some(index_expr) = ctrl.params.get("fv") {
-                let index = self.eval_value(index_expr).to_int();
-                self.assign_var(VarBank::Float, index, value);
+        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
+            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p)) {
+                self.assign_var(VarBank::Int, index.to_int(), value);
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p)) {
+                self.assign_var(VarBank::Float, index.to_int(), value);
             } else {
                 tracing::debug!(
                     "tick: VarSet in state {} has `value` but no `v`/`fv` index; ignored",
@@ -564,21 +598,18 @@ impl Character {
     /// Accepts the same parameter forms as [`Self::ctrl_var_set`]. An
     /// out-of-range index or unrecognized form is a safe no-op.
     fn ctrl_var_add(&mut self, ctrl: &CompiledController) {
-        for (key, expr) in &ctrl.params {
+        for (key, param) in &ctrl.params {
             if let Some((bank, index)) = parse_var_bank_key(key) {
-                let delta = self.eval_value(expr);
+                let delta = self.eval_param(param).unwrap_or(Value::DEFAULT);
                 self.add_var(bank, index, delta);
                 return;
             }
         }
-        if let Some(value_expr) = ctrl.params.get("value") {
-            let delta = self.eval_value(value_expr);
-            if let Some(index_expr) = ctrl.params.get("v") {
-                let index = self.eval_value(index_expr).to_int();
-                self.add_var(VarBank::Int, index, delta);
-            } else if let Some(index_expr) = ctrl.params.get("fv") {
-                let index = self.eval_value(index_expr).to_int();
-                self.add_var(VarBank::Float, index, delta);
+        if let Some(delta) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
+            if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p)) {
+                self.add_var(VarBank::Int, index.to_int(), delta);
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p)) {
+                self.add_var(VarBank::Float, index.to_int(), delta);
             } else {
                 tracing::debug!(
                     "tick: VarAdd in state {} has `value` but no `v`/`fv` index; ignored",
@@ -599,24 +630,25 @@ impl Character {
         let first = ctrl
             .params
             .get("first")
-            .map_or(0, |e| self.eval_value(e).to_int());
+            .and_then(|p| self.eval_param(p))
+            .map_or(0, |v| v.to_int());
         // `value` targets the int bank; `fvalue` targets the float bank.
-        if let Some(value_expr) = ctrl.params.get("value") {
-            let value = self.eval_value(value_expr);
+        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) {
             let last = ctrl
                 .params
                 .get("last")
-                .map_or(NUM_VARS as i32 - 1, |e| self.eval_value(e).to_int());
+                .and_then(|p| self.eval_param(p))
+                .map_or(NUM_VARS as i32 - 1, |v| v.to_int());
             for index in first..=last {
                 self.assign_var(VarBank::Int, index, value);
             }
         }
-        if let Some(value_expr) = ctrl.params.get("fvalue") {
-            let value = self.eval_value(value_expr);
+        if let Some(value) = ctrl.params.get("fvalue").and_then(|p| self.eval_param(p)) {
             let last = ctrl
                 .params
                 .get("last")
-                .map_or(NUM_FVARS as i32 - 1, |e| self.eval_value(e).to_int());
+                .and_then(|p| self.eval_param(p))
+                .map_or(NUM_FVARS as i32 - 1, |v| v.to_int());
             for index in first..=last {
                 self.assign_var(VarBank::Float, index, value);
             }
@@ -631,22 +663,24 @@ impl Character {
     /// an identifier rather than a number). An absent or unrecognized token
     /// leaves that category unchanged.
     fn ctrl_state_type_set(&mut self, ctrl: &CompiledController) {
-        if let Some(expr) = ctrl.params.get("statetype") {
-            if let Some(t) = StateType::from_token(expr.source.trim()) {
+        // These are bare letter tokens (`S`/`C`/`A`/`L`/`I`/`H`/`N`), read from
+        // the parameter's raw source rather than evaluated as numbers.
+        if let Some(param) = ctrl.params.get("statetype") {
+            if let Some(t) = StateType::from_token(param.raw().trim()) {
                 if t != StateType::Unchanged {
                     self.state_type = t;
                 }
             }
         }
-        if let Some(expr) = ctrl.params.get("movetype") {
-            if let Some(m) = MoveType::from_token(expr.source.trim()) {
+        if let Some(param) = ctrl.params.get("movetype") {
+            if let Some(m) = MoveType::from_token(param.raw().trim()) {
                 if m != MoveType::Unchanged {
                     self.move_type = m;
                 }
             }
         }
-        if let Some(expr) = ctrl.params.get("physics") {
-            if let Some(p) = Physics::from_token(expr.source.trim()) {
+        if let Some(param) = ctrl.params.get("physics") {
+            if let Some(p) = Physics::from_token(param.raw().trim()) {
                 if p != Physics::Unchanged {
                     self.physics = p;
                 }
@@ -668,10 +702,7 @@ impl Character {
         // `value` is a `group, index` sound reference; keep the raw source for
         // diagnostics. The expression VM cannot represent the pair, so the raw
         // text is the useful artifact here.
-        let value = ctrl
-            .params
-            .get("value")
-            .map_or("<none>", |e| e.source.as_str());
+        let value = ctrl.params.get("value").map_or("<none>", CompiledParam::raw);
         tracing::debug!(
             "tick: PlaySnd {value:?} in state {} (audio is Phase 8; no-op)",
             ctrl.state_number
@@ -684,11 +715,14 @@ impl Character {
     /// MUGEN's `HitDef` carries two *kinds* of parameter:
     ///
     /// - **String / enum** params (`attr`, `hitflag`, `guardflag`, `ground.type`,
-    ///   `air.type`, and the spark / sound ids which may carry an `S` prefix) are
-    ///   read from the controller's **raw parameter source** ([`CompiledExpr::source`])
-    ///   and parsed with [`fp_combat::AttackAttr::parse`] /
+    ///   and the spark / sound ids which may carry an `S` prefix) are read from
+    ///   the controller's **raw parameter source** ([`CompiledParam::raw`]) and
+    ///   parsed with [`fp_combat::AttackAttr::parse`] /
     ///   [`fp_combat::HitFlags::parse`] / a small local type parser. Compiling
     ///   these as numeric expressions would be wrong (`S, NA` is not arithmetic).
+    ///   (CB27: `air.type` is **not** parsed — there is no `air_type` field; MUGEN
+    ///   defaults a HitDef's `air.type` to its `ground.type`, which is the only hit
+    ///   type modelled here.)
     /// - **Numeric** params (`damage`, `ground.velocity`, `air.velocity`,
     ///   `guard.velocity`, `pausetime`, `p1stateno`, `p2stateno`, the hit-times,
     ///   `fall`, `priority`, `id`, `chainid`, `fall.yvelocity`) are obtained by
@@ -732,95 +766,95 @@ impl Character {
         }
 
         // ---- Numeric params (evaluated against self / the attacker) --------
+        // Each parameter was already split on top-level commas and compiled into
+        // its component list by the loader (6.2b); the executor reads component
+        // `i` directly via the [`CompiledParam`] accessor — no re-splitting.
+        //
         // `damage = hit [, guard]`. A missing guard component mirrors the hit
         // value in MUGEN; we keep it simple and leave guard at its default (0)
         // when absent, matching `HitDef::default()`.
-        if let Some(expr) = ctrl.params.get("damage") {
-            let comps = self.eval_components(expr);
-            if let Some(hit) = comps.first() {
+        if let Some(param) = ctrl.params.get("damage") {
+            if let Some(hit) = self.eval_param_component(param, 0) {
                 hd.damage.hit = hit.to_int();
             }
-            if let Some(guard) = comps.get(1) {
+            if let Some(guard) = self.eval_param_component(param, 1) {
                 hd.damage.guard = guard.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("ground.velocity") {
-            let comps = self.eval_components(expr);
+        if let Some(param) = ctrl.params.get("ground.velocity") {
+            let comps = self.eval_param_components(param);
             hd.ground_velocity = pair_to_vec2(&comps, hd.ground_velocity);
         }
-        if let Some(expr) = ctrl.params.get("air.velocity") {
-            let comps = self.eval_components(expr);
+        if let Some(param) = ctrl.params.get("air.velocity") {
+            let comps = self.eval_param_components(param);
             hd.air_velocity = pair_to_vec2(&comps, hd.air_velocity);
         }
-        if let Some(expr) = ctrl.params.get("guard.velocity") {
+        if let Some(param) = ctrl.params.get("guard.velocity") {
             // Single X pushback (Y unused).
-            if let Some(x) = self.eval_components(expr).first() {
+            if let Some(x) = self.eval_param_component(param, 0) {
                 hd.guard_velocity = x.to_float();
             }
         }
-        if let Some(expr) = ctrl.params.get("pausetime") {
-            let comps = self.eval_components(expr);
-            if let Some(p1) = comps.first() {
+        if let Some(param) = ctrl.params.get("pausetime") {
+            if let Some(p1) = self.eval_param_component(param, 0) {
                 hd.pausetime.p1 = p1.to_int();
             }
-            if let Some(p2) = comps.get(1) {
+            if let Some(p2) = self.eval_param_component(param, 1) {
                 hd.pausetime.p2 = p2.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("ground.hittime") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("ground.hittime") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.hittimes.ground = v.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("air.hittime") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("air.hittime") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.hittimes.air = v.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("guard.hittime") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("guard.hittime") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.hittimes.guard = v.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("p1stateno") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("p1stateno") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.p1stateno = Some(v.to_int());
             }
         }
-        if let Some(expr) = ctrl.params.get("p2stateno") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("p2stateno") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.p2stateno = Some(v.to_int());
             }
         }
-        if let Some(expr) = ctrl.params.get("fall") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("fall") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.fall = v.as_bool();
             }
         }
-        if let Some(expr) = ctrl.params.get("fall.yvelocity") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("fall.yvelocity") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.fall_yvelocity = v.to_float();
             }
         }
-        if let Some(expr) = ctrl.params.get("priority") {
-            // `priority = value [, type]`. The numeric value is evaluated; the
+        if let Some(param) = ctrl.params.get("priority") {
+            // `priority = value [, type]`. The numeric value is component 0; the
             // optional type token is a string/enum read from the raw source.
-            if let Some(v) = self.eval_components(expr).first() {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.priority.value = v.to_int();
             }
-            if let Some(src) = raw_param(ctrl, "priority") {
-                if let Some(kind) = parse_priority_type(src) {
-                    hd.priority.kind = kind;
-                }
+            if let Some(kind) = parse_priority_type(param.raw()) {
+                hd.priority.kind = kind;
             }
         }
-        if let Some(expr) = ctrl.params.get("id") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("id") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.id = v.to_int();
             }
         }
-        if let Some(expr) = ctrl.params.get("chainid") {
-            if let Some(v) = self.eval_components(expr).first() {
+        if let Some(param) = ctrl.params.get("chainid") {
+            if let Some(v) = self.eval_param_component(param, 0) {
                 hd.chainid = v.to_int();
             }
         }
@@ -832,34 +866,6 @@ impl Character {
             hd.damage
         );
         self.active_hitdef = Some(hd);
-    }
-
-    /// Evaluates a possibly multi-component numeric parameter into its component
-    /// [`Value`]s, in order.
-    ///
-    /// MUGEN parameters like `ground.velocity = x, y` are authored as a
-    /// comma-separated list where each component is its own expression. The
-    /// compiled parameter retains the verbatim source ([`CompiledExpr::source`]);
-    /// this splits that source on commas, compiles each component on its own, and
-    /// evaluates it against `self`. A single-component parameter yields a
-    /// one-element vector; an empty / whitespace component evaluates to `0`.
-    ///
-    /// Compiling per-component (rather than reusing the parameter's own compiled
-    /// expression) is necessary because the parameter expression compiler only
-    /// captures the first comma-separated value; the remaining components live in
-    /// the raw source. Never panics.
-    fn eval_components(&self, expr: &CompiledExpr) -> Vec<Value> {
-        expr.source
-            .split(',')
-            .map(|part| {
-                let trimmed = part.trim();
-                if trimmed.is_empty() {
-                    return Value::DEFAULT;
-                }
-                let compiled = CompiledExpr::compile(trimmed);
-                eval(&compiled.expr, self as &dyn EvalContext)
-            })
-            .collect()
     }
 
     // ---- Variable-bank helpers --------------------------------------------
@@ -1164,13 +1170,13 @@ fn parse_var_bank_key(key: &str) -> Option<(VarBank, i32)> {
 /// common case is a direct lookup; the fallback scan tolerates any stray
 /// mixed-case key without panicking.
 fn raw_param<'a>(ctrl: &'a CompiledController, key: &str) -> Option<&'a str> {
-    if let Some(expr) = ctrl.params.get(key) {
-        return Some(expr.source.as_str());
+    if let Some(param) = ctrl.params.get(key) {
+        return Some(param.raw());
     }
     ctrl.params
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.source.as_str())
+        .map(|(_, v)| v.raw())
 }
 
 /// Parses a MUGEN `ground.type` / `air.type` token (`High`/`Low`/`Trip`/`None`,
@@ -1306,7 +1312,9 @@ fn remaining_anim_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::{CompiledExpr, CompiledState, CompiledTriggerGroup, LoadedCharacter};
+    use crate::loader::{
+        CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup, LoadedCharacter,
+    };
     use crate::{
         ActiveCommands, CharacterConstants, MovementConstants, MoveType, NoCommands, Physics,
         StateType,
@@ -1360,7 +1368,7 @@ mod tests {
             ignorehitpause: None,
             params: params
                 .iter()
-                .map(|(k, v)| (k.to_string(), CompiledExpr::compile(v)))
+                .map(|(k, v)| (k.to_string(), CompiledParam::compile(v)))
                 .collect(),
         }
     }
@@ -2206,7 +2214,7 @@ mod tests {
             }],
             persistent: None,
             ignorehitpause: None,
-            params: [("x".to_string(), CompiledExpr::compile("1"))]
+            params: [("x".to_string(), CompiledParam::compile("1"))]
                 .into_iter()
                 .collect(),
         };
@@ -2238,7 +2246,7 @@ mod tests {
             }],
             persistent: None,
             ignorehitpause: None,
-            params: [("x".to_string(), CompiledExpr::compile("1"))]
+            params: [("x".to_string(), CompiledParam::compile("1"))]
                 .into_iter()
                 .collect(),
         };
@@ -4105,8 +4113,8 @@ mod tests {
             persistent: None,
             ignorehitpause: None,
             params: [
-                ("AtTr".to_string(), CompiledExpr::compile("C, HP")),
-                ("Ground.Type".to_string(), CompiledExpr::compile("Low")),
+                ("AtTr".to_string(), CompiledParam::compile("C, HP")),
+                ("Ground.Type".to_string(), CompiledParam::compile("Low")),
             ]
             .into_iter()
             .collect(),
@@ -4180,24 +4188,202 @@ mod tests {
         assert_eq!(pair_to_vec2(&[], dflt), dflt);
     }
 
-    // ---- AC1: eval_components splits and evaluates each component -------------
+    // ======================================================================
+    // Proctor (6.2b): scalar 5.4/6.2 controllers read component 0 via the
+    // accessor and ignore any stray extra components; multi-component
+    // controllers read the right index. Each builds the param through the real
+    // CnsFile parser so the loader's top-level-comma split is exercised.
+    // ======================================================================
+
+    /// Builds a synthetic graph from a single CNS source so the loader's
+    /// param-splitting path (not the test `ctrl` helper) is what produces the
+    /// CompiledParam component lists. Returns the Synth + the entry state number.
+    fn synth_from_cns(src: &str) -> Synth {
+        let cns = CnsFile::from_str(src).expect("cns source parses");
+        let states: Vec<CompiledState> = cns
+            .statedefs
+            .iter()
+            .map(CompiledState::from_parsed)
+            .collect();
+        loaded(states, tiny_air(0, &[5]))
+    }
 
     #[test]
-    fn eval_components_splits_and_evaluates_against_self() {
-        // eval_components is the multi-component numeric parameter splitter. It
-        // splits the raw source on commas and evaluates each part against self.
+    fn changestate_value_reads_component_zero_through_loader_split() {
+        // AC3: ChangeState's `value` is scalar — read via component 0. Even if an
+        // author appended a stray second value, only component 0 is consumed.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, go]\ntype = ChangeState\ntrigger1 = 1\nvalue = 42, 99\n\
+             [Statedef 42]\ntype = S\nphysics = N\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.transitions, 1);
+        assert_eq!(ch.state_no, 42, "ChangeState read component 0 (42), not 99");
+    }
+
+    #[test]
+    fn velset_x_y_are_independent_scalar_params_each_component_zero() {
+        // AC3/AC4: VelSet uses two SEPARATE scalar params `x` and `y`, each read
+        // via component 0. A comma INSIDE one of them must not bleed across axes.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, v]\ntype = VelSet\ntrigger1 = 1\nx = -4\ny = 0\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(9.0, 9.0);
+        lc.tick(&mut ch);
+        assert!((ch.vel.x - (-4.0)).abs() < 1e-6, "x ← component 0 of `x`");
+        assert!((ch.vel.y - 0.0).abs() < 1e-6, "y ← component 0 of `y`");
+    }
+
+    #[test]
+    fn varset_indexed_key_reads_component_zero_only() {
+        // AC3: VarSet `var(2) = expr` is scalar. If an author writes a stray
+        // second value, only component 0 assigns; the bank gets exactly one value.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, set]\ntype = VarSet\ntrigger1 = 1\nvar(2) = 7, 123\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        assert_eq!(ch.vars[2], 7, "VarSet assigned component 0 (7), not 123");
+    }
+
+    #[test]
+    fn hitdef_ground_velocity_reads_x_then_y_components() {
+        // AC4: a multi-component param read by index. `ground.velocity = -4, -3`
+        // sets x from component 0 and y from component 1 (distinct values prove
+        // the index, not a single shared component).
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, h]\ntype = HitDef\ntrigger1 = 1\n\
+             attr = S, NA\nground.velocity = -4, -3\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef");
+        assert!((hd.ground_velocity.x - (-4.0)).abs() < 1e-6, "x ← component 0");
+        assert!((hd.ground_velocity.y - (-3.0)).abs() < 1e-6, "y ← component 1");
+    }
+
+    #[test]
+    fn hitdef_pausetime_p1_p2_are_distinct_components() {
+        // AC4: pausetime p1 (component 0) and p2 (component 1) are read
+        // independently — distinct values guard against reading the same index.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, h]\ntype = HitDef\ntrigger1 = 1\n\
+             attr = S, NA\npausetime = 12, 8\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef");
+        assert_eq!(hd.pausetime.p1, 12, "p1 ← component 0");
+        assert_eq!(hd.pausetime.p2, 8, "p2 ← component 1");
+    }
+
+    #[test]
+    fn hitdef_damage_components_are_per_component_expressions_vs_self() {
+        // AC4 + MUGEN-semantics: each component is its OWN compiled expression,
+        // evaluated against the attacker. `damage = var(1)*2, var(1)+1` with
+        // var(1)=10 → hit=20, guard=11 (component 1 is NOT a copy of component 0).
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, h]\ntype = HitDef\ntrigger1 = 1\n\
+             attr = S, NA\ndamage = var(1) * 2, var(1) + 1\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vars[1] = 10;
+        lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef");
+        assert_eq!(hd.damage.hit, 20, "component 0 = var(1)*2");
+        assert_eq!(hd.damage.guard, 11, "component 1 = var(1)+1");
+    }
+
+    #[test]
+    fn hitdef_priority_value_is_expr_component_zero_type_from_raw() {
+        // AC4: `priority = value [, type]` — component 0 is the numeric value
+        // (evaluated), while the type token is parsed from the RAW source (the
+        // second component is an identifier, not arithmetic).
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, h]\ntype = HitDef\ntrigger1 = 1\n\
+             attr = S, NA\npriority = 5, Miss\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch);
+        let hd = ch.active_hitdef.expect("active_hitdef");
+        assert_eq!(hd.priority.value, 5, "priority value ← component 0");
+        // `Miss` is NOT the default (`Hit`), so this proves the raw-token read.
+        assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss, "type ← raw token");
+    }
+
+    #[test]
+    fn statetypeset_token_read_from_raw_not_compiled_component() {
+        // AC3: StateTypeSet reads bare letter tokens from raw(), not via the
+        // compiled component (a bare `C` parses as an Ident, but the controller
+        // intentionally uses raw()). Confirm the override applies.
+        let lc = synth_from_cns(
+            "[Statedef 0]\ntype = S\nphysics = N\n\
+             [State 0, t]\ntype = StateTypeSet\ntrigger1 = 1\nstatetype = C\nphysics = C\n",
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.state_type = StateType::Standing;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_type, StateType::Crouching, "statetype overridden to C");
+        assert_eq!(ch.physics, Physics::Crouch, "physics overridden to C");
+    }
+
+    // ---- 6.2b: component accessor reads the loader-split components ------------
+
+    #[test]
+    fn eval_param_components_evaluates_each_loader_split_component() {
+        // The loader splits a param on top-level commas into a component list;
+        // `eval_param_components` evaluates each pre-compiled component against
+        // self (no re-splitting). The old raw-source re-split is gone.
         let mut ch = Character::new();
         ch.vars[2] = 8;
         // `var(2) * 2, var(2), ` → [16, 8, 0] (trailing empty component → 0).
-        let comps = ch.eval_components(&CompiledExpr::compile("var(2) * 2, var(2), "));
+        let comps = ch.eval_param_components(&CompiledParam::compile("var(2) * 2, var(2), "));
         assert_eq!(comps.len(), 3);
         assert_eq!(comps[0].to_int(), 16);
         assert_eq!(comps[1].to_int(), 8);
         assert_eq!(comps[2].to_int(), 0, "empty trailing component → 0");
         // A single component yields a one-element vec.
-        let one = ch.eval_components(&CompiledExpr::compile("42"));
+        let one = ch.eval_param_components(&CompiledParam::compile("42"));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].to_int(), 42);
+    }
+
+    #[test]
+    fn eval_param_component_reads_index_with_none_when_absent() {
+        // The scalar/component accessor: index 0 is the scalar value; a missing
+        // component returns None so callers can substitute their own default.
+        let ch = Character::new();
+        let p = CompiledParam::compile("-4, 0");
+        assert_eq!(ch.eval_param_component(&p, 0).map(|v| v.to_int()), Some(-4));
+        assert_eq!(ch.eval_param_component(&p, 1).map(|v| v.to_int()), Some(0));
+        assert!(ch.eval_param_component(&p, 2).is_none(), "no third component");
+        // eval_param is shorthand for component 0.
+        assert_eq!(ch.eval_param(&p).map(|v| v.to_int()), Some(-4));
     }
 
     // ---- AC3: get-hit-state readiness — a synthetic 5000-range state runs -----

@@ -234,6 +234,7 @@ dependencies = [
  "fp-formats",
  "fp-vm",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

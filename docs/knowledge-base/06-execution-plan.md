@@ -143,7 +143,8 @@ Built on the faithful VM (const/alive/commands resolved). Physics prep done: **P
 | ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
 |----|--------|------|----------|--------------------|------|
 | 6.1 | DONE | **HitDef data model + hit-detection primitive** | `fp-combat` | ✅ `HitDef` plain-data + `AttackAttr::parse` + `HitFlags` bit-set + `detect_hit`/`detect_hit_contact` (place_clsn+any_overlap). Leaf crate (fp-physics+fp-core, no cycle). Manual Default w/ MUGEN sentinels (hitflag `MAF`, chainid `-1`). +24 tests; 1163 workspace. Commit `7d7888c`. | P6.1 |
-| 6.2 | DOING | **HitDef controller + GetHitVars + get-hit states** | `fp-character` | `HitDef` state controller evaluates its param exprs (via fp-vm against the attacker) → builds `fp_combat::HitDef`, stores `Character.active_hitdef`. Implement `GetHitVar(...)` (deferred from 5.6b) from a `GetHitVars` struct populated on hit. Wire common get-hit states (5000–5xxx). | 6.1 |
+| 6.2 | DONE | **HitDef controller + GetHitVars + get-hit states** | `fp-character` | ✅ HitDef controller builds `active_hitdef` (string params raw, numeric via eval); `GetHitVars` + `trigger_str("gethitvar")` resolves the last 5.6b deferral; get-hit states 5000-5xxx documented runnable. 250 fp-character / 1195 workspace. Commit `bfc5a58`. SHOULD_FIX → 6.2b + CB27. | 6.1 |
+| 6.2b | DOING | **Multi-component param model** (loader) | `fp-character` | MUGEN params are comma-lists (`damage=20,5`, `ground.velocity=-4,0`); the loader compiles each as ONE expr → const-0 + spurious `warn!("bad expression")` at load (values only correct because HitDef re-splits). Store params as comma-split **component lists** of compiled exprs so all controllers read `component(i)` uniformly, no spurious warn, and `ctrl_hit_def`'s manual re-split is removed. + fix the `air.type` doc overclaim (CB27). | 6.2 |
 | 6.3 | TODO | **Hit resolution + apply** | `fp-combat`+`fp-character` | Given a `HitContact` + defender: hitflag/guardflag/stance check (block vs hit), damage, hitpause (both sides), get-hit velocities, `p2stateno` state-takeover, fall/juggle accounting. Unit-tested with two synthetic Characters. | 6.2 |
 
 (Live two-player fights on screen — ticking P1+P2, running detection each tick, KO/round — are
@@ -227,8 +228,10 @@ parallelizable once the core exists. Deps: Phase 7.
   absent from KFM data — fp-app currently injects them via a minimal shim. Move these built-in common
   command-state transitions into the `fp-character` executor (special-state handling) so stock chars
   move without an app shim. *(added 5.6c — investigate vs Ikemen; likely a Phase-5/common-states item)*
-- **CB26** *(after 5.6e)* remove the `inject_engine_movement_bridge` velocity-repair in fp-app once
-  `const(velocity.walk.fwd.x)` resolves natively. *(added 5.6c)*
+- **CB26** *(after 5.6e — now ready)* remove the `inject_engine_movement_bridge` velocity-repair in
+  fp-app now that `const(velocity.walk.fwd.x)` resolves natively (5.6e). *(added 5.6c)*
+- **CB27** *(folded into 6.2b)* `executor.rs` HitDef-controller doc lists `air.type` among parsed
+  params, but it isn't read (no `air_type` field; MUGEN defaults air.type→ground.type). Fix the doc.
 
 ---
 

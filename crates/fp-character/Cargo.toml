@@ -11,3 +11,10 @@ fp-formats.workspace = true
 fp-vm.workspace = true
 fp-combat.workspace = true
 tracing.workspace = true
+
+# Dev-only: a capturing subscriber lets the 6.2b tests assert that NO spurious
+# "bad expression -> const 0" warning fires for legitimately multi-valued params
+# (AC2), while a genuine malformed component still warns. Test-only, so it never
+# ships in the library.
+[dev-dependencies]
+tracing-subscriber.workspace = true

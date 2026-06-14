@@ -73,7 +73,8 @@ pub mod loader;
 
 pub use executor::TickReport;
 pub use loader::{
-    CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup, LoadedCharacter,
+    CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
+    LoadedCharacter,
 };
 
 use fp_core::Vec2;

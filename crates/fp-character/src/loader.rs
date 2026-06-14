@@ -110,6 +110,129 @@ impl CompiledExpr {
     }
 }
 
+/// A single controller parameter compiled into its top-level comma-separated
+/// **components**.
+///
+/// MUGEN controller parameters are frequently comma-lists where the top-level
+/// comma separates independent values, each its own expression — e.g.
+/// `damage = 20, 5` (hit damage, guard damage), `ground.velocity = -4, 0`
+/// (x, y), or `pausetime = 12, 12` (p1, p2). The expression compiler
+/// ([`fp_vm::parse_str`]) does not accept a bare top-level comma, so compiling
+/// the whole value as one expression would fail and fall back to const-`0`
+/// (with a misleading "bad expression" warning) for every legitimately
+/// multi-valued parameter.
+///
+/// [`CompiledParam`] instead splits the raw value on **top-level** commas
+/// (commas inside parentheses, brackets, or quotes are *not* separators — they
+/// belong to a function call like `ceil(var(1), 0)` or a quoted token) and
+/// compiles each component to its own [`CompiledExpr`]. A single-value
+/// parameter therefore yields a one-element [`components`](CompiledParam::components)
+/// list, and a genuine parse failure of an individual component still warns
+/// (real malformed content stays visible).
+#[derive(Debug, Clone)]
+pub struct CompiledParam {
+    /// The compiled components, in source order. Always at least one element
+    /// (an empty or whitespace-only raw value yields one const-`0` component).
+    pub components: Vec<CompiledExpr>,
+    /// The original, raw parameter value text (the whole comma-list), kept
+    /// verbatim for diagnostics and for the few controllers that read an
+    /// enum/token (e.g. `StateTypeSet`'s `S`/`C`/`A`) from the raw source.
+    pub source: String,
+}
+
+impl CompiledParam {
+    /// Compiles a raw parameter value into its top-level comma-separated
+    /// [`components`](CompiledParam::components).
+    ///
+    /// Splits `source` on top-level commas (respecting parentheses, brackets,
+    /// and quotes) and compiles each component with [`CompiledExpr::compile`].
+    /// A value with no comma yields a single component; an empty value yields a
+    /// single const-`0` component. Never panics.
+    #[must_use]
+    pub fn compile(source: &str) -> Self {
+        let parts = split_top_level_commas(source);
+        let components = parts
+            .iter()
+            .map(|part| CompiledExpr::compile(part.trim()))
+            .collect();
+        Self {
+            components,
+            source: source.to_string(),
+        }
+    }
+
+    /// Returns the compiled expression for component `i`, or `None` when fewer
+    /// than `i + 1` components are present.
+    ///
+    /// Scalar (single-value) parameters live at component `0`. A controller
+    /// reading the second value of an `x, y` pair uses `component(1)`, falling
+    /// back to its own documented default when the component is absent.
+    #[must_use]
+    pub fn component(&self, i: usize) -> Option<&CompiledExpr> {
+        self.components.get(i)
+    }
+
+    /// Returns the verbatim raw source text of the whole parameter value.
+    ///
+    /// Convenience for controllers that parse an enum/token rather than evaluate
+    /// an expression (e.g. `StateTypeSet`, the `HitDef` string params).
+    #[must_use]
+    pub fn raw(&self) -> &str {
+        &self.source
+    }
+
+    /// The number of top-level components this parameter compiled into (always
+    /// `>= 1`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.components.len()
+    }
+
+    /// Returns `true` if this parameter has no components. In practice this is
+    /// never the case (compilation always yields at least one component), but
+    /// the predicate is provided for completeness alongside [`len`](Self::len).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty()
+    }
+}
+
+/// Splits a parameter value on **top-level** commas, ignoring commas nested
+/// inside parentheses `()`, brackets `[]`, or double quotes `"`.
+///
+/// Returns the raw (un-trimmed) slices between separators; the caller trims each
+/// component before compiling. A value with no top-level comma returns a single
+/// element (the whole input). An empty input returns a single empty element so
+/// every parameter has at least one component.
+///
+/// This is intentionally a lightweight scanner, not a full expression parser: it
+/// only needs to find the commas that separate independent MUGEN parameter
+/// values. Nesting depth is tracked across `()`/`[]`; a `"` toggles an in-string
+/// flag that suppresses all delimiter handling until the closing quote. Never
+/// panics.
+fn split_top_level_commas(source: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut start = 0usize;
+
+    for (idx, ch) in source.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '(' | '[' if !in_string => depth += 1,
+            ')' | ']' if !in_string => depth = depth.saturating_sub(1),
+            ',' if !in_string && depth == 0 => {
+                parts.push(&source[start..idx]);
+                // The next component starts after this single-byte comma.
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
 /// A trigger group whose condition expressions have been compiled.
 ///
 /// Mirrors [`fp_formats::cns::TriggerGroup`]: the controller fires if any group
@@ -152,9 +275,12 @@ pub struct CompiledController {
     /// for task 5.3 (there is no hitpause yet); the executor stores the flag.
     pub ignorehitpause: Option<CompiledExpr>,
     /// Compiled controller-specific parameters, keyed by the lowercased
-    /// parameter name. Each value's expression is the parsed parameter
-    /// expression (const-`0` on failure).
-    pub params: HashMap<String, CompiledExpr>,
+    /// parameter name. Each value is a [`CompiledParam`]: the parameter value
+    /// split on top-level commas into one or more components, each compiled to
+    /// its own expression (const-`0` on a genuine single-component failure).
+    /// A scalar parameter has exactly one component (index `0`); read it with
+    /// [`CompiledParam::component`].
+    pub params: HashMap<String, CompiledParam>,
 }
 
 impl CompiledController {
@@ -179,7 +305,7 @@ impl CompiledController {
         let params = ctrl
             .params
             .iter()
-            .map(|(k, v)| (k.clone(), CompiledExpr::compile(v)))
+            .map(|(k, v)| (k.clone(), CompiledParam::compile(v)))
             .collect();
 
         Self {
@@ -813,9 +939,349 @@ mod tests {
         assert_eq!(ctrl.triggers.len(), 2);
         assert_eq!(ctrl.triggers[0].number, 1);
         assert!(!ctrl.triggers[0].conditions[0].is_fallback);
-        // `damage` param compiles; `bad` (1 +) falls back to const 0.
-        assert!(ctrl.params.contains_key("damage"));
-        assert!(ctrl.params.get("bad").is_some_and(|c| c.is_fallback));
+        // `damage = 23, 0` compiles into two components, neither a fallback.
+        let damage = ctrl.params.get("damage").expect("damage param present");
+        assert_eq!(damage.len(), 2, "`23, 0` → two components");
+        assert!(damage.components.iter().all(|c| !c.is_fallback));
+        // `bad` (1 +) is a single component that genuinely fails → const-0 fallback.
+        let bad = ctrl.params.get("bad").expect("bad param present");
+        assert_eq!(bad.len(), 1);
+        assert!(bad.component(0).is_some_and(|c| c.is_fallback));
+    }
+
+    // ---- 6.2b: multi-component param model (top-level comma split) ----
+
+    #[test]
+    fn split_top_level_commas_respects_parens_brackets_quotes() {
+        // Top-level commas separate; nested commas (in parens/brackets/quotes)
+        // do not.
+        assert_eq!(split_top_level_commas("20, 5"), vec!["20", " 5"]);
+        assert_eq!(split_top_level_commas("42"), vec!["42"]);
+        // A comma inside a function call is NOT a separator.
+        assert_eq!(
+            split_top_level_commas("ceil(var(1), 0), 5"),
+            vec!["ceil(var(1), 0)", " 5"]
+        );
+        // A comma inside brackets is NOT a separator.
+        assert_eq!(
+            split_top_level_commas("anim[1, 2], 3"),
+            vec!["anim[1, 2]", " 3"]
+        );
+        // A comma inside quotes is NOT a separator.
+        assert_eq!(
+            split_top_level_commas("\"a, b\", c"),
+            vec!["\"a, b\"", " c"]
+        );
+        // Trailing top-level comma yields an empty final component.
+        assert_eq!(split_top_level_commas("1, "), vec!["1", " "]);
+        // Empty input still yields one (empty) component.
+        assert_eq!(split_top_level_commas(""), vec![""]);
+    }
+
+    #[test]
+    fn compiled_param_multi_value_yields_components_no_fallback() {
+        // AC2: `damage = 20, 5` compiles to TWO components, neither a fallback —
+        // i.e. NO spurious "bad expression -> const 0" for a legit multi-value.
+        let p = CompiledParam::compile("20, 5");
+        assert_eq!(p.len(), 2, "two components");
+        assert_eq!(p.component(0).map(|c| c.expr.clone()), Some(Expr::Int(20)));
+        assert_eq!(p.component(1).map(|c| c.expr.clone()), Some(Expr::Int(5)));
+        assert!(
+            p.components.iter().all(|c| !c.is_fallback),
+            "neither component is a fallback"
+        );
+        assert_eq!(p.raw(), "20, 5", "raw source preserved verbatim");
+    }
+
+    #[test]
+    fn compiled_param_single_value_is_one_element_list() {
+        // AC1: a scalar parameter yields a one-element component list at index 0.
+        let p = CompiledParam::compile("12");
+        assert_eq!(p.len(), 1, "single value → one-element list");
+        assert!(!p.is_empty());
+        assert!(p.component(0).is_some_and(|c| !c.is_fallback));
+        assert_eq!(p.component(0).map(|c| c.expr.clone()), Some(Expr::Int(12)));
+        // No component beyond index 0.
+        assert!(p.component(1).is_none());
+    }
+
+    #[test]
+    fn compiled_param_nested_comma_is_one_component() {
+        // A function-call comma must stay inside its single component and compile
+        // cleanly (no fallback), proving the splitter respects parens.
+        let p = CompiledParam::compile("ceil(var(1) * 1.5)");
+        assert_eq!(p.len(), 1);
+        assert!(p.component(0).is_some_and(|c| !c.is_fallback));
+    }
+
+    #[test]
+    fn compiled_param_each_component_independently_fallbacks() {
+        // AC2: a genuine per-component parse failure still warns/falls back, while
+        // a sibling valid component compiles cleanly (real malformed content stays
+        // visible).
+        let p = CompiledParam::compile("5, 1 +");
+        assert_eq!(p.len(), 2);
+        assert!(p.component(0).is_some_and(|c| !c.is_fallback), "5 compiles");
+        assert!(
+            p.component(1).is_some_and(|c| c.is_fallback),
+            "`1 +` falls back"
+        );
+    }
+
+    #[test]
+    fn multi_value_param_compiles_without_warning_through_controller() {
+        // AC2 end-to-end through the controller compiler: every comma-listed
+        // param (`damage`, `ground.velocity`, `pausetime`) compiles to its
+        // components with NO fallback — the previous single-expression model
+        // would have produced const-0 fallbacks (and warnings) for all of these.
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\ntype = S\n\
+             [State 200, hit]\ntype = HitDef\ntrigger1 = 1\n\
+             damage = 20, 5\nground.velocity = -4, 0\npausetime = 12, 12\n",
+        )
+        .unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        let ctrl = &state.controllers[0];
+        for (name, expected) in [("damage", 2), ("ground.velocity", 2), ("pausetime", 2)] {
+            let p = ctrl.params.get(name).expect("param present");
+            assert_eq!(p.len(), expected, "{name} component count");
+            assert!(
+                p.components.iter().all(|c| !c.is_fallback),
+                "{name} has no fallback component"
+            );
+        }
+    }
+
+    // ======================================================================
+    // Proctor (6.2b): additional edge-case / error-path / MUGEN-semantics
+    // coverage for the multi-component param model.
+    // ======================================================================
+
+    /// A `tracing` writer that appends every formatted event into a shared
+    /// buffer, so a test can assert exactly which warnings fired during a load.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` with a `tracing` subscriber that captures all WARN+ output and
+    /// returns the captured log text. Lets a test prove the *presence* or
+    /// *absence* of the "bad expression -> const 0" warning directly, rather than
+    /// only via the `is_fallback` proxy.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().expect("capture buffer poisoned").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn ac2_legit_multi_value_params_emit_no_bad_expression_warning() {
+        // AC2 (direct, not via the is_fallback proxy): compiling the canonical
+        // multi-valued MUGEN params must NOT emit any "bad expression -> const 0"
+        // warning. Before 6.2b each of these compiled the whole comma-list as one
+        // expression, failed on the top-level comma, and warned once per param.
+        let logs = capture_warnings(|| {
+            for raw in [
+                "20, 5",        // damage = hit, guard
+                "-4, 0",        // ground.velocity = x, y
+                "12, 12",       // pausetime = p1, p2
+                "ceil(var(1) * 1.5), 0", // expression component + scalar
+                "var(2) * 2, var(2)",    // both components are expressions
+            ] {
+                let p = CompiledParam::compile(raw);
+                // Sanity: no component fell back either.
+                assert!(
+                    p.components.iter().all(|c| !c.is_fallback),
+                    "{raw:?} produced an unexpected fallback component"
+                );
+            }
+        });
+        assert!(
+            !logs.contains("bad expression"),
+            "no spurious warn expected for legit multi-value params, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn ac2_genuine_malformed_component_still_warns() {
+        // AC2 second half: a real parse failure in a single component must still
+        // warn so malformed content stays visible — and the warn must name the
+        // offending component source, not the whole comma-list.
+        let logs = capture_warnings(|| {
+            // `5` is fine; `1 +` is genuinely malformed.
+            let p = CompiledParam::compile("5, 1 +");
+            assert!(p.component(0).is_some_and(|c| !c.is_fallback));
+            assert!(p.component(1).is_some_and(|c| c.is_fallback));
+        });
+        assert!(
+            logs.contains("bad expression"),
+            "a genuine malformed component must warn, got:\n{logs}"
+        );
+        // The warn quotes the trimmed component (`"1 +"`), not the full list.
+        assert!(
+            logs.contains("\"1 +\""),
+            "warn should quote the offending component source, got:\n{logs}"
+        );
+        // Exactly one warning — the valid sibling `5` does not warn.
+        assert_eq!(
+            logs.matches("bad expression").count(),
+            1,
+            "only the malformed component warns, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn split_handles_nested_and_utf8_without_panicking() {
+        // Multi-byte UTF-8 around / inside delimiters must not panic and must not
+        // be mis-sliced (the scanner uses char_indices + len_utf8). A quoted
+        // multi-byte token and a unicode-laden bare token are each one component.
+        assert_eq!(split_top_level_commas("\"café, x\", y"), vec!["\"café, x\"", " y"]);
+        assert_eq!(split_top_level_commas("naïve"), vec!["naïve"]);
+        // Deeply nested parens/brackets: every comma is interior → one component.
+        assert_eq!(
+            split_top_level_commas("f(g(a, b), h[c, d])"),
+            vec!["f(g(a, b), h[c, d])"]
+        );
+        // Mixed: a top-level comma after a balanced nested group splits.
+        assert_eq!(
+            split_top_level_commas("f(a, b), g(c, d)"),
+            vec!["f(a, b)", " g(c, d)"]
+        );
+    }
+
+    #[test]
+    fn split_unbalanced_delimiters_never_panic() {
+        // Malformed MUGEN content can have unbalanced parens/brackets/quotes. The
+        // scanner must never panic and must still return at least one component.
+        // (`saturating_sub` on depth and the in_string toggle guarantee this.)
+        for raw in ["(((", ")))", "[a, b", "a, b]", "\"unterminated, comma", "((1, 2)"] {
+            let parts = split_top_level_commas(raw);
+            assert!(!parts.is_empty(), "{raw:?} yielded zero components");
+            // The re-joined parts (with the commas the scanner consumed) preserve
+            // every original byte — nothing is dropped.
+            let rejoined = parts.join(",");
+            assert_eq!(rejoined, raw, "{raw:?} round-trips through split/join");
+        }
+    }
+
+    #[test]
+    fn split_round_trips_for_balanced_inputs() {
+        // For any input, joining the components on ',' reconstructs the source,
+        // because the scanner only ever consumes single-byte top-level commas.
+        for raw in ["", "1", "1, 2, 3", "a,,b", ", leading", "trailing, ", "  ", "x , y"] {
+            assert_eq!(split_top_level_commas(raw).join(","), raw, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn compiled_param_empty_and_whitespace_are_single_fallback_component() {
+        // An empty or whitespace-only value yields exactly one component, the
+        // const-0 fallback (matching CompiledExpr on empty input). len() >= 1
+        // invariant holds; is_empty() is never true.
+        for raw in ["", "   ", "\t"] {
+            let p = CompiledParam::compile(raw);
+            assert_eq!(p.len(), 1, "{raw:?} → one component");
+            assert!(!p.is_empty(), "{raw:?} is never component-empty");
+            assert!(p.component(0).is_some_and(|c| c.is_fallback), "{raw:?} → fallback");
+            assert_eq!(p.component(0).map(|c| c.expr.clone()), Some(Expr::Int(0)));
+            assert_eq!(p.raw(), raw, "{raw:?} raw preserved verbatim");
+        }
+    }
+
+    #[test]
+    fn compiled_param_trailing_and_leading_commas_make_fallback_components() {
+        // MUGEN authors `damage = ,5` (leading) and `pausetime = 12,` (trailing).
+        // The empty side becomes a const-0 fallback component, NOT a dropped one,
+        // so the positional read (component 0 vs 1) stays correct.
+        let lead = CompiledParam::compile(", 5");
+        assert_eq!(lead.len(), 2);
+        assert!(lead.component(0).is_some_and(|c| c.is_fallback), "empty x → 0");
+        assert_eq!(lead.component(0).map(|c| c.expr.clone()), Some(Expr::Int(0)));
+        assert!(lead.component(1).is_some_and(|c| !c.is_fallback));
+        assert_eq!(lead.component(1).map(|c| c.expr.clone()), Some(Expr::Int(5)));
+
+        let trail = CompiledParam::compile("12, ");
+        assert_eq!(trail.len(), 2);
+        assert_eq!(trail.component(0).map(|c| c.expr.clone()), Some(Expr::Int(12)));
+        assert!(trail.component(1).is_some_and(|c| c.is_fallback), "empty y → 0 fallback");
+    }
+
+    #[test]
+    fn compiled_param_three_components_preserved_in_order() {
+        // A 3-value param (e.g. a hypothetical r, g, b or x, y, z) keeps all three
+        // components in source order and reads each by index.
+        let p = CompiledParam::compile("1, 2, 3");
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.component(0).map(|c| c.expr.clone()), Some(Expr::Int(1)));
+        assert_eq!(p.component(1).map(|c| c.expr.clone()), Some(Expr::Int(2)));
+        assert_eq!(p.component(2).map(|c| c.expr.clone()), Some(Expr::Int(3)));
+        assert!(p.component(3).is_none());
+    }
+
+    #[test]
+    fn compiled_param_nested_comma_component_evaluates_via_vm() {
+        // A function-call comma stays inside one component AND that component is a
+        // genuinely valid expression (it parses to a Call), proving the splitter
+        // does not corrupt multi-arg calls. `ceil(var(1), 0)` parses cleanly.
+        let p = CompiledParam::compile("ceil(var(1), 0), 7");
+        assert_eq!(p.len(), 2, "the call-comma is NOT a top-level separator");
+        assert!(p.component(0).is_some_and(|c| !c.is_fallback), "call component compiles");
+        assert!(
+            matches!(p.component(0).map(|c| &c.expr), Some(Expr::Call { .. })),
+            "component 0 is the multi-arg call"
+        );
+        assert_eq!(p.component(1).map(|c| c.expr.clone()), Some(Expr::Int(7)));
+    }
+
+    #[test]
+    fn from_parsed_attr_style_param_compiles_components_without_fallback() {
+        // HitDef enum params like `attr = A, SP` are READ via raw() in the
+        // executor, but the loader still compiles each component. Both `A` and
+        // `SP` are bare identifiers that parse → no fallback, no warn — and raw()
+        // still yields the verbatim source the executor parses.
+        let logs = capture_warnings(|| {
+            let cns = CnsFile::from_str(
+                "[Statedef 200]\ntype = S\n\
+                 [State 200, hit]\ntype = HitDef\ntrigger1 = 1\n\
+                 attr = A, SP\nground.type = Low\n",
+            )
+            .expect("cns parses");
+            let state = CompiledState::from_parsed(&cns.statedefs[0]);
+            let ctrl = &state.controllers[0];
+            let attr = ctrl.params.get("attr").expect("attr present");
+            assert_eq!(attr.len(), 2, "`A, SP` → two identifier components");
+            assert!(attr.components.iter().all(|c| !c.is_fallback));
+            assert_eq!(attr.raw(), "A, SP", "raw source kept for AttackAttr::parse");
+        });
+        assert!(
+            !logs.contains("bad expression"),
+            "identifier-component attr must not warn, got:\n{logs}"
+        );
     }
 
     // ---- AC4: real-fixture load, gated to skip when test-assets is absent ----
@@ -872,6 +1338,76 @@ mod tests {
             })
         });
         assert!(any_compiled, "at least one real trigger should compile");
+    }
+
+    #[test]
+    fn real_fixture_kfm_multi_value_params_split_and_no_bad_expr_warn() {
+        // Proctor AC2 + AC4 end-to-end against REAL content: loading KFM must not
+        // emit ANY "bad expression -> const 0" warning caused by a legitimate
+        // top-level comma in a controller param, and KFM's HitDefs must expose
+        // their multi-component params (damage / *.velocity / pausetime) as >= 2
+        // component lists. Gated to skip when test-assets is absent.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+
+        // Capture warnings emitted during the entire load.
+        let mut maybe_loaded = None;
+        let logs = capture_warnings(|| {
+            maybe_loaded = Some(LoadedCharacter::load(&def).expect("kfm.def should load"));
+        });
+        let loaded = maybe_loaded.expect("load populated");
+
+        // SCOPE: 6.2b fixes *controller parameter* compilation, NOT trigger
+        // expressions. Real KFM (kfm.cmd) carries trigger conditions such as
+        // `trigger2 = hitdefattr = SC, NA, SA, HA`, whose comma-list is a trigger,
+        // not a param — those legitimately still warn and are out of 6.2b scope.
+        //
+        // The 6.2b guarantees under test, against real content:
+        //   (a) No controller param's FULL comma-list is ever compiled as a single
+        //       expression (the pre-6.2b bug); i.e. the verbatim multi-value source
+        //       never appears inside a `"..."` in a "bad expression" warn.
+        //   (b) At least one real numeric multi-component param (e.g. an `x, y`
+        //       velocity) splits into >= 2 components that ALL compile cleanly,
+        //       proving the happy path. (Note: a leading/empty component such as
+        //       `value = , NA, SA, AT` in a HitBy-style controller legitimately
+        //       becomes a const-0 fallback — that is correct 6.2b behavior and not
+        //       checked here.)
+        let mut saw_multi = false;
+        let mut saw_clean_multi = false;
+        for state in loaded.states.values() {
+            for c in &state.controllers {
+                for p in c.params.values() {
+                    if p.len() >= 2 {
+                        saw_multi = true;
+                        // (a) The whole comma-list never warned as one expression.
+                        let full = format!("\"{}\"", p.raw());
+                        assert!(
+                            !logs.contains(&full),
+                            "param comma-list {:?} warned as a single expression \
+                             (the 6.2b bug). Logs:\n{logs}",
+                            p.raw()
+                        );
+                        // (b) Track whether we saw a fully-clean multi-component
+                        // param (the common numeric `x, y` / `hit, guard` case).
+                        if p.components.iter().all(|comp| !comp.is_fallback) {
+                            saw_clean_multi = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_multi,
+            "expected at least one real KFM controller multi-component param"
+        );
+        assert!(
+            saw_clean_multi,
+            "expected at least one real KFM multi-component param with all \
+             components compiling cleanly"
+        );
     }
 
     #[test]
@@ -1287,8 +1823,10 @@ mod tests {
         assert!(params.contains_key("x"));
         assert!(params.contains_key("y"));
         assert!(!params.contains_key("X"), "keys are lowercased");
-        // The compiled value is the parsed parameter expression.
-        assert!(params["x"].source.contains('4'));
+        // The compiled value is the parsed parameter, a single component here.
+        assert_eq!(params["x"].len(), 1);
+        assert!(params["x"].raw().contains('4'));
+        assert!(params["x"].component(0).is_some_and(|c| !c.is_fallback));
     }
 
     #[test]

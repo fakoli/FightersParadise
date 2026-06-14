@@ -346,7 +346,7 @@ fn make_ctrl(
         ignorehitpause: None,
         params: params
             .iter()
-            .map(|(k, v)| (k.to_string(), CompiledExpr::compile(v)))
+            .map(|(k, v)| (k.to_string(), fp_character::CompiledParam::compile(v)))
             .collect(),
     }
 }
@@ -419,10 +419,10 @@ fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
         return;
     }
 
-    // Forward/back walk speeds from the character's OWN authored `[Velocity]`
-    // group, baked into literals to repair the `const(...)` gap below. They are
-    // authored facing-right (fwd > 0, back < 0); we keep those signs as-is, then
-    // multiply by `facing` so a left-facing character walks toward -x.
+    // Walk speeds from the character's own [Velocity] constants. const() now
+    // resolves the magnitude (5.6e), but the executor does not yet apply velocity
+    // facing-relative, so we still mirror by facing here. TODO(6.2c): move facing
+    // mirroring into the executor's VelSet and drop this repair (CB26).
     let walk_fwd_x = loaded.constants.velocity.walk_fwd.x;
     let walk_back_x = loaded.constants.velocity.walk_back.x;
 
@@ -453,13 +453,9 @@ fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
         minus_one.controllers.push(walk_to_stand);
     }
 
-    // Repair the walk state's own velocity controllers. `[Statedef 20]` sets
-    // motion with `VelSet x = const(velocity.walk.fwd.x)` (and `.back`), but the
-    // `const(<member>)` named-constant function does not resolve yet (it returns
-    // 0), so the walk state runs with zero velocity and the character never
-    // advances. We substitute the authored literal (mirrored by `facing`) for any
-    // VelSet `x` expression in state 20 that references `const(velocity.walk.*)`.
-    // This uses the character's OWN data; it is part of the same engine-gap shim.
+    // Mirror the walk state's VelSet x by facing (the const() magnitude is authored
+    // facing-right; the executor does not yet apply velocity facing-relative — TODO
+    // 6.2c, after which this repair is removed, CB26).
     if let Some(walk) = loaded.states.get_mut(&STATE_WALK) {
         for c in &mut walk.controllers {
             let is_velset = c
@@ -470,20 +466,17 @@ fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
                 continue;
             }
             if let Some(x) = c.params.get_mut("x") {
-                let src = x.source.to_ascii_lowercase();
+                let src = x.raw().to_ascii_lowercase();
                 if src.contains("const") && src.contains("walk.fwd") {
-                    *x = CompiledExpr::compile(&format!("{walk_fwd_x} * facing"));
+                    *x = fp_character::CompiledParam::compile(&format!("{walk_fwd_x} * facing"));
                 } else if src.contains("const") && src.contains("walk.back") {
-                    *x = CompiledExpr::compile(&format!("{walk_back_x} * facing"));
+                    *x = fp_character::CompiledParam::compile(&format!("{walk_back_x} * facing"));
                 }
             }
         }
     }
 
-    tracing::info!(
-        "injected engine built-in stand<->walk bridge and repaired walk-state \
-         velocity from authored [Velocity] constants"
-    );
+    tracing::info!("injected engine built-in stand<->walk bridge + walk-velocity facing repair");
 }
 
 /// Builds an empty `[Statedef n]` (no entry params, no controllers).
