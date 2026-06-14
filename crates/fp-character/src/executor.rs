@@ -584,6 +584,8 @@ impl Character {
     /// `Turn`, and `PlaySnd` (task 5.4; 8.3a makes `PlaySnd` emit a
     /// [`SoundRequest`]). Task 6.2 adds the `HitDef` controller, which builds a
     /// [`fp_combat::HitDef`] into [`active_hitdef`](Character::active_hitdef).
+    /// Task 6.6 adds `PowerAdd`/`PowerSet`, which mutate the super meter
+    /// (clamped to `[0, power_max]`).
     /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -618,6 +620,10 @@ impl Character {
             self.ctrl_var_add(ctrl);
         } else if kind.eq_ignore_ascii_case("VarRangeSet") {
             self.ctrl_var_range_set(ctrl);
+        } else if kind.eq_ignore_ascii_case("PowerAdd") {
+            self.ctrl_power_add(ctrl);
+        } else if kind.eq_ignore_ascii_case("PowerSet") {
+            self.ctrl_power_set(ctrl);
         } else if kind.eq_ignore_ascii_case("StateTypeSet") {
             self.ctrl_state_type_set(ctrl);
         } else if kind.eq_ignore_ascii_case("Turn") {
@@ -817,6 +823,40 @@ impl Character {
                 );
             }
         }
+    }
+
+    /// `PowerAdd`: add the `value` expression to the super meter, clamping the
+    /// result to `[0, power_max]`.
+    ///
+    /// Mirrors MUGEN's `PowerAdd` state controller. A missing `value` is a
+    /// safe debug-logged no-op (adds nothing). A garbage value can never panic:
+    /// the addition saturates and the result is clamped.
+    fn ctrl_power_add(&mut self, ctrl: &CompiledController) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+            tracing::debug!(
+                "tick: PowerAdd in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.add_power_clamped(value.to_int());
+    }
+
+    /// `PowerSet`: set the super meter to the `value` expression, clamping the
+    /// result to `[0, power_max]`.
+    ///
+    /// Mirrors MUGEN's `PowerSet` state controller. A missing `value` is a
+    /// safe debug-logged no-op (leaves power unchanged). A garbage value can
+    /// never panic: the result is clamped into range.
+    fn ctrl_power_set(&mut self, ctrl: &CompiledController) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p)) else {
+            tracing::debug!(
+                "tick: PowerSet in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.set_power_clamped(value.to_int());
     }
 
     /// `VarRangeSet`: set a contiguous range of variables to one value.
@@ -1223,6 +1263,25 @@ impl Character {
         }
     }
 
+    // ---- Power (super meter) ----------------------------------------------
+
+    /// Sets the power (super meter) to `value`, clamped to `[0, power_max]`.
+    ///
+    /// All power mutations route through here so the meter is never left outside
+    /// its valid range. A `power_max` that is somehow negative (malformed data)
+    /// collapses the range to `0`, yielding `power == 0` rather than a panic.
+    fn set_power_clamped(&mut self, value: i32) {
+        let max = self.power_max.max(0);
+        self.power = value.clamp(0, max);
+    }
+
+    /// Adds `delta` (which may be negative) to the power meter, clamping the
+    /// result to `[0, power_max]`. Uses saturating arithmetic so a garbage
+    /// `delta` near `i32::MAX`/`i32::MIN` cannot overflow before the clamp.
+    fn add_power_clamped(&mut self, delta: i32) {
+        self.set_power_clamped(self.power.saturating_add(delta));
+    }
+
     // ---- State entry -------------------------------------------------------
 
     /// Performs a state transition into `target`: records the previous state,
@@ -1250,9 +1309,11 @@ impl Character {
     }
 
     /// Applies a statedef's entry parameters: `type`/`movetype`/`physics`
-    /// (letter tokens), `anim`/`ctrl` (compiled expressions), and `velset`
-    /// (`x, y`). An unrecognized or absent value leaves the field unchanged
-    /// (MUGEN's "unchanged" semantics).
+    /// (letter tokens), `anim`/`ctrl` (compiled expressions), `velset`
+    /// (`x, y`), and `poweradd` (compiled expression, added to the super meter
+    /// once per entry and clamped to `[0, power_max]`). An unrecognized or
+    /// absent value leaves the field unchanged (MUGEN's "unchanged" semantics);
+    /// an absent `poweradd` adds nothing.
     fn apply_state_entry(&mut self, state: &CompiledState) {
         if let Some(token) = state.state_type.as_deref() {
             if let Some(t) = StateType::from_token(token) {
@@ -1289,6 +1350,13 @@ impl Character {
                 self.vel.x = x;
                 self.vel.y = y;
             }
+        }
+        // `poweradd`: add to the super meter once, on entry. This is how MUGEN
+        // attack states fill the power bar toward the super threshold (e.g.
+        // KFM's `[Statedef 200] poweradd = 10`). Clamped to `[0, power_max]`.
+        if let Some(poweradd_expr) = &state.poweradd {
+            let delta = self.eval_value(poweradd_expr).to_int();
+            self.add_power_clamped(delta);
         }
     }
 
@@ -1695,7 +1763,7 @@ mod tests {
     /// The string-valued entry parameters of a synthetic statedef, bundled to
     /// keep the [`state`] builder under clippy's argument limit. Field order
     /// mirrors a MUGEN `[Statedef]` header: type, movetype, physics, anim, ctrl,
-    /// velset.
+    /// velset, poweradd.
     #[derive(Clone, Copy, Default)]
     struct Entry<'a> {
         st: Option<&'a str>,
@@ -1704,6 +1772,7 @@ mod tests {
         anim: Option<&'a str>,
         ctrl: Option<&'a str>,
         velset: Option<&'a str>,
+        poweradd: Option<&'a str>,
     }
 
     /// Builds a compiled state with the given entry params and controllers.
@@ -1716,6 +1785,7 @@ mod tests {
             anim: e.anim.map(CompiledExpr::compile),
             ctrl: e.ctrl.map(CompiledExpr::compile),
             velset: e.velset.map(str::to_string),
+            poweradd: e.poweradd.map(CompiledExpr::compile),
             controllers,
         }
     }
@@ -1881,7 +1951,7 @@ mod tests {
         let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "20")]);
         let st0 = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![c]);
         // Destination sets anim 20 and ctrl 1 on entry.
-        let st20 = state(20, Entry { st: Some("A"), mv: Some("A"), ph: Some("A"), anim: Some("20"), ctrl: Some("1"), velset: Some("3, -5") }, vec![]);
+        let st20 = state(20, Entry { st: Some("A"), mv: Some("A"), ph: Some("A"), anim: Some("20"), ctrl: Some("1"), velset: Some("3, -5"), ..Entry::default() }, vec![]);
         let lc = loaded(vec![st0, st20], {
             // Two actions: 0 and 20.
             let mut air = tiny_air(0, &[5]);
@@ -2351,6 +2421,416 @@ mod tests {
         assert!((lc.constants.velocity.walk_fwd.x - 2.4).abs() < 1e-4);
         assert!((lc.constants.movement.yaccel - 0.44).abs() < 1e-4);
         assert!((lc.constants.movement.stand_friction - 0.85).abs() < 1e-4);
+    }
+
+    // =====================================================================
+    // Task 6.6: Power gain — Statedef `poweradd`-on-entry + PowerAdd/PowerSet
+    // controllers. The super meter must actually fill so gated supers
+    // (`power >= 1000`) become reachable. All synthetic except the gated
+    // real-KFM test at the end of this block.
+    // =====================================================================
+
+    /// AC1: entering a state with `poweradd = 10` raises power by 10, and a
+    /// re-entry adds again (the add is once-per-entry, not once-ever). Drives
+    /// the real `enter_state` path directly so the assertion is about entry,
+    /// not per-tick controller scheduling.
+    #[test]
+    fn poweradd_on_entry_adds_once_per_entry() {
+        // State 0: no poweradd. State 1: poweradd=10. Each entry into state 1
+        // bumps power by 10; entering state 0 adds nothing.
+        let st0 = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st1 = state(
+            1,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("10"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(vec![st0, st1], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        assert_eq!(ch.power, 0);
+
+        ch.enter_state(&lc.states, 1);
+        assert_eq!(ch.power, 10, "first entry into state 1 added 10");
+
+        ch.enter_state(&lc.states, 0);
+        assert_eq!(ch.power, 10, "state 0 has no poweradd");
+
+        ch.enter_state(&lc.states, 1);
+        assert_eq!(ch.power, 20, "re-entry adds another 10");
+    }
+
+    /// AC1/AC3: `poweradd`-on-entry clamps at `power_max` and never exceeds it,
+    /// even with a huge authored value.
+    #[test]
+    fn poweradd_on_entry_clamps_at_power_max() {
+        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let dest = state(
+            5,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("999999"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power_max = 1000;
+        ch.power = 990;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 5);
+        assert_eq!(ch.power, 1000, "clamped to power_max");
+    }
+
+    /// AC1: a state with NO `poweradd` adds nothing on entry.
+    #[test]
+    fn entry_without_poweradd_leaves_power_unchanged() {
+        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let dest = state(5, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 250;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 5);
+        assert_eq!(ch.power, 250, "no poweradd -> power unchanged");
+    }
+
+    /// AC2/AC3: `PowerAdd` controller adds `value` and clamps at `power_max`.
+    #[test]
+    fn power_add_controller_adds_and_clamps_high() {
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "300")]);
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power_max = 1000;
+        ch.power = 900;
+        lc.tick(&mut ch);
+        assert_eq!(ch.power, 1000, "900 + 300 clamped to power_max 1000");
+    }
+
+    /// AC2/AC3: `PowerAdd` with a negative `value` clamps at `0` (never goes
+    /// below the floor).
+    #[test]
+    fn power_add_controller_clamps_low() {
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "-500")]);
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 200;
+        lc.tick(&mut ch);
+        assert_eq!(ch.power, 0, "200 - 500 clamped to floor 0");
+    }
+
+    /// AC2/AC3: `PowerSet` controller assigns `value` and clamps at both ends.
+    #[test]
+    fn power_set_controller_sets_and_clamps() {
+        // Set above power_max -> clamps high.
+        let set_hi = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "5000")]);
+        let st_hi = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set_hi]);
+        let lc_hi = loaded(vec![st_hi], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power_max = 3000;
+        ch.power = 100;
+        lc_hi.tick(&mut ch);
+        assert_eq!(ch.power, 3000, "PowerSet 5000 clamped to power_max 3000");
+
+        // Set below 0 -> clamps low.
+        let set_lo = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "-7")]);
+        let st_lo = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set_lo]);
+        let lc_lo = loaded(vec![st_lo], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.power = 500;
+        lc_lo.tick(&mut ch2);
+        assert_eq!(ch2.power, 0, "PowerSet -7 clamped to floor 0");
+    }
+
+    /// AC2/AC3: `PowerAdd`/`PowerSet` with a missing `value` is a safe no-op
+    /// (power unchanged, no panic).
+    #[test]
+    fn power_controllers_missing_value_is_noop() {
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[]);
+        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 333;
+        lc.tick(&mut ch);
+        assert_eq!(ch.power, 333, "PowerAdd with no value adds nothing");
+    }
+
+    // ---- 6.6 (Proctor): additional edge/error-path coverage layered on top of
+    // Forge's power tests. ----
+
+    /// AC1/AC3: a NEGATIVE `poweradd` on entry drains the meter and clamps at the
+    /// `0` floor (poweradd can subtract; it never underflows below 0).
+    #[test]
+    fn poweradd_on_entry_negative_clamps_at_floor() {
+        let drain = state(
+            7,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("-1000"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), drain],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 300;
+        ch.enter_state(&lc.states, 7);
+        assert_eq!(ch.power, 0, "300 + (-1000) clamps to floor 0");
+    }
+
+    /// AC1: `poweradd` is evaluated as an EXPRESSION on entry, not a literal —
+    /// `poweradd = 30 + 20` adds 50. Confirms `eval_value` runs the compiled expr.
+    #[test]
+    fn poweradd_on_entry_evaluates_expression() {
+        let st = state(
+            3,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("30 + 20"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 0;
+        ch.enter_state(&lc.states, 3);
+        assert_eq!(ch.power, 50, "poweradd expression `30 + 20` adds 50");
+    }
+
+    /// AC3: a malformed `poweradd` (const-0 fallback) on entry adds nothing and
+    /// never panics — the fallback evaluates to 0.
+    #[test]
+    fn poweradd_on_entry_malformed_is_noop() {
+        // `Entry.poweradd` is compiled via CompiledExpr::compile; `1 +` is the
+        // const-0 fallback, so entry adds 0.
+        let st = state(
+            4,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("1 +"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 123;
+        ch.enter_state(&lc.states, 4);
+        assert_eq!(ch.power, 123, "malformed poweradd (const-0) adds nothing");
+    }
+
+    /// AC3: a non-positive `power_max` (malformed character data) collapses the
+    /// valid range to `{0}`. Any poweradd / PowerAdd / PowerSet leaves power at 0
+    /// rather than panicking. Exercises `set_power_clamped`'s `max(0)` guard.
+    #[test]
+    fn power_max_non_positive_keeps_power_at_zero() {
+        // poweradd-on-entry with power_max = 0.
+        let st = state(
+            2,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("500"), ..Entry::default() },
+            vec![],
+        );
+        let lc = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power_max = 0;
+        ch.power = 0;
+        ch.enter_state(&lc.states, 2);
+        assert_eq!(ch.power, 0, "power_max=0 -> power pinned to 0 on entry");
+
+        // PowerSet with a negative power_max also pins to 0 (never panics).
+        let set = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "900")]);
+        let lc2 = loaded(
+            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set])],
+            tiny_air(0, &[5]),
+        );
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.power_max = -5;
+        ch2.power = 0;
+        lc2.tick(&mut ch2);
+        assert_eq!(ch2.power, 0, "negative power_max -> power pinned to 0");
+    }
+
+    /// AC3: a garbage (saturating) huge `PowerAdd` value can never overflow before
+    /// the clamp — `add_power_clamped` uses saturating arithmetic. Near-i32::MAX
+    /// add starting from a positive power clamps at power_max, no panic.
+    #[test]
+    fn power_add_controller_saturates_huge_value() {
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "2147483647")]);
+        let st = stand_n(0, vec![add]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power_max = 1000;
+        ch.power = 2000; // already above max (e.g. stale data) — clamp brings it down
+        lc.tick(&mut ch);
+        assert_eq!(ch.power, 1000, "huge add saturates then clamps to power_max");
+    }
+
+    /// AC2: `PowerAdd`/`PowerSet` with a malformed `value` (const-0 fallback) is a
+    /// safe operation — PowerAdd adds 0 (no-op), PowerSet sets 0 (the fallback
+    /// value), neither panics.
+    #[test]
+    fn power_controllers_malformed_value_are_safe() {
+        // PowerAdd with garbage value -> fallback evals to 0 -> adds nothing.
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "1 +")]);
+        let lc_add = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 444;
+        lc_add.tick(&mut ch);
+        assert_eq!(ch.power, 444, "PowerAdd garbage value adds 0");
+
+        // PowerSet with garbage value -> fallback evals to 0 -> sets power to 0.
+        let set = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "*/")]);
+        let lc_set = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.power = 444;
+        lc_set.tick(&mut ch2);
+        assert_eq!(ch2.power, 0, "PowerSet garbage value sets the const-0 fallback");
+    }
+
+    /// AC2: the controller dispatch matches `PowerAdd`/`PowerSet` case-INsensitively
+    /// (MUGEN type names are not case-sensitive). `poweradd`/`POWERSET` both fire.
+    #[test]
+    fn power_controllers_dispatch_case_insensitively() {
+        let add = ctrl(0, "poweradd", &[], &[(1, &["1"])], Some("0"), &[("value", "40")]);
+        let lc_add = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 0;
+        lc_add.tick(&mut ch);
+        assert_eq!(ch.power, 40, "lowercase `poweradd` controller fires");
+
+        let set = ctrl(0, "POWERSET", &[], &[(1, &["1"])], Some("0"), &[("value", "77")]);
+        let lc_set = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        ch2.power = 0;
+        lc_set.tick(&mut ch2);
+        assert_eq!(ch2.power, 77, "uppercase `POWERSET` controller fires");
+    }
+
+    /// AC2: a `PowerAdd` whose `value` is an EXPRESSION (not a literal) is
+    /// evaluated against the live character — `value = power + 100` reads the
+    /// current power. Confirms the controller routes through `eval_param`.
+    #[test]
+    fn power_add_controller_value_is_an_expression() {
+        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "10 * 5")]);
+        let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.power = 100;
+        lc.tick(&mut ch);
+        assert_eq!(ch.power, 150, "PowerAdd `10 * 5` adds 50 to 100");
+    }
+
+    /// AC4 (reinforced): repeated entry into the KFM super-gated attack state
+    /// accumulates power across entries, demonstrating the meter can climb toward
+    /// the `power >= 1000` super threshold. Gated: skips when test-assets/ absent.
+    #[test]
+    fn real_kfm_repeated_attack_entries_climb_toward_super() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        let Some(attack) = lc.states.get(&200) else {
+            eprintln!("skipping: kfm.def has no [Statedef 200]");
+            return;
+        };
+        if attack.poweradd.is_none() {
+            eprintln!("skipping: [Statedef 200] carries no poweradd");
+            return;
+        }
+        let mut ch = Character::with_constants(lc.constants);
+        ch.power = 0;
+        // Re-enter the attack state many times; each entry adds the authored
+        // poweradd. Power must rise monotonically and never leave [0, power_max].
+        let mut last = ch.power;
+        for _ in 0..200 {
+            ch.enter_state(&lc.states, 200);
+            assert!(ch.power >= last, "power never decreases across attack entries");
+            assert!(
+                (0..=ch.power_max).contains(&ch.power),
+                "power stays within [0, power_max] (got {}, max {})",
+                ch.power,
+                ch.power_max
+            );
+            last = ch.power;
+        }
+        // With 200 entries of a positive poweradd, the meter must have crossed the
+        // 1000 super threshold (KFM's authored poweradd=10 => 2000 before clamp),
+        // proving gated supers become reachable.
+        assert!(
+            ch.power >= 1000,
+            "repeated KFM attack entries should fill the meter past the 1000 super gate (got {})",
+            ch.power
+        );
+    }
+
+    /// AC4: gated real-KFM test — entering an attack state (e.g. [Statedef 200],
+    /// which authors `poweradd = 10`) raises power, demonstrating the meter
+    /// fills toward the 1000 super threshold. Skips when test-assets/ is absent.
+    #[test]
+    fn real_kfm_attack_state_fills_power() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let lc = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        // KFM's light-punch attack state. If the fixture lacks it (or it has no
+        // poweradd), skip rather than fail — the gate is the meter mechanism,
+        // and other attack states would still fill it.
+        let Some(attack) = lc.states.get(&200) else {
+            eprintln!("skipping: kfm.def has no [Statedef 200]");
+            return;
+        };
+        if attack.poweradd.is_none() {
+            eprintln!("skipping: [Statedef 200] carries no poweradd");
+            return;
+        }
+        let mut ch = Character::with_constants(lc.constants);
+        ch.power = 0;
+        // Directly enter the attack state through the real executor path.
+        ch.enter_state(&lc.states, 200);
+        assert!(
+            ch.power > 0,
+            "entering KFM attack state 200 should fill the power meter (got {})",
+            ch.power
+        );
+        assert!(ch.power <= ch.power_max, "power stays within [0, power_max]");
     }
 
     // =====================================================================

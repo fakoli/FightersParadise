@@ -188,6 +188,11 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   while `Character.hitpause_time > 0`, running only `ignorehitpause`-flagged controllers (wired but
   unused since 5.3). A core combat-feel feature still missing. Symmetric-pause simplification (hitshake
   nuance deferred). Deps: 6.x combat. *(via fp-loop-batch wferstbec)*
+- **6.6** DONE — **Power / super meter gain** (`fp-character`, single-crate). `Character.power` existed
+  + the `Power` trigger read it, but power was NEVER increased → KFM supers (gated `power >= 1000`)
+  unreachable. Apply the `[Statedef]` header `poweradd` on state entry (KFM's meter source — every
+  attack state adds power) + implement the `PowerAdd`/`PowerSet` controllers; clamp to `[0,power_max]`.
+  Enables KFM's signature super moves. Deps: 6.x. *(via fp-loop-batch wfh9xkpkd)*
 
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).

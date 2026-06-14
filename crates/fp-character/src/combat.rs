@@ -685,6 +685,7 @@ mod tests {
             anim: None,
             ctrl: None,
             velset: None,
+            poweradd: None,
             controllers: Vec::new(),
         }
     }

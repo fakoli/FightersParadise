@@ -327,8 +327,9 @@ impl CompiledController {
 /// controllers with compiled triggers and parameters.
 ///
 /// The raw header fields (`type`, `movetype`, …) are preserved verbatim from the
-/// parser; the executor interprets them. The `anim` entry expression and the
-/// `velset` initial velocity are also compiled where present.
+/// parser; the executor interprets them. The `anim` and `poweradd` entry
+/// expressions are compiled, and the `velset` initial velocity is preserved,
+/// where present.
 #[derive(Debug, Clone)]
 pub struct CompiledState {
     /// The state number.
@@ -345,6 +346,14 @@ pub struct CompiledState {
     pub ctrl: Option<CompiledExpr>,
     /// `velset` — raw velocity-on-entry string (`x, y`), preserved verbatim.
     pub velset: Option<String>,
+    /// `poweradd` — power to add to the super meter on entry, compiled
+    /// expression. Applied once per state entry by the executor, clamped to
+    /// `[0, power_max]`. Absent (the common case) adds nothing.
+    ///
+    /// MUGEN attack states fill the power bar via this `[Statedef]` header
+    /// param (e.g. KFM's `[Statedef 200] poweradd = 10`), which is how supers
+    /// gated on `power >= 1000` become reachable.
+    pub poweradd: Option<CompiledExpr>,
     /// The controllers belonging to this state, in file order, compiled.
     pub controllers: Vec<CompiledController>,
 }
@@ -360,6 +369,7 @@ impl CompiledState {
             anim: def.anim.as_deref().map(CompiledExpr::compile),
             ctrl: def.ctrl.as_deref().map(CompiledExpr::compile),
             velset: def.velset.clone(),
+            poweradd: def.poweradd.as_deref().map(CompiledExpr::compile),
             controllers: def.controllers.iter().map(CompiledController::from_parsed).collect(),
         }
     }
@@ -1135,6 +1145,67 @@ mod tests {
         let bad = ctrl.params.get("bad").expect("bad param present");
         assert_eq!(bad.len(), 1);
         assert!(bad.component(0).is_some_and(|c| c.is_fallback));
+    }
+
+    // ---- 6.6 (Proctor): Statedef `poweradd` header param compiles into
+    // CompiledState. AC1's first half — the *parsing* side — lives here; the
+    // executor module tests the *applied-on-entry* side. ----
+
+    #[test]
+    fn from_parsed_compiles_statedef_poweradd_header() {
+        // AC1 (parse side): a `[Statedef]` header `poweradd = 10` must surface as
+        // a non-fallback compiled entry expression on the CompiledState. This is
+        // the KFM attack-state shape (e.g. `[Statedef 200] poweradd = 10`).
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\n\
+             type = S\n\
+             anim = 200\n\
+             poweradd = 10\n",
+        )
+        .unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        let pa = state.poweradd.as_ref().expect("poweradd compiled into CompiledState");
+        assert!(!pa.is_fallback, "literal `10` compiles cleanly");
+        assert_eq!(pa.source, "10", "raw source preserved verbatim");
+        assert_eq!(pa.expr, Expr::Int(10));
+    }
+
+    #[test]
+    fn from_parsed_poweradd_absent_is_none() {
+        // AC1: a statedef with NO `poweradd` header yields `None` (so the
+        // executor adds nothing on entry — the common case for non-attack states).
+        let cns = CnsFile::from_str("[Statedef 0]\ntype = S\nanim = 0\n").unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        assert!(state.poweradd.is_none(), "no poweradd header -> None");
+    }
+
+    #[test]
+    fn from_parsed_poweradd_expression_is_compiled_not_evaluated() {
+        // AC1: `poweradd` is an EXPRESSION (compiled at load), not a fixed int.
+        // A trigger-bearing value compiles to a non-fallback expr; evaluation is
+        // the executor's job. (Tests the compile step keeps non-literal source.)
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\ntype = S\nanim = 200\npoweradd = 5 + 5\n",
+        )
+        .unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        let pa = state.poweradd.as_ref().expect("poweradd present");
+        assert!(!pa.is_fallback, "`5 + 5` is a valid expression");
+        assert_eq!(pa.source, "5 + 5");
+    }
+
+    #[test]
+    fn from_parsed_poweradd_malformed_is_const_zero_fallback() {
+        // AC3: a garbage `poweradd` value compiles to the const-0 fallback (never
+        // panics, never an Err) — on entry the executor adds 0.
+        let cns = CnsFile::from_str(
+            "[Statedef 200]\ntype = S\nanim = 200\npoweradd = 1 +\n",
+        )
+        .unwrap();
+        let state = CompiledState::from_parsed(&cns.statedefs[0]);
+        let pa = state.poweradd.as_ref().expect("poweradd present even when malformed");
+        assert!(pa.is_fallback, "malformed `1 +` -> const-0 fallback");
+        assert_eq!(pa.expr, Expr::Int(0));
     }
 
     // ---- 6.2b: multi-component param model (top-level comma split) ----

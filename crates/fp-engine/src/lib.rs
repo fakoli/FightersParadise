@@ -2539,6 +2539,7 @@ time = 1
             anim: None,
             ctrl: None,
             velset: None,
+            poweradd: None,
             controllers: vec![controller],
         }
     }
