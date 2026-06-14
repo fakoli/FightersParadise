@@ -51,3 +51,5 @@ bytemuck = { version = "1", features = ["derive"] }
 rodio = "0.20"
 slotmap = "1"
 pollster = "0.4"
+# Dev-only: property/fuzz testing (fp-vm never-panic contract, audit #37).
+proptest = "1"
