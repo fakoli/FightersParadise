@@ -398,9 +398,17 @@ impl Default for SizeConstants {
 /// pixels/tick.
 ///
 /// Velocities are stored as `(x, y)` pairs. Forward velocities assume facing
-/// right; the executor mirrors them by [`Facing::sign`]. Only the fields needed
-/// for basic locomotion are modeled (walk forward/back, run forward, neutral
-/// and up jump); the air-recover velocities and run-jump pairs are not read yet.
+/// right; the executor mirrors them by [`Facing::sign`]. The fields needed for
+/// locomotion and jumping are modeled: walk forward/back, run forward/back,
+/// neutral / forward / back ground jumps, running jumps, and air jumps. Several
+/// of these are read by `common1.cns` via `const(velocity.*)` to seed the
+/// `velset` of jump/run states; before they were modeled those reads resolved
+/// to `0`, so forward/back/run/air jumps all rose straight up.
+///
+/// MUGEN authors most x-axis jump speeds as bare scalars (e.g. `jump.fwd = 2.5`)
+/// whose stored `y` is `0`; the y component of a jump comes from `jump.neu.y`
+/// (mirrored into [`jump_up`](Self::jump_up)) or, for air jumps, from
+/// `airjump.neu.y` (mirrored into [`airjump_y`](Self::airjump_y)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VelocityConstants {
     /// `walk.fwd` — forward walking velocity `(x, y)`. MUGEN authors this as a
@@ -410,23 +418,58 @@ pub struct VelocityConstants {
     pub walk_back: Vec2<f32>,
     /// `run.fwd` — forward running velocity `(x, y)`.
     pub run_fwd: Vec2<f32>,
+    /// `run.back` — backward running (hop) velocity `(x, y)` (x is negative; KFM
+    /// gives it a negative `y`, i.e. an upward hop).
+    pub run_back: Vec2<f32>,
     /// `jump.neu` — neutral jump velocity `(x, y)` (y is negative = upward).
     pub jump_neu: Vec2<f32>,
+    /// `jump.fwd` — forward ground-jump velocity `(x, y)`. MUGEN authors this as
+    /// a bare x value; the jump's y comes from [`jump_up`](Self::jump_up).
+    pub jump_fwd: Vec2<f32>,
+    /// `jump.back` — backward ground-jump velocity `(x, y)` (x is negative). The
+    /// jump's y comes from [`jump_up`](Self::jump_up).
+    pub jump_back: Vec2<f32>,
+    /// `runjump.fwd` — forward running-jump velocity `(x, y)`.
+    pub runjump_fwd: Vec2<f32>,
+    /// `runjump.back` — backward running-jump velocity `(x, y)` (x is negative).
+    pub runjump_back: Vec2<f32>,
+    /// `airjump.neu` — neutral air-jump velocity `(x, y)` (y is negative =
+    /// upward).
+    pub airjump_neu: Vec2<f32>,
+    /// `airjump.fwd` — forward air-jump velocity `(x, y)`. MUGEN authors this as
+    /// a bare x value; the air-jump y comes from [`airjump_y`](Self::airjump_y).
+    pub airjump_fwd: Vec2<f32>,
+    /// `airjump.back` — backward air-jump velocity `(x, y)` (x is negative). The
+    /// air-jump y comes from [`airjump_y`](Self::airjump_y).
+    pub airjump_back: Vec2<f32>,
     /// `jump.up` y-velocity — the upward jump speed. MUGEN derives jump y from
     /// `jump.neu.y`; when an explicit `jump.up` is absent this mirrors
     /// `jump_neu.y`.
     pub jump_up: f32,
+    /// `airjump.y` y-velocity — the upward air-jump speed. MUGEN derives air-jump
+    /// y from `airjump.neu.y`; when an explicit `airjump.y` is absent this
+    /// mirrors `airjump_neu.y`. Read by `common1` as `const(velocity.airjump.y)`.
+    pub airjump_y: f32,
 }
 
 impl Default for VelocityConstants {
     fn default() -> Self {
-        // KFM's authored values.
+        // KFM's authored values (kfm.cns [Velocity]).
         Self {
             walk_fwd: Vec2::new(2.4, 0.0),
             walk_back: Vec2::new(-2.2, 0.0),
             run_fwd: Vec2::new(4.6, 0.0),
+            run_back: Vec2::new(-4.5, -3.8),
             jump_neu: Vec2::new(0.0, -8.4),
+            jump_fwd: Vec2::new(2.5, 0.0),
+            jump_back: Vec2::new(-2.55, 0.0),
+            runjump_fwd: Vec2::new(4.0, -8.1),
+            runjump_back: Vec2::new(-2.55, -8.1),
+            airjump_neu: Vec2::new(0.0, -8.1),
+            airjump_fwd: Vec2::new(2.5, 0.0),
+            airjump_back: Vec2::new(-2.55, 0.0),
             jump_up: -8.4,
+            airjump_y: -8.1,
         }
     }
 }
@@ -1060,7 +1103,13 @@ impl Character {
     ///
     /// - `velocity.walk.fwd.x` / `velocity.walk.back.x`
     /// - `velocity.run.fwd.x` / `velocity.run.fwd.y`
+    /// - `velocity.run.back.x` / `velocity.run.back.y`
     /// - `velocity.jump.neu.x` / `velocity.jump.y`
+    /// - `velocity.jump.fwd.x` / `velocity.jump.back.x`
+    /// - `velocity.runjump.fwd.x` / `velocity.runjump.fwd.y`
+    /// - `velocity.runjump.back.x` / `velocity.runjump.back.y`
+    /// - `velocity.airjump.neu.x` / `velocity.airjump.fwd.x` /
+    ///   `velocity.airjump.back.x` / `velocity.airjump.y`
     /// - `size.ground.front` / `size.ground.back` / `size.height`
     /// - `movement.yaccel` / `movement.stand.friction` / `movement.crouch.friction`
     /// - `data.life` / `data.power` / `data.attack` / `data.defence`
@@ -1108,11 +1157,47 @@ impl Character {
         if m.eq_ignore_ascii_case("velocity.run.fwd.y") {
             return Value::Float(c.velocity.run_fwd.y);
         }
+        if m.eq_ignore_ascii_case("velocity.run.back.x") {
+            return Value::Float(c.velocity.run_back.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.run.back.y") {
+            return Value::Float(c.velocity.run_back.y);
+        }
         if m.eq_ignore_ascii_case("velocity.jump.neu.x") {
             return Value::Float(c.velocity.jump_neu.x);
         }
+        if m.eq_ignore_ascii_case("velocity.jump.fwd.x") {
+            return Value::Float(c.velocity.jump_fwd.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.jump.back.x") {
+            return Value::Float(c.velocity.jump_back.x);
+        }
         if m.eq_ignore_ascii_case("velocity.jump.y") {
             return Value::Float(c.velocity.jump_up);
+        }
+        if m.eq_ignore_ascii_case("velocity.runjump.fwd.x") {
+            return Value::Float(c.velocity.runjump_fwd.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.runjump.fwd.y") {
+            return Value::Float(c.velocity.runjump_fwd.y);
+        }
+        if m.eq_ignore_ascii_case("velocity.runjump.back.x") {
+            return Value::Float(c.velocity.runjump_back.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.runjump.back.y") {
+            return Value::Float(c.velocity.runjump_back.y);
+        }
+        if m.eq_ignore_ascii_case("velocity.airjump.neu.x") {
+            return Value::Float(c.velocity.airjump_neu.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.airjump.fwd.x") {
+            return Value::Float(c.velocity.airjump_fwd.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.airjump.back.x") {
+            return Value::Float(c.velocity.airjump_back.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.airjump.y") {
+            return Value::Float(c.velocity.airjump_y);
         }
         if m.eq_ignore_ascii_case("movement.yaccel") {
             return Value::Float(c.movement.yaccel);
@@ -2075,8 +2160,17 @@ mod tests {
                 walk_fwd: Vec2::new(2.7, 0.0),
                 walk_back: Vec2::new(-2.1, 0.0),
                 run_fwd: Vec2::new(4.9, -1.5),
+                run_back: Vec2::new(-4.3, -3.2),
                 jump_neu: Vec2::new(0.3, -8.1),
+                jump_fwd: Vec2::new(2.6, 0.0),
+                jump_back: Vec2::new(-2.55, 0.0),
+                runjump_fwd: Vec2::new(4.1, -8.2),
+                runjump_back: Vec2::new(-2.65, -8.3),
+                airjump_neu: Vec2::new(0.1, -8.0),
+                airjump_fwd: Vec2::new(2.45, 0.0),
+                airjump_back: Vec2::new(-2.35, 0.0),
                 jump_up: -8.6,
+                airjump_y: -7.9,
             },
             movement: MovementConstants {
                 yaccel: 0.5,
@@ -2091,6 +2185,240 @@ mod tests {
     fn const_resolves_velocity_members() {
         let ch = const_sample();
         // Float members thread through the float path via direct equality.
+        assert_eq!(ch.trigger_str("const", "velocity.walk.fwd.x"), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "velocity.walk.back.x"), Value::Float(-2.1));
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+    }
+
+    #[test]
+    fn const_resolves_movement_velocity_members() {
+        // A.P4: the jump/run/runjump/airjump movement velocities common1 reads
+        // via const(velocity.*). const_sample() makes every value distinct so a
+        // mis-mapping (aliasing or x/y transposition) is caught.
+        let ch = const_sample();
+        let float_pairs = [
+            ("velocity.run.back.x", -4.3f32),
+            ("velocity.run.back.y", -3.2),
+            ("velocity.jump.fwd.x", 2.6),
+            ("velocity.jump.back.x", -2.55),
+            ("velocity.runjump.fwd.x", 4.1),
+            ("velocity.runjump.fwd.y", -8.2),
+            ("velocity.runjump.back.x", -2.65),
+            ("velocity.runjump.back.y", -8.3),
+            ("velocity.airjump.neu.x", 0.1),
+            ("velocity.airjump.fwd.x", 2.45),
+            ("velocity.airjump.back.x", -2.35),
+            ("velocity.airjump.y", -7.9),
+        ];
+        for (m, want) in float_pairs {
+            assert_eq!(ch.trigger_str("const", m), Value::Float(want), "member `{m}`");
+        }
+    }
+
+    #[test]
+    fn const_movement_velocity_match_is_case_insensitive() {
+        // The full dotted name folds case for the new members exactly like the
+        // existing ones (axis suffix included).
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "Velocity.Jump.Fwd.X"), Value::Float(2.6));
+        assert_eq!(ch.trigger_str("const", "VELOCITY.AIRJUMP.FWD.X"), Value::Float(2.45));
+        assert_eq!(ch.trigger_str("const", "velocity.RunJump.Fwd.Y"), Value::Float(-8.2));
+        assert_eq!(ch.trigger_str("const", "Velocity.AirJump.Y"), Value::Float(-7.9));
+    }
+
+    #[test]
+    fn const_movement_velocity_routes_through_parse_and_eval() {
+        // End-to-end via fp_vm::parse_str + eval, mirroring how common1 reads
+        // these in a `velset` expression.
+        let ch = const_sample();
+        assert_eq!(ev("const(velocity.jump.fwd.x) = 2.6", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.back.x) = -2.55", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.run.back.x) = -4.3", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.runjump.fwd.x) = 4.1", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.45", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.y) = -7.9", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_default_character_movement_velocities_are_kfm_baseline() {
+        // A default Character resolves the KFM-baseline movement velocities the
+        // VelocityConstants defaults encode (kfm.cns [Velocity]).
+        let ch = Character::new();
+        assert_eq!(ev("const(velocity.jump.fwd.x) = 2.5", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.back.x) = -2.55", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.run.back.x) = -4.5", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.runjump.fwd.x) = 4", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.5", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.y) = -8.1", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_real_kfm_jump_and_airjump_are_nonzero() {
+        // Gated real-fixture test: load KFM and assert const(velocity.jump.fwd.x)
+        // and an airjump const are nonzero (KFM authored values), proving
+        // common1 jumpstart/airjump velset will move horizontally. Skip-if-absent.
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        let ch = Character::with_constants(loaded.constants);
+        // Nonzero is the load-bearing property (the bug fixed here); the exact
+        // KFM values are asserted in the loader's gated test.
+        assert_eq!(ev("const(velocity.jump.fwd.x) != 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.fwd.x) != 0", &ch), Value::Int(1));
+        // And they match KFM's authored 2.5 for both.
+        assert_eq!(ev("const(velocity.jump.fwd.x) = 2.5", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.5", &ch), Value::Int(1));
+    }
+
+    // ---- A.P4 (Proctor): edge cases, error paths, MUGEN semantics ----------
+
+    #[test]
+    fn const_unknown_movement_velocity_members_are_safe_default() {
+        // Every plausible typo / unmodeled sub-member of the new groups resolves
+        // to the safe default 0 and never panics — the task's explicit "unknown
+        // const still returns 0" requirement applied to the new surface.
+        let ch = const_sample();
+        for m in [
+            // `.y` of the bare-x ground/air jumps is intentionally NOT a const
+            // member (common1 reads the shared velocity.jump.y / velocity.airjump.y
+            // for the vertical component, never a per-direction `.y`).
+            "velocity.jump.fwd.y",
+            "velocity.jump.back.y",
+            "velocity.airjump.fwd.y",
+            "velocity.airjump.back.y",
+            // Bogus axis suffix / missing axis / nonexistent group.
+            "velocity.airjump.neu.z",
+            "velocity.airjump.fwd",
+            "velocity.runjump",
+            "velocity.run.sideways.x",
+            "velocity.jump.diag.x",
+        ] {
+            assert_eq!(
+                ch.trigger_str("const", m),
+                Value::DEFAULT,
+                "unknown member `{m}` must default to 0, not panic or alias"
+            );
+        }
+    }
+
+    #[test]
+    fn const_jump_fwd_x_and_jump_y_are_distinct_members() {
+        // MUGEN semantics: the horizontal directional jump speed (jump.fwd.x) and
+        // the vertical jump speed (jump.y -> jump_up) are independent const
+        // members; a mis-map that aliased the directional jump's stored `y` would
+        // surface here. const_sample(): jump_fwd = (2.6, 0), jump_up = -8.6.
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "velocity.jump.fwd.x"), Value::Float(2.6));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+        // The bare-x jump's own `.y` is unmapped (defaults to 0), proving the
+        // vertical speed never leaks through the directional member.
+        assert_eq!(ch.trigger_str("const", "velocity.jump.fwd.y"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("const", "velocity.airjump.fwd.y"), Value::DEFAULT);
+    }
+
+    #[test]
+    fn const_common1_jumpstart_velset_resolves_horizontal_motion() {
+        // Replicate common1.cns State 40 (JumpStart) controllers 4 & 5 verbatim:
+        //   x = ifelse(sysvar(1)=0, const(velocity.jump.neu.x),
+        //        ifelse(sysvar(1)=1, const(velocity.jump.fwd.x),
+        //               const(velocity.jump.back.x)))
+        //   y = const(velocity.jump.y)
+        //   (running jump) x = const(velocity.runjump.fwd.x)
+        // sysvar(1) selects neutral(0)/forward(1)/back(2). Because sysvar reads
+        // back 0 in this synthetic context, drive the branch with an explicit
+        // const compare per direction instead, then prove each yields the
+        // authored nonzero horizontal speed. const_sample(): jump_fwd=(2.6,..),
+        // jump_back=(-2.55,..), runjump_fwd=(4.1,..), jump_up=-8.6.
+        let ch = const_sample();
+        // Forward branch.
+        assert_eq!(
+            ev("ifelse(0=1, const(velocity.jump.fwd.x), const(velocity.jump.fwd.x)) = 2.6", &ch),
+            Value::Int(1)
+        );
+        // The exact nested-ifelse shape common1 uses, forced down each arm.
+        assert_eq!(
+            ev(
+                "ifelse(1=0, const(velocity.jump.neu.x), ifelse(1=1, const(velocity.jump.fwd.x), const(velocity.jump.back.x))) = 2.6",
+                &ch
+            ),
+            Value::Int(1),
+            "forward jump arm -> jump.fwd.x"
+        );
+        assert_eq!(
+            ev(
+                "ifelse(2=0, const(velocity.jump.neu.x), ifelse(2=1, const(velocity.jump.fwd.x), const(velocity.jump.back.x))) = -2.55",
+                &ch
+            ),
+            Value::Int(1),
+            "back jump arm -> jump.back.x"
+        );
+        // The vertical component and the running-jump horizontal component.
+        assert_eq!(ev("const(velocity.jump.y) = -8.6", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.runjump.fwd.x) = 4.1", &ch), Value::Int(1));
+        // The load-bearing property: the forward/back arms are nonzero, so the
+        // VelSet moves horizontally instead of straight up.
+        assert_eq!(ev("const(velocity.jump.fwd.x) != 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.back.x) != 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.runjump.fwd.x) != 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_common1_airjump_velset_resolves_horizontal_motion() {
+        // Replicate common1.cns State 45 (AirJump) controller verbatim:
+        //   x = ifelse(sysvar(1)=0, const(velocity.airjump.neu.x),
+        //        ifelse(sysvar(1)=1, const(velocity.airjump.fwd.x),
+        //               const(velocity.airjump.back.x)))
+        //   y = const(velocity.airjump.y)
+        // const_sample(): airjump_neu=(0.1,..), airjump_fwd=(2.45,..),
+        // airjump_back=(-2.35,..), airjump_y=-7.9.
+        let ch = const_sample();
+        assert_eq!(
+            ev(
+                "ifelse(1=0, const(velocity.airjump.neu.x), ifelse(1=1, const(velocity.airjump.fwd.x), const(velocity.airjump.back.x))) = 2.45",
+                &ch
+            ),
+            Value::Int(1),
+            "forward air-jump arm -> airjump.fwd.x"
+        );
+        assert_eq!(
+            ev(
+                "ifelse(2=0, const(velocity.airjump.neu.x), ifelse(2=1, const(velocity.airjump.fwd.x), const(velocity.airjump.back.x))) = -2.35",
+                &ch
+            ),
+            Value::Int(1),
+            "back air-jump arm -> airjump.back.x"
+        );
+        assert_eq!(ev("const(velocity.airjump.y) = -7.9", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.fwd.x) != 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.airjump.back.x) != 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_run_back_velset_resolves_both_components() {
+        // common1.cns State 105 (run back / hop) reads both axes:
+        //   x = const(velocity.run.back.x)   y = const(velocity.run.back.y)
+        // const_sample(): run_back = (-4.3, -3.2). Both must be the authored
+        // (distinct, nonzero) components.
+        let ch = const_sample();
+        assert_eq!(ev("const(velocity.run.back.x) = -4.3", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.run.back.y) = -3.2", &ch), Value::Int(1));
+        // x and y are distinct fields, not aliased.
+        assert_eq!(ev("const(velocity.run.back.x) = const(velocity.run.back.y)", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn const_previously_mapped_velocities_still_resolve() {
+        // Regression guard: the walk / run.fwd / jump.neu / jump.y members that
+        // existed before A.P4 must keep resolving unchanged alongside the new ones.
+        let ch = const_sample();
         assert_eq!(ch.trigger_str("const", "velocity.walk.fwd.x"), Value::Float(2.7));
         assert_eq!(ch.trigger_str("const", "velocity.walk.back.x"), Value::Float(-2.1));
         assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));

@@ -961,9 +961,16 @@ fn read_size_group(ini: &DefFile, size: &mut SizeConstants) {
     }
 }
 
-/// Reads the `[Velocity]` group: walk and jump velocities. Each entry may be a
-/// bare scalar (x only, y defaults to `0`) or an `x, y` pair; missing/malformed
-/// fields keep their default.
+/// Reads the `[Velocity]` group: walk, run, jump, run-jump and air-jump
+/// velocities. Each entry may be a bare scalar (x only, y defaults to `0`) or an
+/// `x, y` pair; missing/malformed fields keep their default (never an error).
+///
+/// MUGEN authors the horizontal jump speeds (`jump.fwd`, `jump.back`,
+/// `airjump.fwd`, `airjump.back`) as bare x values — their stored `y` is `0`,
+/// and the actual jump's vertical speed comes from `jump.up`/`airjump.y`
+/// (themselves derived from `jump.neu.y`/`airjump.neu.y`). `common1.cns` reads
+/// these via `const(velocity.*)`; without them every directional jump resolved
+/// to `0` horizontal velocity and rose straight up.
 fn read_velocity_group(ini: &DefFile, vel: &mut VelocityConstants) {
     if let Some(v) = ini.get("Velocity", "walk.fwd").and_then(parse_vec2) {
         vel.walk_fwd = v;
@@ -974,17 +981,50 @@ fn read_velocity_group(ini: &DefFile, vel: &mut VelocityConstants) {
     if let Some(v) = ini.get("Velocity", "run.fwd").and_then(parse_vec2) {
         vel.run_fwd = v;
     }
+    if let Some(v) = ini.get("Velocity", "run.back").and_then(parse_vec2) {
+        vel.run_back = v;
+    }
     if let Some(v) = ini.get("Velocity", "jump.neu").and_then(parse_vec2) {
         vel.jump_neu = v;
         // MUGEN derives the upward jump speed from jump.neu's y unless an
         // explicit jump.up is authored.
         vel.jump_up = v.y;
     }
+    if let Some(v) = ini.get("Velocity", "jump.fwd").and_then(parse_vec2) {
+        vel.jump_fwd = v;
+    }
+    if let Some(v) = ini.get("Velocity", "jump.back").and_then(parse_vec2) {
+        vel.jump_back = v;
+    }
     // An explicit `jump.up` (an upward jump velocity on some characters)
     // overrides the jump.neu-derived value.
     if let Some(raw) = ini.get("Velocity", "jump.up") {
         if let Some(up) = parse_jump_up(raw) {
             vel.jump_up = up;
+        }
+    }
+    if let Some(v) = ini.get("Velocity", "runjump.fwd").and_then(parse_vec2) {
+        vel.runjump_fwd = v;
+    }
+    if let Some(v) = ini.get("Velocity", "runjump.back").and_then(parse_vec2) {
+        vel.runjump_back = v;
+    }
+    if let Some(v) = ini.get("Velocity", "airjump.neu").and_then(parse_vec2) {
+        vel.airjump_neu = v;
+        // As with jump.up, the upward air-jump speed is derived from
+        // airjump.neu's y unless an explicit airjump.y is authored.
+        vel.airjump_y = v.y;
+    }
+    if let Some(v) = ini.get("Velocity", "airjump.fwd").and_then(parse_vec2) {
+        vel.airjump_fwd = v;
+    }
+    if let Some(v) = ini.get("Velocity", "airjump.back").and_then(parse_vec2) {
+        vel.airjump_back = v;
+    }
+    // An explicit `airjump.y` overrides the airjump.neu-derived value.
+    if let Some(raw) = ini.get("Velocity", "airjump.y") {
+        if let Some(up) = parse_jump_up(raw) {
+            vel.airjump_y = up;
         }
     }
 }
@@ -2433,6 +2473,245 @@ mod tests {
         assert!((consts.velocity.jump_neu.y - (-8.4)).abs() < 1e-6);
         assert!((consts.velocity.jump_up - (-9.5)).abs() < 1e-6, "explicit jump.up wins");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- A.P4: jump/run/runjump/airjump movement velocities --------------------
+
+    #[test]
+    fn load_constants_reads_movement_velocity_group() {
+        // The full KFM [Velocity] surface: bare-scalar directional jumps, pair
+        // run/runjump, and airjump (whose y derives from airjump.neu.y). Values
+        // are KFM's authored ones (kfm.cns [Velocity]).
+        let dir = scratch_dir("consts_move_velocity");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Velocity]\n\
+             run.fwd = 4.6, 0\nrun.back = -4.5,-3.8\n\
+             jump.neu = 0,-8.4\njump.fwd = 2.5\njump.back = -2.55\n\
+             runjump.fwd = 4,-8.1\nrunjump.back = -2.55,-8.1\n\
+             airjump.neu = 0,-8.1\nairjump.fwd = 2.5\nairjump.back = -2.55\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let v = consts.velocity;
+        // run.back pair (x, y).
+        assert!((v.run_back.x - (-4.5)).abs() < 1e-6);
+        assert!((v.run_back.y - (-3.8)).abs() < 1e-6);
+        // Bare-scalar directional ground jumps: x set, y = 0.
+        assert!((v.jump_fwd.x - 2.5).abs() < 1e-6);
+        assert!((v.jump_fwd.y - 0.0).abs() < 1e-6);
+        assert!((v.jump_back.x - (-2.55)).abs() < 1e-6);
+        // runjump pairs.
+        assert!((v.runjump_fwd.x - 4.0).abs() < 1e-6);
+        assert!((v.runjump_fwd.y - (-8.1)).abs() < 1e-6);
+        assert!((v.runjump_back.x - (-2.55)).abs() < 1e-6);
+        assert!((v.runjump_back.y - (-8.1)).abs() < 1e-6);
+        // airjump: neu pair, bare-scalar fwd/back, y derived from airjump.neu.y.
+        assert!((v.airjump_neu.x - 0.0).abs() < 1e-6);
+        assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
+        assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6);
+        assert!((v.airjump_y - (-8.1)).abs() < 1e-6, "airjump.y derived from airjump.neu.y");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_explicit_airjump_y_overrides_airjump_neu() {
+        // An explicit airjump.y overrides the airjump.neu-derived value, mirroring
+        // the jump.up / jump.neu relationship.
+        let dir = scratch_dir("consts_airjumpy");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\nairjump.neu = 0,-8.1\nairjump.y = -9.0\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert!((consts.velocity.airjump_neu.y - (-8.1)).abs() < 1e-6);
+        assert!(
+            (consts.velocity.airjump_y - (-9.0)).abs() < 1e-6,
+            "explicit airjump.y wins"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_absent_movement_velocities_keep_defaults() {
+        // A [Velocity] with only walk keys leaves the new movement velocities at
+        // their MUGEN-sane defaults — never an error, never silently 0.
+        let dir = scratch_dir("consts_velocity_absent");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Velocity]\nwalk.fwd = 2.4\n");
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let d = VelocityConstants::default();
+        let v = consts.velocity;
+        assert!((v.run_back.x - d.run_back.x).abs() < 1e-6);
+        assert!((v.jump_fwd.x - d.jump_fwd.x).abs() < 1e-6);
+        assert!((v.jump_back.x - d.jump_back.x).abs() < 1e-6);
+        assert!((v.runjump_fwd.x - d.runjump_fwd.x).abs() < 1e-6);
+        assert!((v.runjump_back.x - d.runjump_back.x).abs() < 1e-6);
+        assert!((v.airjump_neu.y - d.airjump_neu.y).abs() < 1e-6);
+        assert!((v.airjump_fwd.x - d.airjump_fwd.x).abs() < 1e-6);
+        assert!((v.airjump_back.x - d.airjump_back.x).abs() < 1e-6);
+        assert!((v.airjump_y - d.airjump_y).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_fixture_kfm_movement_velocities_nonzero() {
+        // Gated real-KFM test: load kfm.def and assert the authored directional
+        // jump / airjump velocities match KFM and are nonzero, so common1's
+        // jumpstart/airjump `velset = const(velocity.*)` will move horizontally.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        let v = loaded.constants.velocity;
+        // KFM authored values (kfm.cns [Velocity]).
+        assert!((v.jump_fwd.x - 2.5).abs() < 1e-6, "jump.fwd.x");
+        assert!((v.jump_back.x - (-2.55)).abs() < 1e-6, "jump.back.x");
+        assert!((v.run_back.x - (-4.5)).abs() < 1e-6, "run.back.x");
+        assert!((v.runjump_fwd.x - 4.0).abs() < 1e-6, "runjump.fwd.x");
+        assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6, "airjump.fwd.x");
+        assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6, "airjump.back.x");
+        assert!((v.airjump_y - (-8.1)).abs() < 1e-6, "airjump.y derived from airjump.neu.y");
+        // The load-bearing assertion: these must be nonzero (the bug fixed here).
+        assert!(v.jump_fwd.x.abs() > 1e-6, "jump.fwd.x must not be 0");
+        assert!(v.airjump_fwd.x.abs() > 1e-6, "airjump.fwd.x must not be 0");
+        assert!(v.runjump_fwd.x.abs() > 1e-6, "runjump.fwd.x must not be 0");
+    }
+
+    // ---- A.P4 (Proctor): error paths & MUGEN semantics for the new keys ----
+
+    #[test]
+    fn load_constants_malformed_movement_velocities_keep_defaults_no_error() {
+        // Every new key set to garbage: the loader must keep the per-field default
+        // and never error/panic (MUGEN "never crash on bad content"). A bad first
+        // component (parse_vec2 -> None) leaves the whole field at its default.
+        let dir = scratch_dir("consts_move_velocity_garbage");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Velocity]\n\
+             run.back = fast\njump.fwd = nope\njump.back = -\n\
+             runjump.fwd = x,y\nrunjump.back = ,\n\
+             airjump.neu = bad\nairjump.fwd = NaNN\nairjump.back = ??\nairjump.y = oops\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        // No panic on load; values fall back to defaults.
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        let d = VelocityConstants::default();
+        let v = consts.velocity;
+        assert!((v.run_back.x - d.run_back.x).abs() < 1e-6);
+        assert!((v.jump_fwd.x - d.jump_fwd.x).abs() < 1e-6);
+        assert!((v.jump_back.x - d.jump_back.x).abs() < 1e-6);
+        assert!((v.runjump_fwd.x - d.runjump_fwd.x).abs() < 1e-6);
+        assert!((v.runjump_back.x - d.runjump_back.x).abs() < 1e-6);
+        assert!((v.airjump_neu.y - d.airjump_neu.y).abs() < 1e-6);
+        assert!((v.airjump_fwd.x - d.airjump_fwd.x).abs() < 1e-6);
+        assert!((v.airjump_back.x - d.airjump_back.x).abs() < 1e-6);
+        // Malformed airjump.neu means its y can't seed airjump_y; malformed
+        // airjump.y can't override it either, so airjump_y keeps its default.
+        assert!((v.airjump_y - d.airjump_y).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_no_velocity_section_keeps_all_defaults() {
+        // A character with no [Velocity] section at all: every velocity field
+        // (old and new) stays at its KFM-baseline default; load never errors.
+        let dir = scratch_dir("consts_no_velocity_section");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n");
+        let parsed = DefFile::load(&def).unwrap();
+        let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
+        assert_eq!(consts.velocity, VelocityConstants::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_bare_scalar_jump_forces_y_zero_among_pairs() {
+        // MUGEN semantics: a bare-scalar directional jump (jump.fwd = 2.5) stores
+        // y = 0 even when sibling entries in the same section are `x, y` pairs.
+        // A leak of the neighbor's y into the bare field would surface here.
+        let dir = scratch_dir("consts_bare_among_pairs");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n\
+             [Velocity]\n\
+             runjump.fwd = 4, -8.1\njump.fwd = 2.5\nrunjump.back = -2.55, -8.1\n\
+             airjump.neu = 0, -8.1\nairjump.fwd = 2.5\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let v = load_constants(&parsed, &def, &["chr.cns".to_string()]).velocity;
+        assert!((v.jump_fwd.x - 2.5).abs() < 1e-6);
+        assert!(v.jump_fwd.y.abs() < 1e-6, "bare jump.fwd y must be 0, not the pair sibling's y");
+        assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
+        assert!(v.airjump_fwd.y.abs() < 1e-6, "bare airjump.fwd y must be 0");
+        // The pairs keep their authored y.
+        assert!((v.runjump_fwd.y - (-8.1)).abs() < 1e-6);
+        assert!((v.airjump_neu.y - (-8.1)).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_constants_airjump_y_derives_from_neu_when_only_neu_present() {
+        // Mirror of the jump.up/jump.neu rule for air jumps: with airjump.neu set
+        // and no explicit airjump.y, airjump_y takes airjump.neu's y component.
+        let dir = scratch_dir("consts_airjumpy_derived");
+        let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\nairjump.neu = 0, -7.25\n",
+        );
+        let parsed = DefFile::load(&def).unwrap();
+        let v = load_constants(&parsed, &def, &["chr.cns".to_string()]).velocity;
+        assert!(
+            (v.airjump_y - (-7.25)).abs() < 1e-6,
+            "airjump.y must derive from airjump.neu.y when no explicit airjump.y"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_velocity_group_directly_maps_kfm_exact_keys() {
+        // Drive read_velocity_group with the EXACT key spellings + values from
+        // test-assets/kfm/kfm.cns [Velocity], starting from defaults. This locks
+        // the loader's key names to KFM's authored ones independent of the .def
+        // file-resolution path.
+        let ini = DefFile::from_str(
+            "[Velocity]\n\
+             walk.fwd  = 2.4\nwalk.back = -2.2\n\
+             run.fwd  = 4.6, 0\nrun.back = -4.5,-3.8\n\
+             jump.neu = 0,-8.4\njump.back = -2.55\njump.fwd = 2.5\n\
+             runjump.back = -2.55,-8.1\nrunjump.fwd = 4,-8.1\n\
+             airjump.neu = 0,-8.1\nairjump.back = -2.55\nairjump.fwd = 2.5\n",
+        )
+        .expect("synthetic [Velocity] should parse");
+        let mut v = VelocityConstants::default();
+        read_velocity_group(&ini, &mut v);
+        assert!((v.run_back.x - (-4.5)).abs() < 1e-6);
+        assert!((v.run_back.y - (-3.8)).abs() < 1e-6);
+        assert!((v.jump_fwd.x - 2.5).abs() < 1e-6);
+        assert!((v.jump_back.x - (-2.55)).abs() < 1e-6);
+        assert!((v.runjump_fwd.x - 4.0).abs() < 1e-6 && (v.runjump_fwd.y - (-8.1)).abs() < 1e-6);
+        assert!((v.runjump_back.x - (-2.55)).abs() < 1e-6 && (v.runjump_back.y - (-8.1)).abs() < 1e-6);
+        assert!((v.airjump_neu.y - (-8.1)).abs() < 1e-6);
+        assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
+        assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6);
+        // airjump.y derives from airjump.neu.y (KFM authors no explicit airjump.y).
+        assert!((v.airjump_y - (-8.1)).abs() < 1e-6);
     }
 
     // ---- 5.3 review fix (4): jump.up honors the 2-component `x, y` form ----
