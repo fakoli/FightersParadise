@@ -16,6 +16,9 @@
 # Claude Code local settings
 .claude/settings.local.json
 
+# Runtime state for scripts/fp.sh (detached game PID + log)
+/.run
+
 # MUGEN content files (not shipped with repo)
 *.sff
 *.snd
