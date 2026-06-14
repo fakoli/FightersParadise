@@ -258,7 +258,11 @@ dependencies = [
 name = "fp-engine"
 version = "0.1.0"
 dependencies = [
+ "fp-character",
+ "fp-combat",
  "fp-core",
+ "fp-formats",
+ "fp-physics",
  "tracing",
 ]
 

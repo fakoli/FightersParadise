@@ -152,9 +152,15 @@ Built on the faithful VM (const/alive/commands resolved). Physics prep done: **P
 (Live two-player fights on screen — ticking P1+P2, running detection each tick, KO/round — are
 **Phase 7** `fp-engine` + fp-app, where the demo becomes an actual match.)
 
-### Phase 7 — `fp-engine` (round flow)  *(expand when reached)*
-Move loop out of `fp-app`; P1/P2 coordination; round states (intro→fight→KO→win); timer; win
-conditions. Deps: Phase 6.
+### Phase 7 — `fp-engine` + 2-player (the playable match)
+
+**Phase 6 combat mechanics COMPLETE** (6.1 HitDef model, 6.2 controller, 6.2b param model, 6.2c
+facing velocity, 6.3a resolution, 6.3b detection+apply). Now wire two characters into a real match.
+
+| ID | Status | Task | Crate(s) | Acceptance criteria | Deps |
+|----|--------|------|----------|--------------------|------|
+| 7.1 | DONE | **Match coordinator** (2 players) | `fp-engine` | `Match` holds P1+P2 (Character + LoadedCharacter each); `Match::tick()` ticks both, runs `combat::resolve_attack` BOTH directions, applies player-push (P6.2) + screen-bound clamp, keeps each character facing the opponent (facep2 baseline), advances a round state machine (intro→fight→KO when a life hits 0→win) + a round timer. Headless-tested (two KFMs: P1 hit → P2 life drops; KO ends the round). Deps: fp-character/fp-combat/fp-physics. | 6.3b |
+| 7.2 | TODO | **fp-app 2-player render + input** | `fp-app` | Drive a `fp-engine::Match` in the window: render BOTH characters from their current AIR frame; P1 = keyboard, P2 = idle/dummy (or a 2nd input map); a minimal life readout; round-state feedback (KO). The "two characters fight on screen" demo. Deps: 7.1 |
 
 ### Phase 8–11 — stage / audio / ui / storyboard  *(expand when reached)*
 `fp-stage`, `fp-audio`+SND, `fp-ui`+FNT (lifebars/select/screenpacks), `fp-storyboard`. Largely
