@@ -16,3 +16,7 @@ thiserror.workspace = true
 # no dependency cycle, and being dev-only it never ships in the fp-vm library.
 [dev-dependencies]
 fp-formats = { path = "../fp-formats" }
+# Property/fuzz tests (tests/proptest_fuzz.rs) prove the lexer/parser/evaluator
+# never-panic contract against randomized/adversarial input (audit #37). Not
+# asset-gated, so these run on CI (unlike the real-KFM no-panic tests).
+proptest.workspace = true
