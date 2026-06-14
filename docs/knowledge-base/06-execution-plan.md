@@ -131,7 +131,9 @@ finalized fp-vm `EvalContext`. **Phase 4 is complete** (4.1–4.6, 4.8, 4.10, 4.
 | 5.6 | SPLIT | **Engine-gap fixes** (faithful KFM) — split into 5.6a/b/c | — | Original combined task BLOCKED (workflow's single-crate scope-guard boxed the agent in fp-input). Re-split per crate (each fits the workflow + is more reviewable). **Loop policy learned: workflow tasks = ONE crate; multi-crate work must be split (or use a direct agent for genuinely atomic cross-crate changes).** | 5.5 |
 | 5.6a | DONE | fp-input `$`/`>` command symbols | `fp-input` | ✅ `$` (direction-detect) + `>` (strict) in compile_command/CommandMatcher; `/$F` (holdfwd) compiles + matches when forward held (incl. diagonals). +16 tests. 1061 workspace tests. | 5.5 |
 | 5.6b | DONE | `alive` trigger (+ common-state trigger audit) | `fp-character` | ✅ `alive`=>Life>0 (case-insensitive); audited all kfm/common1 triggers, documented the rest (HitOver/RoundState/P2BodyDist…) as deferred to Phase 6/7. +10 tests; 1073 workspace. Critic PASS. Commit `470dafe`. | 5.5 |
-| 5.6c | DOING | Remove fp-app band-aids (faithful KFM walk) | `fp-app` | Now that fp-input ($/>) + fp-character (alive) are fixed, delete `normalize_command`/`drop_unevaluable_alive_controllers`/`inject_default_movement` + call sites; KFM walks from its OWN merged CNS/CMD bridge. Strengthen the headless test (vel.x>0 in state 20) and ensure it passes WITHOUT band-aids. | 5.6a, 5.6b |
+| 5.6c | DONE | Remove fp-app band-aids (faithful KFM walk) | `fp-app` | ✅ 2 of 3 band-aids removed (raw `/$F` compiles; `alive` keeps stand out of death 5050). Strengthened walk test (state 20 + strictly advancing). 1 minimal TODO'd shim left, gated on 2 diagnosed gaps → 5.6d + CB25. 1084 tests. Commit `7983361`. | 5.6a, 5.6b |
+| 5.6d | DOING | **`const(<member>)` resolution** (vm routing) | `fp-vm` | Route `const(<member>)` like `GetHitVar` — pass the member NAME via `trigger_str` (member-keyed func set), not evaluate the dotted ident as a nested trigger. Additive/safe. Enables 5.6e. | 4.11 |
+| 5.6e | TODO | **`const(<member>)` resolution** (char resolver) | `fp-character` | `trigger_str("const", member)` resolves the named constant from `self.constants` (e.g. `velocity.walk.fwd.x`→2.4). Then KFM `[Statedef 20]` `VelSet x=const(velocity.walk.fwd.x)` works natively → remove the shim's velocity-repair (CB26). | 5.6d |
 
 ### Phase 6 — `fp-combat`  *(expand when reached)*
 HitDef application; Clsn1×Clsn2 overlap; priority/trade; damage; guard; p1/p2 state-takeover;
@@ -212,8 +214,13 @@ parallelizable once the core exists. Deps: Phase 7.
   use a word-boundary/token check. *(superseded once 5.6 adds the `alive` trigger)*
 - **CB23** fp-app `inject_default_movement` walk-bridge detection compares ChangeState value source
   to `"20"` literally; would mis-skip on `20.0`/`16+4`. *(superseded once 5.6 removes the injection)*
-- **CB24** fp-app headless walk test asserts `pos.x >= x_before` (a stationary char passes too);
-  strengthen to `vel.x > 0` / strictly advancing while in state 20. *(added 5.5 iter)*
+- **CB24** *(done in 5.6c)* fp-app headless walk test strengthened to strictly-advancing in state 20.
+- **CB25** **Stand↔walk (and crouch/jump) command→state transitions are MUGEN engine built-ins**
+  absent from KFM data — fp-app currently injects them via a minimal shim. Move these built-in common
+  command-state transitions into the `fp-character` executor (special-state handling) so stock chars
+  move without an app shim. *(added 5.6c — investigate vs Ikemen; likely a Phase-5/common-states item)*
+- **CB26** *(after 5.6e)* remove the `inject_engine_movement_bridge` velocity-repair in fp-app once
+  `const(velocity.walk.fwd.x)` resolves natively. *(added 5.6c)*
 
 ---
 

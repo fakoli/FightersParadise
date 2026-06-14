@@ -89,11 +89,15 @@
 //!   ([`Expr::AnimElemTail`]) evaluates to
 //!   "element `N` reached **and** `AnimElemTime(N) op M`".
 //! - **Member-keyed triggers** — `GetHitVar(member)` selects a hit field *by
-//!   name* (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`). The member is a bare
-//!   identifier (a dotted member like `fall.yvel` lexes as one identifier); the
-//!   evaluator passes that name verbatim through
+//!   name* (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`) and `const(member)`
+//!   reads a character's authored constant *by name*
+//!   (`const(velocity.walk.fwd.x)`, `const(movement.yaccel)`, task 5.6d). The
+//!   member is a bare identifier (a dotted member like `fall.yvel` lexes as one
+//!   identifier); the evaluator passes that name verbatim through
 //!   [`EvalContext::trigger_str`] rather than collapsing it to a number, so the
-//!   context identifies which field was requested (task 4.11, item a).
+//!   context identifies which field was requested (task 4.11, item a). The full
+//!   member-keyed set is documented on the private `MEMBER_KEYED_TRIGGERS`
+//!   constant (`GetHitVar`, `const`).
 //! - **`command = "name"`** — string-equality routes through
 //!   [`EvalContext::command_active`] (a boolean string-keyed seam) instead of a
 //!   numeric read, so the comparison actually fires when the command is active.
@@ -847,13 +851,16 @@ fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
         "random" => eval_random(args, ctx),
         // ---- Member-keyed triggers: argument is a named field, not a number ----
         // `GetHitVar(member)` selects a hit field BY NAME (`GetHitVar(fall.yvel)`,
-        // `GetHitVar(xveladd)`). The member is a bare identifier; routing it
-        // through the numeric `trigger` path would lose which field was asked for
-        // (a `Value` has no string variant). So when the sole argument is a bare
+        // `GetHitVar(xveladd)`) and `const(member)` reads an authored character
+        // constant BY NAME (`const(velocity.walk.fwd.x)`, `const(movement.yaccel)`).
+        // The member is a bare identifier (a dotted member lexes as ONE identifier
+        // since task 4.10); routing it through the numeric `trigger` path would
+        // evaluate the dotted ident as a nested trigger and collapse it to 0 (a
+        // `Value` has no string variant). So when the sole argument is a bare
         // identifier we pass the member NAME verbatim through the string-keyed
-        // `trigger_str` seam (task 4.11, item a). Any non-ident argument (a rare
-        // numeric/computed form) falls through to the ordinary numeric path
-        // below.
+        // `trigger_str` seam (task 4.11 for GetHitVar; task 5.6d for const). Any
+        // non-ident argument (a rare numeric/computed form) falls through to the
+        // ordinary numeric path below.
         _ if is_member_keyed_trigger(&lname) => {
             if let [Expr::Ident(member)] = args {
                 Eval::from_value(ctx.trigger_str(name, member))
@@ -866,15 +873,36 @@ fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
     }
 }
 
+/// The complete set of **member-keyed** trigger names (lowercased): triggers
+/// whose argument is a *named field* rather than a number, so a bare-identifier
+/// argument is routed through [`EvalContext::trigger_str`] instead of being
+/// collapsed to a number on the numeric [`EvalContext::trigger`] path.
+///
+/// This is the single source of truth for the member-keyed function set:
+///
+/// - **`gethitvar`** — `GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`,
+///   `GetHitVar(animtype)`: selects a field of the most-recent hit by name
+///   (task 4.11, item a).
+/// - **`const`** — `const(velocity.walk.fwd.x)`, `const(size.ground.front)`,
+///   `const(movement.yaccel)`: reads a character's authored constant by its
+///   dotted member name (task 5.6d). The dotted member lexes as one identifier
+///   (since task 4.10), so it reaches here verbatim; without this routing the
+///   dotted ident would be evaluated as a nested trigger and yield `0`.
+///
+/// An audit of MUGEN's trigger surface found no other functions whose argument
+/// is an arbitrary field *name* rather than an expression: parameterized
+/// triggers (`var` / `fvar` / `sysvar`, `AnimElem`, `NumExplod`, …) take numeric
+/// arguments and stay on the numeric path. So the set is exactly these two.
+const MEMBER_KEYED_TRIGGERS: [&str; 2] = ["gethitvar", "const"];
+
 /// Returns whether `lname` (already lowercased) is a **member-keyed** trigger:
 /// one whose argument is a named field rather than a number, so a bare-identifier
 /// argument is routed through [`EvalContext::trigger_str`] instead of the numeric
-/// [`EvalContext::trigger`] path (task 4.11, item a).
+/// [`EvalContext::trigger`] path.
 ///
-/// Currently this is exactly `GetHitVar`, the one real-content trigger whose
-/// argument (`fall.yvel`, `xveladd`, `animtype`, …) is an arbitrary field label.
+/// See [`MEMBER_KEYED_TRIGGERS`] for the documented set (`GetHitVar`, `const`).
 fn is_member_keyed_trigger(lname: &str) -> bool {
-    lname == "gethitvar"
+    MEMBER_KEYED_TRIGGERS.contains(&lname)
 }
 
 /// Evaluates a parameterized trigger via the numeric [`EvalContext::trigger`]
@@ -2784,6 +2812,254 @@ mod tests {
             .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
             .with_redirect(Redirect::Enemy, enemy);
         assert_eq!(ev("enemy, GetHitVar(fall.yvel)", &ctx), Value::Float(-9.0));
+    }
+
+    // ---- Task 5.6d: member-keyed `const(member)` passes the member NAME ----
+
+    #[test]
+    fn const_member_arg_passes_name_through_string_seam() {
+        // `const(member)` must route through `trigger_str` with the member NAME
+        // (the dotted ident verbatim), exactly like GetHitVar (task 5.6d). This is
+        // acceptance criterion 2's core assertion: a context whose `trigger_str`
+        // returns a known value for a const member returns it.
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4))
+            .with_member_trigger("const", "size.ground.front", Value::Int(16))
+            .with_member_trigger("const", "movement.yaccel", Value::Float(0.44));
+        assert_eq!(ev("const(velocity.walk.fwd.x)", &ctx), Value::Float(2.4));
+        assert_eq!(ev("const(size.ground.front)", &ctx), Value::Int(16));
+        assert_eq!(ev("const(movement.yaccel)", &ctx), Value::Float(0.44));
+        // An unknown member → safe default 0, never a panic.
+        assert_eq!(ev("const(no.such.const)", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn const_is_additive_safe_default_zero_with_empty_context() {
+        // Acceptance criterion 2 (additive/safe): with a context whose
+        // `trigger_str` returns the default (no resolver yet), `const(...)` still
+        // evaluates to 0 — no regression.
+        assert_eq!(ev("const(velocity.walk.fwd.x)", &MockContext::new()), Value::Int(0));
+        // Even composed in arithmetic / comparison it stays a harmless 0.
+        assert_eq!(ev("const(movement.yaccel) > 0", &MockContext::new()), Value::Int(0));
+    }
+
+    #[test]
+    fn const_does_not_evaluate_member_as_nested_trigger() {
+        // The dotted member must NOT be evaluated as a nested trigger (that path
+        // yields 0 — the 5.6c walk-velocity gap). Seeding the member name as an
+        // ordinary numeric trigger AND the const numeric-arg forms the old/lossy
+        // behavior would hit must NOT be consulted; only the member-keyed seam is.
+        let ctx = MockContext::new()
+            .with_trigger("velocity.walk.fwd.x", &[], Value::Int(7))
+            .with_trigger("const", &[Value::Int(7)], Value::Int(99))
+            .with_trigger("const", &[Value::Int(0)], Value::Int(123))
+            .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4));
+        // Only the member-keyed value is returned — not 99 (old: member→7→arg) nor
+        // 123 (old: unknown member→0→arg).
+        assert_eq!(ev("const(velocity.walk.fwd.x)", &ctx), Value::Float(2.4));
+    }
+
+    #[test]
+    fn const_trigger_name_is_case_insensitive_through_eval() {
+        // `const` is matched case-insensitively (MUGEN is case-insensitive); any
+        // casing routes through the string seam.
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "movement.yaccel", Value::Float(0.44));
+        for src in [
+            "const(movement.yaccel)",
+            "Const(movement.yaccel)",
+            "CONST(movement.yaccel)",
+        ] {
+            assert_eq!(ev(src, &ctx), Value::Float(0.44), "src = {src}");
+        }
+    }
+
+    #[test]
+    fn const_through_redirect_uses_target_member_seam() {
+        // `enemy, const(movement.yaccel)` reads the constant from the REDIRECTED
+        // context's member seam, never the local one.
+        let enemy = MockContext::new()
+            .with_member_trigger("const", "movement.yaccel", Value::Float(0.9));
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "movement.yaccel", Value::Float(0.44))
+            .with_redirect(Redirect::Enemy, enemy);
+        assert_eq!(ev("enemy, const(movement.yaccel)", &ctx), Value::Float(0.9));
+    }
+
+    #[test]
+    fn is_member_keyed_trigger_set_is_exactly_gethitvar_and_const() {
+        // The documented member-keyed set (single source of truth) is exactly
+        // these two names; nothing else routes through the string seam.
+        assert!(is_member_keyed_trigger("gethitvar"));
+        assert!(is_member_keyed_trigger("const"));
+        assert_eq!(MEMBER_KEYED_TRIGGERS, ["gethitvar", "const"]);
+        for other in ["var", "fvar", "sysvar", "animelem", "numexplod", ""] {
+            assert!(!is_member_keyed_trigger(other), "unexpected: {other}");
+        }
+    }
+
+    // =====================================================================
+    // Proctor (task 5.6d): additional `const(member)` edge / error-path /
+    // MUGEN-semantics coverage layered on top of Forge's 5.6d tests above.
+    // Mirrors the GetHitVar edge cases (non-ident fallthrough, arity, value
+    // type, composition, default seam) for `const` and pins cross-talk and
+    // verbatim forwarding. Pure tests; no impl code is modified.
+    // =====================================================================
+
+    #[test]
+    fn const_non_ident_arg_falls_through_to_numeric_path() {
+        // The member seam only fires for a SINGLE BARE-IDENTIFIER argument. A
+        // computed / numeric argument (`const(1+1)`, `const(var(0))`) is not a
+        // member name, so it falls through to the ordinary numeric `trigger`
+        // path with the EVALUATED arg — it must NOT touch `trigger_str`. Seed
+        // both seams; only the numeric one may be consulted. (Mirrors the
+        // GetHitVar analogue so `const`'s fallthrough is independently pinned.)
+        let ctx = MockContext::new()
+            .with_var(0, 2)
+            .with_trigger("const", &[Value::Int(2)], Value::Int(70))
+            .with_member_trigger("const", "2", Value::Int(999)); // must NOT be hit
+        // `const(1+1)` → arg evaluates to 2 → numeric trigger("const",[2]).
+        assert_eq!(ev("const(1+1)", &ctx), Value::Int(70));
+        // `const(var(0))` → var(0)=2 → same numeric lookup.
+        assert_eq!(ev("const(var(0))", &ctx), Value::Int(70));
+    }
+
+    #[test]
+    fn const_zero_and_multi_arg_forms_use_numeric_path() {
+        // Only the single-bare-ident shape is member-keyed. A zero-arg or
+        // multi-arg `const` call is not, so it routes numerically and never
+        // panics. (The surface syntax is unusual for `const` but legal in the
+        // AST; build the forms directly.)
+        let ctx = MockContext::new()
+            .with_trigger("const", &[], Value::Int(11))
+            .with_trigger("const", &[Value::Int(1), Value::Int(2)], Value::Int(22));
+        let zero = Expr::Call {
+            name: "const".into(),
+            args: vec![],
+        };
+        assert_eq!(eval(&zero, &ctx), Value::Int(11));
+        let two = Expr::Call {
+            name: "const".into(),
+            args: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        assert_eq!(eval(&two, &ctx), Value::Int(22));
+    }
+
+    #[test]
+    fn const_member_value_type_is_preserved_through_eval() {
+        // The member seam returns whatever Value the authored constant holds: an
+        // int constant stays int, a float constant stays float — proving no
+        // lossy int-collapse (the whole point of routing through trigger_str).
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "size.ground.front", Value::Int(16))
+            .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4));
+        let int_v = ev("const(size.ground.front)", &ctx);
+        assert_eq!(int_v, Value::Int(16));
+        assert!(int_v.is_int(), "an int constant must stay Int, got {int_v:?}");
+        let flt_v = ev("const(velocity.walk.fwd.x)", &ctx);
+        assert_eq!(flt_v, Value::Float(2.4));
+        assert!(flt_v.is_float(), "a float constant must stay Float, got {flt_v:?}");
+    }
+
+    #[test]
+    fn const_member_composes_in_arithmetic_and_comparison() {
+        // The const read is an ordinary atom in a larger expression — this is the
+        // real 5.6c walk-velocity shape, where the authored constant feeds into
+        // arithmetic (`const(velocity.walk.fwd.x) * 60` for a per-second speed)
+        // and comparisons. With the seam resolving, the value flows through; the
+        // 5.6c gap was exactly this composing to 0 because const read 0.
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4));
+        assert_eq!(ev("const(velocity.walk.fwd.x) * 10", &ctx), Value::Float(24.0));
+        assert_eq!(ev("const(velocity.walk.fwd.x) > 0", &ctx), Value::Int(1));
+        assert_eq!(ev("const(velocity.walk.fwd.x) < 0", &ctx), Value::Int(0));
+        // And it short-circuits naturally in a boolean guard.
+        assert_eq!(
+            ev("const(velocity.walk.fwd.x) > 0 && 1", &ctx),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn const_default_trigger_str_yields_zero_not_panic() {
+        // A context that overrides ONLY `trigger` (not `trigger_str`) inherits the
+        // trait default (every member → 0). The const member path must use
+        // `trigger_str`, so it reads 0 here even though `trigger` would answer
+        // nonzero — proving the routing AND the never-panic, additive-safe
+        // contract (this is the pre-resolver state that 5.6e will fill).
+        struct ConstViaTriggerOnly;
+        impl EvalContext for ConstViaTriggerOnly {
+            fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+                // If the member were (wrongly) routed numerically this nonzero
+                // value would leak through; the member path must not see it.
+                Value::Int(42)
+            }
+        }
+        let ctx = ConstViaTriggerOnly;
+        assert_eq!(ev("const(velocity.walk.fwd.x)", &ctx), Value::Int(0));
+        // Even composed, it stays a harmless 0 and never panics.
+        assert_eq!(ev("const(movement.yaccel) || 0", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn const_forwards_member_name_verbatim_to_trigger_str() {
+        // The evaluator must pass the member identifier through to `trigger_str`
+        // VERBATIM (case preserved, dots intact). A context that records the
+        // exact (name, key) it received proves no normalization happens in the
+        // evaluator (case-folding is the context's job, per the trait docs).
+        struct RecordingCtx {
+            seen: Cell<Option<(&'static str, bool)>>,
+        }
+        impl EvalContext for RecordingCtx {
+            fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+                Value::DEFAULT
+            }
+            fn trigger_str(&self, name: &str, key: &str) -> Value {
+                // Record whether the verbatim mixed-case dotted member arrived
+                // unchanged and the trigger name is "const".
+                let exact = name.eq_ignore_ascii_case("const")
+                    && key == "Velocity.Walk.Fwd.X";
+                self.seen.set(Some(("const", exact)));
+                Value::Int(if exact { 1 } else { 0 })
+            }
+        }
+        let ctx = RecordingCtx {
+            seen: Cell::new(None),
+        };
+        // The member ident keeps its authored casing through to the seam.
+        assert_eq!(ev("const(Velocity.Walk.Fwd.X)", &ctx), Value::Int(1));
+        assert_eq!(
+            ctx.seen.get(),
+            Some(("const", true)),
+            "trigger_str must receive the dotted member name verbatim"
+        );
+    }
+
+    #[test]
+    fn const_and_gethitvar_member_seams_do_not_cross_talk() {
+        // `const` and `GetHitVar` are distinct member-keyed triggers. The SAME
+        // member name under each must resolve independently (the seam keys on the
+        // trigger NAME as well as the member), so a `const(x)` read never returns
+        // a `GetHitVar(x)` value or vice versa.
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "yaccel", Value::Float(0.44))
+            .with_member_trigger("GetHitVar", "yaccel", Value::Float(-9.0));
+        assert_eq!(ev("const(yaccel)", &ctx), Value::Float(0.44));
+        assert_eq!(ev("GetHitVar(yaccel)", &ctx), Value::Float(-9.0));
+    }
+
+    #[test]
+    fn const_negative_and_int_member_values_round_trip() {
+        // Authored constants can be negative and int-typed (e.g. a backward walk
+        // velocity, an int size). Both must survive the seam untouched — no sign
+        // loss, no float coercion of an int constant.
+        let ctx = MockContext::new()
+            .with_member_trigger("const", "velocity.walk.back.x", Value::Float(-2.3))
+            .with_member_trigger("const", "size.ground.back", Value::Int(15));
+        assert_eq!(ev("const(velocity.walk.back.x)", &ctx), Value::Float(-2.3));
+        assert_eq!(ev("const(size.ground.back)", &ctx), Value::Int(15));
+        // Negation of a float const stays a float.
+        assert_eq!(ev("0.0 - const(velocity.walk.back.x)", &ctx), Value::Float(2.3));
     }
 
     // ---- Gap 4: `command = "name"` string equality ----

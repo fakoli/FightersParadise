@@ -1136,6 +1136,139 @@ fn task_4_11_real_fixture_member_and_tail_forms_eval_without_panic() {
     assert!(evaluated > 50, "expected many parseable RHS, evaluated {evaluated}");
 }
 
+// =============================================================================
+// Proctor (task 5.6d) — REAL-FIXTURE gate for `const(member)` routing.
+//
+// KFM's common1.cns + kfm.cns are saturated with `const(...)` reads of authored
+// character constants (velocity.*, movement.*, size.*). This harvests those real
+// lines and proves each parses and evaluates through the member-keyed string seam
+// without panic, and that the seam actually fires for the authored member names
+// (a context that seeds `trigger_str` for the harvested members returns the
+// seeded value, not 0). Gated on `test-assets/` so the asset-less checkout stays
+// green.
+// =============================================================================
+
+/// Harvests every `const(<member>)` member name (lowercased) that appears in
+/// `text`, in source order with duplicates preserved. Matches the exact
+/// member-keyed shape: `const(` followed by a dotted/bare identifier and `)`.
+fn harvest_const_members(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = b"const(";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let start = i + needle.len();
+            let mut j = start;
+            // A member name is identifier chars plus dots (no spaces / operators).
+            while j < bytes.len() {
+                let c = bytes[j];
+                let ok = c.is_ascii_alphanumeric() || c == b'.' || c == b'_';
+                if !ok {
+                    break;
+                }
+                j += 1;
+            }
+            // Must be a non-empty member immediately closed by `)`.
+            if j > start && j < bytes.len() && bytes[j] == b')' {
+                out.push(lower[start..j].to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn real_fixture_const_member_forms_route_through_string_seam() {
+    let Some(dir) = kfm_assets_dir() else {
+        eprintln!(
+            "skipping real_fixture_const_member_forms_route_through_string_seam: test-assets/ absent"
+        );
+        return;
+    };
+
+    // Collect the real const() members from both fixtures.
+    let mut members: Vec<String> = Vec::new();
+    for fname in ["kfm.cns", "common1.cns"] {
+        let text = std::fs::read_to_string(dir.join(fname)).expect("read fixture");
+        members.extend(harvest_const_members(&text));
+    }
+    // KFM is full of const() reads; if they vanished this test is vacuous.
+    assert!(
+        members.len() >= 20,
+        "expected many real const(member) reads across the fixtures, saw {}",
+        members.len()
+    );
+    // The task's canonical members must be present in the real content.
+    assert!(
+        members.iter().any(|m| m == "velocity.walk.fwd.x"),
+        "expected const(velocity.walk.fwd.x) in fixtures"
+    );
+    assert!(
+        members.iter().any(|m| m == "movement.yaccel"),
+        "expected const(movement.yaccel) in fixtures"
+    );
+
+    // Build a value-per-DISTINCT-member map (the real content repeats members like
+    // `movement.yaccel` many times, so seeding by source-order index would let a
+    // later duplicate overwrite an earlier key). A BTreeMap dedups by member name
+    // and gives each distinct member a stable, distinct, known value — alternating
+    // int / float so type preservation is exercised too.
+    let mut want: BTreeMap<String, Value> = BTreeMap::new();
+    for (i, m) in members.iter().enumerate() {
+        want.entry(m.clone()).or_insert_with(|| {
+            if i % 2 == 0 {
+                Value::Float(0.5 + i as f32)
+            } else {
+                Value::Int(i as i32 + 1)
+            }
+        });
+    }
+
+    // Seed a context that answers every DISTINCT harvested member with its known
+    // value, so we can prove the seam fires (not merely "doesn't panic"). Members
+    // are lowercased by the harvest and Ctx keys case-insensitively, so seeding by
+    // the lowercased name and reading the authored (possibly mixed-case) source
+    // form both resolve to the same key.
+    let mut ctx = Ctx::new();
+    for (m, v) in &want {
+        ctx = ctx.with_member_trigger("const", m, *v);
+    }
+
+    // Drive each distinct harvested member through parse -> eval as a standalone
+    // `const(member)` expression and assert it resolves to its seeded value (NOT
+    // the safe default 0 — that would mean the seam was bypassed, i.e. the 5.6c
+    // gap). Building the source from the lowercased member keeps it canonical.
+    let mut evaluated = 0usize;
+    for (m, v) in &want {
+        let src = format!("const({m})");
+        let ast = parse_str(&src).unwrap_or_else(|e| panic!("{src:?} should parse: {e}"));
+        let got = eval(&ast, &ctx);
+        assert_eq!(got, *v, "const({m}) must route through the seeded string seam");
+        evaluated += 1;
+    }
+    eprintln!(
+        "task 5.6d real-fixture: evaluated {evaluated} distinct real const(member) reads via the string seam"
+    );
+
+    // Additive-safe on real data: against an EMPTY context every real const read
+    // is still a harmless 0 (no resolver yet → no regression), never a panic.
+    let empty = Ctx::new();
+    for m in want.keys() {
+        let src = format!("const({m})");
+        let ast = parse_str(&src).expect("parse");
+        assert_eq!(
+            eval(&ast, &empty),
+            Value::Int(0),
+            "const({m}) with no resolver must default to 0"
+        );
+    }
+}
+
 #[test]
 fn task_4_11_real_fixture_clean_parse_rate_is_100_percent() {
     // AC4: the cns_integration clean-parse rate must stay 100% (812/812) after the

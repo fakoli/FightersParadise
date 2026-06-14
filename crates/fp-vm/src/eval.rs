@@ -65,12 +65,14 @@
 //!   *command name* (`command = "fwd"`). The evaluator routes `command = "name"`
 //!   (in either operand order) through [`EvalContext::command_active`], a boolean
 //!   string-keyed seam, rather than the numeric [`EvalContext::trigger`] path.
-//! - **`GetHitVar(member)`** — `GetHitVar` selects a hit field *by name*
-//!   (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`). The member name is an
-//!   arbitrary label, so the evaluator routes the call through
-//!   [`EvalContext::trigger_str`], passing the member name verbatim as the key
-//!   rather than collapsing it to a number. See that method and [task 4.11's
-//!   evaluator notes](crate::evaluator) for details.
+//! - **`GetHitVar(member)` / `const(member)`** — `GetHitVar` selects a hit field
+//!   *by name* (`GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`) and `const` reads a
+//!   character's authored constant *by name* (`const(velocity.walk.fwd.x)`,
+//!   `const(movement.yaccel)`). The member name is an arbitrary label, so the
+//!   evaluator routes these calls through [`EvalContext::trigger_str`], passing
+//!   the member name verbatim as the key rather than collapsing it to a number.
+//!   See that method and the [`evaluator`](crate::evaluator) module (its private
+//!   `MEMBER_KEYED_TRIGGERS` set) for the full member-keyed function set.
 //!
 //! [kb]: ../../../docs/knowledge-base/07-evaluator-semantics.md
 
@@ -367,9 +369,10 @@ impl fmt::Display for Redirect {
 ///   so a context that only overrides `trigger` still works; a concrete entity
 ///   may override them to read its variable arrays directly.
 /// - [`trigger_str`](EvalContext::trigger_str) is the **member-keyed** path for
-///   triggers whose argument is a named field rather than a number — currently
-///   `GetHitVar(member)`. The member name is passed through verbatim so the
-///   context can identify *which* hit field was requested (see that method).
+///   triggers whose argument is a named field rather than a number —
+///   `GetHitVar(member)` and `const(member)`. The member name is passed through
+///   verbatim so the context can identify *which* hit field or authored constant
+///   was requested (see that method).
 pub trait EvalContext {
     /// Reads a trigger or state value by (case-insensitive) name, given its
     /// already-evaluated arguments.
@@ -390,34 +393,40 @@ pub trait EvalContext {
     /// ## Why a separate, string-keyed path exists
     ///
     /// A handful of MUGEN triggers are parameterized by a *named field*, not a
-    /// number. The canonical case is `GetHitVar`: `GetHitVar(fall.yvel)`,
-    /// `GetHitVar(xveladd)`, `GetHitVar(animtype)` each select a distinct field
-    /// of the most-recent hit, identified **by name**. The field name is an
-    /// arbitrary label (`fall.yvel`, `xveladd`, `fall.envshake.time`), not an
-    /// index, so it cannot be carried through the numeric
-    /// [`trigger`](EvalContext::trigger) path: [`Value`] has no string variant,
-    /// so collapsing the member to a number would lose *which* field was asked
-    /// for. This method is the seam that preserves the member name end-to-end.
+    /// number. The canonical cases are `GetHitVar` and `const`:
+    /// `GetHitVar(fall.yvel)`, `GetHitVar(xveladd)`, `GetHitVar(animtype)` each
+    /// select a distinct field of the most-recent hit, and
+    /// `const(velocity.walk.fwd.x)`, `const(size.ground.front)`,
+    /// `const(movement.yaccel)` each read a distinct authored character constant
+    /// — all identified **by name**. The member name is an arbitrary, often
+    /// dotted label (`fall.yvel`, `velocity.walk.fwd.x`), not an index, so it
+    /// cannot be carried through the numeric [`trigger`](EvalContext::trigger)
+    /// path: [`Value`] has no string variant, so collapsing the member to a
+    /// number would lose *which* field was asked for. This method is the seam
+    /// that preserves the member name end-to-end.
     ///
     /// The evaluator routes a member-arg call — a call whose single argument is a
-    /// bare identifier, for the recognized member-keyed trigger names (currently
-    /// `GetHitVar`) — here, passing the identifier verbatim as `key`. All other
-    /// calls keep using the numeric [`trigger`](EvalContext::trigger) path with
-    /// evaluated [`Value`] arguments.
+    /// bare identifier, for the recognized member-keyed trigger names
+    /// (`GetHitVar` and `const`; see the [`evaluator`](crate::evaluator) module's
+    /// private `MEMBER_KEYED_TRIGGERS` set) — here, passing the identifier
+    /// verbatim as `key`. All other calls keep using the numeric
+    /// [`trigger`](EvalContext::trigger) path with evaluated [`Value`] arguments.
     ///
     /// ## Contract
     ///
     /// Like every method here it is infallible: an unrecognized trigger name or
     /// member key returns [`Value::DEFAULT`] (`0`), never a panic. The trigger
     /// name should be matched case-insensitively (MUGEN is case-insensitive);
-    /// MUGEN's `GetHitVar` field names are conventionally compared
+    /// MUGEN's `GetHitVar` and `const` member names are conventionally compared
     /// case-insensitively too, so an implementation should use
-    /// [`str::eq_ignore_ascii_case`] against its field table.
+    /// [`str::eq_ignore_ascii_case`] against its field / constant tables.
     ///
     /// The default implementation returns [`Value::DEFAULT`] for every key, so a
-    /// context that does not model hit vars reports `0` for every member read. A
-    /// concrete entity (task Phase 5, `fp-character`) overrides this to read its
-    /// `GetHitVar` field table.
+    /// context that does not model hit vars or character constants reports `0`
+    /// for every member read — making the routing additive and regression-free
+    /// until a resolver lands. A concrete entity (task Phase 5, `fp-character`)
+    /// overrides this to read its `GetHitVar` field table and its authored
+    /// `const(...)` constant table.
     fn trigger_str(&self, name: &str, key: &str) -> Value {
         let _ = (name, key);
         Value::DEFAULT
