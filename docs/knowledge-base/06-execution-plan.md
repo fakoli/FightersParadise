@@ -183,6 +183,11 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   Validated against real `test-assets/kfm-motif-sffv1/intro.def` etc. (the only stub-crate work with
   real fixtures — no stage `.def`/`fight.def`/`.fnt` in assets). Parsing+model only; rendering deferred.
   Deps: DEF parser. *(via fp-loop-batch wkszpf4ly)*
+- **6.5** DONE — **Hitpause (impact freeze)** (`fp-character`, single-crate). On a connecting hit both
+  players freeze for `HitDef.pausetime.p1`/`.p2`; the executor tick skips anim/Time/physics advance
+  while `Character.hitpause_time > 0`, running only `ignorehitpause`-flagged controllers (wired but
+  unused since 5.3). A core combat-feel feature still missing. Symmetric-pause simplification (hitshake
+  nuance deferred). Deps: 6.x combat. *(via fp-loop-batch wferstbec)*
 
 ### Cross-cutting backlog  *(schedule opportunistically; groomed each iteration)*
 - ~~**SFF v1 parser**~~ ✅ DONE (task 0.3 added `sff/v1.rs` w/ PCX RLE decoder; loads intro/ending sprites).
@@ -284,6 +289,7 @@ HitDef impact sounds (8.4). Hitsound/guardsound use the INVERSE prefix conventio
   the character's own SND (8.3b). Load the engine common SND (`data/common.snd`/fight motif) once and
   route `common=true` requests to it. *(added 8.3b)*
 - **CB38** fp-storyboard BG-group layer matching re-scans all sections per group (O(n*groups)) and couples grouping to naming; a layer could attach to two overlapping-prefix groups. Refactor to assign each "[<name> <layer>]" to its single nearest-preceding "[<name>Def]" in file order. *(added 11.1, Critic SHOULD_FIX)*
+- **CB39** Pin the `persistent = n` + `ignorehitpause` interaction during frozen ticks: a flagged controller fires every nth qualifying tick, and frozen ticks DO count (plausibly MUGEN-correct but untested). Add a test locking the chosen semantics. *(added 6.5, Critic SHOULD_FIX)*
 
 ### ✅ Locomotion-shim debt — RESOLVED by 7.3
 ~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,

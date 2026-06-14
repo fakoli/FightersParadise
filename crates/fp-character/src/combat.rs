@@ -88,8 +88,12 @@ pub struct AttackResolution {
 ///      [`Character::change_state`];
 ///    - the defender's [`GetHitVars`](crate::GetHitVars) are populated from the
 ///      outcome;
-///    - hit-pause is set on the attacker (`pausetime.p1`) and the defender
-///      (`pausetime.p2`), and the defender's shake timer from `shaketime`;
+///    - hit-pause (the impact freeze) is set on the attacker (`pausetime.p1`) and
+///      the defender (`pausetime.p2`) via `max(current, new)` so a re-armed move
+///      never shortens an active freeze; the defender's shake timer is set the
+///      same way. A guarded hit falls back to `pausetime` because the modeled
+///      [`fp_combat::HitDef`] carries no distinct `guard.pausetime`; a miss
+///      returns [`None`] before this step and so pauses neither participant;
 ///    - the attacker's [`move_connect`](Character::move_connect) records the
 ///      hit/guard (drives `MoveHit`/`MoveGuarded`/`MoveContact` and `hitonce`).
 ///
@@ -197,10 +201,24 @@ pub fn resolve_attack(
     // Send the defender into the get-hit / guard state.
     defender.change_state(defender_states, outcome.gethit_state);
 
-    // Hit-pause / shake on both participants.
-    attacker.hitpause = outcome.pausetime;
-    defender.hitpause = outcome.shaketime;
-    defender.shaketime = outcome.shaketime;
+    // Hit-pause / shake on both participants (task 6.5 — the impact freeze).
+    //
+    // On a *connecting* hit MUGEN freezes both players: the attacker for
+    // `pausetime.p1` and the defender for `pausetime.p2`. We take the per-side
+    // pause via `max(current, new)` so a fresh connection never shortens an
+    // already-running freeze (a multi-hit move that re-arms mid-pause keeps the
+    // longer of the two). A miss never reaches this point (it returns `None`
+    // above), so a miss pauses NEITHER participant — exactly the required rule.
+    //
+    // GUARD PAUSETIME FALLBACK: MUGEN's `HitDef` can carry a distinct
+    // `guard.pausetime`; [`fp_combat::HitDef`] does not model that field yet, so
+    // [`fp_combat::resolve_hit`] reports `pausetime.p1`/`pausetime.p2` for *both*
+    // the clean-hit and the guard branches. The guard case therefore falls back
+    // to the ordinary `pausetime` here — the documented behavior until a separate
+    // `guard.pausetime` is added to `fp-combat` (out of scope for this crate).
+    attacker.hitpause = attacker.hitpause.max(outcome.pausetime);
+    defender.hitpause = defender.hitpause.max(outcome.shaketime);
+    defender.shaketime = defender.shaketime.max(outcome.shaketime);
 
     // Mark the attacker's move as connected (drives MoveHit/MoveGuarded/
     // MoveContact and enforces hitonce on the next call).
@@ -574,6 +592,46 @@ mod tests {
         a.move_connect.reset();
         assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_some());
         assert!(d.life < life_after_first, "re-armed move connects again");
+    }
+
+    /// AC1/AC4 (task 6.5): a clean hit sets the hit-pause on BOTH characters from
+    /// the HitDef's `pausetime` (attacker from `p1`, defender from `p2`); a miss
+    /// sets NEITHER.
+    #[test]
+    fn hit_sets_hitpause_on_both_miss_sets_neither() {
+        // ---- Clean hit: both paused from pausetime (p1 = p2 = 8 here). ----
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.hitpause, 8, "attacker paused from pausetime.p1");
+        assert_eq!(d.hitpause, 8, "defender paused from pausetime.p2");
+        assert_eq!(a.hitpause_time(), 8, "accessor agrees on the attacker");
+        assert_eq!(d.hitpause_time(), 8, "accessor agrees on the defender");
+
+        // ---- Miss (out of reach): neither participant is paused. ----
+        let (mut a2, a_air2) = make_attacker();
+        let (mut d2, d_air2) = make_defender();
+        d2.pos = Vec2::new(500.0, 0.0); // far out of reach -> no contact
+        assert!(resolve_attack(&mut a2, &a_air2, &mut d2, &d_air2, &states).is_none());
+        assert_eq!(a2.hitpause, 0, "a miss does not pause the attacker");
+        assert_eq!(d2.hitpause, 0, "a miss does not pause the defender");
+    }
+
+    /// AC1 (task 6.5): a re-armed connection uses `max(current, new)` so it never
+    /// SHORTENS an already-running freeze (a multi-hit move keeps the longer pause).
+    #[test]
+    fn re_armed_hit_never_shortens_an_active_pause() {
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        // Pre-load a longer pause than this HitDef's pausetime (8) would set.
+        a.hitpause = 20;
+        d.hitpause = 20;
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.hitpause, 20, "longer existing attacker pause is preserved");
+        assert_eq!(d.hitpause, 20, "longer existing defender pause is preserved");
     }
 
     #[test]
@@ -1097,5 +1155,130 @@ mod tests {
             connected,
             "real KFM punch Clsn1 should overlap idle Clsn2 at some offset"
         );
+    }
+
+    // =====================================================================
+    // Proctor (task 6.5): additional hit-pause coverage for resolve_attack.
+    // The symmetric `pausetime { p1: 8, p2: 8 }` of `sample_hitdef` cannot
+    // distinguish which side reads `p1` versus `p2`; these tests use an
+    // ASYMMETRIC pausetime and exercise the guard fallback so the two sides
+    // are pinned independently.
+    // =====================================================================
+
+    /// AC1: with an ASYMMETRIC `pausetime`, the attacker is paused from `p1` and
+    /// the defender from `p2` — proving the two sides are not accidentally swapped
+    /// or sharing one value (the symmetric `sample_hitdef` cannot show this).
+    #[test]
+    fn asymmetric_pausetime_attacker_from_p1_defender_from_p2() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.pausetime = PauseTime { p1: 6, p2: 11 };
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.hitpause, 6, "attacker hitpause from pausetime.p1");
+        assert_eq!(d.hitpause, 11, "defender hitpause from pausetime.p2");
+        assert_eq!(d.shaketime, 11, "defender shaketime from pausetime.p2");
+        // The resolution recipe carries the same per-side values.
+        assert_eq!(res.attacker_hitpause, 6);
+        assert_eq!(res.defender_hitpause, 11);
+    }
+
+    /// AC1: the DEFENDER side also uses `max(current, new)` — a longer existing
+    /// defender pause is preserved even when the attacker's would be replaced.
+    /// (The existing `re_armed_*` test pre-loads BOTH sides equally; this pins the
+    /// defender's `max` independently with an asymmetric existing pause.)
+    #[test]
+    fn defender_pause_uses_max_independently_of_attacker() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.pausetime = PauseTime { p1: 8, p2: 8 };
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        // Defender already mid-freeze for longer than this hit would set; attacker
+        // starts fresh.
+        d.hitpause = 15;
+        d.shaketime = 15;
+        a.hitpause = 0;
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.hitpause, 8, "fresh attacker takes the new pausetime.p1");
+        assert_eq!(d.hitpause, 15, "longer existing defender pause is preserved");
+        assert_eq!(d.shaketime, 15, "longer existing defender shake is preserved");
+    }
+
+    /// AC1: a GUARDED hit still pauses both participants. The documented fallback
+    /// (no distinct `guard.pausetime` in `fp-combat`) means a guard uses the
+    /// ordinary `pausetime`; verify both sides are set on a block.
+    #[test]
+    fn guard_sets_hitpause_via_pausetime_fallback() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.pausetime = PauseTime { p1: 9, p2: 14 };
+        }
+        let (mut d, d_air) = make_defender();
+        d.holding_back = true; // guardflag MA admits a standing block
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guards");
+        assert_eq!(res.result, HitResult::Guard);
+        // Guard falls back to `pausetime` (p1 on the attacker, p2 on the defender).
+        assert_eq!(a.hitpause, 9, "guard pauses the attacker (pausetime.p1 fallback)");
+        assert_eq!(d.hitpause, 14, "guard pauses the defender (pausetime.p2 fallback)");
+        assert_eq!(d.shaketime, 14, "guard shaketime from the pausetime.p2 fallback");
+    }
+
+    /// AC1: a zero `pausetime` HitDef connects (damage applies) but freezes
+    /// NEITHER side — the gate is a no-op when the move authored no hit-stop.
+    #[test]
+    fn zero_pausetime_hit_connects_but_pauses_neither() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.pausetime = PauseTime { p1: 0, p2: 0 };
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.result, HitResult::Hit);
+        assert_eq!(d.life, 1000 - 30, "damage still applies with no hit-stop");
+        assert_eq!(a.hitpause, 0, "zero pausetime.p1 leaves the attacker unpaused");
+        assert_eq!(d.hitpause, 0, "zero pausetime.p2 leaves the defender unpaused");
+        assert_eq!(d.shaketime, 0, "zero pausetime.p2 leaves no shake");
+    }
+
+    /// AC4: end-to-end across both sides. A hit with asymmetric pausetime, then
+    /// each character is ticked through its OWN freeze to zero and the resume tick
+    /// runs normally. Proves resolve_attack -> executor gate integrate with the
+    /// per-side durations actually counted down.
+    #[test]
+    fn both_sides_count_their_own_freeze_down_then_resume() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.pausetime = PauseTime { p1: 2, p2: 3 };
+        }
+        let (mut d, d_air) = make_defender();
+        let states: HashMap<i32, CompiledState> = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.hitpause, 2);
+        assert_eq!(d.hitpause, 3);
+
+        // Attacker: 2 frozen ticks, then resume.
+        assert!(a.tick_with(&states, &a_air).hitpaused);
+        assert_eq!(a.hitpause, 1);
+        assert!(a.tick_with(&states, &a_air).hitpaused);
+        assert_eq!(a.hitpause, 0);
+        assert!(!a.tick_with(&states, &a_air).hitpaused, "attacker resumes after 2 ticks");
+
+        // Defender: 3 frozen ticks, then resume.
+        assert!(d.tick_with(&states, &d_air).hitpaused);
+        assert!(d.tick_with(&states, &d_air).hitpaused);
+        assert!(d.tick_with(&states, &d_air).hitpaused);
+        assert_eq!(d.hitpause, 0);
+        assert!(!d.tick_with(&states, &d_air).hitpaused, "defender resumes after 3 ticks");
     }
 }

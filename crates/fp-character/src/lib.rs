@@ -806,14 +806,20 @@ pub struct Character {
     /// member reads back its default.
     pub get_hit_vars: GetHitVars,
 
-    /// Remaining hit-pause / hit-stop ticks for **this** character.
+    /// Remaining hit-pause / hit-stop ticks for **this** character (MUGEN's
+    /// `hitpause_time`); `0` (the default) means "not paused".
     ///
     /// MUGEN freezes both participants for a few ticks when an attack connects
-    /// (the "hit stop") so the impact reads. While `hitpause > 0` the executor
-    /// skips normal state processing for this character and decrements the
-    /// counter by one each tick (see [`Character::tick`]). Set on both attacker
-    /// (from `pausetime.p1`) and defender (from `pausetime.p2`/`shaketime`) by
-    /// hit resolution ([`resolve_attack`]). `0` means "not paused".
+    /// (the "hit stop" / impact freeze) so the impact reads. While `hitpause > 0`
+    /// the executor freezes this character for the tick: it does **not** advance
+    /// the animation, the state `Time` counter, or physics (velocity/position),
+    /// and the only controllers that run are those flagged `ignorehitpause`. The
+    /// counter is decremented by one each frozen tick, so a freshly-set
+    /// `hitpause = N` lasts exactly `N` ticks; normal advancement resumes on the
+    /// tick it reaches `0` (see [`Character::tick`] and the
+    /// [`hitpause_time`](Character::hitpause_time) accessor). Set on the attacker
+    /// (from `pausetime.p1`) and the defender (from `pausetime.p2`) by hit
+    /// resolution ([`resolve_attack`]); a miss pauses neither.
     pub hitpause: i32,
 
     /// Remaining hit-shake ticks for **this** character (the defender's visual
@@ -936,6 +942,29 @@ impl Character {
     /// `fp-input`'s recognizer, or by tests to inject a synthetic set).
     pub fn set_command_source(&mut self, source: Box<dyn CommandSource>) {
         self.commands = source;
+    }
+
+    /// Returns the number of hit-pause (impact-freeze) ticks this character still
+    /// has remaining — MUGEN's `hitpause_time`. `0` means the character is not
+    /// frozen and ticks normally.
+    ///
+    /// This reads the [`hitpause`](Character::hitpause) field; the two name the
+    /// same value. While it is positive the executor freezes this character (see
+    /// the field docs and [`Character::tick`]).
+    #[must_use]
+    pub const fn hitpause_time(&self) -> i32 {
+        self.hitpause
+    }
+
+    /// Sets the remaining hit-pause (impact-freeze) ticks — MUGEN's
+    /// `hitpause_time` — clamping any negative input to `0` ("not paused").
+    ///
+    /// Hit resolution ([`resolve_attack`]) is the normal writer (it sets the
+    /// attacker from `pausetime.p1` and the defender from `pausetime.p2`); this
+    /// accessor is the explicit seam for callers and tests that want to freeze a
+    /// character directly. Writes the [`hitpause`](Character::hitpause) field.
+    pub fn set_hitpause_time(&mut self, ticks: i32) {
+        self.hitpause = ticks.max(0);
     }
 
     /// Reads integer variable `index`, or `0` if the index is out of range.

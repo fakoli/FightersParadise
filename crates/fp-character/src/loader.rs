@@ -271,8 +271,10 @@ pub struct CompiledController {
     /// `n` fires every `n`th qualifying tick. See the executor for the applied
     /// semantics.
     pub persistent: Option<CompiledExpr>,
-    /// Compiled `ignorehitpause` universal parameter, if present. Wired through
-    /// for task 5.3 (there is no hitpause yet); the executor stores the flag.
+    /// Compiled `ignorehitpause` universal parameter, if present. When it
+    /// evaluates truthy, the executor still runs this controller during a
+    /// hit-pause freeze (task 6.5); a controller without it (or one that
+    /// evaluates to `0`) is skipped while the character is hit-paused.
     pub ignorehitpause: Option<CompiledExpr>,
     /// Compiled controller-specific parameters, keyed by the lowercased
     /// parameter name. Each value is a [`CompiledParam`]: the parameter value

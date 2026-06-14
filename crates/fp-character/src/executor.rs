@@ -24,8 +24,11 @@
 //!      `trigger3` drops `trigger4` and everything after it).
 //! 3. **Universal params.** `persistent` controls re-firing across ticks
 //!    (`1` = every qualifying tick, the default; `0` = once per state entry;
-//!    `n` = every `n`th qualifying tick). `ignorehitpause` is evaluated and
-//!    wired through (there is no hitpause yet, so it has no effect this task).
+//!    `n` = every `n`th qualifying tick). `ignorehitpause` lets a controller run
+//!    *during* a hit-pause freeze (task 6.5): while [`Character::hitpause`] is
+//!    positive the character is frozen (no anim/time/physics advance) and only
+//!    `ignorehitpause`-flagged controllers are evaluated; every other controller
+//!    is skipped until the pause ends.
 //! 4. **State entry & transitions.** On entering a state the executor applies
 //!    the statedef's `type`/`movetype`/`physics`/`anim`/`ctrl`/`velset`. A
 //!    `ChangeState` controller updates `state_no`/`prev_state_no` and resets
@@ -203,20 +206,32 @@ impl Character {
     ) -> TickReport {
         let mut report = TickReport::default();
 
-        // Hit-pause gate: while frozen by a connecting hit, this minimal model holds
-        // the character completely still for the paused tick — it skips ALL state/
-        // physics processing and counts the pause down by one. (MUGEN additionally
-        // runs controllers flagged `ignorehitpause` during the pause; that exception
-        // is NOT implemented here yet — deferred, tracked as CB30 — and is currently
-        // benign because no get-hit common state relies on it.) The shake timer (the
-        // defender's visual jitter during the pause) counts down alongside it.
-        // Decrementing after the gate makes a freshly-set `hitpause = N` last N ticks.
+        // Hit-pause gate (task 6.5): while frozen by a connecting hit, the engine
+        // holds the character still for the paused tick — it does NOT advance the
+        // animation, the state `Time` counter, or physics (velocity/position is not
+        // integrated). The ONLY controllers permitted to run during the freeze are
+        // those flagged `ignorehitpause`; a controller without that flag is skipped
+        // for the duration of the pause. The pause counter is decremented by one
+        // each frozen tick, so a freshly-set `hitpause = N` lasts exactly N ticks
+        // and normal advancement resumes on the tick it reaches 0.
+        //
+        // SIMPLIFICATION (deferred, tracked as CB30): we model the freeze as a
+        // single symmetric per-character pause. MUGEN's finer distinction between
+        // the attacker's `hitpause` and the defender's `hitshake` — and the precise
+        // shake-then-knockback timing nuance — is not modeled; both participants
+        // simply freeze for their respective `pausetime` and the defender's shake
+        // timer counts down alongside. The shake timer (the defender's visual
+        // jitter during the pause) is decremented in lockstep with the pause.
         if self.hitpause > 0 {
             self.hitpause -= 1;
             if self.shaketime > 0 {
                 self.shaketime -= 1;
             }
             report.hitpaused = true;
+            // Run ONLY the `ignorehitpause`-flagged controllers, in the same
+            // special-state-then-current-state order as a normal tick. Everything
+            // else (anim/time/physics advance, non-flagged controllers) is frozen.
+            self.run_ignorehitpause_only(states, &mut report);
             return report;
         }
         if self.shaketime > 0 {
@@ -369,6 +384,67 @@ impl Character {
                 report.transition_cap_hit = true;
                 return;
             }
+        }
+    }
+
+    /// Runs **only** the controllers flagged `ignorehitpause` during a hit-pause
+    /// freeze, in MUGEN's special-state-then-current-state order (`-3`, `-2`,
+    /// `-1`, then the current numbered state).
+    ///
+    /// This is the hit-pause exception (task 6.5): a paused character is otherwise
+    /// completely frozen (no anim/time/physics advance, no normal controllers),
+    /// but a controller that asserts `ignorehitpause = 1` still evaluates its
+    /// triggers and dispatches if it qualifies. The same gating and `persistent`
+    /// semantics as a normal tick apply; the only difference is the
+    /// [`Self::ignorehitpause_flag`] pre-filter that skips every non-flagged
+    /// controller.
+    ///
+    /// Unlike a normal tick, this does **not** follow `ChangeState` re-entry
+    /// across states within the frozen tick: a hit-paused character should not be
+    /// driving its own state transitions, and the dispatch of a `ChangeState`
+    /// (should an `ignorehitpause` controller carry one) still updates the cursor —
+    /// but we do not re-process the destination this frozen tick. Each special
+    /// state and the current state are scanned once, top-to-bottom. Never panics.
+    fn run_ignorehitpause_only(
+        &mut self,
+        states: &HashMap<i32, CompiledState>,
+        report: &mut TickReport,
+    ) {
+        for state_no in [-3, -2, -1, self.state_no] {
+            let Some(state) = states.get(&state_no) else {
+                continue;
+            };
+            let num = state.controllers.len();
+            for idx in 0..num {
+                let Some(state) = states.get(&state_no) else {
+                    break;
+                };
+                let Some(ctrl) = state.controllers.get(idx) else {
+                    break;
+                };
+                let ctrl = ctrl.clone();
+                if !self.ignorehitpause_flag(&ctrl) {
+                    // A controller without `ignorehitpause` is skipped for the
+                    // duration of the freeze.
+                    continue;
+                }
+                self.run_controller(states, &ctrl, idx, report);
+            }
+        }
+    }
+
+    /// Evaluates a controller's `ignorehitpause` universal parameter.
+    ///
+    /// Returns `true` only when the controller carries an `ignorehitpause`
+    /// expression that evaluates to a non-zero (truthy) value. A controller with
+    /// no `ignorehitpause` line, or one whose expression evaluates to `0`,
+    /// returns `false` — matching MUGEN's default of `0` (the controller is paused
+    /// during hit-pause). A fallback (failed-compile) expression evaluates to `0`
+    /// and so returns `false`. Never panics.
+    fn ignorehitpause_flag(&self, ctrl: &CompiledController) -> bool {
+        match &ctrl.ignorehitpause {
+            Some(expr) => self.eval_bool(expr),
+            None => false,
         }
     }
 
@@ -3029,13 +3105,13 @@ mod tests {
         assert_eq!(ch.state_no, 1);
     }
 
-    // ---- AC5: ignorehitpause is wired through the loader (no runtime effect yet)
+    // ---- ignorehitpause is wired through the loader -----------------------
 
     #[test]
     fn ignorehitpause_is_compiled_onto_the_controller() {
-        // There is no hitpause yet, so ignorehitpause has no observable runtime
-        // effect; but the loader must compile and carry the flag so 5.4+ can honor
-        // it. Verify the compiled controller preserves it from CNS.
+        // The loader must compile and carry the flag so the executor can honor it
+        // during a hit-pause freeze (task 6.5). Verify the compiled controller
+        // preserves it from CNS.
         let cns = CnsFile::from_str(
             "[Statedef 0]\ntype = S\n\
              [State 0, x]\ntype = Null\ntrigger1 = 1\nignorehitpause = 1\n",
@@ -3048,6 +3124,295 @@ mod tests {
             .expect("ignorehitpause should be compiled");
         assert!(!ihp.is_fallback);
         assert_eq!(ihp.source, "1");
+    }
+
+    // ---- Task 6.5: hit-pause (impact freeze) in the executor ---------------
+
+    /// Builds a compiled controller exactly like [`ctrl`] but with an
+    /// `ignorehitpause` expression set, so the test can prove the gate runs it
+    /// during a freeze.
+    fn ctrl_ihp(
+        state_number: i32,
+        kind: &str,
+        groups: &[(u32, &[&str])],
+        ignorehitpause: &str,
+        params: &[(&str, &str)],
+    ) -> CompiledController {
+        CompiledController {
+            ignorehitpause: Some(CompiledExpr::compile(ignorehitpause)),
+            ..ctrl(state_number, kind, &[], groups, None, params)
+        }
+    }
+
+    /// AC2/AC4: a character with `hitpause = N` freezes anim, state `Time`, and
+    /// position for N ticks, then resumes normal advancement on the tick the
+    /// counter reaches 0. The default `hitpause = 0` path is exercised by every
+    /// other test (AC3); here we set it explicitly.
+    #[test]
+    fn hitpause_freezes_anim_time_and_pos_for_n_ticks_then_resumes() {
+        // State 0: VelSet x = 1 every tick (so a *non-frozen* tick visibly moves
+        // the character via integration). Anim 0 has two 1-tick frames so a
+        // running tick advances the element each tick.
+        let mover = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let lc = loaded(
+            vec![stand_n(0, vec![mover])],
+            tiny_air(0, &[1, 1]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.facing = Facing::Right;
+        ch.set_hitpause_time(2); // accessor names the same field
+
+        // Snapshot the frozen baseline.
+        let anim_elem0 = ch.anim_elem;
+        let pos0 = ch.pos;
+        let time0 = ch.state_time;
+
+        // Tick 1: frozen. Nothing advances; hitpause counts 2 -> 1.
+        let r1 = lc.tick(&mut ch);
+        assert!(r1.hitpaused, "first paused tick is reported as hit-paused");
+        assert_eq!(ch.hitpause_time(), 1, "hitpause decremented by one");
+        assert_eq!(ch.anim_elem, anim_elem0, "anim frozen");
+        assert_eq!(ch.state_time, time0, "state Time frozen");
+        assert_eq!(ch.pos, pos0, "position frozen (no physics integration)");
+        assert_eq!(ch.vel.x, 0.0, "VelSet did not fire (controller is gated off)");
+        assert_eq!(r1.controllers_fired, 0, "no controllers fire while frozen");
+
+        // Tick 2: still frozen. hitpause counts 1 -> 0.
+        let r2 = lc.tick(&mut ch);
+        assert!(r2.hitpaused, "second paused tick still frozen");
+        assert_eq!(ch.hitpause_time(), 0, "hitpause reaches zero");
+        assert_eq!(ch.anim_elem, anim_elem0, "anim still frozen");
+        assert_eq!(ch.pos, pos0, "position still frozen");
+
+        // Tick 3: hitpause is 0 -> normal advancement resumes. The mover fires,
+        // physics integrates position, and the state Time advances.
+        let r3 = lc.tick(&mut ch);
+        assert!(!r3.hitpaused, "freeze is over; tick runs normally");
+        assert_eq!(ch.vel.x, 1.0, "VelSet fired on the resumed tick");
+        assert!(ch.pos.x > pos0.x, "position integrated once the freeze ended");
+        assert!(ch.state_time > time0, "state Time advances after the freeze");
+    }
+
+    /// AC2/AC4: during a freeze, an `ignorehitpause`-flagged controller still
+    /// fires while a normal controller in the same state does not.
+    #[test]
+    fn ignorehitpause_controller_runs_during_pause_normal_one_does_not() {
+        // State 0 has two VarSet controllers, both unconditionally triggered:
+        //  - idx 0: writes var(0) = 1, NO ignorehitpause -> skipped while frozen.
+        //  - idx 1: writes var(1) = 1, ignorehitpause = 1 -> runs while frozen.
+        let normal = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "0"), ("value", "1")]);
+        let flagged =
+            ctrl_ihp(0, "VarSet", &[(1, &["1"])], "1", &[("v", "1"), ("value", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![normal, flagged])], tiny_air(0, &[1]));
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.set_hitpause_time(1);
+
+        let report = lc.tick(&mut ch);
+        assert!(report.hitpaused, "the tick is hit-paused");
+        assert_eq!(ch.vars[0], 0, "normal controller is SKIPPED during the pause");
+        assert_eq!(ch.vars[1], 1, "ignorehitpause controller STILL fires during pause");
+        assert_eq!(report.controllers_fired, 1, "exactly the flagged one fired");
+        assert_eq!(ch.hitpause_time(), 0, "pause counted down to zero");
+
+        // After the pause ends, the normal controller fires too.
+        let report2 = lc.tick(&mut ch);
+        assert!(!report2.hitpaused);
+        assert_eq!(ch.vars[0], 1, "normal controller fires once the freeze ends");
+    }
+
+    /// AC2: an `ignorehitpause` whose expression evaluates to `0` is treated as
+    /// absent — the controller is skipped during a freeze, like any normal one.
+    #[test]
+    fn ignorehitpause_evaluating_to_zero_is_skipped_during_pause() {
+        let flagged_off =
+            ctrl_ihp(0, "VarSet", &[(1, &["1"])], "0", &[("v", "2"), ("value", "9")]);
+        let lc = loaded(vec![stand_n(0, vec![flagged_off])], tiny_air(0, &[1]));
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.set_hitpause_time(1);
+
+        let report = lc.tick(&mut ch);
+        assert!(report.hitpaused);
+        assert_eq!(ch.vars[2], 0, "ignorehitpause=0 controller is skipped while frozen");
+        assert_eq!(report.controllers_fired, 0);
+    }
+
+    /// AC1 (executor side): the `set_hitpause_time` accessor reads/writes the same
+    /// value the freeze gates on, and clamps a negative input to zero.
+    #[test]
+    fn hitpause_time_accessor_round_trips_and_clamps() {
+        let mut ch = Character::new();
+        assert_eq!(ch.hitpause_time(), 0, "default is not paused");
+        ch.set_hitpause_time(5);
+        assert_eq!(ch.hitpause_time(), 5);
+        assert_eq!(ch.hitpause, 5, "accessor and field are the same value");
+        ch.set_hitpause_time(-3);
+        assert_eq!(ch.hitpause_time(), 0, "negative input clamps to zero");
+    }
+
+    // ---- Proctor (task 6.5): extra hit-pause gate edge cases ----------------
+
+    /// AC3: a character with `hitpause == 0` (the default, and an explicit zero)
+    /// takes the NORMAL path — the gate is a transparent no-op. The mover fires,
+    /// physics integrates, anim and state Time advance, and the tick is not
+    /// reported as hit-paused.
+    #[test]
+    fn zero_hitpause_is_a_transparent_no_op() {
+        let mover = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![mover])], tiny_air(0, &[1, 1]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.facing = Facing::Right;
+        ch.set_hitpause_time(0); // explicit zero — same as the default path
+
+        let pos0 = ch.pos;
+        let r = lc.tick(&mut ch);
+        assert!(!r.hitpaused, "hitpause == 0 is never reported as a freeze");
+        assert_eq!(r.controllers_fired, 1, "the normal controller fires");
+        assert_eq!(ch.vel.x, 1.0, "VelSet ran on the unpaused tick");
+        assert!(ch.pos.x > pos0.x, "physics integrated normally");
+        assert!(ch.state_time > 0, "state Time advanced normally");
+        assert_eq!(ch.hitpause_time(), 0, "still zero — nothing decremented below 0");
+    }
+
+    /// AC2: `hitpause == 1` is a single-tick freeze: one frozen tick (counter
+    /// 1 -> 0), then the very next tick resumes normally. Pins the smallest
+    /// non-trivial freeze and its boundary.
+    #[test]
+    fn hitpause_of_one_freezes_exactly_one_tick() {
+        let mover = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![mover])], tiny_air(0, &[1, 1]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.facing = Facing::Right;
+        ch.set_hitpause_time(1);
+
+        let r1 = lc.tick(&mut ch);
+        assert!(r1.hitpaused, "the single paused tick is frozen");
+        assert_eq!(ch.hitpause_time(), 0, "one tick takes the counter to zero");
+        assert_eq!(ch.vel.x, 0.0, "mover did not fire while frozen");
+
+        let r2 = lc.tick(&mut ch);
+        assert!(!r2.hitpaused, "resumes on the very next tick");
+        assert_eq!(ch.vel.x, 1.0, "mover fires once the freeze ends");
+    }
+
+    /// AC2: an `ignorehitpause`-flagged controller in a SPECIAL state (`[Statedef
+    /// -2]`) also runs during the freeze — the gate scans `-3,-2,-1` then the
+    /// current state, not just the current state. Forge's tests only flag a
+    /// controller in the current state; this covers the special-state path.
+    #[test]
+    fn ignorehitpause_controller_in_special_state_runs_during_pause() {
+        // [Statedef -2]: writes var(3) = 1, ignorehitpause = 1 -> runs while frozen.
+        let special = ctrl_ihp(-2, "VarSet", &[(1, &["1"])], "1", &[("v", "3"), ("value", "1")]);
+        // Current state has a NON-flagged controller that must stay skipped.
+        let normal = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "4"), ("value", "1")]);
+        let lc = loaded(
+            vec![stand_n(-2, vec![special]), stand_n(0, vec![normal])],
+            tiny_air(0, &[1]),
+        );
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.set_hitpause_time(1);
+
+        let report = lc.tick(&mut ch);
+        assert!(report.hitpaused);
+        assert_eq!(ch.vars[3], 1, "special-state ignorehitpause controller fires");
+        assert_eq!(ch.vars[4], 0, "current-state normal controller stays skipped");
+        assert_eq!(report.controllers_fired, 1, "only the flagged special one fired");
+    }
+
+    /// AC2/MUGEN-semantics: a `ChangeState` carried by an `ignorehitpause`
+    /// controller during a freeze updates the cursor but does NOT re-process the
+    /// destination state that same frozen tick (the documented hit-pause rule:
+    /// the gate scans each state once and does not follow re-entry). The mover in
+    /// the destination must therefore stay inert until the freeze ends.
+    #[test]
+    fn changestate_during_pause_does_not_reprocess_destination() {
+        // Current state 0: ignorehitpause ChangeState -> state 7.
+        let jump = ctrl_ihp(0, "ChangeState", &[(1, &["1"])], "1", &[("value", "7")]);
+        // Destination state 7: a mover (no ignorehitpause) that would set vel.x if
+        // it were re-processed this tick — it must NOT run during the freeze.
+        let dest_mover = ctrl(7, "VelSet", &[], &[(1, &["1"])], None, &[("x", "9")]);
+        let lc = loaded(
+            vec![stand_n(0, vec![jump]), stand_n(7, vec![dest_mover])],
+            tiny_air(0, &[1]),
+        );
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.facing = Facing::Right;
+        ch.set_hitpause_time(1);
+
+        let report = lc.tick(&mut ch);
+        assert!(report.hitpaused);
+        assert_eq!(ch.state_no, 7, "the ChangeState dispatched and moved the cursor");
+        assert_eq!(ch.vel.x, 0.0, "destination state was NOT re-processed this frozen tick");
+        assert_eq!(ch.hitpause_time(), 0, "freeze still counted down");
+    }
+
+    /// AC2: when `shaketime` outlasts `hitpause`, the freeze ends when `hitpause`
+    /// reaches 0 (normal advancement resumes) while the remaining shake ticks keep
+    /// counting down on the now-normal ticks. Pins the shake counter's independent
+    /// lifetime — the simplification note says the defender's shake counts down
+    /// alongside the pause and continues after it.
+    #[test]
+    fn shaketime_outlasting_hitpause_keeps_counting_after_freeze_ends() {
+        let mover = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let lc = loaded(vec![stand_n(0, vec![mover])], tiny_air(0, &[1, 1]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.facing = Facing::Right;
+        ch.hitpause = 1;
+        ch.shaketime = 3;
+
+        // Tick 1: frozen (hitpause 1 -> 0, shaketime 3 -> 2). Mover gated off.
+        let r1 = lc.tick(&mut ch);
+        assert!(r1.hitpaused, "frozen while hitpause > 0");
+        assert_eq!(ch.hitpause, 0);
+        assert_eq!(ch.shaketime, 2, "shake decremented during the freeze");
+        assert_eq!(ch.vel.x, 0.0, "mover gated off while frozen");
+
+        // Tick 2: hitpause is 0 -> NOT frozen, but shaketime still counts down on
+        // the normal path (3 -> 2 -> 1). The mover now fires.
+        let r2 = lc.tick(&mut ch);
+        assert!(!r2.hitpaused, "freeze over once hitpause hit 0");
+        assert_eq!(ch.shaketime, 1, "remaining shake counts down on a normal tick");
+        assert_eq!(ch.vel.x, 1.0, "mover fires once the freeze ended");
+
+        // Tick 3: shaketime 1 -> 0.
+        lc.tick(&mut ch);
+        assert_eq!(ch.shaketime, 0, "shake fully counted out");
+    }
+
+    /// AC2: a frozen tick performs NO state transitions even when the current
+    /// state authors a normal `ChangeState` whose triggers are satisfied — the
+    /// transition is gated off with every other non-`ignorehitpause` controller.
+    #[test]
+    fn normal_changestate_is_suppressed_during_freeze() {
+        let jump = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "42")]);
+        let lc = loaded(
+            vec![stand_n(0, vec![jump]), stand_n(42, vec![])],
+            tiny_air(0, &[1]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.set_hitpause_time(2);
+
+        let r = lc.tick(&mut ch);
+        assert!(r.hitpaused);
+        assert_eq!(ch.state_no, 0, "no transition while frozen");
+        assert_eq!(r.transitions, 0, "no transitions counted during a freeze");
+        assert_eq!(r.controllers_fired, 0, "the normal ChangeState did not fire");
     }
 
     // ---- AC5: full multi-tick walk-cycle integration through the executor ----
