@@ -444,6 +444,7 @@ dependencies = [
  "fp-input",
  "fp-physics",
  "fp-render",
+ "fp-stage",
  "pollster",
  "sdl2",
  "tracing",
@@ -548,6 +549,7 @@ name = "fp-stage"
 version = "0.1.0"
 dependencies = [
  "fp-core",
+ "fp-formats",
  "tracing",
 ]
 
