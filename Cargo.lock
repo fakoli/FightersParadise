@@ -233,6 +233,7 @@ dependencies = [
  "fp-combat",
  "fp-core",
  "fp-formats",
+ "fp-input",
  "fp-vm",
  "tracing",
  "tracing-subscriber",
@@ -263,6 +264,7 @@ dependencies = [
  "fp-combat",
  "fp-core",
  "fp-formats",
+ "fp-input",
  "fp-physics",
  "tracing",
 ]

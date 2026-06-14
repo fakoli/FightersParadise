@@ -9,6 +9,7 @@ license.workspace = true
 fp-core.workspace = true
 fp-character.workspace = true
 fp-physics.workspace = true
+fp-input.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

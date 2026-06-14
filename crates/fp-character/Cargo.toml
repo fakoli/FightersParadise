@@ -10,6 +10,7 @@ fp-core.workspace = true
 fp-formats.workspace = true
 fp-vm.workspace = true
 fp-combat.workspace = true
+fp-input.workspace = true
 tracing.workspace = true
 
 # Dev-only: a capturing subscriber lets the 6.2b tests assert that NO spurious

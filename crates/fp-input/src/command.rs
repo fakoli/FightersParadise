@@ -150,6 +150,36 @@ impl CommandMatcher {
         self.active.iter().any(|r| r.name == name)
     }
 
+    /// Returns the names of every command active on the current tick.
+    ///
+    /// Duplicates never occur because an already-active command is not re-matched,
+    /// and callers must not rely on any particular ordering. To snapshot into a
+    /// character's command source, prefer [`active_command_names_in`], which bounds
+    /// the result to that character's own command vocabulary and gives a stable
+    /// order.
+    ///
+    /// [`active_command_names_in`]: CommandMatcher::active_command_names_in
+    #[must_use]
+    pub fn active_command_names(&self) -> Vec<String> {
+        self.active.iter().map(|r| r.name.clone()).collect()
+    }
+
+    /// Returns the names from `defs` that are active this tick, in `defs` order.
+    ///
+    /// This is the single shared snapshot primitive: it bounds the matcher's
+    /// active set to a character's own command vocabulary (and yields a
+    /// deterministic order) before the names are handed to a command source.
+    /// Borrowing from `defs` avoids cloning. Both the two-player
+    /// `fp_engine::Match` and the single-character `fp-app` path use it, so the
+    /// filter logic lives in exactly one place.
+    #[must_use]
+    pub fn active_command_names_in<'a>(&self, defs: &'a [CommandDef]) -> Vec<&'a str> {
+        defs.iter()
+            .map(|d| d.name.as_str())
+            .filter(|name| self.command_active(name))
+            .collect()
+    }
+
     /// Returns `true` and removes the command if it is active (consuming it).
     ///
     /// This prevents the same command match from triggering multiple times.
@@ -819,6 +849,100 @@ mod tests {
         matcher.check_commands(&buffer, true);
         assert!(matcher.consume("consume_test"));
         assert!(!matcher.consume("consume_test"));
+    }
+
+    #[test]
+    fn active_command_names_reports_all_active() {
+        // `active_command_names` must list every active command (the shared
+        // snapshot helper both fp-engine and fp-app use) and be empty when none
+        // are active.
+        let cmds = vec![
+            CommandDef {
+                name: "holdfwd".into(),
+                elements: compile_command("/$F").unwrap(),
+                time: 1,
+                buffer_time: 1,
+            },
+            CommandDef {
+                name: "punch".into(),
+                elements: compile_command("x").unwrap(),
+                time: 1,
+                buffer_time: 1,
+            },
+        ];
+        let mut matcher = CommandMatcher::new(cmds);
+
+        // Nothing active on an empty buffer.
+        let buffer = InputBuffer::new();
+        matcher.check_commands(&buffer, true);
+        assert!(matcher.active_command_names().is_empty());
+
+        // Hold Forward + press X: both commands active.
+        let mut buffer = InputBuffer::new();
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[Button::X],
+        ));
+        matcher.check_commands(&buffer, true);
+        let names = matcher.active_command_names();
+        assert!(names.iter().any(|n| n == "holdfwd"), "holdfwd active: {names:?}");
+        assert!(names.iter().any(|n| n == "punch"), "punch active: {names:?}");
+        assert_eq!(names.len(), 2, "exactly the two active commands: {names:?}");
+        // It agrees with `command_active` for every name.
+        for n in &names {
+            assert!(matcher.command_active(n));
+        }
+    }
+
+    #[test]
+    fn active_command_names_in_bounds_and_orders_by_defs() {
+        // `active_command_names_in` returns the defs that are active, in DEFS order
+        // (not matcher order), excluding defs that are not active. This is the
+        // shared snapshot primitive fp-engine and fp-app both call.
+        let mut matcher = CommandMatcher::new(vec![
+            holdfwd_cmd(),
+            CommandDef {
+                name: "punch".into(),
+                elements: compile_command("x").unwrap(),
+                time: 1,
+                buffer_time: 1,
+            },
+        ]);
+        let mut buffer = InputBuffer::new();
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[Button::X],
+        ));
+        matcher.check_commands(&buffer, true);
+
+        // Pass defs in a DIFFERENT order than the matcher, with an extra inactive
+        // "kick": the result is bounded to active defs, in defs order.
+        let defs = vec![
+            CommandDef {
+                name: "punch".into(),
+                elements: compile_command("x").unwrap(),
+                time: 1,
+                buffer_time: 1,
+            },
+            holdfwd_cmd(),
+            CommandDef {
+                name: "kick".into(),
+                elements: compile_command("y").unwrap(),
+                time: 1,
+                buffer_time: 1,
+            },
+        ];
+        assert_eq!(
+            matcher.active_command_names_in(&defs),
+            vec!["punch", "holdfwd"],
+            "active defs in defs order, inactive 'kick' excluded"
+        );
     }
 
     /// Builds the MUGEN `holdfwd` command (`/$F`, time = 1) used by KFM's

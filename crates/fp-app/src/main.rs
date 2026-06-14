@@ -16,13 +16,16 @@
 //! ## The two-player match (task 7.2 — the playable milestone)
 //!
 //! The default mode loads **two** full MUGEN characters (both KFM) from their
-//! `.def`s, applies the engine-built-in stand<->walk movement bridge to each (see
-//! [`inject_engine_movement_bridge`]), places them at opposing start positions
-//! facing each other, and drives them through a [`fp_engine::Match`]. Every 60Hz
-//! frame the app gathers P1 input from the keyboard and a neutral/idle input for
-//! P2, calls [`fp_engine::Match::tick`], then renders BOTH fighters from their
-//! current AIR frame (per-character texture cache) plus a minimal HUD: each
-//! fighter's life as a bar (P1 top-left, P2 top-right) and a KO/round indicator.
+//! `.def`s, places them at opposing start positions facing each other, and drives
+//! them through a [`fp_engine::Match`]. Basic ground locomotion is no longer
+//! shimmed in the app: the loader supplies MUGEN's built-in
+//! stand<->walk<->crouch<->jump command-states for every character (task 7.3
+//! part B) and the `Match` runs each player's real [`fp_input::CommandMatcher`]
+//! (task 7.3 part A). Every 60Hz frame the app gathers P1 input from the keyboard
+//! and a neutral/idle input for P2, calls [`fp_engine::Match::tick`], then renders
+//! BOTH fighters from their current AIR frame (per-character texture cache) plus a
+//! minimal HUD: each fighter's life as a bar (P1 top-left, P2 top-right) and a
+//! KO/round indicator.
 //!
 //! Controls (P1): arrow keys or WASD move; attack buttons map to U/I/O (a/b/c)
 //! and J/K/L (x/y/z). P2 is a stationary dummy in this milestone.
@@ -39,7 +42,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fp_character::{Character, CompiledController, CompiledExpr, LoadedCharacter};
+use fp_character::{Character, LoadedCharacter};
 use fp_core::SpriteId;
 use fp_engine::{Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
@@ -68,7 +71,10 @@ const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 
 /// MUGEN common stand (idle) state number.
 const STATE_STAND: i32 = 0;
-/// MUGEN common walk state number.
+/// MUGEN common walk state number. Only referenced by the single-character CNS
+/// regression tests now that the app no longer shims locomotion, so it is gated
+/// to keep the shipped binary free of an unused constant.
+#[cfg(test)]
 const STATE_WALK: i32 = 20;
 
 /// Player 1's starting world X (left of center), in pixels.
@@ -128,11 +134,8 @@ struct CachedSprite {
 /// inside the matcher, which already resolves `F`/`B` against the facing.
 #[cfg(test)]
 fn snapshot_active_commands(matcher: &CommandMatcher, defs: &[CommandDef]) -> ActiveCommands {
-    let names = defs
-        .iter()
-        .filter(|d| matcher.command_active(&d.name))
-        .map(|d| d.name.clone());
-    ActiveCommands::from_names(names)
+    // The actual filter lives in `fp-input` (one place); this is a thin wrapper.
+    ActiveCommands::from_names(matcher.active_command_names_in(defs))
 }
 
 /// A fully CNS-driven playable character: a [`LoadedCharacter`] (assets +
@@ -160,58 +163,18 @@ struct CnsCharacter {
 impl CnsCharacter {
     /// Builds a CNS-driven character from a loaded `.def`.
     ///
-    /// Compiles the `.cmd` commands into a [`CommandMatcher`] (feeding the raw
-    /// MUGEN command strings straight to [`compile_command`], which parses the
-    /// `$`/`>` modifiers natively as of task 5.6a), supplies the MUGEN
-    /// engine-built-in stand<->walk movement bridge when the character's own data
-    /// does not author it (see [`inject_engine_movement_bridge`]), and starts the
-    /// entity standing with control in state 0.
-    fn new(mut loaded: LoadedCharacter) -> Self {
-        // Compile commands from the .cmd file (if any) into the matcher.
-        //
-        // The raw command string is fed straight to `compile_command`: as of task
-        // 5.6a, fp-input parses the MUGEN `$` (direction-detect) and `>`
-        // (strict-immediate) modifiers natively, so KFM's `holdfwd = /$F` etc.
-        // compile without any app-side pre-processing. Commands that still fail to
-        // compile (genuinely malformed) are skipped here rather than aborting.
-        let command_defs: Vec<CommandDef> = loaded
-            .cmd
-            .as_ref()
-            .map(|cmd_file| {
-                cmd_file
-                    .commands
-                    .iter()
-                    .filter_map(|c| {
-                        let elements = match compile_command(&c.command) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "skipping uncompilable command {:?} ({:?}): {e}",
-                                    c.name,
-                                    c.command
-                                );
-                                return None;
-                            }
-                        };
-                        Some(CommandDef {
-                            name: c.name.clone(),
-                            elements,
-                            time: c.time,
-                            buffer_time: c.buffer_time,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Compiles the `.cmd` commands into a [`CommandMatcher`] via the shared
+    /// [`LoadedCharacter::command_defs`] (which feeds the raw MUGEN command
+    /// strings straight to `compile_command`, parsing the `$`/`>` modifiers
+    /// natively), and starts the entity standing with control in state 0. The
+    /// engine-built-in stand<->walk<->crouch<->jump locomotion is supplied by the
+    /// loader for every character (task 7.3 part B), so there is no app-side shim
+    /// here anymore.
+    fn new(loaded: LoadedCharacter) -> Self {
+        // Compile commands from the .cmd file (if any) into the matcher, using the
+        // same shared compilation the two-player Match path uses.
+        let command_defs: Vec<CommandDef> = loaded.command_defs();
         tracing::info!("Compiled {} commands from CMD file", command_defs.len());
-
-        // Supply the MUGEN engine-built-in stand<->walk bridge when (and only
-        // when) the character's data does not author its own. This is NOT a
-        // band-aid for an fp-input/fp-character bug: stock KFM genuinely has no
-        // `holdfwd -> ChangeState 20` controller in either common1.cns or kfm.cmd
-        // — in real MUGEN that transition is hardcoded in the engine, not the data
-        // files. See the function docs for the full diagnosis.
-        inject_engine_movement_bridge(&mut loaded);
 
         let mut entity = Character::with_constants(loaded.constants);
         // Start standing, with control, in the stand state. The stand animation
@@ -291,228 +254,6 @@ fn clamp_elem(index: i32, len: usize) -> usize {
         0
     } else {
         (index as usize).min(len - 1)
-    }
-}
-
-/// Builds a controller with a type, trigger groups, and params, all compiled.
-fn make_ctrl(
-    state_number: i32,
-    label: &str,
-    kind: &str,
-    triggerall: &[&str],
-    groups: &[(u32, &[&str])],
-    params: &[(&str, &str)],
-) -> CompiledController {
-    CompiledController {
-        state_number,
-        label: label.to_string(),
-        controller_type: Some(kind.to_string()),
-        triggerall: triggerall.iter().map(|s| CompiledExpr::compile(s)).collect(),
-        triggers: groups
-            .iter()
-            .map(|(n, conds)| fp_character::CompiledTriggerGroup {
-                number: *n,
-                conditions: conds.iter().map(|s| CompiledExpr::compile(s)).collect(),
-            })
-            .collect(),
-        persistent: None,
-        ignorehitpause: None,
-        params: params
-            .iter()
-            .map(|(k, v)| (k.to_string(), fp_character::CompiledParam::compile(v)))
-            .collect(),
-    }
-}
-
-/// Supplies the MUGEN engine-built-in stand<->walk movement bridge into the
-/// loaded state graph, but only when the character's own data does not already
-/// author it.
-///
-/// # Why this is still needed (genuine engine gap, not a band-aid)
-///
-/// Task 5.6c removed the `normalize_command` and `drop_unevaluable_alive_controllers`
-/// band-aids because their root causes were fixed upstream (fp-input now parses
-/// `$`/`>`; fp-character now implements the `alive` trigger). This shim is a
-/// different animal: it papers over a **genuine engine gap**, not a bug.
-///
-/// In real MUGEN the stand->walk and walk->stand transitions are **hardcoded
-/// engine built-ins** — they are NOT authored in any character's data files.
-/// Empirically verified against stock KFM (the diagnostic in task 5.6c):
-///
-/// - `kfm.cmd` `[Statedef -1]` defines only special moves and the `FF`/`BB`
-///   double-tap *run* (-> states 100/105); it has **no** plain
-///   `holdfwd -> ChangeState 20`.
-/// - `common1.cns` `[Statedef 0]` (stand) has no stand->walk `ChangeState`; the
-///   only `value = 20` in all of KFM's data is a `ChangeAnim` inside
-///   `[Statedef 20]`, not a state transition.
-///
-/// So with all three band-aids removed, KFM holds Forward and never leaves state
-/// 0 (`pos.x` stays 0). The correct long-term fix is to model MUGEN's built-in
-/// common-state command->state bridge inside `fp-character`'s executor (so every
-/// character gets it for free, exactly as MUGEN does), at which point this shim
-/// can be deleted.
-///
-/// # Walk velocity is now fully engine-driven (no app-side repair)
-///
-/// Entering state 20 *and walking* now works end-to-end with no app-side repair:
-/// KFM's `[Statedef 20]` sets motion with `VelSet x = const(velocity.walk.fwd.x)`,
-/// `const(<member>)` resolves the authored magnitude (2.4) in fp-character (5.6e),
-/// and the executor integrates the world position **facing-relative**
-/// (`pos.x += vel.x * facing_sign`, task 6.2c). The stored velocity stays
-/// facing-relative (matching the `Vel X` trigger that common1.cns's walk-anim
-/// selectors rely on), so KFM walks the correct direction for BOTH facings
-/// without rewriting the walk-state `VelSet`. The previous CB26 walk-velocity
-/// facing repair (which rewrote state-20 `VelSet x` to `{walk_fwd_x} * facing`)
-/// was therefore removed in 6.2c.
-///
-/// TODO(fp-character): move the stand<->walk (and crouch/jump) engine built-in
-/// command->state transitions into the executor's special-state handling so every
-/// character gets them for free, then remove this remaining app-side bridge (CB25).
-///
-/// The bridge is appended to `[Statedef -1]` (the per-tick command->state state),
-/// gated on the standard `holdfwd`/`holdback` commands the data file defines, so
-/// the rest of the CNS-driven path runs unmodified. It is a no-op for any
-/// character that authors its own `ChangeState`-to-walk (avoiding a double walk).
-fn inject_engine_movement_bridge(loaded: &mut LoadedCharacter) {
-    // Only inject if the data doesn't already drive entry into the walk state
-    // (avoid double-walking for characters that author their own bridge).
-    let already_walks = loaded.states.values().any(|s| {
-        s.controllers.iter().any(|c| {
-            c.controller_type
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"))
-                && c.params
-                    .get("value")
-                    .is_some_and(|e| e.source.trim() == STATE_WALK.to_string())
-        })
-    });
-    if already_walks {
-        tracing::info!("character authors its own walk bridge; skipping engine built-in");
-        return;
-    }
-
-    // The bridge recognizes BOTH directional command naming schemes that drive
-    // this app:
-    //  * the single-character CNS path feeds KFM's own `.cmd` `holdfwd`/`holdback`
-    //    named commands through fp-input's CommandMatcher; and
-    //  * the two-player `fp_engine::Match` feeds facing-relative `fwd`/`back`
-    //    command names directly (see `fp_engine`'s `facing_relative_commands`),
-    //    and stock KFM has no `command = "fwd"` controller of its own.
-    // Each trigger group is OR'd, so any of the four "toward/away" commands enters
-    // walk; the return-to-stand controller requires NONE of them to be held.
-    let stand_to_walk = make_ctrl(
-        -1,
-        "engine: stand->walk",
-        "ChangeState",
-        &["stateno = 0", "ctrl"],
-        &[
-            (1, &["command = \"holdfwd\""]),
-            (2, &["command = \"holdback\""]),
-            (3, &["command = \"fwd\""]),
-            (4, &["command = \"back\""]),
-        ],
-        &[("value", "20")],
-    );
-    let walk_to_stand = make_ctrl(
-        -1,
-        "engine: walk->stand",
-        "ChangeState",
-        &[
-            "stateno = 20",
-            "command != \"holdfwd\"",
-            "command != \"holdback\"",
-            "command != \"fwd\"",
-            "command != \"back\"",
-        ],
-        &[(1, &["1"])],
-        &[("value", "0")],
-    );
-
-    {
-        let minus_one = loaded.states.entry(-1).or_insert_with(|| empty_state(-1));
-        minus_one.controllers.push(stand_to_walk);
-        minus_one.controllers.push(walk_to_stand);
-    }
-
-    tracing::info!("injected engine built-in stand<->walk command->state bridge");
-}
-
-/// Supplies the walk-state velocity for the **engine command naming scheme**
-/// (`fwd`/`back`), needed by the two-player [`fp_engine::Match`] path.
-///
-/// # Why this is a genuine engine gap (like the stand<->walk bridge)
-///
-/// Stock KFM's `[Statedef 20]` sets its walk velocity with controllers gated on
-/// `command = "holdfwd"` / `command = "holdback"` — the names KFM authors in its
-/// own `.cmd`. The single-character path drives those names through fp-input's
-/// CommandMatcher, so its walk velocity works. The two-player `fp_engine::Match`,
-/// however, feeds **facing-relative** `fwd`/`back` command names directly (see
-/// `fp_engine`'s `facing_relative_commands`) and never feeds `holdfwd`/`holdback`.
-/// As a result KFM enters walk state 20 (via the bridge above, which now also
-/// recognizes `fwd`/`back`) but its `VelSet` never fires and it walks in place.
-///
-/// This shim appends two `VelSet` controllers to `[Statedef 20]` mirroring the
-/// authored ones but gated on `fwd`/`back`, setting the same authored magnitudes
-/// (`const(velocity.walk.fwd.x)` / `const(velocity.walk.back.x)`, which fp-character
-/// resolves). It is idempotent (a no-op if the `fwd`-gated VelSet is already
-/// present) and only added by the [`Match`] construction path; the single-character
-/// path is unaffected. Like the stand<->walk bridge, the long-term fix is to model
-/// MUGEN's built-in command->state/velocity locomotion inside `fp-character`.
-fn inject_walk_velocity_bridge(loaded: &mut LoadedCharacter) {
-    let Some(walk) = loaded.states.get_mut(&STATE_WALK) else {
-        // No walk state to augment (e.g. a character without common1 walk); the
-        // stand<->walk bridge is harmless and this is simply a no-op.
-        return;
-    };
-
-    // Idempotence: skip if a `fwd`-gated VelSet is already present.
-    let already = walk.controllers.iter().any(|c| {
-        c.controller_type
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case("VelSet"))
-            && c.triggers.iter().any(|g| {
-                g.conditions
-                    .iter()
-                    .any(|e| e.source.replace(' ', "").eq_ignore_ascii_case("command=\"fwd\""))
-            })
-    });
-    if already {
-        return;
-    }
-
-    let vel_fwd = make_ctrl(
-        STATE_WALK,
-        "engine: walk vel fwd",
-        "VelSet",
-        &[],
-        &[(1, &["command = \"fwd\""])],
-        &[("x", "const(velocity.walk.fwd.x)")],
-    );
-    let vel_back = make_ctrl(
-        STATE_WALK,
-        "engine: walk vel back",
-        "VelSet",
-        &[],
-        &[(1, &["command = \"back\""])],
-        &[("x", "const(velocity.walk.back.x)")],
-    );
-    walk.controllers.push(vel_fwd);
-    walk.controllers.push(vel_back);
-
-    tracing::info!("injected engine built-in walk-velocity bridge for fwd/back commands");
-}
-
-/// Builds an empty `[Statedef n]` (no entry params, no controllers).
-fn empty_state(number: i32) -> fp_character::CompiledState {
-    fp_character::CompiledState {
-        number,
-        state_type: None,
-        movetype: None,
-        physics: None,
-        anim: None,
-        ctrl: None,
-        velset: None,
-        controllers: Vec::new(),
     }
 }
 
@@ -635,20 +376,17 @@ fn build_two_player_match(p1_def: &Path, p2_def: &Path) -> fp_core::FpResult<Mat
     ))
 }
 
-/// Loads one character `.def` into a [`Player`] positioned at `start_x`, applying
-/// the engine movement bridge and standing it in state 0 with control.
+/// Loads one character `.def` into a [`Player`] positioned at `start_x`,
+/// standing it in state 0 with control.
+///
+/// No app-side movement shim is applied: the loader supplies MUGEN's built-in
+/// stand<->walk<->crouch<->jump locomotion for every character (task 7.3 part B),
+/// and the [`Match`] runs each player's real [`fp_input::CommandMatcher`]
+/// (task 7.3 part A) so `holdfwd`/`holdback`/… and walk velocity all fire from
+/// the character's own data.
 fn build_player(def_path: &Path, start_x: f32) -> fp_core::FpResult<Player> {
     tracing::info!("Loading match character: {}", def_path.display());
-    let mut loaded = LoadedCharacter::load(def_path)?;
-
-    // Supply the MUGEN engine-built-in stand<->walk bridge to this character
-    // (a no-op for characters that author their own) — same shim the single
-    // character path applies, now applied to BOTH fighters. The companion
-    // walk-velocity bridge supplies the walk speed for the engine's `fwd`/`back`
-    // command naming (the two-player Match feeds those, not KFM's `.cmd`
-    // `holdfwd`/`holdback`).
-    inject_engine_movement_bridge(&mut loaded);
-    inject_walk_velocity_bridge(&mut loaded);
+    let loaded = LoadedCharacter::load(def_path)?;
 
     let mut entity = Character::with_constants(loaded.constants);
     entity.pos = fp_core::Vec2::new(start_x, 0.0);
@@ -1446,21 +1184,6 @@ mod tests {
         assert_eq!(clamp_elem(0, 0), 0); // empty action
     }
 
-    #[test]
-    fn engine_movement_bridge_controller_targets_walk_state() {
-        // A walk-bridge controller built by `make_ctrl` carries `value = 20`
-        // (the target stand->walk state). Full end-to-end behavior is covered by
-        // the headless test below; here we pin the controller shape.
-        let already = make_ctrl(
-            -1,
-            "x",
-            "ChangeState",
-            &["1"],
-            &[(1, &["1"])],
-            &[("value", "20")],
-        );
-        assert_eq!(already.params.get("value").map(|e| e.source.as_str()), Some("20"));
-    }
 
     // =====================================================================
     // Task 7.2 — two-player Match wiring (the playable demo)
@@ -1730,16 +1453,14 @@ mod tests {
         assert!(pc.entity.ctrl, "starts with control");
         assert_eq!(pc.entity.facing, fp_character::Facing::Right, "starts facing right");
 
-        // CRITICAL (5.6c): this whole path runs WITHOUT the removed band-aids.
-        // `holdfwd = /$F` compiles natively in fp-input (5.6a — no
-        // `normalize_command`), and `alive` resolves to Life>0 in fp-character
-        // (5.6b — no `drop_unevaluable_alive_controllers`), so the common stand
-        // state does not fall into death 5050. The only remaining shim is the
-        // MUGEN engine-built-in stand<->walk bridge (a genuine engine gap, not a
-        // band-aid — see `inject_engine_movement_bridge`).
+        // CRITICAL: this whole path runs WITHOUT any app-side shim.
+        // `holdfwd = /$F` compiles natively in fp-input, `alive` resolves to
+        // Life>0 in fp-character (so the common stand state does not fall into
+        // death 5050), and the MUGEN engine-built-in stand<->walk command-state is
+        // supplied by the fp-character loader for every character (task 7.3 part B).
 
         // Hold Forward (facing right → absolute Right) for many ticks. The
-        // `holdfwd` command activates while held; the engine movement bridge in
+        // `holdfwd` command activates while held; the loader's built-in
         // [Statedef -1] then fires the stand->walk ChangeState into state 20.
         let mut entered_walk = false;
         for _ in 0..30 {
@@ -2003,43 +1724,6 @@ mod tests {
         assert_eq!(clamp_elem(5, 1), 0, "single-frame action clamps to 0");
     }
 
-    // ---- AC3: make_ctrl / empty_state build well-formed graph pieces ----
-
-    #[test]
-    fn make_ctrl_compiles_triggers_and_params() {
-        let c = make_ctrl(
-            -1,
-            "test",
-            "ChangeState",
-            &["stateno = 0", "ctrl"],
-            &[(1, &["command = \"holdfwd\""])],
-            &[("value", "20")],
-        );
-        assert_eq!(c.state_number, -1);
-        assert_eq!(c.controller_type.as_deref(), Some("ChangeState"));
-        assert_eq!(c.triggerall.len(), 2);
-        assert!(c.triggerall.iter().all(|e| !e.is_fallback), "triggerall compiled");
-        assert_eq!(c.triggers.len(), 1);
-        assert_eq!(c.triggers[0].number, 1);
-        assert!(!c.triggers[0].conditions[0].is_fallback);
-        assert_eq!(c.params.get("value").map(|e| e.source.as_str()), Some("20"));
-        assert!(c.persistent.is_none());
-        assert!(c.ignorehitpause.is_none());
-    }
-
-    #[test]
-    fn empty_state_has_no_entry_fields_or_controllers() {
-        let s = empty_state(-1);
-        assert_eq!(s.number, -1);
-        assert!(s.state_type.is_none());
-        assert!(s.movetype.is_none());
-        assert!(s.physics.is_none());
-        assert!(s.anim.is_none());
-        assert!(s.ctrl.is_none());
-        assert!(s.velset.is_none());
-        assert!(s.controllers.is_empty());
-    }
-
     // ---- AC2 (facing-relative): holding the SCREEN direction toward the
     // opponent drives walk regardless of which way the character faces. ----
 
@@ -2230,15 +1914,16 @@ mod tests {
         );
     }
 
-    // ---- AC3: the engine-default walk bridge is injected into [Statedef -1] and
-    // injection is idempotent (no double bridge on a second call). ----
+    // ---- AC3: the engine built-in stand->walk command-state is present in
+    // [Statedef -1] after loading (now supplied by the fp-character loader for
+    // every character, task 7.3 part B — not an app shim). ----
 
     #[test]
     fn headless_walk_bridge_present_after_construction() {
         let Some(pc) = load_kfm_pc() else { return };
-        // CnsCharacter::new injected the stand<->walk bridge (KFM relies on the
-        // MUGEN engine default). [Statedef -1] must exist and carry a ChangeState
-        // into state 20 gated on a holdfwd-style command.
+        // The loader appended the engine built-in stand<->walk locomotion to
+        // [Statedef -1]. It must carry a ChangeState into state 20 gated on a
+        // holdfwd-style command.
         let minus_one = pc
             .loaded
             .state(-1)
@@ -2252,37 +1937,6 @@ mod tests {
                     .is_some_and(|e| e.source.trim() == STATE_WALK.to_string())
         });
         assert!(walks, "a ChangeState -> walk(20) must be present in [Statedef -1]");
-    }
-
-    #[test]
-    fn inject_engine_movement_bridge_is_idempotent() {
-        let Some(mut pc) = load_kfm_pc() else { return };
-        // Count walk-bridge controllers in [Statedef -1] after construction.
-        let count_walk_bridges = |pc: &CnsCharacter| -> usize {
-            pc.loaded
-                .state(-1)
-                .map(|s| {
-                    s.controllers
-                        .iter()
-                        .filter(|c| {
-                            c.params
-                                .get("value")
-                                .is_some_and(|e| e.source.trim() == STATE_WALK.to_string())
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-        };
-        let before = count_walk_bridges(&pc);
-        assert!(before >= 1, "construction injected at least one walk bridge");
-        // A second injection must NOT add another (the helper detects an existing
-        // walk bridge and skips), or the character would double-walk.
-        inject_engine_movement_bridge(&mut pc.loaded);
-        let after = count_walk_bridges(&pc);
-        assert_eq!(
-            before, after,
-            "second inject_engine_movement_bridge must be a no-op"
-        );
     }
 
     // ---- AC2 (5.6b end-to-end): the `alive` trigger now resolves natively, so
@@ -2635,9 +2289,10 @@ mod tests {
         assert!((full - 255.0 / 256.0).abs() < 1e-6, "255/256, got {full}");
     }
 
-    // ---- AC1/AC4: exactly ONE residual shim remains. The removed band-aids leave
-    // no death-state-strip and no synthesized standalone movement state; the only
-    // injected piece is the documented engine bridge inside [Statedef -1]. Gated. ----
+    // ---- AC1/AC4: no app-side movement shim remains. The death-state-strip and
+    // synthesized standalone movement state are gone; the engine built-in
+    // stand->walk command-state now comes from the fp-character loader (task 7.3
+    // part B), and is present exactly once in [Statedef -1]. Gated. ----
 
     #[test]
     fn only_residual_shim_is_the_documented_engine_bridge() {
@@ -2658,10 +2313,10 @@ mod tests {
             "stock `alive`-gated controllers must remain (death-strip band-aid gone)"
         );
 
-        // (b) The ONLY injected residual is the engine stand<->walk bridge in
-        //     [Statedef -1]: exactly one ChangeState->20 and one ChangeState->0
-        //     authored by the shim (labelled `engine:`). We assert the bridge is
-        //     present and singular (idempotent), confirming the residual is minimal.
+        // (b) The engine built-in stand->walk command-state appears EXACTLY once
+        //     in [Statedef -1] (the loader appends it once; KFM's own `.cmd` `-1`
+        //     authors no walk-entry of its own), confirming no duplicate / no extra
+        //     synthesized movement state.
         let minus_one = pc.loaded.state(-1).expect("[Statedef -1] exists");
         let to_walk = minus_one
             .controllers
@@ -2677,14 +2332,13 @@ mod tests {
             .count();
         assert_eq!(
             to_walk, 1,
-            "exactly one stand->walk ChangeState shim (no duplicate / no extra synthesized movement state)"
+            "exactly one stand->walk ChangeState built-in (no duplicate / no extra synthesized movement state)"
         );
     }
 
-    // ---- AC1/AC2 end-to-end: stand state falls through to walk via the OWN
-    // merged bridge path (not a synthesized standalone movement state). The
-    // `inject_default_movement` band-aid is gone, so the transition flows through
-    // [Statedef -1]'s command->state controllers. Gated. ----
+    // ---- AC1/AC2 end-to-end: stand state falls through to walk via [Statedef -1]
+    // (no synthesized standalone movement state). The transition flows through the
+    // loader's built-in command->state controllers in [Statedef -1]. Gated. ----
 
     #[test]
     fn headless_walk_transition_flows_through_statedef_minus_one() {
@@ -2732,13 +2386,11 @@ mod tests {
     // advances) and the helper purity (life_fraction, world_to_screen_x,
     // clamp_elem, map_blend_mode). The gaps Proctor closes here are:
     //
-    //   * AC1 — the SECOND 7.2-specific shim, `inject_walk_velocity_bridge`, is
-    //           applied to BOTH fighters by `build_player` and is NOT exercised
-    //           anywhere above. It is what makes KFM actually MOVE under the
-    //           engine's facing-relative `fwd`/`back` command naming (vs KFM's own
-    //           `holdfwd`/`holdback`). We pin: it injects fwd/back-gated VelSet
-    //           controllers into [Statedef 20]; it is idempotent; and the two
-    //           bridges together let an app-built match WALK P1 toward P2.
+    //   * AC1 — an app-built two-KFM match WALKS P1 toward P2 when "toward the
+    //           opponent" is held, end to end, with NO app shim: the `Match` runs
+    //           KFM's real CommandMatcher (so `holdfwd` fires), the loader's
+    //           built-in stand->walk command-state enters state 20, and KFM's own
+    //           `[Statedef 20]` VelSet (gated on `command="holdfwd"`) moves it.
     //   * AC1 — `build_player` seeds the exact start X / stand state / control /
     //           full life the demo relies on (not just "left/right of center").
     //   * AC2 — `player_current_frame` (the engine-Player analog of the single-
@@ -2758,107 +2410,13 @@ mod tests {
     // Every fixture-dependent test skips cleanly when test-assets/ is absent.
     // =====================================================================
 
-    // ---- AC1 (7.2 shim #2): the walk-velocity bridge for the engine's fwd/back
-    // command naming. Gated on the KFM fixture (it augments KFM's [Statedef 20]). ----
-
-    /// Counts `VelSet` controllers in `[Statedef 20]` gated on a given bare
-    /// command name (`fwd`/`back`), matching how `inject_walk_velocity_bridge`
-    /// recognizes its own idempotence marker (`command="fwd"`, spaces stripped).
-    fn count_walk_velset_for_command(loaded: &LoadedCharacter, command: &str) -> usize {
-        let needle = format!("command=\"{command}\"");
-        loaded
-            .state(STATE_WALK)
-            .map(|s| {
-                s.controllers
-                    .iter()
-                    .filter(|c| {
-                        c.controller_type
-                            .as_deref()
-                            .is_some_and(|t| t.eq_ignore_ascii_case("VelSet"))
-                            && c.triggers.iter().any(|g| {
-                                g.conditions.iter().any(|e| {
-                                    e.source
-                                        .replace(' ', "")
-                                        .eq_ignore_ascii_case(&needle)
-                                })
-                            })
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    #[test]
-    fn build_player_injects_walk_velocity_bridge_for_fwd_and_back() {
-        // `build_player` applies BOTH 7.2 shims. The walk-velocity bridge must add
-        // a fwd-gated AND a back-gated VelSet to [Statedef 20] so the two-player
-        // Match (which feeds facing-relative `fwd`/`back`, never KFM's own
-        // `holdfwd`/`holdback`) actually moves the fighter rather than walking in
-        // place. This is the exact gap the shim documents.
-        let def = test_asset("kfm/kfm.def");
-        if !def.exists() {
-            eprintln!("skipping walk-velocity bridge test: {} not present", def.display());
-            return;
-        }
-        let player = match build_player(&def, P1_START_X) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skipping walk-velocity bridge test: build_player failed: {e}");
-                return;
-            }
-        };
-        assert_eq!(
-            count_walk_velset_for_command(&player.loaded, "fwd"),
-            1,
-            "exactly one fwd-gated VelSet must be injected into [Statedef 20]"
-        );
-        assert_eq!(
-            count_walk_velset_for_command(&player.loaded, "back"),
-            1,
-            "exactly one back-gated VelSet must be injected into [Statedef 20]"
-        );
-    }
-
-    #[test]
-    fn inject_walk_velocity_bridge_is_idempotent() {
-        // A second application must NOT add a duplicate fwd/back VelSet (the shim
-        // detects its own fwd-gated marker and returns early), or the fighter would
-        // get a doubled walk velocity.
-        let def = test_asset("kfm/kfm.def");
-        if !def.exists() {
-            eprintln!("skipping walk-velocity idempotence test: {} not present", def.display());
-            return;
-        }
-        let mut player = match build_player(&def, P1_START_X) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skipping walk-velocity idempotence test: {e}");
-                return;
-            }
-        };
-        let fwd_before = count_walk_velset_for_command(&player.loaded, "fwd");
-        let back_before = count_walk_velset_for_command(&player.loaded, "back");
-        assert!(fwd_before >= 1 && back_before >= 1, "build_player injected the bridge");
-        // Re-apply directly: must be a no-op.
-        inject_walk_velocity_bridge(&mut player.loaded);
-        assert_eq!(
-            count_walk_velset_for_command(&player.loaded, "fwd"),
-            fwd_before,
-            "second inject_walk_velocity_bridge must not add another fwd VelSet"
-        );
-        assert_eq!(
-            count_walk_velset_for_command(&player.loaded, "back"),
-            back_before,
-            "second inject_walk_velocity_bridge must not add another back VelSet"
-        );
-    }
-
-    /// AC1 end-to-end: with BOTH 7.2 shims applied (as `build_player` does), an
-    /// app-built two-KFM match must actually WALK P1 toward P2 when "toward the
-    /// opponent" is held — not merely flip to state 20 and stand still. This is
-    /// the load-bearing proof that the walk-velocity bridge wires the engine's
-    /// `fwd` command to the authored walk speed (the single-character path proves
-    /// the `holdfwd` naming; this proves the Match's `fwd` naming).
+    /// AC1 end-to-end (NO app shim): an app-built two-KFM match must actually WALK
+    /// P1 toward P2 when "toward the opponent" is held — not merely flip to state
+    /// 20 and stand still. This is the load-bearing proof of the whole 7.3 change:
+    /// the `Match` runs KFM's real `CommandMatcher` (Part A) so `holdfwd` fires,
+    /// the loader's built-in stand->walk command-state (Part B) enters state 20,
+    /// and KFM's own `[Statedef 20]` VelSet (gated on `command="holdfwd"`) supplies
+    /// the walk speed — with the two shims now deleted (Part C).
     #[test]
     fn app_built_match_walks_p1_toward_opponent() {
         let Some(mut m) = build_kfm_match() else { return };

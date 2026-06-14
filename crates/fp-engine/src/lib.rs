@@ -13,10 +13,14 @@
 //! and the [`StageBounds`] that pin the fighters to the playfield.
 //! [`Match::tick`] advances exactly one frame in MUGEN-ish order:
 //!
-//! 1. **Feed inputs.** Each player's [`MatchInput`] is translated to a
-//!    *facing-relative* command set (so a held "toward the opponent" reads as
-//!    `fwd` regardless of which way the character faces) and pushed into the
-//!    character's [`fp_character::CommandSource`] seam.
+//! 1. **Feed inputs.** Each player's [`MatchInput`] becomes a RAW absolute
+//!    [`fp_input::InputState`], pushed into that player's own
+//!    [`fp_input::InputBuffer`], and the player's real
+//!    [`fp_input::CommandMatcher`] (compiled from the character's `.cmd`) is run
+//!    facing-relative. The recognized command names (`holdfwd`, `QCF_x`, …) are
+//!    snapshotted into the character's [`fp_character::CommandSource`] seam, so
+//!    the character's own CNS/CMD controllers and the engine built-in locomotion
+//!    fire off the same command vocabulary the data files author.
 //! 2. **Tick both state machines** via [`fp_character::Character::tick`].
 //! 3. **Run combat both directions** with
 //!    [`fp_character::combat::resolve_attack`] — P1 attacks P2, then P2 attacks
@@ -44,9 +48,13 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, Character, Facing, LoadedCharacter, MoveType, StateType,
+    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
+    StateType,
 };
 use fp_core::Vec2;
+use fp_input::{
+    logical_direction, Button, CommandDef, CommandMatcher, Direction, InputBuffer, InputState,
+};
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 
 /// The horizontal extent of the playfield, in world pixels.
@@ -85,11 +93,12 @@ impl Default for StageBounds {
 /// One frame of player input, expressed in **absolute screen directions**.
 ///
 /// The fields are screen-relative (left/right are world directions, not
-/// "toward/away from the opponent"). [`Match::tick`] converts them to the
-/// facing-relative command names a character's state machine expects, so that,
-/// for example, holding *toward* the opponent always reads as `fwd` and holding
-/// *away* reads as `back` (the latter also setting
-/// [`fp_character::Character::holding_back`] so the defender can guard).
+/// "toward/away from the opponent"). [`Match::tick`] feeds them straight into
+/// each player's [`fp_input::CommandMatcher`] as a raw [`fp_input::InputState`];
+/// the matcher resolves facing at match time, so holding *toward* the opponent
+/// activates the character's forward-detect commands (e.g. KFM's `holdfwd`) and
+/// holding *away* activates `holdback` and sets
+/// [`fp_character::Character::holding_back`] so the defender can guard.
 ///
 /// This is a deliberately small, renderer-/input-agnostic shape: a front end
 /// backed by `fp-input`, a replay file, or a test harness can all populate it.
@@ -200,19 +209,47 @@ pub struct Player {
     pub character: Character,
     /// The loaded, compiled assets the character ticks against.
     pub loaded: LoadedCharacter,
+    /// Rolling raw-input history (absolute directions + buttons) this player's
+    /// command recognizer scans each tick.
+    input_buffer: InputBuffer,
+    /// The player's real command recognizer, compiled from its `.cmd` at
+    /// construction. Run every fight tick to produce the active command names
+    /// (`holdfwd`, `FF`, special motions, …) the character's state machine reads.
+    matcher: CommandMatcher,
+    /// The compiled command definitions, kept to enumerate which command names to
+    /// snapshot into the character's command source each tick.
+    command_defs: Vec<CommandDef>,
 }
 
 impl Player {
-    /// Wraps a live [`Character`] and its [`LoadedCharacter`] into a [`Player`].
+    /// Wraps a live [`Character`] and its [`LoadedCharacter`] into a [`Player`],
+    /// building the player's real [`CommandMatcher`] from the character's loaded
+    /// `.cmd`.
     ///
     /// The caller is responsible for having seeded the character's constants from
     /// the loaded assets (e.g. via
     /// [`Character::with_constants`](fp_character::Character::with_constants)); a
     /// freshly [`Character::new`](fp_character::Character::new)'d character is also
     /// accepted and simply uses default constants.
+    ///
+    /// The command recognizer is compiled via
+    /// [`LoadedCharacter::command_defs`](fp_character::LoadedCharacter::command_defs),
+    /// the same shared compilation the single-character `fp-app` path uses, so a
+    /// `Match` recognizes the character's authored commands (the `holdfwd`/
+    /// `holdback`/`holdup`/`holddown` the engine built-in locomotion gates on, the
+    /// `FF`/`BB` runs, and every special motion) exactly as the data files define
+    /// them. A character with no `.cmd` simply yields an empty recognizer.
     #[must_use]
     pub fn new(character: Character, loaded: LoadedCharacter) -> Self {
-        Self { character, loaded }
+        let command_defs = loaded.command_defs();
+        let matcher = CommandMatcher::new(command_defs.clone());
+        Self {
+            character,
+            loaded,
+            input_buffer: InputBuffer::new(),
+            matcher,
+            command_defs,
+        }
     }
 
     /// The character's world position in pixels (`Pos X`/`Pos Y`).
@@ -390,8 +427,8 @@ impl Match {
         //     play) but receive no commands.
         let fighting = self.round_state == RoundState::Fight;
         if fighting {
-            Self::feed_input(&mut self.p1.character, p1_input);
-            Self::feed_input(&mut self.p2.character, p2_input);
+            self.p1.feed_input(p1_input);
+            self.p2.feed_input(p2_input);
         } else {
             // Clear any stale commands so nothing fires outside the fight phase.
             self.p1
@@ -438,84 +475,6 @@ impl Match {
 
         // (6) Advance the round state machine and timer.
         self.advance_round();
-    }
-
-    /// Translates a [`MatchInput`] into a facing-relative command set and installs
-    /// it as the character's [`fp_character::CommandSource`], also updating
-    /// [`fp_character::Character::holding_back`] for the guard path.
-    fn feed_input(character: &mut Character, input: MatchInput) {
-        let (commands, holding_back) = Self::facing_relative_commands(character.facing, input);
-        character.holding_back = holding_back;
-        character.set_command_source(Box::new(fp_character::ActiveCommands::from_names(commands)));
-    }
-
-    /// Builds the list of active, **facing-relative** command names for an input,
-    /// plus whether the character is holding "back" (away from the opponent).
-    ///
-    /// MUGEN command directions are relative to facing: pressing toward where the
-    /// character faces is `fwd`, away is `back`. We map the absolute left/right
-    /// input through the character's [`Facing`]:
-    ///
-    /// - facing right: `right` → `fwd`, `left` → `back`;
-    /// - facing left: `left` → `fwd`, `right` → `back`.
-    ///
-    /// Up/down map to `up`/`down` unchanged, and each pressed button contributes
-    /// its lowercase letter (`a`..`z`). The returned `holding_back` flag is `true`
-    /// when the resolved direction is `back`, which the caller writes to
-    /// [`Character::holding_back`] so [`resolve_attack`] can choose the guard path.
-    fn facing_relative_commands(facing: Facing, input: MatchInput) -> (Vec<String>, bool) {
-        let mut commands: Vec<String> = Vec::new();
-
-        // Horizontal: resolve to fwd/back by facing. If both or neither are held,
-        // there is no net horizontal command and the character is not blocking.
-        let mut holding_back = false;
-        match (input.left, input.right) {
-            (true, false) => {
-                // Pressing left: fwd when facing left, back when facing right.
-                match facing {
-                    Facing::Left => commands.push("fwd".to_string()),
-                    Facing::Right => {
-                        commands.push("back".to_string());
-                        holding_back = true;
-                    }
-                }
-            }
-            (false, true) => {
-                // Pressing right: fwd when facing right, back when facing left.
-                match facing {
-                    Facing::Right => commands.push("fwd".to_string()),
-                    Facing::Left => {
-                        commands.push("back".to_string());
-                        holding_back = true;
-                    }
-                }
-            }
-            // Both or neither: no net horizontal direction.
-            _ => {}
-        }
-
-        if input.up {
-            commands.push("up".to_string());
-        }
-        if input.down {
-            commands.push("down".to_string());
-        }
-
-        // Attack buttons map to their bare lowercase letters.
-        for (pressed, name) in [
-            (input.a, "a"),
-            (input.b, "b"),
-            (input.c, "c"),
-            (input.x, "x"),
-            (input.y, "y"),
-            (input.z, "z"),
-        ] {
-            if pressed {
-                commands.push(name.to_string());
-            }
-        }
-
-        (commands, holding_back)
     }
 
     /// Pushes overlapping bodies apart along X (mutual `PlayerPush`) and clamps
@@ -623,6 +582,39 @@ impl Match {
 }
 
 impl Player {
+    /// Runs this player's real [`CommandMatcher`] over a frame of input and
+    /// installs the recognized command names as the character's command source.
+    ///
+    /// This is the correct command pipeline (mirroring `fp-app`'s single-character
+    /// path): build a RAW absolute [`InputState`] straight from the [`MatchInput`]
+    /// (no facing pre-rotation — facing is resolved at match time inside the
+    /// matcher), push it into the rolling buffer, run the matcher facing-relative
+    /// (`F`/`B` resolve against the character's current facing), then snapshot the
+    /// active command names into an [`ActiveCommands`] command source. The
+    /// character's own `.cmd`/common1 controllers (and the engine built-in
+    /// locomotion) then read `command = "holdfwd"`, `command = "QCF_x"`, … exactly
+    /// as the data files author them.
+    ///
+    /// Also updates [`fp_character::Character::holding_back`] from the
+    /// facing-relative direction so [`resolve_attack`] can choose the guard path.
+    fn feed_input(&mut self, input: MatchInput) {
+        let raw = match_input_to_state(input);
+        self.input_buffer.push(raw);
+
+        let facing_right = self.character.facing == Facing::Right;
+        self.matcher.check_commands(&self.input_buffer, facing_right);
+
+        // The defender guards while holding "back" (away from the opponent):
+        // resolve the raw absolute direction to facing-relative and read `back`,
+        // but only when "back" is *unambiguously* held — both horizontals held
+        // (or neither) is not a block, matching MUGEN's guard gate.
+        let logical = logical_direction(&raw.direction, facing_right);
+        self.character.holding_back = logical.back && !logical.forward;
+
+        let active = snapshot_active_commands(&self.matcher, &self.command_defs);
+        self.character.set_command_source(Box::new(active));
+    }
+
     /// The body's left half-width (distance from axis to the `-X` edge), resolved
     /// for the current facing. Mirrors [`PushBody`]'s internal resolution so the
     /// clamp uses the same geometry as the push.
@@ -643,6 +635,49 @@ impl Player {
             Facing::Left => size.ground_back as f32,
         }
     }
+}
+
+/// Builds a RAW (absolute-direction) [`InputState`] from a [`MatchInput`].
+///
+/// The mapping is straight-through: [`MatchInput`]'s `left`/`right`/`up`/`down`
+/// are already absolute screen directions, so they become the [`Direction`]'s
+/// raw fields unchanged — facing is resolved later, at match time, inside the
+/// [`CommandMatcher`] (do NOT pre-rotate here). Each attack button maps to its
+/// [`Button`]. The resulting state is what gets pushed into the player's input
+/// buffer each fight tick.
+fn match_input_to_state(input: MatchInput) -> InputState {
+    let mut state = InputState {
+        direction: Direction {
+            up: input.up,
+            down: input.down,
+            left: input.left,
+            right: input.right,
+        },
+        ..Default::default()
+    };
+    for (pressed, button) in [
+        (input.a, Button::A),
+        (input.b, Button::B),
+        (input.c, Button::C),
+        (input.x, Button::X),
+        (input.y, Button::Y),
+        (input.z, Button::Z),
+    ] {
+        if pressed {
+            state.set_button(button, true);
+        }
+    }
+    state
+}
+
+/// Snapshots the command names a [`CommandMatcher`] reports active this tick into
+/// an [`ActiveCommands`] command source.
+///
+/// Thin wrapper over the shared [`CommandMatcher::active_command_names_in`]
+/// primitive (the actual filter lives in `fp-input`, in one place), which bounds
+/// the matcher's active set to this character's own command vocabulary.
+fn snapshot_active_commands(matcher: &CommandMatcher, command_defs: &[CommandDef]) -> ActiveCommands {
+    ActiveCommands::from_names(matcher.active_command_names_in(command_defs))
 }
 
 /// Decides a winner by comparing two life totals (used at time over).
@@ -715,12 +750,54 @@ fn facings_toward(ax: f32, bx: f32) -> (Facing, Facing) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fp_character::{CharacterConstants, Character, Facing, LoadedCharacter, MoveType, StateType};
+    use fp_character::{
+        CharacterConstants, Character, Facing, LoadedCharacter, MoveType, StateType,
+    };
     use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime};
     use fp_core::{Rect, SpriteId, Vec2};
     use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode};
+    use fp_formats::cmd::CmdFile;
     use fp_formats::sff::SffFile;
     use std::collections::HashMap;
+
+    /// Builds a [`LoadedCharacter`] with the given AIR and a `.cmd` parsed from
+    /// `cmd_text`, so a [`Player`] built from it has a real, non-empty
+    /// [`CommandMatcher`]. Used by the input-pipeline tests.
+    fn loaded_with_cmd(air: AirFile, cmd_text: &str) -> LoadedCharacter {
+        let mut loaded = loaded_with(air);
+        loaded.cmd = Some(CmdFile::from_str(cmd_text).expect("test .cmd must parse"));
+        loaded
+    }
+
+    /// The minimal `.cmd` defining the four facing-relative "hold" commands the
+    /// engine built-in locomotion gates on, plus a light-punch button command,
+    /// mirroring the shapes a real `.cmd` (like KFM's) authors.
+    const HOLD_CMD: &str = "\
+[Command]
+name = \"holdfwd\"
+command = /$F
+time = 1
+
+[Command]
+name = \"holdback\"
+command = /$B
+time = 1
+
+[Command]
+name = \"holdup\"
+command = /$U
+time = 1
+
+[Command]
+name = \"holddown\"
+command = /$D
+time = 1
+
+[Command]
+name = \"punch\"
+command = x
+time = 1
+";
 
     /// Builds a one-action, one-frame [`AirFile`] carrying the given Clsn boxes.
     fn air_with(action: i32, clsn1: Vec<Rect>, clsn2: Vec<Rect>) -> AirFile {
@@ -1021,42 +1098,45 @@ mod tests {
     }
 
     #[test]
-    fn facing_relative_commands_map_by_facing() {
-        // Facing right: pressing right is fwd (not blocking); pressing left is
-        // back (blocking).
-        let right_in = MatchInput {
-            right: true,
-            ..MatchInput::none()
-        };
-        let (cmds, blocking) = Match::facing_relative_commands(Facing::Right, right_in);
-        assert!(cmds.iter().any(|c| c == "fwd"));
-        assert!(!blocking);
+    fn feed_input_runs_real_matcher_facing_relative() {
+        // The real pipeline: pushing raw absolute input runs the player's own
+        // CommandMatcher, which resolves F/B against facing. Facing right,
+        // hardware-right activates `holdfwd` (toward opponent) and clears
+        // holding_back; hardware-left activates `holdback` and sets holding_back.
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Right;
+        p.feed_input(MatchInput { right: true, ..MatchInput::none() });
+        assert!(p.character.commands.is_active("holdfwd"), "right while facing right is holdfwd");
+        assert!(!p.character.commands.is_active("holdback"));
+        assert!(!p.character.holding_back, "toward opponent is not back");
 
-        let left_in = MatchInput {
-            left: true,
-            ..MatchInput::none()
-        };
-        let (cmds, blocking) = Match::facing_relative_commands(Facing::Right, left_in);
-        assert!(cmds.iter().any(|c| c == "back"));
-        assert!(blocking, "holding away from the opponent sets holding_back");
+        // Hardware-left while facing right is Back.
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Right;
+        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
+        assert!(p.character.commands.is_active("holdback"), "left while facing right is holdback");
+        assert!(!p.character.commands.is_active("holdfwd"));
+        assert!(p.character.holding_back, "holding away from the opponent sets holding_back");
 
-        // Facing left mirrors the mapping.
-        let (cmds, blocking) = Match::facing_relative_commands(Facing::Left, left_in);
-        assert!(cmds.iter().any(|c| c == "fwd"));
-        assert!(!blocking);
+        // Facing LEFT mirrors it: hardware-left is now Forward.
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Left;
+        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
+        assert!(p.character.commands.is_active("holdfwd"), "left while facing left is holdfwd");
+        assert!(!p.character.holding_back);
     }
 
     #[test]
-    fn buttons_become_command_names() {
-        let input = MatchInput {
-            a: true,
-            c: true,
-            ..MatchInput::none()
-        };
-        let (cmds, _) = Match::facing_relative_commands(Facing::Right, input);
-        assert!(cmds.iter().any(|c| c == "a"));
-        assert!(cmds.iter().any(|c| c == "c"));
-        assert!(!cmds.iter().any(|c| c == "b"));
+    fn feed_input_recognizes_button_commands() {
+        // A button command in the `.cmd` (`punch = x`) fires when the matching
+        // button is pressed, and not otherwise.
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.feed_input(MatchInput { x: true, ..MatchInput::none() });
+        assert!(p.character.commands.is_active("punch"), "pressing x fires the `punch` command");
+
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.feed_input(MatchInput { a: true, ..MatchInput::none() });
+        assert!(!p.character.commands.is_active("punch"), "pressing a does not fire `punch`");
     }
 
     #[test]
@@ -1725,43 +1805,54 @@ mod tests {
     }
 
     /// AC1: pressing both left and right (or neither) yields no net horizontal
-    /// command and is not treated as blocking.
+    /// command and is not treated as blocking. `$F`/`$B` exclude the opposing
+    /// axis, so both-held activates neither holdfwd nor holdback.
     #[test]
     fn opposing_horizontal_inputs_cancel() {
-        let both = MatchInput {
-            left: true,
-            right: true,
-            ..MatchInput::none()
-        };
-        let (cmds, blocking) = Match::facing_relative_commands(Facing::Right, both);
-        assert!(!cmds.iter().any(|c| c == "fwd" || c == "back"));
-        assert!(!blocking, "ambiguous horizontal is not blocking");
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Right;
+        p.feed_input(MatchInput { left: true, right: true, ..MatchInput::none() });
+        assert!(!p.character.commands.is_active("holdfwd"));
+        assert!(!p.character.commands.is_active("holdback"));
+        assert!(!p.character.holding_back, "ambiguous horizontal is not blocking");
 
-        let neither = MatchInput::none();
-        let (cmds, blocking) = Match::facing_relative_commands(Facing::Left, neither);
-        assert!(cmds.is_empty());
-        assert!(!blocking);
+        // Neither held: no horizontal command, not blocking.
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Left;
+        p.feed_input(MatchInput::none());
+        assert!(!p.character.commands.is_active("holdfwd"));
+        assert!(!p.character.commands.is_active("holdback"));
+        assert!(!p.character.holding_back);
     }
 
-    /// AC1: up/down map straight through to `up`/`down` command names regardless
+    /// AC1: up/down are facing-independent — `holdup`/`holddown` fire regardless
     /// of facing.
     #[test]
     fn vertical_inputs_map_unchanged() {
-        let input = MatchInput {
-            up: true,
-            down: true,
-            ..MatchInput::none()
-        };
         for facing in [Facing::Left, Facing::Right] {
-            let (cmds, _) = Match::facing_relative_commands(facing, input);
-            assert!(cmds.iter().any(|c| c == "up"));
-            assert!(cmds.iter().any(|c| c == "down"));
+            let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+            p.character.facing = facing;
+            p.feed_input(MatchInput { up: true, ..MatchInput::none() });
+            assert!(p.character.commands.is_active("holdup"), "up fires holdup ({facing:?})");
+
+            let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+            p.character.facing = facing;
+            p.feed_input(MatchInput { down: true, ..MatchInput::none() });
+            assert!(p.character.commands.is_active("holddown"), "down fires holddown ({facing:?})");
         }
     }
 
-    /// AC1: all six attack buttons become their bare letter command names.
+    /// AC1: each attack button drives its own button command through the matcher.
     #[test]
     fn all_attack_buttons_map() {
+        // A `.cmd` with one command per button.
+        let cmd = "\
+[Command]\nname = \"a\"\ncommand = a\ntime = 1\n
+[Command]\nname = \"b\"\ncommand = b\ntime = 1\n
+[Command]\nname = \"c\"\ncommand = c\ntime = 1\n
+[Command]\nname = \"x\"\ncommand = x\ntime = 1\n
+[Command]\nname = \"y\"\ncommand = y\ntime = 1\n
+[Command]\nname = \"z\"\ncommand = z\ntime = 1\n";
         let input = MatchInput {
             a: true,
             b: true,
@@ -1771,39 +1862,28 @@ mod tests {
             z: true,
             ..MatchInput::none()
         };
-        let (cmds, _) = Match::facing_relative_commands(Facing::Right, input);
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), cmd));
+        p.feed_input(input);
         for name in ["a", "b", "c", "x", "y", "z"] {
-            assert!(cmds.iter().any(|c| c == name), "missing button {name}");
+            assert!(p.character.commands.is_active(name), "missing button command {name}");
         }
     }
 
     /// AC1: holding "back" (away from the opponent) sets `holding_back` on the
-    /// character through the full feed path (not just the pure helper), enabling
-    /// the guard path in combat.
+    /// character through the full feed path, enabling the guard path in combat.
     #[test]
     fn feed_input_sets_holding_back_on_character() {
-        let mut c = Character::new();
-        c.facing = Facing::Right;
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Right;
         // Facing right, pressing left = away from opponent = back.
-        Match::feed_input(
-            &mut c,
-            MatchInput {
-                left: true,
-                ..MatchInput::none()
-            },
-        );
-        assert!(c.holding_back, "holding away from opponent sets holding_back");
+        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
+        assert!(p.character.holding_back, "holding away from opponent sets holding_back");
 
         // Pressing toward the opponent clears it.
-        c.facing = Facing::Right;
-        Match::feed_input(
-            &mut c,
-            MatchInput {
-                right: true,
-                ..MatchInput::none()
-            },
-        );
-        assert!(!c.holding_back, "holding toward opponent is not back");
+        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        p.character.facing = Facing::Right;
+        p.feed_input(MatchInput { right: true, ..MatchInput::none() });
+        assert!(!p.character.holding_back, "holding toward opponent is not back");
     }
 
     /// AC1: `MatchInput::none()` and the derived `Default` agree (nothing held).
@@ -2048,6 +2128,149 @@ mod tests {
         assert!(
             connected,
             "real KFM punch (action 200/2) should connect with idle hurt box across the sweep"
+        );
+    }
+
+    // ---- Task 7.3: the real command pipeline drives locomotion (no shim) ----
+
+    /// Builds a two-KFM [`Match`] (P1 left, P2 right, facing each other, stood in
+    /// state 0 with the round about to start), or `None` (skip) when the fixture
+    /// is absent. Mirrors the app's construction but lives in fp-engine so it
+    /// exercises the engine's own command pipeline.
+    fn two_kfm_match() -> Option<Match> {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return None;
+        }
+        let lc1 = LoadedCharacter::load(&def).ok()?;
+        let lc2 = LoadedCharacter::load(&def).ok()?;
+        let mut p1c = Character::with_constants(lc1.constants);
+        p1c.pos = Vec2::new(-60.0, 0.0);
+        p1c.state_no = 0;
+        p1c.anim = 0;
+        p1c.ctrl = true;
+        let mut p2c = Character::with_constants(lc2.constants);
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.state_no = 0;
+        p2c.anim = 0;
+        p2c.ctrl = true;
+        Some(Match::new(
+            Player::new(p1c, lc1),
+            Player::new(p2c, lc2),
+            StageBounds::new(-220.0, 220.0),
+        ))
+    }
+
+    /// Drives `m` through the intro into the live fight, returning whether it
+    /// became live within the budget.
+    fn run_until_fight(m: &mut Match) -> bool {
+        for _ in 0..(INTRO_FRAMES + 5) {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.round_state() == RoundState::Fight {
+                return true;
+            }
+        }
+        m.round_state() == RoundState::Fight
+    }
+
+    /// Task 7.3 headline: in a real two-KFM match, P1 holding "toward the
+    /// opponent" (absolute right, since P1 faces right) enters walk (state 20) and
+    /// its world X advances toward P2 — driven entirely by P1's REAL CommandMatcher
+    /// (Part A) and the loader's built-in stand->walk plus KFM's own walk velocity
+    /// (Part B), with NO app/engine shim inventing `fwd`/`back`.
+    #[test]
+    fn p1_walks_toward_opponent_via_real_commands() {
+        let Some(mut m) = two_kfm_match() else { return };
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert_eq!(m.p1().facing(), Facing::Right, "P1 faces P2 (to its right)");
+
+        let x_before = m.p1().pos().x;
+        let gap_before = (m.p1().pos().x - m.p2().pos().x).abs();
+
+        let mut entered_walk = false;
+        for _ in 0..60 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            if m.p1().character.state_no == 20 {
+                entered_walk = true;
+            }
+        }
+        assert!(
+            entered_walk,
+            "P1 holding toward the opponent must enter walk (state 20) via its real CommandMatcher"
+        );
+        assert!(
+            m.p1().pos().x > x_before,
+            "P1's world X must advance toward P2 while walking; {x_before} -> {}",
+            m.p1().pos().x
+        );
+        let gap_after = (m.p1().pos().x - m.p2().pos().x).abs();
+        assert!(
+            gap_after < gap_before,
+            "walking toward P2 must close the gap ({gap_before} -> {gap_after})"
+        );
+    }
+
+    /// Task 7.3 (mirror facing): P2 faces LEFT, so holding absolute LEFT is "toward
+    /// the opponent" for P2 and must walk it toward P1 — proving facing-relative
+    /// command resolution flows through each player's own matcher.
+    #[test]
+    fn p2_walks_toward_opponent_facing_left() {
+        let Some(mut m) = two_kfm_match() else { return };
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert_eq!(m.p2().facing(), Facing::Left, "P2 faces P1 (to its left)");
+
+        let x_before = m.p2().pos().x;
+        for _ in 0..60 {
+            m.tick(MatchInput::none(), MatchInput { left: true, ..MatchInput::none() });
+        }
+        assert!(
+            m.p2().pos().x < x_before,
+            "P2 (facing left) holding absolute left must advance toward P1; {x_before} -> {}",
+            m.p2().pos().x
+        );
+    }
+
+    /// Task 7.3 end-to-end in fp-engine: P1 walks into range on real commands and
+    /// a real KFM light punch connects, dropping P2's life — the same behavior the
+    /// app's `headless_two_player_attack_connects_and_drops_life` proves, asserted
+    /// here against the engine's own pipeline (no shim).
+    #[test]
+    fn real_command_attack_connects_and_drops_life() {
+        let Some(mut m) = two_kfm_match() else { return };
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        let p2_life_before = m.p2().life();
+
+        // Walk into range.
+        for _ in 0..240 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
+                break;
+            }
+        }
+        // Throw light punches (x) on alternate frames so the matcher sees fresh
+        // presses; over a generous budget a punch must connect.
+        let mut hit = false;
+        for i in 0..400 {
+            let inp = if i % 3 == 0 {
+                MatchInput { x: true, ..MatchInput::none() }
+            } else {
+                MatchInput::none()
+            };
+            m.tick(inp, MatchInput::none());
+            if m.p2().life() < p2_life_before {
+                hit = true;
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert!(
+            hit,
+            "a P1 attack on real commands must connect and drop P2's life; P2 stayed at {} ({:?})",
+            m.p2().life(),
+            m.round_state()
         );
     }
 }

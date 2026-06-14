@@ -226,13 +226,22 @@ impl Character {
             // nothing to do, never an error.
             return;
         };
-        // Snapshot the controllers count; if a controller changes self.state_no
-        // we still finish this state's list (MUGEN runs the special states fully
-        // each tick), but a ChangeState here is honored for the current state.
+        // MUGEN scans a command state (-1, and likewise -2/-3) top-down and stops
+        // at the first controller that changes the current numbered state: the
+        // first matching `ChangeState` wins and the remaining controllers are
+        // skipped this tick. This is what gives a character's authored `[State -1]`
+        // specials/run/attacks priority over the engine's built-in locomotion
+        // controllers appended after them (task 7.3) — once a special's
+        // `ChangeState` fires, the built-ins below it never run. Mirrors the same
+        // break in `run_current_with_transitions`.
+        let entry_state = self.state_no;
         let num = state.controllers.len();
         for idx in 0..num {
-            // Re-fetch the state each iteration: a ChangeState may have entered a
-            // new current state, but the special-state list itself is stable.
+            if self.state_no != entry_state {
+                break;
+            }
+            // Re-fetch the state each iteration: the special-state list itself is
+            // stable, but defensively re-borrow in case a controller mutated it.
             let Some(state) = states.get(&state_no) else {
                 return;
             };
@@ -1892,6 +1901,34 @@ mod tests {
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 2);
         assert!((ch.vel.x - 11.0).abs() < 1e-6, "both -2 and current fired");
+    }
+
+    #[test]
+    fn special_state_minus1_stops_at_first_changestate() {
+        // Two always-true ChangeStates in [Statedef -1]: the first (an authored
+        // special analog) must win and the second (an engine built-in analog
+        // appended after it, task 7.3 part B) must NOT also fire. MUGEN scans -1
+        // top-down and stops at the first state change. Regression test for the
+        // 7.3-fix priority guarantee (without it, the second would redirect 100->200).
+        let first = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "100")]);
+        let second = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "200")]);
+        let lc = loaded(
+            vec![
+                stand_n(-1, vec![first, second]),
+                stand_n(0, vec![]),
+                stand_n(100, vec![]),
+                stand_n(200, vec![]),
+            ],
+            tiny_air(0, &[5]),
+        );
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let _ = lc.tick(&mut ch);
+        assert_eq!(
+            ch.state_no, 100,
+            "first -1 ChangeState wins; the second must be skipped after the state change"
+        );
     }
 
     // ---- AC4: never panics on unknown states / cyclic graph ----------------

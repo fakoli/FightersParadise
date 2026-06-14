@@ -502,12 +502,29 @@ impl LoadedCharacter {
             }
         }
 
+        // Validate that the character actually authored state data BEFORE adding
+        // the engine built-ins below: a character whose CNS/CMD files loaded no
+        // statedefs at all is broken (MUGEN-equivalent), and the engine built-in
+        // locomotion (which always synthesizes a `[Statedef -1]`) must not mask
+        // that failure.
         if states.is_empty() {
             return Err(FpError::not_found(
                 "state",
                 format!("{} loaded no CNS states", def_path.display()),
             ));
         }
+
+        // ---- Engine built-in ground locomotion (task 7.3 part B) ------------
+        // MUGEN's basic stand<->walk<->crouch<->jumpstart transitions are a
+        // hardcoded ENGINE built-in, not character data: stock KFM authors none of
+        // them (its `[Statedef -1]` has only specials/run/throws/attacks, and its
+        // common1.cns stand/walk states never enter each other). The engine injects
+        // them when the player has `ctrl`. We model that here so EVERY loaded
+        // character gets them automatically, appending the controllers AFTER the
+        // character's own `[State -1, ...]` controllers so the character's
+        // specials/run/attacks keep priority (first matching ChangeState wins, and
+        // `ctrl` is consumed before the built-in fires).
+        append_builtin_ground_locomotion(&mut states);
 
         // ---- Constants from the CNS [Data]/[Size]/[Velocity]/[Movement] ----
         // These groups live in the `cns` file (KFM puts them in kfm.cns). The
@@ -545,6 +562,48 @@ impl LoadedCharacter {
     #[must_use]
     pub fn state_count(&self) -> usize {
         self.states.len()
+    }
+
+    /// Compiles this character's `.cmd` command list into a
+    /// [`fp_input::CommandDef`] vector ready to feed a
+    /// [`fp_input::CommandMatcher`].
+    ///
+    /// This is the single, shared way to turn a loaded character's authored
+    /// commands (`holdfwd`, `FF`, special-move motions, …) into a recognizer
+    /// input. The two-player `fp_engine::Match` builds each player's matcher from
+    /// it, and the single-character `fp-app` path uses the same compilation. The
+    /// raw command string is fed straight to [`fp_input::compile_command`], which
+    /// parses the MUGEN `$`/`>`/`~`/`/` modifiers natively; a command that fails
+    /// to compile (genuinely malformed) is warn-logged and skipped rather than
+    /// aborting. Returns an empty vector when the character referenced no `.cmd`.
+    #[must_use]
+    pub fn command_defs(&self) -> Vec<fp_input::CommandDef> {
+        let Some(cmd_file) = self.cmd.as_ref() else {
+            return Vec::new();
+        };
+        cmd_file
+            .commands
+            .iter()
+            .filter_map(|c| {
+                let elements = match fp_input::compile_command(&c.command) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping uncompilable command {:?} ({:?}): {e}",
+                            c.name,
+                            c.command
+                        );
+                        return None;
+                    }
+                };
+                Some(fp_input::CommandDef {
+                    name: c.name.clone(),
+                    elements,
+                    time: c.time,
+                    buffer_time: c.buffer_time,
+                })
+            })
+            .collect()
     }
 }
 
@@ -652,6 +711,133 @@ fn merge_cmd_statedefs(states: &mut HashMap<i32, CompiledState>, path: &Path, re
     tracing::info!(
         "merged CMD statedefs from {rel}: {inserted} new state(s), \
          {appended} controller(s) appended to existing states"
+    );
+}
+
+/// The MUGEN engine-built-in ground locomotion controllers, authored as a CNS
+/// `[Statedef -1]` snippet.
+///
+/// These are the hardcoded stand<->walk<->crouch<->jumpstart command-state
+/// transitions every MUGEN character gets for free (they are NOT in any
+/// character's data files). Each is a `type=ChangeState` gated on the standard
+/// `holdfwd`/`holdback`/`holdup`/`holddown` command names a `.cmd` defines, on
+/// the current `stateno`, and on `ctrl` — exactly the ruleset task 7.3 part B
+/// specifies, in this priority order:
+///
+/// - stand(0)  + holdup                                    -> 40 (jumpstart)
+/// - stand(0)  + holddown (not holdup)                     -> 10 (crouch start)
+/// - stand(0)  + (holdfwd|holdback), not holdup/holddown   -> 20 (walk)
+/// - walk(20)  + holdup                                    -> 40
+/// - walk(20)  + holddown (not holdup)                     -> 10
+/// - walk(20)  not holdfwd/holdback/holdup/holddown        -> 0  (back to stand)
+/// - crouch(11) not holddown                               -> 12 (crouch->stand)
+///
+/// The 10->11, 12->0, and 40->50 transitions already exist in common1 via
+/// AnimTime, so they are deliberately NOT duplicated here. Air movement / airjump
+/// are deferred. Walk *velocity* is the character's concern (common1's
+/// `[Statedef 20]` sets it via `command="holdfwd"`, which now fires because the
+/// real `CommandMatcher` produces `holdfwd`).
+///
+/// This is appended AFTER the character's own `[State -1, ...]` controllers, so a
+/// character that authors its own command-state (a special, a run, an attack)
+/// matches first and consumes `ctrl` before any of these built-ins can fire.
+const BUILTIN_GROUND_LOCOMOTION_CNS: &str = "\
+[Statedef -1]
+
+[State -1, engine: stand->jump]
+type = ChangeState
+value = 40
+triggerall = ctrl
+trigger1 = stateno = 0 && command = \"holdup\"
+
+[State -1, engine: stand->crouch]
+type = ChangeState
+value = 10
+triggerall = ctrl
+trigger1 = stateno = 0 && command = \"holddown\" && command != \"holdup\"
+
+[State -1, engine: stand->walk]
+type = ChangeState
+value = 20
+triggerall = ctrl
+trigger1 = stateno = 0 && command = \"holdfwd\" && command != \"holdup\" && command != \"holddown\"
+trigger2 = stateno = 0 && command = \"holdback\" && command != \"holdup\" && command != \"holddown\"
+
+[State -1, engine: walk->jump]
+type = ChangeState
+value = 40
+triggerall = ctrl
+trigger1 = stateno = 20 && command = \"holdup\"
+
+[State -1, engine: walk->crouch]
+type = ChangeState
+value = 10
+triggerall = ctrl
+trigger1 = stateno = 20 && command = \"holddown\" && command != \"holdup\"
+
+[State -1, engine: walk->stand]
+type = ChangeState
+value = 0
+triggerall = ctrl
+trigger1 = stateno = 20 && command != \"holdfwd\" && command != \"holdback\" && command != \"holdup\" && command != \"holddown\"
+
+[State -1, engine: crouch->stand]
+type = ChangeState
+value = 12
+triggerall = ctrl
+trigger1 = stateno = 11 && command != \"holddown\"
+";
+
+/// Appends the engine-built-in ground locomotion controllers (task 7.3 part B)
+/// to the merged state graph's `[Statedef -1]`.
+///
+/// Parses [`BUILTIN_GROUND_LOCOMOTION_CNS`] (the hardcoded stand<->walk<->crouch
+/// <->jumpstart command-states MUGEN injects for every character) with the same
+/// CNS-compile path the loader already uses for the CMD->-1 bridge, then
+/// **appends** the compiled controllers after any existing `[State -1, ...]`
+/// controllers — so the character's own specials/run/attacks (merged earlier
+/// from the `.cmd`) keep priority and consume `ctrl` first. If no `-1` state
+/// exists yet (a character with no `.cmd` command-states at all) the synthesized
+/// state is inserted wholesale.
+///
+/// Never panics: the const snippet is known-good, and a (theoretically
+/// impossible) parse failure is warn-logged and skipped, leaving the graph
+/// unchanged.
+fn append_builtin_ground_locomotion(states: &mut HashMap<i32, CompiledState>) {
+    // Idempotency guard: the built-in controllers are tagged with an `engine: `
+    // label prefix. If they are already present in `[Statedef -1]` (e.g. a second
+    // `load` of the same graph), do nothing — appending twice would create
+    // duplicate command-states that can flicker (a stale `walk->stand` firing in
+    // the same `-1` pass). No real character labels its controllers `engine: `.
+    if states
+        .get(&-1)
+        .is_some_and(|s| s.controllers.iter().any(|c| c.label.starts_with("engine: ")))
+    {
+        return;
+    }
+    let cns = match CnsFile::from_str(BUILTIN_GROUND_LOCOMOTION_CNS) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("built-in ground locomotion CNS failed to compile: {e}");
+            return;
+        }
+    };
+    let mut appended = 0usize;
+    for def in &cns.statedefs {
+        let compiled = CompiledState::from_parsed(def);
+        match states.entry(def.number) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                appended += compiled.controllers.len();
+                slot.get_mut().controllers.extend(compiled.controllers);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                appended += compiled.controllers.len();
+                slot.insert(compiled);
+            }
+        }
+    }
+    tracing::info!(
+        "appended {appended} engine built-in ground-locomotion controller(s) to [Statedef -1]"
     );
 }
 
@@ -2419,5 +2605,226 @@ mod tests {
         assert!((c.movement.yaccel - 0.44).abs() < 1e-4);
         assert!((c.movement.stand_friction - 0.85).abs() < 1e-4);
         assert!((c.movement.crouch_friction - 0.82).abs() < 1e-4);
+    }
+
+    // ====================================================================
+    // Task 7.3 part B: engine built-in ground locomotion, proven against real
+    // KFM with NO app shim. A live Character is given `ctrl` and a command
+    // source set directly to the `hold*` command names a real CommandMatcher
+    // would produce; the loader-injected `[Statedef -1]` controllers must drive
+    // the basic 4-way transitions, and KFM's own `[Statedef 20]` must then walk.
+    // ====================================================================
+
+    /// Loads real KFM and stands a fresh [`Character`](crate::Character) in state
+    /// 0 with control, returning `(loaded, character)` or `None` (skip) when the
+    /// fixture is absent/unloadable.
+    fn kfm_standing_with_ctrl() -> Option<(LoadedCharacter, crate::Character)> {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping locomotion test: {} not present", def.display());
+            return None;
+        }
+        let loaded = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping locomotion test: kfm.def failed to load: {e}");
+                return None;
+            }
+        };
+        let mut ch = crate::Character::with_constants(loaded.constants);
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.ctrl = true;
+        ch.facing = crate::Facing::Right;
+        Some((loaded, ch))
+    }
+
+    /// Sets the character's command source to exactly the given active command
+    /// names (what a real `CommandMatcher` snapshot would feed each tick).
+    fn set_commands(ch: &mut crate::Character, names: &[&str]) {
+        ch.set_command_source(Box::new(crate::ActiveCommands::from_names(
+            names.iter().map(|s| s.to_string()),
+        )));
+    }
+
+    /// Part B AC: holding Forward from stand reaches walk (state 20) and gains a
+    /// nonzero walk velocity within a few ticks — driven entirely by the loader's
+    /// engine built-in plus KFM's own `[Statedef 20]`, with NO app shim.
+    #[test]
+    fn builtin_locomotion_stand_to_walk_and_velocity() {
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+
+        let mut reached_walk = false;
+        for _ in 0..5 {
+            // `holdfwd` is what KFM's real matcher produces while Forward is held.
+            set_commands(&mut ch, &["holdfwd"]);
+            ch.tick(&loaded);
+            if ch.state_no == 20 {
+                reached_walk = true;
+                break;
+            }
+        }
+        assert!(reached_walk, "holding Forward from stand must reach walk (state 20)");
+        assert!(
+            ch.vel.x.abs() > 0.0,
+            "walk state must impart a nonzero walk velocity, got vel.x = {}",
+            ch.vel.x
+        );
+    }
+
+    /// Part B AC: holding Down from stand drives the crouch path (10 -> 11). The
+    /// crouch start (10) and its AnimTime-gated advance to crouch-hold (11) can
+    /// both resolve within a single tick (the executor follows ChangeState chains
+    /// in one frame), so the observable end state is the crouch hold (11) — proof
+    /// the built-in stand->crouch fired and common1's 10->11 took over.
+    #[test]
+    fn builtin_locomotion_stand_to_crouch() {
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+
+        let mut reached_crouch = false;
+        let mut visited = Vec::new();
+        for _ in 0..20 {
+            set_commands(&mut ch, &["holddown"]);
+            ch.tick(&loaded);
+            visited.push(ch.state_no);
+            // Either the crouch start (10) or the crouch hold (11) proves the
+            // built-in stand->crouch transition fired.
+            if ch.state_no == 10 || ch.state_no == 11 {
+                reached_crouch = true;
+                break;
+            }
+        }
+        assert!(
+            reached_crouch,
+            "holding Down from stand must drive the crouch path (10 -> 11); visited {visited:?}"
+        );
+        assert_eq!(
+            ch.state_type,
+            crate::StateType::Crouching,
+            "the character must be crouching after holding Down"
+        );
+    }
+
+    /// Part B AC: holding Up from stand drives the jump path (40 -> 50). The jump
+    /// start (40) and its AnimTime-gated advance to the air state (50) can both
+    /// resolve within a single tick, so the observable end state is the air state
+    /// (50) — proof the built-in stand->jump fired and common1's 40->50 took over.
+    #[test]
+    fn builtin_locomotion_stand_to_jump() {
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+
+        let mut reached_jump = false;
+        let mut visited = Vec::new();
+        for _ in 0..20 {
+            set_commands(&mut ch, &["holdup"]);
+            ch.tick(&loaded);
+            visited.push(ch.state_no);
+            // Either the jump start (40) or the air state (50) proves the built-in
+            // stand->jump transition fired.
+            if ch.state_no == 40 || ch.state_no == 50 {
+                reached_jump = true;
+                break;
+            }
+        }
+        assert!(
+            reached_jump,
+            "holding Up from stand must drive the jump path (40 -> 50); visited {visited:?}"
+        );
+    }
+
+    /// Part B AC: releasing all directions while walking returns to stand (0).
+    #[test]
+    fn builtin_locomotion_walk_to_stand_on_release() {
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+
+        // First walk.
+        for _ in 0..5 {
+            set_commands(&mut ch, &["holdfwd"]);
+            ch.tick(&loaded);
+            if ch.state_no == 20 {
+                break;
+            }
+        }
+        assert_eq!(ch.state_no, 20, "precondition: walking before release");
+
+        // Release everything: the walk->stand built-in must return to state 0.
+        let mut returned = false;
+        for _ in 0..5 {
+            set_commands(&mut ch, &[]);
+            ch.tick(&loaded);
+            if ch.state_no == 0 {
+                returned = true;
+                break;
+            }
+        }
+        assert!(returned, "releasing in walk must return to stand (state 0)");
+    }
+
+    /// Part B (priority): the engine built-ins are appended AFTER the character's
+    /// own `[State -1, ...]` controllers, so a character's authored command-states
+    /// (specials/run/attacks) keep priority. KFM's `[Statedef -1]` controllers
+    /// must all precede the appended `engine:`-labelled built-ins.
+    #[test]
+    fn builtin_locomotion_is_appended_after_authored_minus_one() {
+        let Some((loaded, _)) = kfm_standing_with_ctrl() else { return };
+        let minus_one = loaded.state(-1).expect("[Statedef -1] exists");
+        let first_builtin = minus_one
+            .controllers
+            .iter()
+            .position(|c| c.label.starts_with("engine:"));
+        let last_authored = minus_one
+            .controllers
+            .iter()
+            .rposition(|c| !c.label.starts_with("engine:"));
+        // KFM authors its own -1 controllers (run/specials/attacks).
+        let last_authored = last_authored.expect("KFM authors its own [Statedef -1] controllers");
+        let first_builtin = first_builtin.expect("engine built-ins must be present");
+        assert!(
+            first_builtin > last_authored,
+            "engine built-ins (first at {first_builtin}) must come AFTER all authored \
+             controllers (last at {last_authored}), preserving character priority"
+        );
+        // Exactly the seven built-in controllers we synthesize.
+        let builtin_count = minus_one
+            .controllers
+            .iter()
+            .filter(|c| c.label.starts_with("engine:"))
+            .count();
+        assert_eq!(builtin_count, 7, "exactly the seven built-in locomotion controllers");
+    }
+
+    /// Part B (synthetic, no fixture): a character with no `.cmd` (so no authored
+    /// `[Statedef -1]`) still gets the engine built-in locomotion synthesized into
+    /// `[Statedef -1]`, proving the built-in is applied to EVERY loaded character.
+    #[test]
+    fn builtin_locomotion_present_for_character_without_cmd() {
+        let sff_src = test_asset("kfm/kfm.sff");
+        let air_src = test_asset("kfm/kfm.air");
+        if !sff_src.exists() || !air_src.exists() {
+            eprintln!("skipping no-cmd locomotion test: kfm binaries absent");
+            return;
+        }
+        let dir = scratch_dir("builtin_no_cmd");
+        fs::write(dir.join("chr.sff"), fs::read(&sff_src).unwrap()).unwrap();
+        fs::write(dir.join("chr.air"), fs::read(&air_src).unwrap()).unwrap();
+        write_file(&dir, "chr.cns", "[Statedef 0]\ntype = S\n");
+        // No `cmd` in [Files] at all.
+        let def = write_file(
+            &dir,
+            "chr.def",
+            "[Files]\nsprite = chr.sff\nanim = chr.air\ncns = chr.cns\n",
+        );
+        let loaded = LoadedCharacter::load(&def).expect("synthetic character should load");
+        let minus_one = loaded
+            .state(-1)
+            .expect("engine built-in locomotion must synthesize [Statedef -1] even without a .cmd");
+        let walks = minus_one.controllers.iter().any(|c| {
+            c.controller_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"))
+                && c.params.get("value").is_some_and(|e| e.source.trim() == "20")
+        });
+        assert!(walks, "the built-in stand->walk command-state must be present");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

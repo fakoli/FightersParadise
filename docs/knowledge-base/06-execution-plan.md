@@ -161,6 +161,7 @@ facing velocity, 6.3a resolution, 6.3b detection+apply). Now wire two characters
 |----|--------|------|----------|--------------------|------|
 | 7.1 | DONE | **Match coordinator** (2 players) | `fp-engine` | `Match` holds P1+P2 (Character + LoadedCharacter each); `Match::tick()` ticks both, runs `combat::resolve_attack` BOTH directions, applies player-push (P6.2) + screen-bound clamp, keeps each character facing the opponent (facep2 baseline), advances a round state machine (intro→fight→KO when a life hits 0→win) + a round timer. Headless-tested (two KFMs: P1 hit → P2 life drops; KO ends the round). Deps: fp-character/fp-combat/fp-physics. | 6.3b |
 | 7.2 | DONE | **fp-app 2-player render + input** | `fp-app` | Drive a `fp-engine::Match` in the window: render BOTH characters from their current AIR frame; P1 = keyboard, P2 = idle/dummy (or a 2nd input map); a minimal life readout; round-state feedback (KO). The "two characters fight on screen" demo. Deps: 7.1 |
+| 7.3 | DONE | **Command-pipeline fidelity + built-in locomotion** (atomic, multi-crate → direct Agent, not the single-crate workflow) | `fp-engine`+`fp-character`+`fp-app` | **A:** each `Player` owns an `InputBuffer` + `CommandMatcher` built from the loaded `.cmd`; `Match::tick` takes RAW directional+button input, runs each player's matcher → real command set (`holdfwd`/`FF`/`QCF_x`/specials), feeding the executor. Deletes the invented `fwd`/`back` names + `inject_walk_velocity_bridge`. **B:** implement MUGEN's hardcoded ground locomotion command-states in the executor (gated on `ctrl`), the transitions ABSENT from KFM data — empirically confirmed missing from common1 `[Statedef 0]` AND kfm.cmd `[Statedef -1]`: `0→40` holdup, `0→10` holddown, `0→20` holdfwd∥holdback; `20→40`, `20→10`, `20→0` (release); `11→12` !holddown. **C:** delete the three fp-app shims; fp-app feeds raw input only. Stock KFM must walk/crouch/jump/stop with ZERO app shims; two-player headless attack test still green. Airjump (45 on holdup-in-air) deferred → CB. Deps: 7.2 |
 
 ### Phase 8–11 — stage / audio / ui / storyboard  *(expand when reached)*
 `fp-stage`, `fp-audio`+SND, `fp-ui`+FNT (lifebars/select/screenpacks), `fp-storyboard`. Largely
@@ -252,6 +253,28 @@ parallelizable once the core exists. Deps: Phase 7.
   deferred). *(added 6.3b — benign until a get-hit state needs it)*
 - **CB31** `fp-engine` declares `tracing` but never logs; wire `tracing::debug!` on round-state
   transitions (KO/time-over/round start) or drop the dep. *(added 7.1)*
+- **CB32** fp-app samples the keyboard INSIDE the fixed-timestep catch-up loop, so a multi-tick
+  catch-up replays one physical input N times (distorts press-vs-hold/command timing on hitches).
+  Sample once per real frame. *(added 7.2)*
+- **CB33** fp-app `draw_player` hardcodes `ground_y = win_h*0.8` (legacy viewer uses 0.7), divorced
+  from the world→screen mapping; derive a named `GROUND_Y_FRACTION` from the coord system. *(added 7.2)*
+- **CB34** Jump faithfulness: now that jump is reachable (7.3), verify state 40 (jumpstart) holds for
+  its prejump frames before chaining to 50 (airborne) rather than resolving in one tick — i.e. the
+  prejump pause is preserved against real common1 timing. Also implement **airjump** (state 45 on
+  holdup-while-airborne) which 7.3 deferred. *(added 7.3, Critic CONSIDER #5)*
+- **CB35** `CommandMatcher::active_command_names_in` allocates a `Vec` per player per tick on the hot
+  path; offer an iterator-returning variant if profiling ever flags it. Low priority. *(added 7.3)*
+
+### ✅ Locomotion-shim debt — RESOLVED by 7.3
+~~fp-app carried engine-gap shims (`inject_engine_movement_bridge`, `inject_walk_velocity_bridge`,
+`fwd/back` vs `holdfwd/holdback`).~~ **Done (7.3, commit pending):** (A) each `fp_engine` `Player`
+runs its OWN `CommandMatcher` from the loaded `.cmd` (real `holdfwd`/`FF`/specials — `fwd`/`back`
+invention deleted); (B) MUGEN's built-in ground locomotion (stand↔walk↔crouch↔jumpstart — empirically
+confirmed absent from ALL KFM data, a hardcoded engine built-in) is now injected by `fp-character`'s
+loader as canonical `[Statedef -1]` controllers appended after the character's own, with first-
+matching-`ChangeState`-wins priority (executor fix); (C) all three fp-app shims deleted. Stock KFM
+walks/crouches/jumps/stops with ZERO app shims, both single-char and two-player paths. **This also
+closes CB25** (locomotion built-ins) and the input-pipeline half of the old debt.
 
 ---
 
