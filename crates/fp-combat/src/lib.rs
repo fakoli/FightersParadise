@@ -561,6 +561,25 @@ pub struct PauseTime {
     pub p2: i32,
 }
 
+/// A `(hit, guard)` pair of power-meter amounts: power gained on a clean hit vs.
+/// when the attack is guarded.
+///
+/// Used by both [`HitDef::getpower`] (power given to the **attacker**, P1) and
+/// [`HitDef::givepower`] (power given to the **defender**, P2). MUGEN's documented
+/// defaults are damage-proportional: when the author omits the value it derives
+/// from the HitDef's [`Damage`] via a *life-to-power* multiplier (see
+/// [`HitDef::default_getpower`] / [`HitDef::default_givepower`]), and the guard
+/// amount defaults to half the hit amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PowerGain {
+    /// Power added when the attack lands cleanly (`getpower`/`givepower` first
+    /// component, MUGEN `p1power`/`p2power`).
+    pub hit: i32,
+    /// Power added when the attack is guarded (`getpower`/`givepower` second
+    /// component, MUGEN `p1gpower`/`p2gpower`). Defaults to [`hit`](Self::hit) / 2.
+    pub guard: i32,
+}
+
 /// Per-situation hit-time values (ticks the defender stays in hit-stun), in ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HitTimes {
@@ -771,8 +790,22 @@ pub struct HitDef {
     pub hittimes: HitTimes,
     /// `fall` — whether this hit knocks the defender into a falling state.
     pub fall: bool,
+    /// `fall.xvelocity` — initial X velocity when entering the falling state
+    /// (MUGEN `fall.xvelocity`; surfaces via `GetHitVar(fall.xvel)`).
+    ///
+    /// MUGEN's documented default is "no change" (the defender keeps its current X
+    /// velocity); we model that absence as `None`. Authored values (e.g. evilken's
+    /// `fall.xvelocity`) are carried through to `GetHitVar(fall.xvel)`.
+    pub fall_xvelocity: Option<f32>,
     /// `fall.yvelocity` — initial upward Y velocity when entering the falling state.
     pub fall_yvelocity: f32,
+    /// `fall.damage` — extra life damage dealt to the defender **when it lands**
+    /// from the fall (MUGEN `fall.damage`; surfaces via `GetHitVar(fall.damage)`,
+    /// applied by the `HitFallDamage` controller in the authored get-hit state).
+    ///
+    /// Default `0` (no landing damage). KFM authors `fall.damage = 70` on its
+    /// sweep so common1's `HitFallDamage` drops 70 life on landing.
+    pub fall_damage: i32,
     /// `p1stateno` — state to force the **attacker** into (`None` = no change).
     pub p1stateno: Option<i32>,
     /// `p2stateno` — state to force the **defender** into (`None` = no change).
@@ -783,6 +816,25 @@ pub struct HitDef {
     pub id: i32,
     /// `chainid` — the id this hit may chain from (`-1` = any / unset).
     pub chainid: i32,
+    /// `getpower` — power-meter `(hit, guard)` granted to the **attacker** (P1)
+    /// when this HitDef connects (MUGEN `p1power`/`p1gpower`).
+    ///
+    /// When the author omits `getpower`, MUGEN derives it from the hit damage via
+    /// the `Default.Attack.LifeToPowerMul` config (default `0.7`), with the guard
+    /// amount half the hit amount. The HitDef *controller* fills this in via
+    /// [`HitDef::default_getpower`] when the param is absent; the struct-level
+    /// [`Default`] is `(0, 0)` (no gain), since the controller — not the bare
+    /// struct — knows the damage at parse time. KFM authors `getpower = 0` on
+    /// every attack (13×) to **suppress** this default gain.
+    pub getpower: PowerGain,
+    /// `givepower` — power-meter `(hit, guard)` granted to the **defender** (P2)
+    /// when this HitDef connects (MUGEN `p2power`/`p2gpower`).
+    ///
+    /// When omitted, MUGEN derives it from the hit damage via the
+    /// `Default.GetHit.LifeToPowerMul` config (default `0.6`), guard amount half
+    /// the hit amount — see [`HitDef::default_givepower`]. Struct-level [`Default`]
+    /// is `(0, 0)`.
+    pub givepower: PowerGain,
 }
 
 impl Default for HitDef {
@@ -805,12 +857,63 @@ impl Default for HitDef {
             guard_velocity: 0.0,
             hittimes: HitTimes::default(),
             fall: false,
+            fall_xvelocity: None,
             fall_yvelocity: 0.0,
+            fall_damage: 0,
             p1stateno: None,
             p2stateno: None,
             priority: Priority::default(),
             id: 0,
             chainid: -1,
+            getpower: PowerGain::default(),
+            givepower: PowerGain::default(),
+        }
+    }
+}
+
+/// MUGEN's default `Default.Attack.LifeToPowerMul` — the multiplier applied to a
+/// HitDef's hit damage to derive the **attacker's** default `getpower` when the
+/// param is omitted (`data/mugen.cfg`, default `0.7`).
+pub const DEFAULT_ATTACK_LIFE_TO_POWER_MUL: f32 = 0.7;
+
+/// MUGEN's default `Default.GetHit.LifeToPowerMul` — the multiplier applied to a
+/// HitDef's hit damage to derive the **defender's** default `givepower` when the
+/// param is omitted (`data/mugen.cfg`, default `0.6`).
+pub const DEFAULT_GETHIT_LIFE_TO_POWER_MUL: f32 = 0.6;
+
+impl HitDef {
+    /// MUGEN's documented default `getpower` (attacker power gain), derived from
+    /// this HitDef's [`Damage::hit`].
+    ///
+    /// `hit = round(damage.hit * `[`DEFAULT_ATTACK_LIFE_TO_POWER_MUL`]`)` and
+    /// `guard = hit / 2` (integer division, matching MUGEN's "`p1gpower` defaults
+    /// to `p1power / 2`"). Negative damage clamps the gain to `0`. The HitDef
+    /// *controller* calls this only when the `getpower` param is **absent**; an
+    /// authored `getpower = 0` keeps the explicit `(0, 0)` (KFM's suppression).
+    #[must_use]
+    pub fn default_getpower(&self) -> PowerGain {
+        let hit = (self.damage.hit as f32 * DEFAULT_ATTACK_LIFE_TO_POWER_MUL)
+            .round()
+            .max(0.0) as i32;
+        PowerGain {
+            hit,
+            guard: hit / 2,
+        }
+    }
+
+    /// MUGEN's documented default `givepower` (defender power gain), derived from
+    /// this HitDef's [`Damage::hit`].
+    ///
+    /// `hit = round(damage.hit * `[`DEFAULT_GETHIT_LIFE_TO_POWER_MUL`]`)` and
+    /// `guard = hit / 2`. See [`HitDef::default_getpower`] for the symmetric notes.
+    #[must_use]
+    pub fn default_givepower(&self) -> PowerGain {
+        let hit = (self.damage.hit as f32 * DEFAULT_GETHIT_LIFE_TO_POWER_MUL)
+            .round()
+            .max(0.0) as i32;
+        PowerGain {
+            hit,
+            guard: hit / 2,
         }
     }
 }
@@ -1324,6 +1427,48 @@ mod tests {
     }
 
     #[test]
+    fn hitdef_default_power_gain_is_zero() {
+        // Struct-level default: no automatic power gain (the controller fills the
+        // damage-proportional defaults; the bare struct does not).
+        let hd = HitDef::default();
+        assert_eq!(hd.getpower, PowerGain { hit: 0, guard: 0 });
+        assert_eq!(hd.givepower, PowerGain { hit: 0, guard: 0 });
+    }
+
+    #[test]
+    fn default_getpower_givepower_are_damage_proportional() {
+        // MUGEN defaults: getpower = round(damage*0.7), givepower = round(damage*0.6);
+        // each guard amount is the hit amount / 2 (integer division).
+        let hd = HitDef {
+            damage: Damage { hit: 100, guard: 10 },
+            ..HitDef::default()
+        };
+        // 100 * 0.7 = 70, guard 35.
+        assert_eq!(hd.default_getpower(), PowerGain { hit: 70, guard: 35 });
+        // 100 * 0.6 = 60, guard 30.
+        assert_eq!(hd.default_givepower(), PowerGain { hit: 60, guard: 30 });
+    }
+
+    #[test]
+    fn default_power_gain_rounds_and_clamps_nonnegative() {
+        // 23 * 0.7 = 16.1 -> 16; 23 * 0.6 = 13.8 -> 14.
+        let hd = HitDef {
+            damage: Damage { hit: 23, guard: 0 },
+            ..HitDef::default()
+        };
+        assert_eq!(hd.default_getpower().hit, 16);
+        assert_eq!(hd.default_givepower().hit, 14);
+
+        // Negative damage never yields negative power gain.
+        let neg = HitDef {
+            damage: Damage { hit: -50, guard: 0 },
+            ..HitDef::default()
+        };
+        assert_eq!(neg.default_getpower(), PowerGain { hit: 0, guard: 0 });
+        assert_eq!(neg.default_givepower(), PowerGain { hit: 0, guard: 0 });
+    }
+
+    #[test]
     fn attack_attr_parses_canonical_forms() {
         let a = AttackAttr::parse("S, NA");
         assert_eq!(a.class, StateClass::Standing);
@@ -1588,7 +1733,9 @@ mod tests {
             guard_velocity: -2.0,
             hittimes: HitTimes { ground: 15, air: 18, guard: 9 },
             fall: true,
+            fall_xvelocity: Some(-2.5),
             fall_yvelocity: -4.5,
+            fall_damage: 70,
             p1stateno: Some(1000),
             p2stateno: Some(5050),
             priority: Priority { value: 5, kind: PriorityType::Miss },
@@ -1599,6 +1746,8 @@ mod tests {
                 hitsound: Some(SoundId { group: 5, sample: 0, common: false }),
                 guardsound: Some(SoundId { group: 6, sample: 0, common: false }),
             },
+            getpower: PowerGain { hit: 63, guard: 31 },
+            givepower: PowerGain { hit: 54, guard: 27 },
         };
         let copy = base; // Copy, not move.
         assert_eq!(base, copy); // original still usable -> proves Copy

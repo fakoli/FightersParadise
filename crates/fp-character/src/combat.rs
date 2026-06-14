@@ -179,6 +179,44 @@ pub fn resolve_attack(
         return None;
     }
 
+    // (2c) HitOverride (audit #9b). BEFORE the normal get-hit, consult the
+    // DEFENDER's armed override slots against the ATTACKER's HitDef `attr`. On the
+    // first matching active slot MUGEN redirects the defender to the slot's
+    // `stateno` *instead of* the normal get-hit: no damage, knockback, or get-hit
+    // state is applied (the override state fully takes over the reaction — armor /
+    // parry / counter logic). The hit still COUNTS as a connection — the attacker
+    // registers move-contact and a target, and `hitonce` is consumed — so a single
+    // HitDef cannot re-trigger the override. The slot is consumed (disarmed) on a
+    // match, matching MUGEN. (Simplification: MUGEN's `forceair` / damage-applied
+    // variants are not modeled; the common armor/counter case — redirect with no
+    // damage — is implemented faithfully.)
+    if let Some((slot, override_state)) = defender.hit_overrides.matching(&hitdef.attr) {
+        defender.hit_overrides.consume(slot);
+        defender.change_state(defender_states, override_state);
+        // The attacker still connected: flag move-contact + target and consume
+        // hitonce so the same HitDef cannot fire the override again.
+        attacker.move_connect.hit = true;
+        attacker.has_target = true;
+        // Power gain on an override match (#18 × #9b): MUGEN still counts the hit
+        // as a *connection* for the attacker, so the attacker's `getpower.hit`
+        // still accrues. The DEFENDER, however, does NOT run the normal get-hit
+        // (the override state takes over the reaction), so its `givepower` is
+        // deliberately NOT granted here — the defender's meter is the override
+        // state's own concern. KFM authors `getpower = 0`, so this adds nothing
+        // for KFM; it matters only for a character that gains meter on contact.
+        attacker.add_power_clamped(hitdef.getpower.hit);
+        return Some(AttackResolution {
+            result: HitResult::Hit,
+            damage: 0,
+            knockback: Vec2::new(0.0, 0.0),
+            defender_state: override_state,
+            attacker_hitpause: 0,
+            defender_hitpause: 0,
+            hit_sound: None,
+            attacker_state: hitdef.p1stateno,
+        });
+    }
+
     // (3) Resolve against the defender's situation (pure logic in fp-combat).
     let defender_state = DefenderState::new(
         stance_of(defender),
@@ -242,9 +280,20 @@ pub fn resolve_attack(
     gh.fall = i32::from(outcome.fall);
     gh.guarded = i32::from(guarded);
     gh.chainid = hitdef.chainid;
+    // Fall velocities/damage for the `HitFallVel`/`HitFallDamage` controllers
+    // (audit #23). On a falling hit the fall Y velocity is the HitDef's
+    // `fall.yvelocity`; the fall X velocity is the HitDef's authored
+    // `fall.xvelocity` when present, else "no change" — MUGEN leaves the
+    // defender's current X velocity, which here is the imparted knockback X.
     if outcome.fall {
         gh.yvel = outcome.fall_yvelocity;
+        gh.fall_yvel = outcome.fall_yvelocity;
+        gh.fall_xvel = hitdef.fall_xvelocity.unwrap_or(knockback.x);
     }
+    // `fall.damage` is carried from the HitDef and surfaces via
+    // `GetHitVar(fall.damage)`; the `HitFallDamage` controller in the authored
+    // get-hit state subtracts it from life when the defender lands.
+    gh.fall_damage = hitdef.fall_damage;
 
     // Send the defender into the get-hit / guard state.
     defender.change_state(defender_states, outcome.gethit_state);
@@ -267,6 +316,23 @@ pub fn resolve_attack(
     attacker.hitpause = attacker.hitpause.max(outcome.pausetime);
     defender.hitpause = defender.hitpause.max(outcome.shaketime);
     defender.shaketime = defender.shaketime.max(outcome.shaketime);
+
+    // On-hit super-meter gain (audit #18). MUGEN grants the ATTACKER `getpower`
+    // and the DEFENDER `givepower` when a HitDef connects: the `hit` component on
+    // a clean hit, the `guard` component on a block. Both are clamped to
+    // `[0, power_max]` via the shared `add_power_clamped` path (so this never
+    // overflows or leaves the meter out of range). KFM authors `getpower = 0` on
+    // every attack, which the controller stores as an explicit `(0, 0)` — so this
+    // adds nothing for KFM and its statedef-`poweradd` meter source is NOT double-
+    // counted. This is the SECONDARY, damage-proportional default gain; the
+    // primary `poweradd`/`PowerAdd`/`PowerSet` path is entirely independent.
+    let (atk_gain, def_gain) = if guarded {
+        (hitdef.getpower.guard, hitdef.givepower.guard)
+    } else {
+        (hitdef.getpower.hit, hitdef.givepower.hit)
+    };
+    attacker.add_power_clamped(atk_gain);
+    defender.add_power_clamped(def_gain);
 
     // Mark the attacker's move as connected (drives MoveHit/MoveGuarded/
     // MoveContact and enforces hitonce on the next call).
@@ -1149,6 +1215,290 @@ mod tests {
         assert_eq!(gh.slidetime, 12, "ground slidetime mirrors ground hittime");
         assert_eq!(gh.ctrltime, 12, "ground ctrltime mirrors ground hittime");
         assert_eq!(gh.hitshaketime, 8, "shaketime from pausetime.p2");
+    }
+
+    // ---- #18: on-hit power gain (getpower / givepower) --------------------
+
+    /// A clean hit grants the attacker its HitDef `getpower.hit` and the defender
+    /// its `givepower.hit`, both clamped into `[0, power_max]`.
+    #[test]
+    fn clean_hit_grants_getpower_to_attacker_and_givepower_to_defender() {
+        use fp_combat::PowerGain;
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: 70, guard: 35 };
+            hd.givepower = PowerGain { hit: 60, guard: 30 };
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        assert_eq!(a.power, 0);
+        assert_eq!(d.power, 0);
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.power, 70, "attacker gains getpower.hit on a clean hit");
+        assert_eq!(d.power, 60, "defender gains givepower.hit on a clean hit");
+    }
+
+    /// A guarded hit uses the GUARD components, not the hit components.
+    #[test]
+    fn guarded_hit_grants_guard_power_components() {
+        use fp_combat::PowerGain;
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: 70, guard: 35 };
+            hd.givepower = PowerGain { hit: 60, guard: 30 };
+        }
+        let (mut d, d_air) = make_defender();
+        d.holding_back = true; // guardflag MA admits a standing block
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guards");
+        assert_eq!(res.result, HitResult::Guard);
+        assert_eq!(a.power, 35, "attacker gains getpower.guard on a block");
+        assert_eq!(d.power, 30, "defender gains givepower.guard on a block");
+    }
+
+    /// `getpower = 0` (KFM's suppression on every attack) adds NO attacker power,
+    /// so the statedef-`poweradd` meter source is not double-counted by this path.
+    #[test]
+    fn zero_getpower_suppresses_attacker_gain() {
+        use fp_combat::PowerGain;
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: 0, guard: 0 };
+            hd.givepower = PowerGain { hit: 60, guard: 30 };
+        }
+        a.power = 100; // pre-existing meter from a `poweradd` path
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.power, 100, "getpower = 0 leaves the attacker meter untouched");
+        assert_eq!(d.power, 60, "givepower still applies to the defender");
+    }
+
+    /// Power gain clamps to `[0, power_max]`: a huge getpower cannot exceed the
+    /// meter cap, and a miss grants no power at all.
+    #[test]
+    fn power_gain_clamps_to_max_and_miss_grants_nothing() {
+        use fp_combat::PowerGain;
+        // Clamp at power_max.
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: i32::MAX, guard: 0 };
+        }
+        a.power_max = 3000;
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(a.power, 3000, "getpower clamps at power_max, never overflows");
+
+        // A miss (out of reach) grants no power to either participant.
+        let (mut a2, a_air2) = make_attacker();
+        if let Some(hd) = a2.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: 70, guard: 35 };
+            hd.givepower = PowerGain { hit: 60, guard: 30 };
+        }
+        let (mut d2, d_air2) = make_defender();
+        d2.pos = Vec2::new(10_000.0, 0.0);
+        assert!(resolve_attack(&mut a2, &a_air2, &mut d2, &d_air2, &states).is_none());
+        assert_eq!(a2.power, 0, "a whiff grants no attacker power");
+        assert_eq!(d2.power, 0, "a whiff grants no defender power");
+    }
+
+    // ---- #9b: HitOverride redirects the defender instead of the normal hit -
+
+    /// An armed `HitOverride` slot whose attr matches the attacker redirects the
+    /// defender to the override state, applies NO damage/knockback, consumes the
+    /// slot, and still registers the attacker's contact (move_connect + target).
+    #[test]
+    fn hit_override_redirects_defender_and_suppresses_damage() {
+        use crate::invuln::AttackAttrSet;
+        let (mut a, a_air) = make_attacker(); // HitDef attr defaults to S, NA
+        let (mut d, d_air) = make_defender();
+        // Arm slot 0 to override a standing normal attack -> state 700.
+        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states)
+            .expect("override fires as a connection");
+        assert_eq!(res.result, HitResult::Hit);
+        assert_eq!(res.damage, 0, "override applies no damage");
+        assert_eq!(res.defender_state, 700, "defender redirected to the override state");
+        assert_eq!(d.state_no, 700, "defender actually entered the override state");
+        assert_eq!(d.life, 1000, "no life lost under a hit override");
+        assert_eq!(d.vel, Vec2::new(0.0, 0.0), "no knockback under a hit override");
+        // The attacker still registered a connection (so hitonce holds).
+        assert!(a.move_connect.hit);
+        assert!(a.has_target);
+        // The slot was consumed.
+        assert!(!d.hit_overrides.slots[0].is_active(), "matching slot consumed");
+    }
+
+    /// On a `HitOverride` match the attacker still counts the hit as a connection,
+    /// so its `getpower.hit` accrues; the defender's `givepower` does NOT, since
+    /// the override state replaces the normal get-hit reaction.
+    #[test]
+    fn hit_override_grants_attacker_getpower_but_not_defender_givepower() {
+        use crate::invuln::AttackAttrSet;
+        use fp_combat::PowerGain;
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.getpower = PowerGain { hit: 70, guard: 35 };
+            hd.givepower = PowerGain { hit: 60, guard: 30 };
+        }
+        let (mut d, d_air) = make_defender();
+        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("override fires");
+        assert_eq!(a.power, 70, "attacker still gains getpower.hit on an override connection");
+        assert_eq!(d.power, 0, "defender's givepower is NOT granted under an override");
+    }
+
+    /// A `HitOverride` whose attr does NOT match the attacker is ignored — the
+    /// normal get-hit applies.
+    #[test]
+    fn hit_override_non_matching_attr_falls_through_to_normal_hit() {
+        use crate::invuln::AttackAttrSet;
+        let (mut a, a_air) = make_attacker(); // attr S, NA
+        let (mut d, d_air) = make_defender();
+        // Override only throws; the attacker's S,NA is a normal strike -> no match.
+        d.hit_overrides.arm(0, AttackAttrSet::parse(", NT,ST,HT"), 700, 30);
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("normal hit");
+        assert_eq!(res.result, HitResult::Hit);
+        assert_eq!(res.damage, 30, "normal hit damage applied (override did not match)");
+        assert_eq!(d.state_no, 5000, "normal get-hit state, not the override");
+        assert!(d.hit_overrides.slots[0].is_active(), "non-matching slot is NOT consumed");
+    }
+
+    /// An inactive (expired) `HitOverride` slot never fires.
+    #[test]
+    fn hit_override_inactive_slot_does_not_fire() {
+        use crate::invuln::AttackAttrSet;
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 0); // time 0 = inactive
+        let states = HashMap::new();
+
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("normal hit");
+        assert_eq!(res.defender_state, 5000, "inactive override slot is ignored");
+        assert_eq!(d.life, 1000 - 30, "normal damage applied");
+    }
+
+    // ---- #23: fall.damage / fall.xvelocity flow from HitDef -> GetHitVars --
+
+    /// Builds a single-controller `[State n]` with the given controller `type`
+    /// and a single always-true trigger (`trigger1 = 1`), plus a trivial
+    /// one-frame action `0`. Lets the combat tests drive a real get-hit
+    /// controller through [`Character::tick_with`] without the executor crate's
+    /// private test harness.
+    fn state_with_ctrl(number: i32, ctrl_type: &str) -> (HashMap<i32, CompiledState>, AirFile) {
+        use crate::loader::{CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup};
+        let controller = CompiledController {
+            state_number: number,
+            label: String::new(),
+            controller_type: Some(ctrl_type.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: HashMap::new(),
+        };
+        let state = CompiledState {
+            number,
+            state_type: None,
+            movetype: None,
+            physics: None,
+            anim: None,
+            ctrl: None,
+            velset: None,
+            poweradd: None,
+            controllers: vec![controller],
+        };
+        let mut states = HashMap::new();
+        states.insert(number, state);
+        let air = air_with(0, Vec::new(), Vec::new());
+        (states, air)
+    }
+
+    /// End-to-end (#23): a falling HitDef carries its authored `fall.damage` /
+    /// `fall.xvelocity` onto the defender's [`GetHitVars`] in `resolve_attack`,
+    /// and then the defender's `HitFallDamage` controller subtracts that value
+    /// from life — proving the controller is NOT fed a constant 0 on real
+    /// content (KFM authors `fall.damage = 70`).
+    #[test]
+    fn falling_hit_propagates_fall_damage_then_hitfalldamage_drops_life() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.fall = true;
+            hd.fall_yvelocity = -7.0;
+            hd.fall_xvelocity = Some(-2.5);
+            hd.fall_damage = 70; // KFM's authored sweep value.
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+
+        // The fall vars were carried from the HitDef (not the hardcoded 0).
+        assert!(d.get_hit_vars.fall != 0, "defender is in a falling reaction");
+        assert_eq!(d.get_hit_vars.fall_damage, 70, "fall.damage carried from HitDef");
+        assert!(
+            (d.get_hit_vars.fall_yvel - (-7.0)).abs() < 1e-4,
+            "fall.yvelocity carried"
+        );
+        assert!(
+            (d.get_hit_vars.fall_xvel - (-2.5)).abs() < 1e-4,
+            "authored fall.xvelocity carried (not the knockback X)"
+        );
+        // Surfaces through the evaluator too (the get-hit state reads it this way).
+        assert_eq!(ev_against("GetHitVar(fall.damage)", &d), Value::Int(70));
+
+        // Now tick the defender's HitFallDamage controller on the populated vars:
+        // life must actually drop by 70 (proves the controller is not inert).
+        // Clear the post-hit freeze so normal controllers run this tick (the
+        // landing happens after hit-stun elapses in real play).
+        let life_before = d.life;
+        d.hitpause = 0;
+        d.shaketime = 0;
+        let (fall_states, fall_air) = state_with_ctrl(5050, "HitFallDamage");
+        d.state_no = 5050;
+        d.state_time = 0;
+        d.tick_with(&fall_states, &fall_air, None, StageView::default());
+        assert_eq!(
+            d.life,
+            life_before - 70,
+            "HitFallDamage subtracts the HitDef's authored fall.damage on landing"
+        );
+    }
+
+    /// When the author omits `fall.xvelocity` (the common case), the fall X
+    /// velocity falls back to the imparted knockback X — MUGEN's "no change".
+    #[test]
+    fn falling_hit_without_authored_xvel_uses_knockback_x() {
+        let (mut a, a_air) = make_attacker();
+        if let Some(hd) = a.active_hitdef.as_mut() {
+            hd.fall = true;
+            hd.fall_yvelocity = -6.0;
+            hd.fall_xvelocity = None; // not authored
+            hd.fall_damage = 0;
+        }
+        let (mut d, d_air) = make_defender();
+        let states = HashMap::new();
+
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        // fall_xvel mirrors the (mirrored) knockback X, which is non-zero here.
+        assert!(
+            d.get_hit_vars.fall_xvel.abs() > 0.0,
+            "absent fall.xvelocity defaults to the knockback X"
+        );
+        assert_eq!(d.get_hit_vars.fall_damage, 0, "no fall.damage authored");
     }
 
     // ---- P7: GetHitVar(animtype) populated from the HitDef ----------------

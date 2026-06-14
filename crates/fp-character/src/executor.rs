@@ -366,6 +366,15 @@ impl Character {
     ) -> TickReport {
         let mut report = TickReport::default();
 
+        // Per-tick `AssertSpecial` flags (#13) and the `Width` push override (#10)
+        // are TRANSIENT: they hold only for the tick that (re-)asserts them, so
+        // clear them at the very top — before any branch — and let this tick's
+        // controllers set them again. (During a hit-pause freeze below, the normal
+        // controllers do not run, so the flags correctly stay cleared — a frozen
+        // character asserts nothing.)
+        self.asserted.clear();
+        self.cur_width.clear();
+
         // Build the opponent's cross-entity context ONCE for this whole tick. Its
         // own opponent is `None` (a single level of `p2, ...` is enough for KFM /
         // common1; the opponent's nested redirects bottom out). The opponent is
@@ -423,6 +432,9 @@ impl Character {
         }
         // Not hit-paused: both invuln slots count down this tick.
         self.invuln.tick(false);
+        // Armed `HitOverride` slots (#9b) count down their `time` window alongside
+        // the other per-tick timers (the `< 0` "forever" slots are untouched).
+        self.hit_overrides.tick();
 
         // Process the special states first, in MUGEN order, then the current
         // state. The current state number is re-read after each special state in
@@ -895,7 +907,13 @@ impl Character {
     /// [`TickReport::target_ops`] for a downstream applier (`fp-engine`); they are
     /// safe no-ops when this character has no target. Audit P9 adds `NotHitBy` /
     /// `HitBy`, which set the character's attack-attribute invulnerability slots
-    /// (see [`ctrl_invuln`](Self::ctrl_invuln) and [`crate::invuln`]).
+    /// (see [`ctrl_invuln`](Self::ctrl_invuln) and [`crate::invuln`]). Audit #13
+    /// adds `AssertSpecial` (per-tick engine flags — `NoWalk`/`NoAutoTurn`/`Intro`,
+    /// see [`ctrl_assert_special`](Self::ctrl_assert_special)); #10 adds `Width`
+    /// (per-tick push-width override, [`ctrl_width`](Self::ctrl_width)); #23 adds
+    /// the get-hit velocity/fall controllers `HitVelSet` / `HitFallSet` /
+    /// `HitFallVel` / `HitFallDamage`; and #9b adds `HitOverride`
+    /// ([`ctrl_hit_override`](Self::ctrl_hit_override)).
     /// Every other type is a safe no-op, debug-logged and deferred to a later task.
     fn dispatch(
         &mut self,
@@ -969,6 +987,20 @@ impl Character {
             self.ctrl_target_vel_add(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("TargetPowerAdd") {
             self.ctrl_target_power_add(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("AssertSpecial") {
+            self.ctrl_assert_special(ctrl);
+        } else if kind.eq_ignore_ascii_case("Width") {
+            self.ctrl_width(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("HitVelSet") {
+            self.ctrl_hit_vel_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("HitFallSet") {
+            self.ctrl_hit_fall_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("HitFallVel") {
+            self.ctrl_hit_fall_vel();
+        } else if kind.eq_ignore_ascii_case("HitFallDamage") {
+            self.ctrl_hit_fall_damage();
+        } else if kind.eq_ignore_ascii_case("HitOverride") {
+            self.ctrl_hit_override(ctrl, env);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -1000,6 +1032,21 @@ impl Character {
             return;
         };
         let target = value.to_int();
+
+        // `AssertSpecial NoWalk` (#13) suppresses the engine's built-in
+        // stand↔walk locomotion this tick: when asserted, the loader-injected
+        // `engine: stand->walk` / `engine: walk->stand` ChangeStates are skipped so
+        // the character cannot start (or auto-stop) a walk. Gated by the controller
+        // label (only the engine built-ins carry the `engine:` prefix) so a
+        // character's OWN ChangeStates are never affected.
+        if self.asserted.no_walk && is_engine_walk_transition(&ctrl.label) {
+            tracing::debug!(
+                "tick: NoWalk asserted; suppressing built-in walk transition {:?}",
+                ctrl.label
+            );
+            return;
+        }
+
         // A self-transition still counts as a re-entry in MUGEN (resets time).
         self.enter_state(states, target, env);
         report.transitions += 1;
@@ -1682,7 +1729,8 @@ impl Character {
     ///   type modelled here.)
     /// - **Numeric** params (`damage`, `ground.velocity`, `air.velocity`,
     ///   `guard.velocity`, `pausetime`, `p1stateno`, `p2stateno`, the hit-times,
-    ///   `fall`, `priority`, `id`, `chainid`, `fall.yvelocity`) are obtained by
+    ///   `fall`, `priority`, `id`, `chainid`, `fall.xvelocity`, `fall.yvelocity`,
+    ///   `fall.damage`, `getpower`, `givepower`) are obtained by
     ///   **evaluating** the compiled parameter expression(s) against `self` (the
     ///   attacker), so authored expressions like `damage = ceil(var(1)*1.5), 0`
     ///   resolve correctly. Multi-component params (`x, y` or `hit, guard`) are
@@ -1811,9 +1859,25 @@ impl Character {
                 hd.fall = v.as_bool();
             }
         }
+        if let Some(param) = ctrl.params.get("fall.xvelocity") {
+            // `fall.xvelocity` — X velocity entering the falling state; surfaces
+            // via `GetHitVar(fall.xvel)`. Absent = "no change" (modeled `None`).
+            if let Some(v) = self.eval_param_component(param, 0, env) {
+                hd.fall_xvelocity = Some(v.to_float());
+            }
+        }
         if let Some(param) = ctrl.params.get("fall.yvelocity") {
             if let Some(v) = self.eval_param_component(param, 0, env) {
                 hd.fall_yvelocity = v.to_float();
+            }
+        }
+        if let Some(param) = ctrl.params.get("fall.damage") {
+            // `fall.damage` — life dealt to the defender when it lands from the
+            // fall; surfaces via `GetHitVar(fall.damage)`, applied by the
+            // `HitFallDamage` controller in the authored get-hit state. KFM
+            // authors `fall.damage = 70` on its sweep.
+            if let Some(v) = self.eval_param_component(param, 0, env) {
+                hd.fall_damage = v.to_int();
             }
         }
         if let Some(param) = ctrl.params.get("priority") {
@@ -1837,11 +1901,44 @@ impl Character {
             }
         }
 
+        // `getpower = p1power [, p1gpower]` (attacker meter gain on hit / guard)
+        // and `givepower = p2power [, p2gpower]` (defender meter gain). MUGEN rule:
+        // when the WHOLE param is omitted, the gain defaults to a damage-
+        // proportional value (and the guard component to half the hit component);
+        // an authored value — even `0` (KFM suppresses meter with `getpower = 0`
+        // on every attack) — overrides that default. So: seed each from the
+        // damage-derived default FIRST (damage was parsed above), then let an
+        // explicit param overwrite it. A present param with only the hit component
+        // leaves the guard at the default `hit / 2`.
+        hd.getpower = hd.default_getpower();
+        hd.givepower = hd.default_givepower();
+        if let Some(param) = ctrl.params.get("getpower") {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
+                hd.getpower.hit = v.to_int();
+                // Guard component defaults to hit / 2 unless explicitly given.
+                hd.getpower.guard = hd.getpower.hit / 2;
+            }
+            if let Some(g) = self.eval_param_component(param, 1, env) {
+                hd.getpower.guard = g.to_int();
+            }
+        }
+        if let Some(param) = ctrl.params.get("givepower") {
+            if let Some(v) = self.eval_param_component(param, 0, env) {
+                hd.givepower.hit = v.to_int();
+                hd.givepower.guard = hd.givepower.hit / 2;
+            }
+            if let Some(g) = self.eval_param_component(param, 1, env) {
+                hd.givepower.guard = g.to_int();
+            }
+        }
+
         tracing::debug!(
-            "tick: HitDef in state {} -> attr {:?}, damage {:?}",
+            "tick: HitDef in state {} -> attr {:?}, damage {:?}, getpower {:?}, givepower {:?}",
             ctrl.state_number,
             hd.attr,
-            hd.damage
+            hd.damage,
+            hd.getpower,
+            hd.givepower
         );
         self.active_hitdef = Some(hd);
     }
@@ -1908,6 +2005,234 @@ impl Character {
                 time_remaining: time,
                 ignore_hitpause,
             };
+        }
+    }
+
+    // ---- AssertSpecial / Width / get-hit / HitOverride (audit #13/#10/#23/#9b) --
+
+    /// `AssertSpecial`: assert one or more named engine flags for the current tick
+    /// (faithfulness audit #13).
+    ///
+    /// MUGEN's `AssertSpecial` takes up to three `flag` / `flag2` / `flag3`
+    /// parameters, each a bare flag name (e.g. `NoWalk`, `NoAutoTurn`, `Intro`,
+    /// `NoBarDisplay`). The assertion holds **only for this tick** — the executor
+    /// cleared [`Character::asserted`] at the top of the tick, so a state must
+    /// re-assert every tick to keep a flag set. Flag names are read from the
+    /// **raw** source (they are identifiers, not arithmetic) and matched
+    /// case-insensitively; an unknown flag is stored verbatim in
+    /// [`AssertedFlags::others`](crate::AssertedFlags) rather than dropped, so it is
+    /// recorded even though no subsystem consumes it yet. Never panics.
+    ///
+    /// common1's run state (100) asserts `NoWalk` + `NoAutoTurn`; kfm.cns asserts
+    /// `Intro` during its intro.
+    fn ctrl_assert_special(&mut self, ctrl: &CompiledController) {
+        let mut any = false;
+        for key in ["flag", "flag2", "flag3"] {
+            if let Some(src) = raw_param(ctrl, key) {
+                let flag = src.trim();
+                if !flag.is_empty() {
+                    self.asserted.assert(flag);
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            tracing::debug!(
+                "tick: AssertSpecial in state {} had no flag/flag2/flag3; no-op",
+                ctrl.state_number
+            );
+        }
+    }
+
+    /// `Width`: override the player-push half-widths for the current tick
+    /// (faithfulness audit #10).
+    ///
+    /// MUGEN's `Width` controller accepts three forms (the first present wins):
+    ///
+    /// - `value = front, back` — the **player** push width (the form KFM uses, e.g.
+    ///   `Width 16, 16` on crouch/attack/throw-bind states). Both components are
+    ///   facing-relative half-widths.
+    /// - `player = front, back` — an explicit alias for the player push width.
+    /// - `edge = front, back` — the stage-edge width. We fold it into the same
+    ///   push override (we do not model a separate edge width yet); when only
+    ///   `edge` is present its `front`/`back` drive the push override.
+    ///
+    /// A single scalar (`value = 16`) sets both halves to that value. The override
+    /// is **transient** (cleared at the top of each tick, like `AssertSpecial`), so
+    /// the engine's player-push / stage-bound clamping reads
+    /// [`Character::cur_width`] when active and falls back to the static `[Size]`
+    /// width otherwise. A missing/garbage value is a safe no-op; never panics.
+    fn ctrl_width(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        // Prefer `value`, then `player`, then `edge` (MUGEN orders them the same
+        // way; a real character supplies exactly one).
+        let param = ctrl
+            .params
+            .get("value")
+            .or_else(|| ctrl.params.get("player"))
+            .or_else(|| ctrl.params.get("edge"));
+        let Some(param) = param else {
+            tracing::debug!(
+                "tick: Width in state {} had no value/player/edge; no-op",
+                ctrl.state_number
+            );
+            return;
+        };
+        // Component 0 is the front half-width; component 1 the back. A scalar form
+        // (only one component) sets both halves to that value.
+        let Some(front) = self.eval_param_component(param, 0, env).map(|v| v.to_float()) else {
+            tracing::debug!(
+                "tick: Width in state {} had an unparseable width; no-op",
+                ctrl.state_number
+            );
+            return;
+        };
+        let back = self
+            .eval_param_component(param, 1, env)
+            .map_or(front, |v| v.to_float());
+        self.cur_width.set(front, back);
+    }
+
+    /// `HitVelSet`: (re)set the character's velocity from its `GetHitVar` x/y
+    /// velocities (faithfulness audit #23).
+    ///
+    /// Used inside authored get-hit states to apply the knockback the hit imparted.
+    /// The `x` and `y` parameters are 0/1 flags (MUGEN default `0` — only the
+    /// requested axes are set) selecting which axis is overwritten with
+    /// `GetHitVar(xvel)` / `GetHitVar(yvel)`. The get-hit velocities were stored on
+    /// [`Character::get_hit_vars`] by hit resolution. A missing axis flag leaves
+    /// that axis unchanged; never panics.
+    fn ctrl_hit_vel_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let set_x = ctrl
+            .params
+            .get("x")
+            .and_then(|p| self.eval_param(p, env))
+            .is_some_and(|v| v.as_bool());
+        let set_y = ctrl
+            .params
+            .get("y")
+            .and_then(|p| self.eval_param(p, env))
+            .is_some_and(|v| v.as_bool());
+        if set_x {
+            self.vel.x = self.get_hit_vars.xvel;
+        }
+        if set_y {
+            self.vel.y = self.get_hit_vars.yvel;
+        }
+    }
+
+    /// `HitFallSet`: set or clear the defender's fall flag (faithfulness audit
+    /// #23).
+    ///
+    /// MUGEN's `HitFallSet value = v`: `v = 1` forces falling, `v = 0` clears it,
+    /// `v = -1` leaves it unchanged (the "no change" sentinel). The fall flag lives
+    /// on [`GetHitVars::fall`](crate::GetHitVars::fall) (`GetHitVar(fall)`), which
+    /// the get-hit states branch on. A missing `value` is a no-op; never panics.
+    fn ctrl_hit_fall_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: HitFallSet in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        match value.to_int() {
+            v if v > 0 => self.get_hit_vars.fall = 1,
+            0 => self.get_hit_vars.fall = 0,
+            // Negative: MUGEN's "no change" sentinel.
+            _ => {}
+        }
+    }
+
+    /// `HitFallVel`: set the character's velocity from its `GetHitVar` *fall*
+    /// velocities (faithfulness audit #23).
+    ///
+    /// Applied inside the fall portion of a get-hit state to switch the defender
+    /// onto its fall arc: `vel x = GetHitVar(fall.xvel)`, `vel y =
+    /// GetHitVar(fall.yvel)`. The fall velocities were stored on
+    /// [`Character::get_hit_vars`] by hit resolution from the HitDef's
+    /// `fall.yvelocity`. Never panics (pure field writes).
+    fn ctrl_hit_fall_vel(&mut self) {
+        self.vel.x = self.get_hit_vars.fall_xvel;
+        self.vel.y = self.get_hit_vars.fall_yvel;
+    }
+
+    /// `HitFallDamage`: apply the fall damage from `GetHitVar(fall.damage)` to life
+    /// (faithfulness audit #23).
+    ///
+    /// MUGEN deals the hit's `fall.damage` to the defender when it lands from a
+    /// fall. The value is carried from the HitDef's `fall.damage` field (parsed by
+    /// [`ctrl_hit_def`](Self::ctrl_hit_def)) onto
+    /// [`GetHitVars::fall_damage`](crate::GetHitVars::fall_damage) at hit
+    /// resolution; here it is subtracted from life, clamped to `>= 0`. KFM authors
+    /// `fall.damage = 70` on its sweep, so this lands 70 on a falling KO. Never
+    /// panics.
+    fn ctrl_hit_fall_damage(&mut self) {
+        let dmg = self.get_hit_vars.fall_damage;
+        if dmg != 0 {
+            self.life = (self.life - dmg).max(0);
+        }
+    }
+
+    /// `HitOverride`: arm one of the 8 hit-override slots (faithfulness audit #9b).
+    ///
+    /// MUGEN's `HitOverride` redirects the **defender** to a custom `stateno`
+    /// (instead of the normal get-hit) when a matching attribute hit lands during
+    /// the `time` window — armor / dodge / counter logic. Parameters:
+    ///
+    /// - `attr` — the attack-attribute set that arms the slot, in the same grammar
+    ///   as `NotHitBy`/`HitBy` (a state-type group plus PK pairs). Read raw and
+    ///   parsed with [`AttackAttrSet::parse`](crate::invuln::AttackAttrSet::parse).
+    /// - `stateno` — the state the defender is sent to on a match (evaluated).
+    /// - `slot` — which of the 8 slots to arm (evaluated, MUGEN default `0`,
+    ///   clamped to `0..8`; out-of-range is a no-op).
+    /// - `time` — how many ticks the slot stays armed (evaluated, MUGEN default
+    ///   `1`; `-1` = "until consumed/replaced", the forever sentinel).
+    ///
+    /// A missing `attr` or `stateno` is a safe debug-logged no-op (nothing is
+    /// armed). Hit resolution ([`resolve_attack`](crate::combat::resolve_attack))
+    /// consults the armed slots before the normal get-hit. Never panics.
+    fn ctrl_hit_override(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(attr_src) = raw_param(ctrl, "attr") else {
+            tracing::debug!(
+                "tick: HitOverride in state {} has no `attr`; nothing armed",
+                ctrl.state_number
+            );
+            return;
+        };
+        let Some(stateno) = ctrl
+            .params
+            .get("stateno")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int())
+        else {
+            tracing::debug!(
+                "tick: HitOverride in state {} has no `stateno`; nothing armed",
+                ctrl.state_number
+            );
+            return;
+        };
+        let slot = ctrl
+            .params
+            .get("slot")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+
+        // MUGEN slots are 0..7; a negative or out-of-range index is dropped by
+        // `HitOverrides::arm` (debug-logged), never panicking.
+        let attrs = crate::invuln::AttackAttrSet::parse(attr_src);
+        match usize::try_from(slot) {
+            Ok(idx) => self.hit_overrides.arm(idx, attrs, stateno, time),
+            Err(_) => {
+                tracing::debug!(
+                    "tick: HitOverride in state {} has negative slot {slot}; ignored",
+                    ctrl.state_number
+                );
+            }
         }
     }
 
@@ -1990,7 +2315,12 @@ impl Character {
     /// Adds `delta` (which may be negative) to the power meter, clamping the
     /// result to `[0, power_max]`. Uses saturating arithmetic so a garbage
     /// `delta` near `i32::MAX`/`i32::MIN` cannot overflow before the clamp.
-    fn add_power_clamped(&mut self, delta: i32) {
+    ///
+    /// This is the single power-add clamp path: the `PowerAdd`/`PowerSet`
+    /// controllers and on-hit power gain (HitDef `getpower`/`givepower`, audit
+    /// #18, in [`combat::resolve_attack`](crate::combat::resolve_attack)) all
+    /// route through it, so the meter can never be left out of range or overflow.
+    pub(crate) fn add_power_clamped(&mut self, delta: i32) {
         self.set_power_clamped(self.power.saturating_add(delta));
     }
 
@@ -2322,6 +2652,19 @@ fn raw_param<'a>(ctrl: &'a CompiledController, key: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.raw())
+}
+
+/// Returns `true` if `label` is one of the engine-built-in stand↔walk locomotion
+/// `ChangeState` controllers the loader injects (`engine: stand->walk` /
+/// `engine: walk->stand`), which `AssertSpecial NoWalk` suppresses (#13).
+///
+/// Matched case-insensitively. Only the loader's built-ins carry the `engine: `
+/// label prefix (no real character labels its controllers that way — see
+/// `BUILTIN_GROUND_LOCOMOTION_CNS`), so a character's own walk-related
+/// `ChangeState`s are never matched by this and are unaffected by `NoWalk`.
+fn is_engine_walk_transition(label: &str) -> bool {
+    let l = label.trim();
+    l.eq_ignore_ascii_case("engine: stand->walk") || l.eq_ignore_ascii_case("engine: walk->stand")
 }
 
 /// Parses a MUGEN `ground.type` / `air.type` token (`High`/`Low`/`Trip`/`None`,
@@ -7666,8 +8009,8 @@ mod tests {
     #[test]
     fn hit_def_all_numeric_params_mapped() {
         // Cover the numeric params not exercised by Forge's happy-path test:
-        // p1stateno, guard.velocity, guard.hittime, air.hittime, fall.yvelocity,
-        // id, chainid, and the priority value-only form.
+        // p1stateno, guard.velocity, guard.hittime, air.hittime, fall.xvelocity,
+        // fall.yvelocity, fall.damage, id, chainid, and the priority value-only form.
         let hd = build_hitdef(&[
             ("attr", "S, NA"),
             ("p1stateno", "1100"),
@@ -7676,7 +8019,9 @@ mod tests {
             ("ground.hittime", "11"),
             ("air.hittime", "22"),
             ("guard.hittime", "9"),
+            ("fall.xvelocity", "-2.5"),
             ("fall.yvelocity", "-4.5"),
+            ("fall.damage", "70"),
             ("id", "7"),
             ("chainid", "3"),
             ("priority", "6"), // value only, no type token
@@ -7687,7 +8032,9 @@ mod tests {
         assert_eq!(hd.hittimes.ground, 11);
         assert_eq!(hd.hittimes.air, 22);
         assert_eq!(hd.hittimes.guard, 9);
+        assert!((hd.fall_xvelocity.expect("fall.xvelocity parsed") - (-2.5)).abs() < 1e-4);
         assert!((hd.fall_yvelocity - (-4.5)).abs() < 1e-4);
+        assert_eq!(hd.fall_damage, 70, "fall.damage parsed onto the HitDef");
         assert_eq!(hd.id, 7);
         assert_eq!(hd.chainid, 3);
         assert_eq!(hd.priority.value, 6);
@@ -9539,5 +9886,358 @@ mod tests {
         assert_eq!(ch.state_no, 9, "seam performed the state entry");
         // anim resolved with SelfAnimExist degraded to 0 at the seam → 0 + 7.
         assert_eq!(ch.anim, 7, "SelfAnimExist degraded to 0 at the no-AIR seam");
+    }
+
+    // =====================================================================
+    // PR-D: AssertSpecial (#13), Width (#10), get-hit vel/fall (#23),
+    // HitOverride (#9b). Synthetic-controller dispatch tests.
+    // =====================================================================
+
+    /// Like [`ctrl`] but with an explicit label (so engine-built-in walk
+    /// transitions can be modeled for the NoWalk gate test).
+    fn ctrl_labeled(
+        state_number: i32,
+        label: &str,
+        kind: &str,
+        groups: &[(u32, &[&str])],
+        params: &[(&str, &str)],
+    ) -> CompiledController {
+        let mut c = ctrl(state_number, kind, &[], groups, None, params);
+        c.label = label.to_string();
+        c
+    }
+
+    // ---- #13 AssertSpecial -------------------------------------------------
+
+    /// `AssertSpecial flag = NoWalk` sets the per-tick flag; it is cleared on the
+    /// next tick (a transient assertion).
+    #[test]
+    fn assert_special_sets_and_clears_per_tick() {
+        // State 0 asserts NoWalk every tick (persistent default).
+        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
+        let st0 = stand_n(0, vec![assert]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+
+        lc.tick(&mut ch);
+        assert!(ch.asserted.no_walk, "NoWalk asserted during the tick");
+        assert!(ch.asserted.is_asserted("nowalk"), "case-insensitive lookup");
+
+        // A tick where the state no longer asserts (swap to an empty state).
+        let st0_empty = stand_n(0, vec![]);
+        let lc2 = loaded(vec![st0_empty], tiny_air(0, &[5]));
+        lc2.tick(&mut ch);
+        assert!(!ch.asserted.no_walk, "flag cleared when not re-asserted");
+    }
+
+    /// `AssertSpecial` records multiple flags and stores unknown ones verbatim.
+    #[test]
+    fn assert_special_multiple_and_unknown_flags() {
+        let assert = ctrl(
+            0,
+            "AssertSpecial",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("flag", "NoAutoTurn"), ("flag2", "Intro"), ("flag3", "NoBarDisplay")],
+        );
+        let st0 = stand_n(0, vec![assert]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert!(ch.asserted.no_auto_turn);
+        assert!(ch.asserted.intro);
+        assert!(ch.asserted.is_asserted("NoBarDisplay"), "unknown flag stored verbatim");
+        assert!(!ch.asserted.is_asserted("NoWalk"), "an un-asserted flag reads false");
+    }
+
+    /// NoWalk suppresses ONLY the engine-built-in stand->walk / walk->stand
+    /// ChangeStates (matched by their `engine:` label), not a character's own.
+    #[test]
+    fn nowalk_suppresses_engine_walk_transition() {
+        // A character-OWN walk ChangeState (empty label) is NOT suppressed; the
+        // engine-built-in one (labeled `engine: stand->walk`) IS.
+        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
+        let engine_walk =
+            ctrl_labeled(0, "engine: stand->walk", "ChangeState", &[(1, &["1"])], &[("value", "20")]);
+        let st0 = stand_n(0, vec![assert, engine_walk]);
+        let st20 = stand_n(20, vec![]);
+        let lc = loaded(vec![st0, st20], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 0, "NoWalk blocked the engine walk transition");
+
+        // Without NoWalk, the same engine transition fires.
+        let engine_walk2 =
+            ctrl_labeled(0, "engine: stand->walk", "ChangeState", &[(1, &["1"])], &[("value", "20")]);
+        let st0b = stand_n(0, vec![engine_walk2]);
+        let st20b = stand_n(20, vec![]);
+        let lc2 = loaded(vec![st0b, st20b], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 0;
+        lc2.tick(&mut ch2);
+        assert_eq!(ch2.state_no, 20, "walk transition fires when NoWalk is not asserted");
+    }
+
+    /// NoWalk does NOT suppress a character's OWN (non-engine-labeled)
+    /// ChangeState to the walk state.
+    #[test]
+    fn nowalk_does_not_suppress_own_changestate() {
+        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
+        let own_walk = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "20")]);
+        let st0 = stand_n(0, vec![assert, own_walk]);
+        let st20 = stand_n(20, vec![]);
+        let lc = loaded(vec![st0, st20], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        lc.tick(&mut ch);
+        assert_eq!(ch.state_no, 20, "NoWalk only gates engine-labeled walk built-ins");
+    }
+
+    // ---- #10 Width ---------------------------------------------------------
+
+    /// `Width value = front, back` sets the per-tick push override and clears it
+    /// next tick.
+    #[test]
+    fn width_sets_override_per_tick() {
+        let width = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("value", "16, 12")]);
+        let st0 = stand_n(0, vec![width]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert!(ch.cur_width.active);
+        assert_eq!(ch.cur_width.front, 16.0);
+        assert_eq!(ch.cur_width.back, 12.0);
+
+        // Not re-asserted next tick -> cleared.
+        let st0_empty = stand_n(0, vec![]);
+        let lc2 = loaded(vec![st0_empty], tiny_air(0, &[5]));
+        lc2.tick(&mut ch);
+        assert!(!ch.cur_width.active, "Width override cleared when not re-asserted");
+    }
+
+    /// A scalar `Width value = 16` sets both halves; `edge`/`player` forms parse.
+    #[test]
+    fn width_scalar_and_alias_forms() {
+        // Scalar -> both halves equal.
+        let w = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("value", "16")]);
+        let st0 = stand_n(0, vec![w]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert_eq!((ch.cur_width.front, ch.cur_width.back), (16.0, 16.0));
+
+        // `player = a, b` alias.
+        let wp = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("player", "20, 8")]);
+        let st0p = stand_n(0, vec![wp]);
+        let lcp = loaded(vec![st0p], tiny_air(0, &[5]));
+        let mut chp = Character::new();
+        lcp.tick(&mut chp);
+        assert_eq!((chp.cur_width.front, chp.cur_width.back), (20.0, 8.0));
+
+        // `edge = a, b` form (folded into the same push override).
+        let we = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("edge", "30, 30")]);
+        let st0e = stand_n(0, vec![we]);
+        let lce = loaded(vec![st0e], tiny_air(0, &[5]));
+        let mut che = Character::new();
+        lce.tick(&mut che);
+        assert!(che.cur_width.active);
+        assert_eq!((che.cur_width.front, che.cur_width.back), (30.0, 30.0));
+    }
+
+    // ---- #23 get-hit velocity / fall controllers ---------------------------
+
+    /// `HitVelSet x=1, y=1` copies the stored GetHitVar x/y velocities onto vel;
+    /// an unset axis flag leaves that axis unchanged.
+    #[test]
+    fn hit_vel_set_applies_selected_axes() {
+        let hvs = ctrl(5000, "HitVelSet", &[], &[(1, &["1"])], None, &[("x", "1"), ("y", "1")]);
+        let st = stand_n(5000, vec![hvs]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 5000;
+        ch.get_hit_vars.xvel = -4.0;
+        ch.get_hit_vars.yvel = -7.0;
+        ch.vel = Vec2::new(0.0, 0.0);
+        lc.tick(&mut ch);
+        assert_eq!(ch.vel.x, -4.0, "x axis set from GetHitVar(xvel)");
+        assert_eq!(ch.vel.y, -7.0, "y axis set from GetHitVar(yvel)");
+
+        // Only x: y stays as it was.
+        let hvs_x = ctrl(5000, "HitVelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
+        let st_x = stand_n(5000, vec![hvs_x]);
+        let lc_x = loaded(vec![st_x], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 5000;
+        ch2.get_hit_vars.xvel = -3.0;
+        ch2.vel = Vec2::new(1.0, 2.0);
+        lc_x.tick(&mut ch2);
+        assert_eq!(ch2.vel.x, -3.0);
+        assert_eq!(ch2.vel.y, 2.0, "y unchanged when its flag is unset");
+    }
+
+    /// `HitFallSet` sets (1), clears (0), or leaves unchanged (-1) the fall flag.
+    #[test]
+    fn hit_fall_set_sets_clears_and_holds() {
+        // value=1 -> fall set.
+        let set1 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "1")]);
+        let mut ch = Character::new();
+        ch.state_no = 5000;
+        ch.get_hit_vars.fall = 0;
+        loaded(vec![stand_n(5000, vec![set1])], tiny_air(0, &[5])).tick(&mut ch);
+        assert_eq!(ch.get_hit_vars.fall, 1);
+
+        // value=0 -> fall cleared.
+        let set0 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        ch.get_hit_vars.fall = 1;
+        loaded(vec![stand_n(5000, vec![set0])], tiny_air(0, &[5])).tick(&mut ch);
+        assert_eq!(ch.get_hit_vars.fall, 0);
+
+        // value=-1 -> unchanged ("no change" sentinel).
+        let setm1 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "-1")]);
+        ch.get_hit_vars.fall = 1;
+        loaded(vec![stand_n(5000, vec![setm1])], tiny_air(0, &[5])).tick(&mut ch);
+        assert_eq!(ch.get_hit_vars.fall, 1, "-1 leaves the fall flag unchanged");
+    }
+
+    /// `HitFallVel` sets velocity from the stored GetHitVar fall velocities.
+    #[test]
+    fn hit_fall_vel_applies_fall_velocities() {
+        let hfv = ctrl(5050, "HitFallVel", &[], &[(1, &["1"])], None, &[]);
+        let st = stand_n(5050, vec![hfv]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 5050;
+        ch.get_hit_vars.fall_xvel = -1.5;
+        ch.get_hit_vars.fall_yvel = -8.0;
+        ch.vel = Vec2::new(0.0, 0.0);
+        lc.tick(&mut ch);
+        assert_eq!(ch.vel.x, -1.5);
+        assert_eq!(ch.vel.y, -8.0);
+    }
+
+    /// `HitFallDamage` subtracts GetHitVar(fall.damage) from life, clamped at 0.
+    #[test]
+    fn hit_fall_damage_applies_clamped() {
+        let hfd = ctrl(5050, "HitFallDamage", &[], &[(1, &["1"])], None, &[]);
+        let st = stand_n(5050, vec![hfd]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 5050;
+        ch.life = 100;
+        ch.get_hit_vars.fall_damage = 30;
+        lc.tick(&mut ch);
+        assert_eq!(ch.life, 70, "fall.damage subtracted from life");
+
+        // Clamps at zero.
+        let hfd2 = ctrl(5050, "HitFallDamage", &[], &[(1, &["1"])], None, &[]);
+        let lc2 = loaded(vec![stand_n(5050, vec![hfd2])], tiny_air(0, &[5]));
+        let mut ch2 = Character::new();
+        ch2.state_no = 5050;
+        ch2.life = 10;
+        ch2.get_hit_vars.fall_damage = 999;
+        lc2.tick(&mut ch2);
+        assert_eq!(ch2.life, 0, "life clamps at zero");
+    }
+
+    // ---- #9b HitOverride ---------------------------------------------------
+
+    /// `HitOverride attr=, NT,ST,HT, stateno=N, slot=S, time=T` arms a slot whose
+    /// attribute set, destination, and duration round-trip onto the table.
+    #[test]
+    fn hit_override_arms_slot() {
+        let ho = ctrl(
+            0,
+            "HitOverride",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", ", NT,ST,HT"), ("stateno", "700"), ("slot", "2"), ("time", "30")],
+        );
+        let st0 = stand_n(0, vec![ho]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        let slot = &ch.hit_overrides.slots[2];
+        assert_eq!(slot.stateno, 700);
+        // The per-tick countdown runs BEFORE the controllers (so it does not eat
+        // into the tick that arms the slot): a slot armed with `time = 30` reads a
+        // full 30 on the arming tick and is active for 30 ticks.
+        assert_eq!(slot.time_remaining, 30, "armed this tick, not yet decremented");
+        assert!(slot.is_active());
+
+        // A throw attr matches; a normal strike does not.
+        use fp_combat::AttackAttr;
+        assert!(ch.hit_overrides.matching(&AttackAttr::parse("S, NT")).is_some());
+        assert!(ch.hit_overrides.matching(&AttackAttr::parse("S, NA")).is_none());
+    }
+
+    /// An armed `HitOverride` slot counts down and expires.
+    #[test]
+    fn hit_override_slot_counts_down_and_expires() {
+        // Arm once with time=2 (state 0 fires it once, persistent=0).
+        let ho = ctrl(
+            0,
+            "HitOverride",
+            &[],
+            &[(1, &["1"])],
+            Some("0"), // once per entry
+            &[("attr", "SCA"), ("stateno", "700"), ("slot", "0"), ("time", "2")],
+        );
+        let st0 = stand_n(0, vec![ho]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5, 5, 5]));
+        let mut ch = Character::new();
+        // Tick 1: countdown runs (no slot yet), then the controller arms it to 2.
+        lc.tick(&mut ch);
+        assert_eq!(ch.hit_overrides.slots[0].time_remaining, 2);
+        // Tick 2: not re-armed (persistent=0); countdown decrements 2 -> 1.
+        lc.tick(&mut ch);
+        assert_eq!(ch.hit_overrides.slots[0].time_remaining, 1);
+        assert!(ch.hit_overrides.slots[0].is_active());
+        // Tick 3: decrements 1 -> 0 (expired).
+        lc.tick(&mut ch);
+        assert_eq!(ch.hit_overrides.slots[0].time_remaining, 0);
+        assert!(!ch.hit_overrides.slots[0].is_active());
+    }
+
+    /// A negative `time` (-1) arms a slot "forever" — it stays active across ticks.
+    #[test]
+    fn hit_override_negative_time_is_forever() {
+        let ho = ctrl(
+            0,
+            "HitOverride",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("attr", "SCA"), ("stateno", "700"), ("slot", "1"), ("time", "-1")],
+        );
+        let st0 = stand_n(0, vec![ho]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5, 5, 5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        lc.tick(&mut ch);
+        lc.tick(&mut ch);
+        assert_eq!(ch.hit_overrides.slots[1].time_remaining, -1, "forever sentinel preserved");
+        assert!(ch.hit_overrides.slots[1].is_active());
+    }
+
+    /// An out-of-range slot index is a safe no-op (nothing armed, no panic).
+    #[test]
+    fn hit_override_out_of_range_slot_is_noop() {
+        let ho = ctrl(
+            0,
+            "HitOverride",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", "SCA"), ("stateno", "700"), ("slot", "99"), ("time", "10")],
+        );
+        let st0 = stand_n(0, vec![ho]);
+        let lc = loaded(vec![st0], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        // No slot armed.
+        assert!(ch.hit_overrides.slots.iter().all(|s| !s.is_active()));
     }
 }

@@ -653,6 +653,238 @@ impl CommandSource for ActiveCommands {
     }
 }
 
+/// The per-tick `AssertSpecial` flag set (faithfulness audit #13).
+///
+/// MUGEN's `AssertSpecial` controller asserts a named engine flag *for the
+/// current tick only*: the assertion holds while the state that asserts it is
+/// running and is **cleared at the start of every tick**, so a flag must be
+/// re-asserted each tick to stay set. The executor clears this set at the top of
+/// [`Character::tick`] and the `AssertSpecial` dispatch arm sets the named flags
+/// during the tick; consumers (built-in walk locomotion, auto-turn / face-opponent
+/// logic, intro gating) read it back the same tick.
+///
+/// Only the flags Fighters Paradise currently consumes have named fields
+/// (`NoWalk`, `NoAutoTurn`, `Intro`). Any other asserted flag name (MUGEN has
+/// ~30, e.g. `NoBarDisplay`, `Invisible`, `NoShadow`) is stored verbatim in
+/// [`others`](Self::others) so [`is_asserted`](Self::is_asserted) can report it
+/// without the engine needing a field per flag — an unmodeled flag is recorded,
+/// never dropped, and simply has no consumer yet (a safe no-op).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssertedFlags {
+    /// `NoWalk` — suppress the engine's built-in stand↔walk locomotion this tick
+    /// (common1 run state 100 asserts this so a run does not fall back to a walk).
+    pub no_walk: bool,
+    /// `NoAutoTurn` — suppress automatic turning to face the opponent this tick
+    /// (common1 run state 100 asserts this; a turning run would look wrong).
+    pub no_auto_turn: bool,
+    /// `Intro` — the character is in its intro pose (kfm.cns asserts this during
+    /// its intro state). Consumers may gate intro-only behavior on it.
+    pub intro: bool,
+    /// Any other asserted flag name (lower-cased), stored verbatim so it is not
+    /// silently dropped even though no subsystem consumes it yet.
+    pub others: Vec<String>,
+}
+
+impl AssertedFlags {
+    /// Clears every asserted flag — called at the **start** of each tick so an
+    /// assertion only holds for the tick that (re-)asserts it.
+    pub fn clear(&mut self) {
+        self.no_walk = false;
+        self.no_auto_turn = false;
+        self.intro = false;
+        self.others.clear();
+    }
+
+    /// Records an asserted flag by its MUGEN name (case-insensitive).
+    ///
+    /// Known flags (`NoWalk`, `NoAutoTurn`, `Intro`) set their dedicated field;
+    /// any other name is appended to [`others`](Self::others) (de-duplicated)
+    /// rather than dropped. Never panics.
+    pub fn assert(&mut self, flag: &str) {
+        let f = flag.trim();
+        if f.eq_ignore_ascii_case("NoWalk") {
+            self.no_walk = true;
+        } else if f.eq_ignore_ascii_case("NoAutoTurn") {
+            self.no_auto_turn = true;
+        } else if f.eq_ignore_ascii_case("Intro") {
+            self.intro = true;
+        } else {
+            let lower = f.to_ascii_lowercase();
+            if !self.others.iter().any(|o| o == &lower) {
+                self.others.push(lower);
+            }
+        }
+    }
+
+    /// Returns `true` if the named flag is currently asserted (case-insensitive),
+    /// checking both the dedicated fields and the [`others`](Self::others) catch-all.
+    #[must_use]
+    pub fn is_asserted(&self, flag: &str) -> bool {
+        let f = flag.trim();
+        if f.eq_ignore_ascii_case("NoWalk") {
+            self.no_walk
+        } else if f.eq_ignore_ascii_case("NoAutoTurn") {
+            self.no_auto_turn
+        } else if f.eq_ignore_ascii_case("Intro") {
+            self.intro
+        } else {
+            let lower = f.to_ascii_lowercase();
+            self.others.iter().any(|o| o == &lower)
+        }
+    }
+}
+
+/// A per-state push/collision **width override** set by the MUGEN `Width`
+/// controller (faithfulness audit #10).
+///
+/// MUGEN's `Width` controller overrides the player-push half-widths for the
+/// current state (e.g. a crouch or an attack that should push differently, or a
+/// throw-bind state that pins the victim). Like other per-tick controllers it is
+/// transient: the executor **clears** it at the start of each tick, so a state
+/// that wants a sustained override must re-assert `Width` every tick (which
+/// MUGEN content does, gating it on the state being active).
+///
+/// `front`/`back` are facing-relative half-widths (front = toward the direction
+/// the character faces). When [`active`](Self::active) is `false` the engine
+/// falls back to the static `[Size] ground.front`/`ground.back` constants.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WidthOverride {
+    /// Whether a `Width` override is in effect this tick. When `false`, push/bounds
+    /// use the static `[Size]` width.
+    pub active: bool,
+    /// Front (facing-forward) push half-width, in pixels.
+    pub front: f32,
+    /// Back (facing-backward) push half-width, in pixels.
+    pub back: f32,
+}
+
+impl WidthOverride {
+    /// Clears the override — called at the start of each tick so a `Width` only
+    /// holds for the tick that (re-)asserts it.
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.front = 0.0;
+        self.back = 0.0;
+    }
+
+    /// Sets the override to the given facing-relative half-widths and marks it
+    /// active for this tick.
+    pub fn set(&mut self, front: f32, back: f32) {
+        self.active = true;
+        self.front = front;
+        self.back = back;
+    }
+}
+
+/// The number of `HitOverride` slots a character carries (MUGEN's `slot = 0..7`).
+pub const NUM_HIT_OVERRIDE_SLOTS: usize = 8;
+
+/// One armed `HitOverride` slot (faithfulness audit #9b).
+///
+/// MUGEN's `HitOverride` controller arms one of a character's 8 slots so that, for
+/// a number of ticks (`time`), an incoming hit whose attacker `attr` matches the
+/// slot's attribute set redirects the **defender** to a custom `stateno` instead
+/// of running the normal get-hit reaction. This is how characters implement armor,
+/// dodges, and counters ("if hit by a normal during this window, go to my counter
+/// state").
+///
+/// A slot is **active** while [`time_remaining`](Self::time_remaining) `> 0` (or
+/// `< 0`, MUGEN's "until cleared / forever" sentinel — modeled as "always active";
+/// see [`is_active`](Self::is_active)). When an active slot's
+/// [`attrs`](Self::attrs) match the attacker's
+/// [`AttackAttr`](fp_combat::AttackAttr), hit resolution
+/// ([`combat::resolve_attack`](crate::combat::resolve_attack)) sends the defender
+/// to [`stateno`](Self::stateno) and consumes the slot, *bypassing* the normal
+/// get-hit path (no damage/knockback/get-hit-state is applied — MUGEN treats the
+/// override state as fully taking over the reaction).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HitOverrideSlot {
+    /// The parsed attack-attribute set that arms this slot (the `attr` param).
+    /// Reuses the `NotHitBy`/`HitBy` grammar via [`AttackAttrSet`].
+    pub attrs: AttackAttrSet,
+    /// The state number the defender is sent to when this slot matches.
+    pub stateno: i32,
+    /// Remaining ticks this slot stays armed. `0` = inactive; `> 0` counts down;
+    /// `< 0` is MUGEN's "stay armed until consumed/replaced" sentinel
+    /// (always active).
+    pub time_remaining: i32,
+}
+
+impl HitOverrideSlot {
+    /// Returns `true` while this slot is armed — `time_remaining != 0` (a positive
+    /// countdown or the negative "forever" sentinel). A `0` slot is inactive.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.time_remaining != 0
+    }
+
+    /// Decrements a positive countdown by one tick (saturating at `0`). A `< 0`
+    /// "forever" slot and an already-`0` slot are left untouched. Never panics.
+    pub fn decrement(&mut self) {
+        if self.time_remaining > 0 {
+            self.time_remaining -= 1;
+        }
+    }
+}
+
+/// A character's 8-slot `HitOverride` table (faithfulness audit #9b).
+///
+/// Slot indices `0..8` map to MUGEN's `HitOverride slot = N`. The executor's
+/// `HitOverride` arm sets a slot; the executor decrements active slots each tick
+/// (respecting hit-pause is unnecessary — MUGEN counts these down normally — but
+/// they are ticked alongside the other per-tick timers); and hit resolution
+/// consults the slots **before** the normal get-hit, redirecting and consuming the
+/// first matching active slot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HitOverrides {
+    /// The 8 override slots, indexed by MUGEN `slot` number.
+    pub slots: [HitOverrideSlot; NUM_HIT_OVERRIDE_SLOTS],
+}
+
+impl HitOverrides {
+    /// Arms slot `slot` with the given attribute set, destination state, and
+    /// duration. An out-of-range `slot` index is a safe no-op (debug-logged),
+    /// matching MUGEN's tolerance — it never panics.
+    pub fn arm(&mut self, slot: usize, attrs: AttackAttrSet, stateno: i32, time: i32) {
+        match self.slots.get_mut(slot) {
+            Some(s) => {
+                s.attrs = attrs;
+                s.stateno = stateno;
+                s.time_remaining = time;
+            }
+            None => {
+                tracing::debug!("HitOverride: slot index {slot} out of range 0..8; ignored");
+            }
+        }
+    }
+
+    /// Finds the first **active** slot whose attribute set matches `attr`, returning
+    /// its index and destination `stateno`, or `None` when no slot overrides this
+    /// hit. Lower slot indices take priority (scanned in order).
+    #[must_use]
+    pub fn matching(&self, attr: &fp_combat::AttackAttr) -> Option<(usize, i32)> {
+        self.slots.iter().enumerate().find_map(|(i, s)| {
+            (s.is_active() && s.attrs.matches(attr)).then_some((i, s.stateno))
+        })
+    }
+
+    /// Consumes (disarms) the slot at `index` after a successful override match —
+    /// MUGEN clears a `HitOverride` once it fires. Out-of-range is a no-op.
+    pub fn consume(&mut self, index: usize) {
+        if let Some(s) = self.slots.get_mut(index) {
+            s.time_remaining = 0;
+        }
+    }
+
+    /// Advances all positive-countdown slots by one tick. The `< 0` "forever"
+    /// slots and `0` inactive slots are untouched. Never panics.
+    pub fn tick(&mut self) {
+        for s in &mut self.slots {
+            s.decrement();
+        }
+    }
+}
+
 /// The numeric hit-effect variables a **defender** reads about the last hit it
 /// took, exposed to triggers via MUGEN's `GetHitVar(<member>)` redirection.
 ///
@@ -712,6 +944,16 @@ pub struct GetHitVars {
     pub guarded: i32,
     /// `GetHitVar(chainid)` — the chain id of the hit (`-1` = none / any).
     pub chainid: i32,
+    /// `GetHitVar(fall.xvel)` — the X fall velocity the hit imparts, read by the
+    /// `HitFallVel` controller (audit #23).
+    pub fall_xvel: f32,
+    /// `GetHitVar(fall.yvel)` — the Y fall velocity the hit imparts (negative =
+    /// upward), read by the `HitFallVel` controller (audit #23). Populated from the
+    /// HitDef's `fall.yvelocity` on a falling hit.
+    pub fall_yvel: f32,
+    /// `GetHitVar(fall.damage)` — extra damage applied when the defender lands from
+    /// the fall, applied by the `HitFallDamage` controller (audit #23).
+    pub fall_damage: i32,
 }
 
 impl Default for GetHitVars {
@@ -735,6 +977,9 @@ impl Default for GetHitVars {
             isbound: 0,
             guarded: 0,
             chainid: -1,
+            fall_xvel: 0.0,
+            fall_yvel: 0.0,
+            fall_damage: 0,
         }
     }
 }
@@ -784,6 +1029,12 @@ impl GetHitVars {
             Value::Int(self.guarded)
         } else if m.eq_ignore_ascii_case("chainid") {
             Value::Int(self.chainid)
+        } else if m.eq_ignore_ascii_case("fall.xvel") {
+            Value::Float(self.fall_xvel)
+        } else if m.eq_ignore_ascii_case("fall.yvel") {
+            Value::Float(self.fall_yvel)
+        } else if m.eq_ignore_ascii_case("fall.damage") {
+            Value::Int(self.fall_damage)
         } else {
             // Unknown member: safe default (0), debug-logged (not warn — many
             // GetHitVar members are unmodeled and that is not an error).
@@ -1064,6 +1315,33 @@ pub struct Character {
     /// nothing. See [`crate::invuln`].
     pub invuln: InvulnMask,
 
+    /// The per-tick `AssertSpecial` flag set (faithfulness audit #13).
+    ///
+    /// Cleared at the **start** of each [`Character::tick`] and re-populated by the
+    /// `AssertSpecial` controller during the tick, so an assertion holds only for
+    /// the tick that asserts it. Consumed the same tick by the built-in walk
+    /// locomotion (`NoWalk`), the auto-turn / face-opponent logic (`NoAutoTurn`),
+    /// and intro gating (`Intro`). See [`AssertedFlags`].
+    pub asserted: AssertedFlags,
+
+    /// The current-tick player-push **width override** set by the `Width`
+    /// controller (faithfulness audit #10).
+    ///
+    /// Cleared at the start of each tick and set by `Width` during it; when
+    /// inactive, player-push / stage-bound clamping fall back to the static
+    /// `[Size] ground.front`/`ground.back` constants. See [`WidthOverride`].
+    pub cur_width: WidthOverride,
+
+    /// The 8-slot `HitOverride` table (faithfulness audit #9b).
+    ///
+    /// Unlike [`asserted`](Self::asserted) and [`cur_width`](Self::cur_width),
+    /// these slots are **not** per-tick: they stay armed for their `time` window
+    /// (counted down each tick), and hit resolution
+    /// ([`combat::resolve_attack`](crate::combat::resolve_attack)) consults them
+    /// **before** the normal get-hit, redirecting the defender to the slot's
+    /// `stateno` on an attribute match and consuming the slot. See [`HitOverrides`].
+    pub hit_overrides: HitOverrides,
+
     /// The raw Park–Miller RNG state backing the MUGEN `random` trigger
     /// (faithfulness audit #28).
     ///
@@ -1171,6 +1449,9 @@ impl Default for Character {
             move_connect: MoveConnect::default(),
             has_target: false,
             invuln: InvulnMask::default(),
+            asserted: AssertedFlags::default(),
+            cur_width: WidthOverride::default(),
+            hit_overrides: HitOverrides::default(),
             attack_mul: 1.0,
             defence_mul: 1.0,
             // Deterministic fixed seed (never wall-clock); the cell is kept in
@@ -2463,6 +2744,7 @@ mod tests {
             isbound: 1,
             guarded: 0,
             chainid: 5,
+            ..GetHitVars::default()
         };
         // Integer members.
         assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(33));
@@ -2515,6 +2797,9 @@ mod tests {
             isbound: 20,
             guarded: 21,
             chainid: 22,
+            fall_xvel: -2.25,
+            fall_yvel: -6.5,
+            fall_damage: 23,
         }
     }
 
@@ -2540,6 +2825,10 @@ mod tests {
         assert_eq!(g.member("isbound"), Value::Int(20));
         assert_eq!(g.member("guarded"), Value::Int(21));
         assert_eq!(g.member("chainid"), Value::Int(22));
+        // Fall velocity/damage members (audit #23).
+        assert_eq!(g.member("fall.xvel"), Value::Float(-2.25));
+        assert_eq!(g.member("fall.yvel"), Value::Float(-6.5));
+        assert_eq!(g.member("fall.damage"), Value::Int(23));
     }
 
     #[test]
@@ -2573,8 +2862,6 @@ mod tests {
         // garbage and empty, all resolve to the safe default (0) — never a panic.
         let g = populated_get_hit_vars();
         for unknown in [
-            "fall.yvel",     // modeled on HitDef but not GetHitVars
-            "fall.damage",
             "xveladd",
             "yveladd",
             "groundtype",
@@ -3241,8 +3528,12 @@ mod tests {
         // GetHitVar member name routed under const → unknown const member → default.
         assert_eq!(ch.trigger_str("const", "fall.yvel"), Value::DEFAULT);
         assert_eq!(ch.trigger_str("const", "xveladd"), Value::DEFAULT);
-        // The GetHitVar branch itself still defaults for its own members.
-        assert_eq!(ch.trigger_str("GetHitVar", "fall.yvel"), Value::DEFAULT);
+        // The GetHitVar branch still defaults for members it does NOT model
+        // (`xveladd` is not a GetHitVar field). `fall.yvel` IS now modeled (audit
+        // #23), so it resolves to its zero float value on a fresh character —
+        // routed by GetHitVar, not bleeding from `const`.
+        assert_eq!(ch.trigger_str("GetHitVar", "xveladd"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("GetHitVar", "fall.yvel"), Value::Float(0.0));
     }
 
     #[test]
@@ -3981,17 +4272,20 @@ mod tests {
     #[test]
     fn gethitvar_members_all_default_via_trigger_str() {
         let ch = sample();
-        // Real get-hit state is Phase 6; every named member reports 0 for now,
-        // routed through the string-keyed seam (not the numeric path).
-        for member in ["fall.yvel", "xveladd", "yveladd", "animtype", "fall", "ground.velocity"] {
+        // On a fresh character every named member reports 0, routed through the
+        // string-keyed seam (not the numeric path). These members are int-typed
+        // (or unmodeled), so they read back as the int `Value::DEFAULT` (0).
+        // (`fall.yvel`/`fall.xvel` are float-typed and read `Float(0.0)` — covered
+        // separately — so they are intentionally not in this int-default list.)
+        for member in ["xveladd", "yveladd", "animtype", "fall", "ground.velocity"] {
             assert_eq!(
                 ch.trigger_str("GetHitVar", member),
                 Value::DEFAULT,
                 "GetHitVar({member}) should default to 0"
             );
         }
-        // Case-insensitive trigger name.
-        assert_eq!(ch.trigger_str("gethitvar", "fall.yvel"), Value::DEFAULT);
+        // Case-insensitive trigger name (an unmodeled member still defaults).
+        assert_eq!(ch.trigger_str("gethitvar", "xveladd"), Value::DEFAULT);
         // An unrecognized member-keyed trigger name also defaults.
         assert_eq!(ch.trigger_str("NotAMemberTrigger", "x"), Value::DEFAULT);
         // End-to-end through the evaluator (which routes GetHitVar to trigger_str).
