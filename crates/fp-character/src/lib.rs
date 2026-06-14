@@ -774,6 +774,87 @@ impl Character {
             Some(_) => vec.x,
         }
     }
+
+    /// Resolves a MUGEN `const(<member>)` read against this character's loaded
+    /// [`CharacterConstants`].
+    ///
+    /// `member` is the dotted member name exactly as written inside `const(...)`
+    /// (e.g. `velocity.walk.fwd.x`, `size.ground.front`, `movement.yaccel`); the
+    /// match is **case-insensitive on the full dotted name**, mirroring MUGEN's
+    /// case-insensitive constant lookup. The members the KFM/common states read
+    /// are mapped to the sub-structs added in task 5.3:
+    ///
+    /// - `velocity.walk.fwd.x` / `velocity.walk.back.x`
+    /// - `velocity.run.fwd.x` / `velocity.run.fwd.y`
+    /// - `velocity.jump.neu.x` / `velocity.jump.y`
+    /// - `size.ground.front` / `size.ground.back` / `size.height`
+    /// - `movement.yaccel` / `movement.stand.friction` / `movement.crouch.friction`
+    /// - `data.life` / `data.power` / `data.attack` / `data.defence`
+    ///
+    /// An **unknown** member resolves to [`Value::DEFAULT`] (`0`) and is logged
+    /// at `debug` level — never `warn`, since unmodeled `const` members are
+    /// common in community content and not an error. This never panics.
+    fn resolve_const(&self, member: &str) -> Value {
+        let c = &self.constants;
+        let m = member.trim();
+
+        // Integer-typed members (`[Data]` and `[Size]`).
+        if m.eq_ignore_ascii_case("data.life") {
+            return Value::Int(c.life_max);
+        }
+        if m.eq_ignore_ascii_case("data.power") {
+            return Value::Int(c.power_max);
+        }
+        if m.eq_ignore_ascii_case("data.attack") {
+            return Value::Int(c.attack);
+        }
+        if m.eq_ignore_ascii_case("data.defence") {
+            return Value::Int(c.defence);
+        }
+        if m.eq_ignore_ascii_case("size.ground.front") {
+            return Value::Int(c.size.ground_front);
+        }
+        if m.eq_ignore_ascii_case("size.ground.back") {
+            return Value::Int(c.size.ground_back);
+        }
+        if m.eq_ignore_ascii_case("size.height") {
+            return Value::Int(c.size.height);
+        }
+
+        // Float-typed members (`[Velocity]` and `[Movement]`).
+        if m.eq_ignore_ascii_case("velocity.walk.fwd.x") {
+            return Value::Float(c.velocity.walk_fwd.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.walk.back.x") {
+            return Value::Float(c.velocity.walk_back.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.run.fwd.x") {
+            return Value::Float(c.velocity.run_fwd.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.run.fwd.y") {
+            return Value::Float(c.velocity.run_fwd.y);
+        }
+        if m.eq_ignore_ascii_case("velocity.jump.neu.x") {
+            return Value::Float(c.velocity.jump_neu.x);
+        }
+        if m.eq_ignore_ascii_case("velocity.jump.y") {
+            return Value::Float(c.velocity.jump_up);
+        }
+        if m.eq_ignore_ascii_case("movement.yaccel") {
+            return Value::Float(c.movement.yaccel);
+        }
+        if m.eq_ignore_ascii_case("movement.stand.friction") {
+            return Value::Float(c.movement.stand_friction);
+        }
+        if m.eq_ignore_ascii_case("movement.crouch.friction") {
+            return Value::Float(c.movement.crouch_friction);
+        }
+
+        // Unknown member: safe default 0. `debug!` (not `warn!`) because unmodeled
+        // const members are common and benign in community content.
+        tracing::debug!("const({member}): unmodeled member, defaulting to 0");
+        Value::DEFAULT
+    }
 }
 
 impl EvalContext for Character {
@@ -946,7 +1027,14 @@ impl EvalContext for Character {
         Value::Int(self.read_sysvar(index))
     }
 
-    fn trigger_str(&self, name: &str, _key: &str) -> Value {
+    fn trigger_str(&self, name: &str, key: &str) -> Value {
+        // const(member): read the character's authored constant by name. Since
+        // task 5.6d the VM routes `const(<member>)` here with the dotted member
+        // name verbatim in `key`. See [`Character::resolve_const`].
+        if name.eq_ignore_ascii_case("const") {
+            return self.resolve_const(key);
+        }
+
         // GetHitVar(member): real get-hit state is Phase 6. Until then every hit
         // field reports its safe default (0). Recognize the trigger name so the
         // intent is explicit, but still return the default for every member.
@@ -1145,6 +1233,462 @@ mod tests {
         // Real get-hit state is Phase 6; every member reports 0 for now.
         assert_eq!(ev("GetHitVar(xveladd) = 0", &ch), Value::Int(1));
         assert_eq!(ev("GetHitVar(fall.yvel) = 0", &ch), Value::Int(1));
+    }
+
+    // ---- const(<member>) resolver (task 5.6e) ------------------------------
+
+    /// Builds a character whose constants are distinct from every default so a
+    /// resolver bug that returns a hardcoded/default value is caught.
+    fn const_sample() -> Character {
+        let consts = CharacterConstants {
+            life_max: 1234,
+            power_max: 4321,
+            attack: 111,
+            defence: 222,
+            size: SizeConstants {
+                ground_front: 17,
+                ground_back: 19,
+                height: 63,
+            },
+            velocity: VelocityConstants {
+                walk_fwd: Vec2::new(2.7, 0.0),
+                walk_back: Vec2::new(-2.1, 0.0),
+                run_fwd: Vec2::new(4.9, -1.5),
+                jump_neu: Vec2::new(0.3, -8.1),
+                jump_up: -8.6,
+            },
+            movement: MovementConstants {
+                yaccel: 0.5,
+                stand_friction: 0.83,
+                crouch_friction: 0.81,
+            },
+        };
+        Character::with_constants(consts)
+    }
+
+    #[test]
+    fn const_resolves_velocity_members() {
+        let ch = const_sample();
+        // Float members thread through the float path via direct equality.
+        assert_eq!(ch.trigger_str("const", "velocity.walk.fwd.x"), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "velocity.walk.back.x"), Value::Float(-2.1));
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+    }
+
+    #[test]
+    fn const_resolves_size_members() {
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "size.ground.front"), Value::Int(17));
+        assert_eq!(ch.trigger_str("const", "size.ground.back"), Value::Int(19));
+        assert_eq!(ch.trigger_str("const", "size.height"), Value::Int(63));
+    }
+
+    #[test]
+    fn const_resolves_movement_members() {
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "movement.yaccel"), Value::Float(0.5));
+        assert_eq!(ch.trigger_str("const", "movement.stand.friction"), Value::Float(0.83));
+        assert_eq!(ch.trigger_str("const", "movement.crouch.friction"), Value::Float(0.81));
+    }
+
+    #[test]
+    fn const_resolves_data_members() {
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "data.life"), Value::Int(1234));
+        assert_eq!(ch.trigger_str("const", "data.power"), Value::Int(4321));
+        assert_eq!(ch.trigger_str("const", "data.attack"), Value::Int(111));
+        assert_eq!(ch.trigger_str("const", "data.defence"), Value::Int(222));
+    }
+
+    #[test]
+    fn const_member_match_is_case_insensitive() {
+        let ch = const_sample();
+        // Mixed/upper case on the full dotted name resolves the same value.
+        assert_eq!(ch.trigger_str("const", "Velocity.Walk.Fwd.X"), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "SIZE.GROUND.FRONT"), Value::Int(17));
+        assert_eq!(ch.trigger_str("const", "Movement.YAccel"), Value::Float(0.5));
+        // The trigger name itself is also case-insensitive.
+        assert_eq!(ch.trigger_str("CONST", "data.life"), Value::Int(1234));
+    }
+
+    #[test]
+    fn const_unknown_member_is_safe_default() {
+        let ch = const_sample();
+        // Unknown member → Value::DEFAULT (0), never a panic.
+        assert_eq!(ch.trigger_str("const", "no.such.member"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("const", ""), Value::DEFAULT);
+    }
+
+    #[test]
+    fn const_routes_through_parse_and_eval() {
+        // End-to-end through fp_vm::parse_str + eval: `const(member)` routes via
+        // trigger_str and compares against the loaded value.
+        let ch = const_sample();
+        assert_eq!(ev("const(velocity.walk.fwd.x) = 2.7", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.ground.front) = 17", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.yaccel) > 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.life) = 1234", &ch), Value::Int(1));
+        // Unknown member compares equal to 0 (and never panics).
+        assert_eq!(ev("const(no.such.member) = 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_uses_default_values_for_default_character() {
+        // A character built from CharacterConstants::default() reads the KFM
+        // baseline values the defaults encode.
+        let ch = Character::new();
+        assert_eq!(ev("const(velocity.walk.fwd.x) = 2.4", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.ground.front) = 16", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.yaccel) = 0.44", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_real_kfm_walk_fwd_x_is_2_4() {
+        // Gated real-fixture test: load KFM, build a Character from its loaded
+        // constants, and assert `const(velocity.walk.fwd.x)` evaluates to KFM's
+        // authored 2.4 via fp_vm::parse_str + eval. Skips when the fixture is
+        // absent (matching the loader's gated real-KFM tests).
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        let ch = Character::with_constants(loaded.constants);
+        assert_eq!(ev("const(velocity.walk.fwd.x) = 2.4", &ch), Value::Int(1));
+    }
+
+    // =====================================================================
+    // Proctor (task 5.6e): edge-case / error-path / MUGEN-semantics coverage
+    // for the `const(<member>)` resolver, layered on top of Forge's tests
+    // above. Grouped by acceptance criterion. All synthetic data is distinct
+    // from every CharacterConstants default so a resolver that returns a
+    // hardcoded/default value is caught; the gated real-KFM end-to-end test is
+    // skip-if-absent.
+    // =====================================================================
+
+    // ---- AC1: every modeled member maps to the CORRECT field (no aliasing) --
+
+    #[test]
+    fn const_members_do_not_alias_each_other() {
+        // A swapped/transposed mapping bug (e.g. walk.fwd.x reading walk.back.x,
+        // or jump.neu.x reading jump.y) would pass a "non-default" smoke test but
+        // be wrong. Pin each member to its OWN field value via const_sample(),
+        // whose every constant is distinct.
+        let ch = const_sample();
+        // The set of (member, expected) pairs is exhaustive over the modeled
+        // surface; if two members returned the same wrong field, at least one of
+        // these would fail because the source values are all unique.
+        let int_pairs = [
+            ("data.life", 1234),
+            ("data.power", 4321),
+            ("data.attack", 111),
+            ("data.defence", 222),
+            ("size.ground.front", 17),
+            ("size.ground.back", 19),
+            ("size.height", 63),
+        ];
+        for (m, want) in int_pairs {
+            assert_eq!(ch.trigger_str("const", m), Value::Int(want), "member `{m}`");
+        }
+        let float_pairs = [
+            ("velocity.walk.fwd.x", 2.7f32),
+            ("velocity.walk.back.x", -2.1),
+            ("velocity.run.fwd.x", 4.9),
+            ("velocity.run.fwd.y", -1.5),
+            ("velocity.jump.neu.x", 0.3),
+            ("velocity.jump.y", -8.6),
+            ("movement.yaccel", 0.5),
+            ("movement.stand.friction", 0.83),
+            ("movement.crouch.friction", 0.81),
+        ];
+        for (m, want) in float_pairs {
+            assert_eq!(ch.trigger_str("const", m), Value::Float(want), "member `{m}`");
+        }
+    }
+
+    #[test]
+    fn const_member_value_types_match_mugen_groups() {
+        // [Data] and [Size] are integer-typed; [Velocity] and [Movement] are
+        // float-typed. The resolver must preserve those types so downstream
+        // arithmetic stays in the right domain (a float const compared against an
+        // int literal must not silently truncate the const).
+        let ch = const_sample();
+        for m in [
+            "data.life", "data.power", "data.attack", "data.defence",
+            "size.ground.front", "size.ground.back", "size.height",
+        ] {
+            assert!(ch.trigger_str("const", m).is_int(), "`{m}` must be int-typed");
+        }
+        for m in [
+            "velocity.walk.fwd.x", "velocity.walk.back.x", "velocity.run.fwd.x",
+            "velocity.run.fwd.y", "velocity.jump.neu.x", "velocity.jump.y",
+            "movement.yaccel", "movement.stand.friction", "movement.crouch.friction",
+        ] {
+            assert!(ch.trigger_str("const", m).is_float(), "`{m}` must be float-typed");
+        }
+    }
+
+    #[test]
+    fn const_run_fwd_x_and_y_are_independent_components() {
+        // `velocity.run.fwd` is the only modeled member with BOTH an x and a y
+        // component read separately. Confirm they thread to the matching Vec2
+        // axis (a bug returning x for both would pass a single-axis test).
+        let ch = const_sample(); // run_fwd = (4.9, -1.5)
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
+        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
+        assert_ne!(
+            ch.trigger_str("const", "velocity.run.fwd.x"),
+            ch.trigger_str("const", "velocity.run.fwd.y"),
+            "run.fwd.x and run.fwd.y must read distinct components"
+        );
+    }
+
+    #[test]
+    fn const_jump_neu_x_and_jump_y_are_distinct_fields() {
+        // `jump.neu.x` reads VelocityConstants::jump_neu.x; `jump.y` reads the
+        // separate jump_up field. const_sample() makes them distinct (0.3 vs
+        // -8.6) so a mapping that confuses the two is caught.
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
+        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+    }
+
+    // ---- AC1: case-insensitive matching on the FULL dotted name --------------
+
+    #[test]
+    fn const_member_match_handles_arbitrary_casing_per_segment() {
+        // MUGEN folds case across the whole dotted name; segments may be mixed.
+        // const_sample() keeps every value unique so a case slip that lands on a
+        // different member would surface.
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "VELOCITY.WALK.FWD.X"), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "velocity.WALK.fwd.X"), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "Size.Ground.Back"), Value::Int(19));
+        assert_eq!(ch.trigger_str("const", "Movement.Crouch.Friction"), Value::Float(0.81));
+        assert_eq!(ch.trigger_str("const", "DATA.DEFENCE"), Value::Int(222));
+    }
+
+    #[test]
+    fn const_member_leading_trailing_whitespace_is_tolerated() {
+        // The resolver trims the member before matching, so a member arriving with
+        // incidental surrounding whitespace still resolves rather than defaulting.
+        // (Defends the never-panic / be-lenient posture on messy content.)
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "  velocity.walk.fwd.x  "), Value::Float(2.7));
+        assert_eq!(ch.trigger_str("const", "\tsize.height\t"), Value::Int(63));
+    }
+
+    // ---- AC1: unknown / malformed members → Value::DEFAULT, never panic ------
+
+    #[test]
+    fn const_partial_and_prefix_members_default() {
+        // Members that are PREFIXES of a real dotted name, or a real name with an
+        // extra suffix, are NOT matches: the match is on the exact full dotted
+        // name. They must default to 0 (debug-logged), never partially resolve.
+        let ch = const_sample();
+        for m in [
+            "data",                       // group only
+            "velocity",                   // group only
+            "velocity.walk",              // partial
+            "velocity.walk.fwd",          // missing axis
+            "size.ground",                // partial
+            "movement",                   // group only
+            "velocity.walk.fwd.x.extra",  // trailing junk
+            "size.ground.front.x",        // bogus axis on an int member
+            "velocity.walk.fwd.z",        // unmodeled z axis
+            "data.life.max",              // over-qualified
+        ] {
+            assert_eq!(
+                ch.trigger_str("const", m),
+                Value::DEFAULT,
+                "non-exact member `{m}` must default to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn const_adversarial_member_strings_never_panic() {
+        // The resolver must survive arbitrary, hostile member strings (a core
+        // "never crash on bad content" invariant). None should panic; all unknown
+        // strings resolve to the safe default.
+        let ch = const_sample();
+        let junk = [
+            "",
+            ".",
+            "...",
+            "   ",
+            "velocity..walk..fwd..x",
+            "VELOCITY .WALK. FWD .X", // internal spaces are not stripped → no match
+            "🥋.combo",               // non-ASCII
+            &"a".repeat(4096),        // very long
+        ];
+        for m in junk {
+            assert_eq!(
+                ch.trigger_str("const", m),
+                Value::DEFAULT,
+                "adversarial member `{m}` must default to 0 without panicking"
+            );
+        }
+    }
+
+    #[test]
+    fn const_internal_whitespace_is_not_a_match() {
+        // Only leading/trailing whitespace is trimmed; internal whitespace within
+        // the dotted name is significant, so a spaced-out member does NOT alias a
+        // valid one. (Pins that `trim()`, not a whitespace-stripping match, is the
+        // semantics.)
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("const", "velocity. walk.fwd.x"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("const", "size .height"), Value::DEFAULT);
+    }
+
+    // ---- AC1: the GetHitVar branch of trigger_str is unchanged ---------------
+
+    #[test]
+    fn const_and_gethitvar_branches_are_independent() {
+        // A const member queried under the GetHitVar trigger name must NOT resolve
+        // to the constant (it is not a hit field) — it defaults. Symmetrically, a
+        // GetHitVar member under `const` is unknown and defaults. This pins that
+        // the two member-keyed branches do not bleed into each other and that the
+        // GetHitVar branch still defaults (Phase 6 deferral) unchanged.
+        let ch = const_sample();
+        // const member name routed under GetHitVar → default, not 2.7.
+        assert_eq!(
+            ch.trigger_str("GetHitVar", "velocity.walk.fwd.x"),
+            Value::DEFAULT
+        );
+        // GetHitVar member name routed under const → unknown const member → default.
+        assert_eq!(ch.trigger_str("const", "fall.yvel"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("const", "xveladd"), Value::DEFAULT);
+        // The GetHitVar branch itself still defaults for its own members.
+        assert_eq!(ch.trigger_str("GetHitVar", "fall.yvel"), Value::DEFAULT);
+    }
+
+    #[test]
+    fn trigger_str_unknown_function_name_defaults() {
+        // A string-keyed trigger name that is neither `const` nor `GetHitVar`
+        // falls through to the safe default rather than mis-routing to either
+        // branch.
+        let ch = const_sample();
+        assert_eq!(ch.trigger_str("NotARealStrTrigger", "velocity.walk.fwd.x"), Value::DEFAULT);
+        assert_eq!(ch.trigger_str("", "data.life"), Value::DEFAULT);
+    }
+
+    // ---- AC2: end-to-end through parse_str + eval, including MUGEN compare ---
+
+    #[test]
+    fn const_int_member_compares_against_float_literal_end_to_end() {
+        // MUGEN promotes to float when either side is float. An int-typed const
+        // compared against a float literal must compare by numeric value, so
+        // `const(size.ground.front) = 17.0` is true for ground_front == 17.
+        let ch = const_sample();
+        assert_eq!(ev("const(size.ground.front) = 17.0", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.life) >= 1000.5", &ch), Value::Int(1)); // 1234 >= 1000.5
+        assert_eq!(ev("const(size.height) < 63.5", &ch), Value::Int(1)); // 63 < 63.5
+    }
+
+    #[test]
+    fn const_mixed_case_member_resolves_through_parser() {
+        // The lexer preserves identifier case verbatim, so a mixed-case member
+        // reaches trigger_str unfolded; this exercises resolve_const's OWN
+        // case-insensitive matching end-to-end (not lexer folding).
+        let ch = const_sample();
+        assert_eq!(ev("const(Velocity.Walk.Fwd.X) = 2.7", &ch), Value::Int(1));
+        assert_eq!(ev("const(SIZE.GROUND.FRONT) = 17", &ch), Value::Int(1));
+        assert_eq!(ev("const(Movement.YAccel) > 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_used_in_compound_kfm_style_trigger() {
+        // A realistic shape: gate on velocity being authored positive AND a size
+        // bound — the kind of compound expression common states build from const.
+        let ch = const_sample();
+        let expr = "const(velocity.walk.fwd.x) > 0 && const(size.ground.front) > 0";
+        assert_eq!(ev(expr, &ch), Value::Int(1));
+        // Negative authored back-walk velocity flows through arithmetic correctly.
+        assert_eq!(ev("const(velocity.walk.back.x) < 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn const_unknown_member_is_falsey_end_to_end() {
+        // An unknown member resolves to 0, so bare `const(bogus)` is falsey and a
+        // comparison against 0 is true — and never panics through the VM.
+        let ch = const_sample();
+        assert_eq!(ev("const(no.such.member)", &ch), Value::Int(0));
+        assert_eq!(ev("const(no.such.member) = 0", &ch), Value::Int(1));
+        // An unknown member never accidentally equals a real authored value.
+        assert_eq!(ev("const(no.such.member) = 2.7", &ch), Value::Int(0));
+    }
+
+    #[test]
+    fn const_default_character_reads_kfm_baseline_all_members() {
+        // CharacterConstants::default() encodes KFM's authored baseline. Pin the
+        // full modeled surface against those documented defaults so the default
+        // table and the resolver mapping stay in lockstep.
+        let ch = Character::new();
+        assert_eq!(ev("const(velocity.walk.fwd.x) = 2.4", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.walk.back.x) = -2.2", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.run.fwd.x) = 4.6", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.run.fwd.y) = 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.neu.x) = 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.y) = -8.4", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.ground.front) = 16", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.ground.back) = 15", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.height) = 60", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.yaccel) = 0.44", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.stand.friction) = 0.85", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.crouch.friction) = 0.82", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.life) = 1000", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.power) = 3000", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.attack) = 100", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.defence) = 100", &ch), Value::Int(1));
+    }
+
+    // ---- AC2: gated real-KFM fixture, broadened beyond walk.fwd.x ------------
+
+    #[test]
+    fn const_real_kfm_members_match_authored_values() {
+        // Gated real-fixture test: load KFM and assert a SPREAD of const members
+        // evaluate to KFM's authored values via fp_vm::parse_str + eval. Skips
+        // cleanly when test-assets/ is absent (matching the loader's gated tests).
+        // This is the broadened companion to const_real_kfm_walk_fwd_x_is_2_4:
+        // it exercises every constant group against real content, so a per-group
+        // mapping regression is caught against authored data, not just synthetic.
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        let ch = Character::with_constants(loaded.constants);
+
+        // Walk velocities (the task's headline value plus its mirror).
+        assert_eq!(ev("const(velocity.walk.fwd.x) = 2.4", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.walk.back.x) = -2.2", &ch), Value::Int(1));
+        // Run + jump (signs/components).
+        assert_eq!(ev("const(velocity.run.fwd.x) > 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(velocity.jump.y) < 0", &ch), Value::Int(1));
+        // Size group is integer-typed and positive.
+        assert_eq!(ev("const(size.ground.front) > 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(size.height) > 0", &ch), Value::Int(1));
+        // Movement group: gravity positive, frictions in (0,1].
+        assert_eq!(ev("const(movement.yaccel) > 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(movement.stand.friction) > 0", &ch), Value::Int(1));
+        // Data group: life/power are the authored maxima (KFM ships 1000/3000).
+        assert_eq!(ev("const(data.life) > 0", &ch), Value::Int(1));
+        assert_eq!(ev("const(data.power) > 0", &ch), Value::Int(1));
+        // Case-insensitive end-to-end against real content.
+        assert_eq!(ev("const(VELOCITY.WALK.FWD.X) = 2.4", &ch), Value::Int(1));
+        // An unknown member against a real character still defaults to 0.
+        assert_eq!(ev("const(no.such.member) = 0", &ch), Value::Int(1));
     }
 
     #[test]
