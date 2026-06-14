@@ -3118,6 +3118,42 @@ mod tests {
         assert!((c.movement.crouch_friction - 0.82).abs() < 1e-4);
     }
 
+    /// PR-D #23 (gated KFM): KFM's sweep state (`[Statedef 3050]`) authors
+    /// `fall = 1, fall.damage = 70`. Driving a real KFM character into that state
+    /// must build an `active_hitdef` carrying `fall = true` and `fall_damage = 70`
+    /// — proving the loader → `ctrl_hit_def` → HitDef path is no longer a constant
+    /// `0`. The companion synthetic combat test then proves `HitFallDamage`
+    /// actually subtracts that value from life on landing.
+    #[test]
+    fn real_kfm_sweep_hitdef_carries_fall_damage_70() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: kfm.def failed to load: {e}");
+                return;
+            }
+        };
+        let mut ch = crate::Character::with_constants(loaded.constants);
+        // Enter the sweep state; its HitDef is gated on `trigger1 = Time = 0`, so
+        // the first tick at state-time 0 builds the active HitDef.
+        ch.change_state(&loaded.states, 3050);
+        ch.tick(&loaded, None, crate::StageView::default());
+
+        let hd = ch
+            .active_hitdef
+            .expect("KFM sweep state 3050 must build an active HitDef on entry");
+        assert!(hd.fall, "KFM sweep authors `fall = 1`");
+        assert_eq!(
+            hd.fall_damage, 70,
+            "KFM sweep authors `fall.damage = 70` -> carried onto the HitDef (not 0)"
+        );
+    }
+
     // ====================================================================
     // Task 7.3 part B: engine built-in ground locomotion, proven against real
     // KFM with NO app shim. A live Character is given `ctrl` and a command

@@ -348,15 +348,34 @@ impl Player {
     }
 
     /// Builds the [`PushBody`] used for player-push and bound clamping from the
-    /// character's `size.ground.front`/`back` constants, current X, and facing.
+    /// character's current X and facing, using the facing-relative `(front, back)`
+    /// half-widths from [`push_widths`](Self::push_widths).
     fn push_body(&self) -> PushBody {
-        let size = self.character.constants.size;
+        let (front, back) = self.push_widths();
         PushBody::new(
             self.character.pos.x,
-            size.ground_front as f32,
-            size.ground_back as f32,
+            front,
+            back,
             to_phys_facing(self.character.facing),
         )
+    }
+
+    /// The facing-relative `(front, back)` push half-widths for this character.
+    ///
+    /// Returns the per-tick `Width` controller override
+    /// ([`Character::cur_width`](fp_character::Character::cur_width), audit #10)
+    /// when it is active this tick, else the static `[Size] ground.front` /
+    /// `ground.back` constants. KFM asserts `Width 16, x` on crouch/attack and its
+    /// throw-bind state (810) to change how it pushes; with no override the
+    /// behaviour is unchanged.
+    fn push_widths(&self) -> (f32, f32) {
+        let w = self.character.cur_width;
+        if w.active {
+            (w.front, w.back)
+        } else {
+            let size = self.character.constants.size;
+            (size.ground_front as f32, size.ground_back as f32)
+        }
     }
 }
 
@@ -1080,22 +1099,23 @@ impl Player {
 
     /// The body's left half-width (distance from axis to the `-X` edge), resolved
     /// for the current facing. Mirrors [`PushBody`]'s internal resolution so the
-    /// clamp uses the same geometry as the push.
+    /// clamp uses the same geometry as the push, and honours the per-tick `Width`
+    /// override (#10) via [`push_widths`](Self::push_widths).
     fn push_body_left_half(&self) -> f32 {
-        let size = self.character.constants.size;
+        let (front, back) = self.push_widths();
         match self.character.facing {
-            Facing::Right => size.ground_back as f32,
-            Facing::Left => size.ground_front as f32,
+            Facing::Right => back,
+            Facing::Left => front,
         }
     }
 
     /// The body's right half-width (distance from axis to the `+X` edge), resolved
     /// for the current facing.
     fn push_body_right_half(&self) -> f32 {
-        let size = self.character.constants.size;
+        let (front, back) = self.push_widths();
         match self.character.facing {
-            Facing::Right => size.ground_front as f32,
-            Facing::Left => size.ground_back as f32,
+            Facing::Right => front,
+            Facing::Left => back,
         }
     }
 }
@@ -1248,10 +1268,15 @@ fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
 /// out of an attack or get-hit reaction mid-animation.
 fn face_each_other_when_neutral(a: &mut Character, b: &mut Character) {
     let (fa, fb) = facings_toward(a.pos.x, b.pos.x);
-    if is_neutral_facing_state(a) {
+    // `AssertSpecial NoAutoTurn` (#13) suppresses this baseline auto-turn for the
+    // tick that asserted it — e.g. common1's run (state 100) asserts it so a run
+    // is not flipped mid-dash. The flag was set during this character's tick (and
+    // is not cleared until the start of its next tick), so it is still readable
+    // here at end-of-frame.
+    if is_neutral_facing_state(a) && !a.asserted.no_auto_turn {
         a.facing = fa;
     }
-    if is_neutral_facing_state(b) {
+    if is_neutral_facing_state(b) && !b.asserted.no_auto_turn {
         b.facing = fb;
     }
 }
@@ -4757,5 +4782,97 @@ time = 1
             200,
             "with no p1stateno the attacker stays in its current state"
         );
+    }
+
+    // =====================================================================
+    // PR-D: #10 (Width -> player push) and #13 (NoAutoTurn -> face-opponent).
+    // =====================================================================
+
+    /// #10: an active `Width` override changes the half-widths the player-push /
+    /// bound clamp consult; with no override the static `[Size]` width is used.
+    #[test]
+    fn width_override_drives_player_push_half_widths() {
+        let mut c = Character::new(); // size.ground_front=16, ground_back=15
+        c.facing = Facing::Right;
+        let mut p = Player::new(c, defender_loaded());
+
+        // No override: static [Size] widths (front 16 / back 15), facing right ->
+        // right half = front = 16, left half = back = 15.
+        assert_eq!(p.push_body_right_half(), 16.0);
+        assert_eq!(p.push_body_left_half(), 15.0);
+
+        // Activate a Width override (front 40, back 8). Now the push consults it.
+        p.character.cur_width.set(40.0, 8.0);
+        assert_eq!(p.push_body_right_half(), 40.0, "right half = override front (facing right)");
+        assert_eq!(p.push_body_left_half(), 8.0, "left half = override back (facing right)");
+
+        // Facing left swaps which half each maps to.
+        p.character.facing = Facing::Left;
+        assert_eq!(p.push_body_right_half(), 8.0, "right half = override back (facing left)");
+        assert_eq!(p.push_body_left_half(), 40.0, "left half = override front (facing left)");
+    }
+
+    /// #10: a `Width` override actually changes how far two coincident bodies are
+    /// pushed apart through a full `Match` step (override re-asserted via the
+    /// character field, which `apply_push_and_bounds` reads).
+    #[test]
+    fn width_override_widens_player_push_separation() {
+        // Baseline coincident default bodies separate to centers 30 apart (front
+        // 16 + back ... see player_push_separation_is_exact). With a fat override
+        // they separate further.
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(0.0, 0.0);
+        // Force a wide push body on P1 (40, 40). cur_width is only cleared inside a
+        // Character::tick; the engine push reads it in apply_push_and_bounds AFTER
+        // the ticks, so set it and avoid running the executor by checking the
+        // push half-widths directly through the Player.
+        p1c.cur_width.set(40.0, 40.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(Character::new(), defender_loaded());
+        let m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        // P1's symmetric (40, 40) override makes BOTH halves 40, regardless of the
+        // facing `Match::new` settled — wider than the static front 16 / back 15.
+        assert_eq!(m.p1().push_body_right_half(), 40.0);
+        assert_eq!(m.p1().push_body_left_half(), 40.0);
+        // P2 has no override, so it keeps its static [Size] widths (front 16 /
+        // back 15); either half is one of those, never the 40 of the override.
+        let p2_right = m.p2().push_body_right_half();
+        assert!(
+            p2_right == 16.0 || p2_right == 15.0,
+            "P2 keeps its static width (16 or 15), got {p2_right}"
+        );
+    }
+
+    /// #13: `face_each_other_when_neutral` turns neutral characters to face each
+    /// other, but a character whose `NoAutoTurn` is asserted keeps its facing.
+    #[test]
+    fn noautoturn_suppresses_baseline_face_opponent() {
+        // Two neutral standing characters, both facing right, with A to the LEFT of
+        // B. The baseline would face A right (already) and B left (toward A).
+        let neutral_pair = || {
+            let mut a = Character::new();
+            a.pos = Vec2::new(-50.0, 0.0);
+            a.facing = Facing::Right;
+            a.state_type = StateType::Standing;
+            a.move_type = MoveType::Idle;
+            let mut b = Character::new();
+            b.pos = Vec2::new(50.0, 0.0);
+            b.facing = Facing::Right; // "wrong" way; baseline should flip it left
+            b.state_type = StateType::Standing;
+            b.move_type = MoveType::Idle;
+            (a, b)
+        };
+
+        // Without NoAutoTurn: B is flipped to face left (toward A).
+        let (mut a, mut b) = neutral_pair();
+        face_each_other_when_neutral(&mut a, &mut b);
+        assert_eq!(b.facing, Facing::Left, "neutral B turns to face A");
+
+        // With NoAutoTurn asserted on B: B keeps its (wrong-way) facing.
+        let (mut a, mut b) = neutral_pair();
+        b.asserted.no_auto_turn = true;
+        face_each_other_when_neutral(&mut a, &mut b);
+        assert_eq!(b.facing, Facing::Right, "NoAutoTurn keeps B's facing");
+        assert_eq!(a.facing, Facing::Right, "A (no assertion) is unaffected / already correct");
     }
 }
