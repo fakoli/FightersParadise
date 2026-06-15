@@ -189,11 +189,15 @@ MUGEN community content is messy. Parsers and the evaluator must:
   shipped or tracked. The **only** tracked content/binaries are the project's own **original** assets:
   `assets/banner.png`, the original conformance character under `assets/trainingdummy/`
   (`*.def/.cns/.cmd/.air/.sff/.snd` — MIT, authored from scratch as the shippable default + CI fixture),
-  and the original common hit-spark effects under `assets/data/` (`fightfx.sff` + `fightfx.air` — MIT,
+  the original common hit-spark effects under `assets/data/` (`fightfx.sff` + `fightfx.air` — MIT,
   audit #17, the shipped common-effects set so KFM/conventional characters render hit-sparks; sprites are
-  authored procedurally from scratch). The only ASCII strings in any tracked `.sff`/`.snd` are the
-  required `ElecbyteSpr\0`/`ElecbyteSnd\0` format magic, not copyrighted data. `*.sff`/`*.snd` stay
-  gitignored globally except the `assets/trainingdummy/*.sff`/`*.snd` and `assets/data/*.sff` paths.
+  authored procedurally from scratch), and the original HUD bitmap font `assets/data/font.fnt` (MIT, FL2b —
+  a 5x7 block font covering `0-9`, `A-Z`, space, and colon for the real HUD text; an FNT v1 file whose only
+  ASCII run is the required `ElecbyteFnt` magic plus its own original `[Def]`/`[Map]` config). The only
+  ASCII strings in any tracked `.sff`/`.snd`/`.fnt` are the required `ElecbyteSpr\0`/`ElecbyteSnd\0`/
+  `ElecbyteFnt` format magic (and, for the `.fnt`, original engine config), not copyrighted data.
+  `*.sff`/`*.snd`/`*.fnt` stay gitignored globally except the `assets/trainingdummy/*.sff`/`*.snd`,
+  `assets/data/*.sff`, and `assets/data/*.fnt` paths.
   Beyond these originals, `git ls-files` shows zero `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act` files.
   Real KFM content (CC BY-NC 3.0, Elecbyte) is **local-only** behind the gitignored `test-assets`
   symlink. Never commit or ship it.
