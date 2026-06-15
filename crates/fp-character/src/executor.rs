@@ -963,8 +963,12 @@ impl Character {
             let Some(ctrl) = state.controllers.get(idx) else {
                 return;
             };
-            let ctrl = ctrl.clone();
-            self.run_controller(states, &ctrl, idx, env, report);
+            // Borrow the controller from the (externally-owned) compiled state graph
+            // instead of cloning it: `states` comes from `LoadedCharacter`, not
+            // `self`, so `ctrl` does not alias `&mut self`. Cloning here deep-copied
+            // the controller's whole `Expr` AST every tick — catastrophic for a
+            // large state (e.g. a persistent `[State -2]`) ticked by many helpers.
+            self.run_controller(states, ctrl, idx, env, report);
         }
     }
 
@@ -1000,8 +1004,10 @@ impl Character {
                 let Some(ctrl) = state.controllers.get(idx) else {
                     break;
                 };
-                let ctrl = ctrl.clone();
-                self.run_controller(states, &ctrl, idx, env, report);
+                // Borrow (not clone) the controller from the external compiled
+                // state graph — see the note in `run_state`. Cloning the `Expr` AST
+                // every tick is what froze complex characters.
+                self.run_controller(states, ctrl, idx, env, report);
             }
 
             // We are done with this state unless a ChangeState moved us to a
@@ -1076,13 +1082,13 @@ impl Character {
                 let Some(ctrl) = state.controllers.get(idx) else {
                     break;
                 };
-                let ctrl = ctrl.clone();
-                if !self.ignorehitpause_flag(&ctrl, env) {
+                // Borrow (not clone) the controller — see `run_state`.
+                if !self.ignorehitpause_flag(ctrl, env) {
                     // A controller without `ignorehitpause` is skipped for the
                     // duration of the freeze.
                     continue;
                 }
-                self.run_controller(states, &ctrl, idx, env, report);
+                self.run_controller(states, ctrl, idx, env, report);
             }
         }
     }
