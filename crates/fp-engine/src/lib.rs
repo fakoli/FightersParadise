@@ -56,8 +56,8 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
-    RoundView, StageView, StateType,
+    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, Facing,
+    LoadedCharacter, MoveType, RoundView, StageView, StateType,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -68,6 +68,13 @@ use fp_input::{
     logical_direction, Button, CommandDef, CommandMatcher, Direction, InputBuffer, InputState,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
+use serde::{Deserialize, Serialize};
+
+mod replay;
+mod snapshot;
+
+pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
+pub use snapshot::{MatchSnapshot, PlayerSnapshot};
 
 /// The horizontal extent of the playfield, in world pixels.
 ///
@@ -75,7 +82,7 @@ use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 /// `[left, right]` (MUGEN's `ScreenBound`). The bounds are assumed ordered
 /// (`left <= right`); a reversed pair still yields finite, deterministic clamping
 /// (see [`fp_physics::clamp_to_bounds`]) rather than a panic.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StageBounds {
     /// Leftmost world X a character body may reach.
     pub left: f32,
@@ -122,7 +129,7 @@ impl Default for StageBounds {
 /// This is a deliberately small, renderer-/input-agnostic shape: a front end
 /// backed by `fp-input`, a replay file, or a test harness can all populate it.
 /// All fields default to "not held" / "not pressed".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchInput {
     /// Holding the left direction this frame.
     pub left: bool,
@@ -178,7 +185,7 @@ impl MatchInput {
 ///
 /// The state never moves backwards, so a renderer can drive intro/outro
 /// animations off [`Match::round_state`] without extra bookkeeping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoundState {
     /// Pre-fight intro; the timer has not started.
     Intro,
@@ -219,7 +226,7 @@ impl RoundState {
 }
 
 /// Which player won the round, once it reaches [`RoundState::Win`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Winner {
     /// Player 1 won (P2 was KO'd or had less life at time over).
     P1,
@@ -238,7 +245,7 @@ pub enum Winner {
 /// time a round is decided below the win threshold; once a player reaches the
 /// threshold it becomes the terminal [`MatchState::Over`] and
 /// [`Match::match_winner`] reports who.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchState {
     /// The match is still being contested; more rounds may be played.
     InProgress,
@@ -267,13 +274,54 @@ const TICKS_PER_SECOND: i32 = 60;
 /// [`Match::with_rounds_to_win`] / [`Match::set_rounds_to_win`].
 const DEFAULT_ROUNDS_TO_WIN: i32 = 2;
 
+/// The default match RNG seed used when a caller does not supply one (#38).
+///
+/// A *fixed* constant on purpose: the whole point of seeding from a match seed is
+/// reproducibility, so the default must not be wall-clock / OS randomness. Both
+/// players are seeded deterministically from it via [`Match::seed_players`] (P1
+/// gets the match seed, P2 a derived distinct seed) so the default match plays out
+/// identically every run, and a replay reproduces it. Pass an explicit seed to
+/// [`Match::seed_players`] to vary the streams while staying reproducible.
+pub const DEFAULT_MATCH_SEED: i32 = 1;
+
+/// Derives a distinct per-player RNG seed from a single match seed and a player
+/// index (#38).
+///
+/// Player 1 is seeded with the match seed itself (`player_index = 0` returns it
+/// unchanged), so a match seed reads naturally as "P1's seed"; each subsequent
+/// player is given a *distinct* seed derived by a cheap integer hash of
+/// `(match_seed, player_index)`, so the two fighters draw **independent**
+/// `random` streams rather than sharing one (the deferred #28 follow-up: both
+/// players are built from the same `.def`, so without this they would share the
+/// identical [`fp_character::DEFAULT_RNG_SEED`] stream). The derivation is pure
+/// and deterministic, so a fixed match seed always reproduces the same per-player
+/// seeds. [`fp_character::Character::seed_rng`] normalizes whatever value this
+/// yields into the Park–Miller generator's valid range, so any `i32` (including a
+/// collision-avoiding mix that lands on `0`) is accepted.
+#[must_use]
+pub fn derive_player_seed(match_seed: i32, player_index: u32) -> i32 {
+    if player_index == 0 {
+        return match_seed;
+    }
+    // A small deterministic integer mix (splitmix64-style finalizer on a 64-bit
+    // lane built from the seed and index), folded back to i32. Purely for
+    // *decorrelating* the two players' streams; it is not cryptographic.
+    let mut z = (match_seed as i64 as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(player_index).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    z as i32
+}
+
 /// Which fighter's SFF/AIR a hit-spark [`Effect`] draws from (audit #17).
 ///
 /// A MUGEN attacker-own spark (`sparkno` negative / `S`-prefixed) plays an action
 /// from the **attacker's own** sprite/animation set, so an [`Effect`] records the
 /// attacking side and a renderer resolves its frames against that fighter's
 /// [`LoadedCharacter::sff`](fp_character::LoadedCharacter)/`air`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectSide {
     /// The spark draws from player 1's SFF/AIR.
     P1,
@@ -312,7 +360,7 @@ pub enum EffectSide {
 /// the resolved current-frame [`fp_core::SpriteId`] is [`Effect::sprite`]. All
 /// fields are read accessors a renderer consumes; the cursor/lifetime are advanced
 /// only by [`Match`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Effect {
     /// Which fighter's SFF/AIR this spark's frames are resolved against.
     pub side: EffectSide,
@@ -468,6 +516,18 @@ impl Player {
         self.character.power_max
     }
 
+    /// This player's stable [`CharacterFingerprint`] — the cheap identity stamp of
+    /// its [`LoadedCharacter`] (#38).
+    ///
+    /// Derived deterministically from the loaded `.def`'s name, integer constants,
+    /// and compiled state-number set; identical across runs of the same build.
+    /// Used by the snapshot / replay restore guards to verify a save-state is being
+    /// applied to a match built from the same character.
+    #[must_use]
+    pub fn fingerprint(&self) -> CharacterFingerprint {
+        CharacterFingerprint::of(&self.loaded)
+    }
+
     /// Builds the [`PushBody`] used for player-push and bound clamping from the
     /// character's current X and facing, using the facing-relative `(front, back)`
     /// half-widths from [`push_widths`](Self::push_widths).
@@ -616,7 +676,7 @@ pub struct Match {
 /// pieces the coordinator needs to recreate that: the seeded start position and
 /// facing (so a reset re-seeds the same opener), and the life/power maxima (so a
 /// reset restores `life` to `life_max`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct RoundResetState {
     /// The world position the fighter started the match at, restored each round.
     pos: Vec2<f32>,
@@ -630,7 +690,7 @@ struct RoundResetState {
 /// and is therefore **exempt** from the freeze (keeps ticking while everyone else
 /// is frozen). A [`Pause`](fp_character::FreezeKind::Pause) freezes everyone, so it
 /// has no exempt player ([`FreezeExempt::None`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum FreezeExempt {
     /// No player is exempt — every fighter is frozen (a `Pause`).
     None,
@@ -648,7 +708,7 @@ enum FreezeExempt {
 /// [`remaining`](Self::remaining) ticks; the [`exempt`](Self::exempt) player (the
 /// `SuperPause` triggerer, if any) keeps ticking so its super move animates. The
 /// freeze counts down one tick per frame and clears at `0`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct Freeze {
     /// Ticks of freeze remaining; `0` (the inactive default) means no freeze.
     remaining: i32,
@@ -782,6 +842,39 @@ impl Match {
         self.rounds_to_win = rounds_to_win.max(1);
     }
 
+    /// Seeds the two fighters' `random` streams **distinctly** from a single match
+    /// seed (#38 — the deferred #28 follow-up).
+    ///
+    /// Both players are typically built from the same `.def`, so without this they
+    /// would share the identical [`fp_character::DEFAULT_RNG_SEED`] stream and draw
+    /// the *same* random sequence — visibly wrong, and a determinism foot-gun.
+    /// This seeds player 1 with `match_seed` and player 2 with a *derived distinct*
+    /// seed (see [`derive_player_seed`]), so the two draw **independent** streams.
+    /// The derivation is pure and deterministic: the same `match_seed` always
+    /// reproduces the same per-player seeds, so a replay (which records the match
+    /// seed) re-creates both streams exactly.
+    ///
+    /// Call this once, right after constructing the match, before the first
+    /// [`tick`](Match::tick). Pass [`DEFAULT_MATCH_SEED`] for the fixed,
+    /// reproducible default.
+    pub fn seed_players(&mut self, match_seed: i32) {
+        self.p1.character.seed_rng(derive_player_seed(match_seed, 0));
+        self.p2.character.seed_rng(derive_player_seed(match_seed, 1));
+    }
+
+    /// Constructs a match (default round length / best-of-N) and immediately seeds
+    /// its two players distinctly from `match_seed` (#38).
+    ///
+    /// A convenience wrapper around [`Match::new`] + [`Match::seed_players`]; the
+    /// resulting match is fully reproducible from `(p1, p2, bounds, match_seed)`,
+    /// which is exactly what a replay log records.
+    #[must_use]
+    pub fn with_seed(p1: Player, p2: Player, bounds: StageBounds, match_seed: i32) -> Self {
+        let mut m = Self::new(p1, p2, bounds);
+        m.seed_players(match_seed);
+        m
+    }
+
     /// Read access to player 1.
     #[must_use]
     pub fn p1(&self) -> &Player {
@@ -792,6 +885,17 @@ impl Match {
     #[must_use]
     pub fn p2(&self) -> &Player {
         &self.p2
+    }
+
+    /// The two players' stable identity fingerprints, `(p1, p2)` (#38).
+    ///
+    /// Each is [`Player::fingerprint`] of the corresponding loaded character. This
+    /// is the value stamped into a [`MatchSnapshot`] / [`ReplayLog`] and validated
+    /// against on restore / replay, so a save-state built from one pair of `.def`s
+    /// cannot be silently applied to a match built from a different pair.
+    #[must_use]
+    pub fn character_fingerprints(&self) -> (CharacterFingerprint, CharacterFingerprint) {
+        (self.p1.fingerprint(), self.p2.fingerprint())
     }
 
     /// The stage bounds the fighters are clamped to.
@@ -6499,6 +6603,512 @@ time = 1
             "a real KFM punch must connect through Match::tick and drop P2's life; P2 at {} ({:?})",
             m.p2().life(),
             m.round_state()
+        );
+    }
+
+    // =====================================================================
+    // Replay / determinism + whole-Match state serialization (#38).
+    //
+    // These exercise the four pillars: (1) Match snapshot/restore round-trip,
+    // (2) input record→replay reproduces a match byte-for-byte, (3) two
+    // independent runs with the same input script are identical, and
+    // (4) distinct per-player RNG seeds + fixed-seed reproduction. A malformed
+    // snapshot must be a recoverable Err, never a panic.
+    // =====================================================================
+
+    /// A loaded character whose state 0 draws `random` into `var(0)` every tick
+    /// **and** carries the action-0 hurt frame, so two such fighters both advance
+    /// their RNG streams each frame and remain hittable. This is what lets the
+    /// determinism / distinct-seed tests observe the RNG actually flowing through
+    /// the live executor (not just a field poke).
+    fn rng_probe_loaded() -> LoadedCharacter {
+        let mut loaded = defender_loaded();
+        loaded.states.insert(
+            0,
+            CompiledState {
+                number: 0,
+                state_type: Some("S".to_string()),
+                movetype: Some("I".to_string()),
+                physics: Some("N".to_string()),
+                controllers: vec![varset_controller(0, "random")],
+                ..Default::default()
+            },
+        );
+        loaded
+    }
+
+    /// A two-fighter match built from the RNG-probe character on both sides,
+    /// positioned apart, on a wide stage. Not yet seeded (callers seed it).
+    fn rng_probe_match() -> Match {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, rng_probe_loaded());
+        let p2 = Player::new(p2c, rng_probe_loaded());
+        Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+    }
+
+    /// A deterministic, varied input script of `n` frames: a repeating pattern of
+    /// directions and buttons distinct per player, so the two diverge and the
+    /// replay has something non-trivial to reproduce.
+    fn scripted_inputs(n: usize) -> Vec<(MatchInput, MatchInput)> {
+        (0..n)
+            .map(|i| {
+                let p1 = MatchInput {
+                    right: i % 3 == 0,
+                    left: i % 7 == 0,
+                    a: i % 5 == 0,
+                    up: i % 11 == 0,
+                    ..MatchInput::none()
+                };
+                let p2 = MatchInput {
+                    left: i % 4 == 0,
+                    right: i % 9 == 0,
+                    b: i % 6 == 0,
+                    down: i % 13 == 0,
+                    ..MatchInput::none()
+                };
+                (p1, p2)
+            })
+            .collect()
+    }
+
+    // ---- (1) snapshot / restore round-trip --------------------------------
+
+    #[test]
+    fn snapshot_restore_round_trips_to_the_snapshot_point() {
+        let mut m = rng_probe_match();
+        m.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut m);
+
+        // Tick N frames, then snapshot.
+        for (p1, p2) in scripted_inputs(40) {
+            m.tick(p1, p2);
+        }
+        let saved = m.snapshot().expect("snapshot must serialize");
+
+        // Tick further, diverging the live state away from the snapshot point.
+        for (p1, p2) in scripted_inputs(40) {
+            m.tick(p1, p2);
+        }
+        let after = m.snapshot().expect("snapshot");
+        assert_ne!(
+            saved, after,
+            "ticking past the snapshot must change the runtime state"
+        );
+
+        // Restore -> the match returns to exactly the snapshot point.
+        m.restore_snapshot(&saved).expect("restore must succeed");
+        let restored = m.snapshot().expect("snapshot");
+        assert_eq!(
+            saved, restored,
+            "restore must reproduce the snapshot byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn restore_then_tick_matches_continuing_from_the_original() {
+        // A save-state must be a perfect resume point: restoring at frame N and
+        // ticking M more frames yields the SAME state as never having snapshotted
+        // and ticking N+M frames from the start.
+        let script = scripted_inputs(60);
+
+        // Reference run: tick all 60 frames.
+        let mut reference = rng_probe_match();
+        reference.seed_players(7);
+        into_fight(&mut reference);
+        for &(p1, p2) in &script {
+            reference.tick(p1, p2);
+        }
+        let reference_end = reference.snapshot().expect("snapshot");
+
+        // Save-state run: snapshot at frame 30, restore, then tick the rest.
+        let mut resumed = rng_probe_match();
+        resumed.seed_players(7);
+        into_fight(&mut resumed);
+        for &(p1, p2) in &script[..30] {
+            resumed.tick(p1, p2);
+        }
+        let mid = resumed.snapshot().expect("snapshot");
+        // Drive it somewhere else, then restore to the mid-point and continue.
+        for &(p1, p2) in &script[..15] {
+            resumed.tick(p1, p2);
+        }
+        resumed.restore_snapshot(&mid).expect("restore");
+        for &(p1, p2) in &script[30..] {
+            resumed.tick(p1, p2);
+        }
+        let resumed_end = resumed.snapshot().expect("snapshot");
+
+        assert_eq!(
+            reference_end, resumed_end,
+            "restore-and-continue must match a straight-through run"
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_is_a_recoverable_error_not_a_panic() {
+        let mut m = rng_probe_match();
+        m.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut m);
+        let good = m.snapshot().expect("snapshot");
+
+        // Truncated blob: recoverable Err.
+        let truncated = &good[..good.len() / 2];
+        assert!(
+            m.restore_snapshot(truncated).is_err(),
+            "a truncated snapshot must be a recoverable Err"
+        );
+        // Garbage blob: recoverable Err.
+        assert!(
+            m.restore_snapshot(&[0xFFu8; 8]).is_err(),
+            "a garbage snapshot must be a recoverable Err"
+        );
+        // Empty blob: recoverable Err.
+        assert!(m.restore_snapshot(&[]).is_err(), "empty must be a recoverable Err");
+
+        // The match is still usable after the failed restores (no corruption).
+        m.tick(MatchInput::none(), MatchInput::none());
+    }
+
+    // ---- (1b) character-identity guard on restore / replay (#38) ----------
+
+    /// An RNG-probe match whose two characters carry the given `.def` name, so its
+    /// [`Match::character_fingerprints`] differs from a default-named probe match.
+    fn named_rng_probe_match(name: &str) -> Match {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let mut l1 = rng_probe_loaded();
+        l1.name = name.to_string();
+        let mut l2 = rng_probe_loaded();
+        l2.name = name.to_string();
+        let p1 = Player::new(p1c, l1);
+        let p2 = Player::new(p2c, l2);
+        Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+    }
+
+    #[test]
+    fn snapshot_restores_into_same_characters_unchanged() {
+        // The happy path: a snapshot taken from one match restores cleanly into a
+        // freshly-built match with the SAME characters and reproduces it exactly.
+        let mut source = rng_probe_match();
+        source.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut source);
+        for (p1, p2) in scripted_inputs(40) {
+            source.tick(p1, p2);
+        }
+        let saved = source.snapshot().expect("snapshot");
+        let saved_state = source.snapshot().expect("snapshot");
+
+        let mut target = rng_probe_match();
+        target
+            .restore_snapshot(&saved)
+            .expect("restore into same characters must succeed");
+        assert_eq!(
+            target.snapshot().expect("snapshot"),
+            saved_state,
+            "restored same-character match must reproduce the snapshot byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn snapshot_restored_into_different_character_is_rejected() {
+        // A snapshot taken from match A must NOT silently apply to match B built
+        // from a DIFFERENT character: the identity guard returns a recoverable Err.
+        let mut source = named_rng_probe_match("FighterA");
+        source.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut source);
+        for (p1, p2) in scripted_inputs(20) {
+            source.tick(p1, p2);
+        }
+        let saved = source.snapshot().expect("snapshot");
+        let before = source.snapshot().expect("snapshot");
+
+        // Different character (distinct .def name -> distinct fingerprint).
+        let mut other = named_rng_probe_match("FighterB");
+        let other_before = other.snapshot().expect("snapshot");
+        let err = other
+            .restore_snapshot(&saved)
+            .expect_err("restoring into a different character must fail");
+        assert!(
+            matches!(err, fp_core::FpError::Mismatch(_)),
+            "identity mismatch must be a recoverable FpError::Mismatch, got {err:?}"
+        );
+        // The rejected restore must NOT have mutated the target (changes nothing).
+        assert_eq!(
+            other.snapshot().expect("snapshot"),
+            other_before,
+            "a rejected restore must leave the target match untouched"
+        );
+
+        // Same-character restore of the SAME blob still works (the source matches).
+        let mut same = named_rng_probe_match("FighterA");
+        same.restore_snapshot(&saved)
+            .expect("same-character restore still succeeds");
+        // Sanity: `before` is non-trivial (the source actually advanced).
+        assert_ne!(before, named_rng_probe_match("FighterA").snapshot().unwrap());
+    }
+
+    #[test]
+    fn tampered_snapshot_fingerprint_is_rejected() {
+        // Tampering the stored fingerprint in a typed snapshot is caught by the
+        // guard even when the characters are otherwise identical.
+        let mut m = rng_probe_match();
+        m.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut m);
+        for (p1, p2) in scripted_inputs(10) {
+            m.tick(p1, p2);
+        }
+        let mut snap = m.snapshot_state();
+        // Corrupt P1's recorded fingerprint.
+        snap.p1_fingerprint = fp_character::CharacterFingerprint(snap.p1_fingerprint.0 ^ 0xDEAD);
+
+        let mut target = rng_probe_match();
+        let err = target
+            .restore_snapshot_state(&snap)
+            .expect_err("a tampered fingerprint must be rejected");
+        assert!(matches!(err, fp_core::FpError::Mismatch(_)));
+    }
+
+    #[test]
+    fn replay_into_different_character_is_rejected() {
+        // A recorded log (which stamps the source characters' fingerprints) must
+        // refuse to replay into a match built from a different character.
+        const SEED: i32 = 7;
+        let mut source = named_rng_probe_match("FighterA");
+        source.seed_players(SEED);
+        let log = {
+            let mut rec = MatchRecorder::new(&mut source, SEED, DEFAULT_ROUND_SECONDS);
+            for (p1, p2) in scripted_inputs(30) {
+                rec.tick(p1, p2);
+            }
+            rec.into_log()
+        };
+        // The recorder stamped the real fingerprints (not the unstamped sentinel).
+        let (fp_a, _) = named_rng_probe_match("FighterA").character_fingerprints();
+        assert_eq!(log.p1_fingerprint, fp_a, "recorder stamps the source fingerprint");
+
+        // Replaying into the SAME character succeeds.
+        let mut ok = named_rng_probe_match("FighterA");
+        replay_match(&mut ok, &log).expect("replay into same character succeeds");
+
+        // Replaying into a DIFFERENT character is a recoverable mismatch error.
+        let mut wrong = named_rng_probe_match("FighterB");
+        let before = wrong.snapshot().expect("snapshot");
+        let err = replay_match(&mut wrong, &log)
+            .expect_err("replay into a different character must fail");
+        assert!(
+            matches!(err, ReplayError::CharacterMismatch { side: "P1", .. }),
+            "expected a P1 character mismatch, got {err:?}"
+        );
+        // The rejected replay neither seeded nor ticked the target.
+        assert_eq!(
+            wrong.snapshot().expect("snapshot"),
+            before,
+            "a rejected replay must leave the target match untouched"
+        );
+    }
+
+    // ---- (2) record -> replay reproduces a match --------------------------
+
+    #[test]
+    fn record_then_replay_reproduces_identical_final_state() {
+        const SEED: i32 = 4242;
+        const FRAMES: usize = 200;
+        let script = scripted_inputs(FRAMES);
+
+        // Record: drive a live match through the recorder, logging each frame.
+        let mut original = rng_probe_match();
+        original.seed_players(SEED);
+        into_fight(&mut original);
+        let log = {
+            let mut rec = MatchRecorder::new(&mut original, SEED, DEFAULT_ROUND_SECONDS);
+            for &(p1, p2) in &script {
+                rec.tick(p1, p2);
+            }
+            rec.into_log()
+        };
+        let original_end = original.snapshot().expect("snapshot");
+
+        // The log captured exactly the frames we fed it.
+        assert_eq!(log.len(), FRAMES, "log records every frame");
+
+        // Replay into a FRESH match built from the same characters. The replay
+        // must reproduce the intro drive too, so the fresh match starts from a
+        // clean intro and the script includes the same into_fight frames.
+        let mut fresh = rng_probe_match();
+        // Reproduce the intro the original did before recording, then replay the
+        // logged inputs. (The recorder began after into_fight, so prepend it.)
+        replay_match(&mut fresh, &replay_with_intro(&log)).expect("replay must succeed");
+        let replay_end = fresh.snapshot().expect("snapshot");
+
+        assert_eq!(
+            original_end, replay_end,
+            "replay must reproduce the recorded match byte-for-byte"
+        );
+    }
+
+    /// Builds a replay log that prepends the intro frames `into_fight` drives
+    /// (all-neutral) ahead of the recorded log, since the recorder in the test
+    /// above started *after* the intro. Keeps the seed/config from `log`.
+    fn replay_with_intro(log: &ReplayLog) -> ReplayLog {
+        let mut full = ReplayLog::new(
+            log.match_seed,
+            log.bounds,
+            log.rounds_to_win,
+            log.round_seconds,
+        );
+        for _ in 0..(INTRO_FRAMES + 1) {
+            full.push(MatchInput::none(), MatchInput::none());
+        }
+        for &(p1, p2) in &log.inputs {
+            full.push(p1, p2);
+        }
+        full
+    }
+
+    #[test]
+    fn replay_log_persists_and_reloads_via_bincode() {
+        const SEED: i32 = 99;
+        let mut original = rng_probe_match();
+        original.seed_players(SEED);
+        let log = {
+            let mut rec = MatchRecorder::new(&mut original, SEED, DEFAULT_ROUND_SECONDS);
+            for (p1, p2) in scripted_inputs(50) {
+                rec.tick(p1, p2);
+            }
+            rec.into_log()
+        };
+
+        // Encode -> decode round-trips the log losslessly.
+        let bytes = log.encode().expect("encode");
+        let reloaded = ReplayLog::decode(&bytes).expect("decode");
+        assert_eq!(log, reloaded);
+
+        // And replaying the reloaded log reproduces the same final state.
+        let mut a = rng_probe_match();
+        let mut b = rng_probe_match();
+        replay_match(&mut a, &log).expect("replay must succeed");
+        replay_match(&mut b, &reloaded).expect("replay must succeed");
+        assert_eq!(
+            a.snapshot().expect("snap"),
+            b.snapshot().expect("snap"),
+            "a reloaded replay log reproduces the same state"
+        );
+    }
+
+    // ---- (3) two-run determinism ------------------------------------------
+
+    #[test]
+    fn two_identical_runs_are_byte_equal_every_frame() {
+        const SEED: i32 = 1234;
+        const FRAMES: usize = 300;
+        let script = scripted_inputs(FRAMES);
+
+        let mut a = rng_probe_match();
+        let mut b = rng_probe_match();
+        a.seed_players(SEED);
+        b.seed_players(SEED);
+
+        for &(p1, p2) in &script {
+            a.tick(p1, p2);
+            b.tick(p1, p2);
+            // Frame-by-frame byte equality is the strongest determinism proof:
+            // any nondeterminism source (e.g. HashMap iteration order leaking into
+            // simulation) would diverge the snapshots here.
+            assert_eq!(
+                a.snapshot_state(),
+                b.snapshot_state(),
+                "two identical runs diverged at game_time {}",
+                a.game_time()
+            );
+        }
+    }
+
+    // ---- (4) distinct per-player RNG seeds + reproduction ------------------
+
+    #[test]
+    fn derive_player_seed_gives_p1_the_match_seed_and_p2_a_distinct_one() {
+        for &seed in &[0, 1, -1, 1234, i32::MAX, i32::MIN] {
+            let p1 = derive_player_seed(seed, 0);
+            let p2 = derive_player_seed(seed, 1);
+            assert_eq!(p1, seed, "P1 seed is the match seed itself");
+            assert_ne!(p1, p2, "P2 seed must be distinct from P1 (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn distinct_seeds_make_p1_and_p2_draw_different_random_streams() {
+        let mut m = rng_probe_match();
+        m.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut m);
+
+        // Drive a number of fight frames; each tick both fighters' state-0 VarSet
+        // draws `random` into var(0). With distinct seeds the two streams differ,
+        // so the recorded var(0) sequences must NOT be identical.
+        let mut p1_draws = Vec::new();
+        let mut p2_draws = Vec::new();
+        for _ in 0..40 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            p1_draws.push(m.p1().character.vars[0]);
+            p2_draws.push(m.p2().character.vars[0]);
+        }
+        assert_ne!(
+            p1_draws, p2_draws,
+            "distinct per-player seeds must yield different random streams"
+        );
+        // Sanity: the draws are not all-zero (random actually flowed).
+        assert!(
+            p1_draws.iter().any(|&v| v != 0),
+            "P1's random stream should produce non-zero draws"
+        );
+    }
+
+    #[test]
+    fn a_fixed_match_seed_reproduces_the_run() {
+        const SEED: i32 = 31337;
+        let script = scripted_inputs(120);
+
+        let run = |seed: i32| {
+            let mut m = rng_probe_match();
+            m.seed_players(seed);
+            into_fight(&mut m);
+            for &(p1, p2) in &script {
+                m.tick(p1, p2);
+            }
+            m.snapshot().expect("snapshot")
+        };
+
+        // Same fixed seed -> identical run.
+        assert_eq!(run(SEED), run(SEED), "a fixed match seed must reproduce");
+        // A different seed -> a different run (the seed actually matters).
+        assert_ne!(
+            run(SEED),
+            run(SEED + 1),
+            "a different match seed should change the run"
+        );
+    }
+
+    #[test]
+    fn unseeded_players_share_a_stream_motivating_distinct_seeding() {
+        // Documents WHY seed_players exists: two fighters built from the same
+        // character and NOT distinctly seeded share the identical default stream,
+        // so they draw the same random sequence. seed_players fixes exactly this.
+        let mut m = rng_probe_match(); // not seeded -> both at DEFAULT_RNG_SEED
+        into_fight(&mut m);
+        let mut p1_draws = Vec::new();
+        let mut p2_draws = Vec::new();
+        for _ in 0..30 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            p1_draws.push(m.p1().character.vars[0]);
+            p2_draws.push(m.p2().character.vars[0]);
+        }
+        assert_eq!(
+            p1_draws, p2_draws,
+            "unseeded same-character players share one default RNG stream (the bug seed_players fixes)"
         );
     }
 }

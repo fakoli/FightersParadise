@@ -8,6 +8,7 @@
 use crate::buffer::InputBuffer;
 use crate::state::*;
 use fp_core::{FpError, FpResult};
+use serde::{Deserialize, Serialize};
 
 /// Modifier applied to a command element.
 ///
@@ -97,6 +98,22 @@ struct CommandResult {
     name: String,
     /// Ticks remaining before this result expires.
     remaining: u32,
+}
+
+/// A serializable snapshot of a [`CommandMatcher`]'s **transient recognition
+/// state** (replay / rollback, #38).
+///
+/// Captures only the currently-active (matched, not-yet-expired) commands and
+/// their remaining buffer timers — the recognition state that carries across
+/// ticks. The compiled [`CommandDef`]s (parsed from the character's `.cmd`) are
+/// **static** and are *not* captured: [`CommandMatcher::restore_snapshot`] is
+/// applied to a matcher already built from the same `.cmd`. A snapshot whose
+/// names are not in the live matcher's vocabulary are dropped on restore (never
+/// panics).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandMatcherSnapshot {
+    /// The `(name, remaining_ticks)` of each active command.
+    active: Vec<(String, u32)>,
 }
 
 /// Matches input buffer contents against command definitions.
@@ -190,6 +207,43 @@ impl CommandMatcher {
         } else {
             false
         }
+    }
+
+    /// Captures the matcher's transient recognition state (active commands and
+    /// their remaining timers) as a serializable [`CommandMatcherSnapshot`]
+    /// (replay / rollback, #38).
+    ///
+    /// The active commands are emitted **sorted by name** so the snapshot bytes
+    /// are deterministic regardless of match order. The compiled command
+    /// definitions are not captured (they are static; see
+    /// [`CommandMatcherSnapshot`]).
+    #[must_use]
+    pub fn snapshot(&self) -> CommandMatcherSnapshot {
+        let mut active: Vec<(String, u32)> = self
+            .active
+            .iter()
+            .map(|r| (r.name.clone(), r.remaining))
+            .collect();
+        active.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        CommandMatcherSnapshot { active }
+    }
+
+    /// Restores the matcher's transient recognition state from a
+    /// [`CommandMatcherSnapshot`].
+    ///
+    /// Replaces the active-command set with the snapshot's. The compiled command
+    /// definitions are untouched (they are static; this matcher must already be
+    /// built from the same `.cmd`). Never panics; a name that is no longer in the
+    /// vocabulary is simply restored as an active result and will expire normally.
+    pub fn restore_snapshot(&mut self, snap: &CommandMatcherSnapshot) {
+        self.active = snap
+            .active
+            .iter()
+            .map(|(name, remaining)| CommandResult {
+                name: name.clone(),
+                remaining: *remaining,
+            })
+            .collect();
     }
 
     /// Attempts to match a command definition against the buffer by scanning

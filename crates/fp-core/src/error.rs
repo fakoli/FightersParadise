@@ -48,6 +48,18 @@ pub enum FpError {
     #[error("render error: {0}")]
     Render(String),
 
+    /// A persisted blob does not match the live context it is being applied to.
+    ///
+    /// Raised when a save-state / replay restore is asked to apply data that was
+    /// produced from a **different** source than the target it is now being
+    /// restored into — most notably a [`Match`](../../fp_engine/struct.Match.html)
+    /// snapshot or replay log whose recorded per-character identity fingerprint
+    /// does not match the characters the target match was loaded from. Applying
+    /// such a blob would silently corrupt simulation state, so the restore path
+    /// returns this recoverable error and changes nothing instead of panicking.
+    #[error("identity mismatch: {0}")]
+    Mismatch(String),
+
     /// A generic error with a descriptive message.
     ///
     /// Use sparingly; prefer more specific variants when possible.

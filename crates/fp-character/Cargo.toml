@@ -12,10 +12,21 @@ fp-vm.workspace = true
 fp-combat.workspace = true
 fp-input.workspace = true
 tracing.workspace = true
+# Runtime-state serialization (#38): the per-tick mutable `Character` state is
+# captured into a plain-data `CharacterSnapshot` that derives
+# Serialize/Deserialize for the whole-Match snapshot / replay log. The loaded
+# static data (`LoadedCharacter`: compiled state graph, sprites, AIR, CMD) is
+# NOT serialized — it is reloaded from the `.def`.
+serde.workspace = true
 
 # Dev-only: a capturing subscriber lets the 6.2b tests assert that NO spurious
 # "bad expression -> const 0" warning fires for legitimately multi-valued params
 # (AC2), while a genuine malformed component still warns. Test-only, so it never
 # ships in the library.
+#
+# `bincode` (test-only) lets the snapshot determinism test assert true ENCODED
+# byte-equality of a `CharacterSnapshot` (#38), matching the codec `fp-engine`
+# uses for the whole-Match snapshot; it never ships in the library.
 [dev-dependencies]
 tracing-subscriber.workspace = true
+bincode.workspace = true

@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+# Runtime-state serialization (#38): `Vec2` and `Rect` flow into the Match
+# snapshot / replay log, so they derive Serialize/Deserialize.
+serde.workspace = true

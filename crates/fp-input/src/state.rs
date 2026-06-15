@@ -5,11 +5,13 @@
 //! inputs, while [`LogicalDirection`] and [`DirToken`] represent facing-relative
 //! directions used in MUGEN command definitions.
 
+use serde::{Deserialize, Serialize};
+
 /// MUGEN button identifiers.
 ///
 /// Maps to the standard 6-button MUGEN layout (A through Z) plus Start.
 /// The enum discriminants serve as indices into [`InputState::buttons`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Button {
     /// Light punch.
     A = 0,
@@ -34,7 +36,7 @@ pub const BUTTON_COUNT: usize = 7;
 ///
 /// This represents the physical direction pressed on a joystick or D-pad.
 /// Left and right are absolute screen directions, not relative to character facing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Direction {
     /// Up is held.
     pub up: bool,
@@ -57,7 +59,7 @@ impl Direction {
 ///
 /// Combines directional and button state into a single snapshot that gets
 /// pushed into the [`crate::buffer::InputBuffer`] each frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InputState {
     /// Directional input for this frame.
     pub direction: Direction,

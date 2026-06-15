@@ -77,11 +77,12 @@
 //! than silently extracting the stray `a` from `garbage` as "air").
 
 use fp_combat::{AttackAttr, AttackKind, AttackPower, StateClass};
+use serde::{Deserialize, Serialize};
 
 /// Which way an [`InvulnSlot`] filters the attacker's attack attribute.
 ///
 /// See the [module docs](crate::invuln) for the full block rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum InvulnMode {
     /// `NotHitBy` — **exclude** the listed attributes: a hit whose attr **is in**
     /// the set is blocked. This is the default (an inactive slot reads as a
@@ -101,7 +102,7 @@ pub enum InvulnMode {
 /// value was an explicit wildcard (`*` or empty), which matches *everything*.
 ///
 /// See the [module docs](crate::invuln) for the grammar and match rule.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AttackAttrSet {
     /// The admitted attacker state-classes (`S`/`C`/`A`). Empty means **no**
     /// state-type matches (the fail-safe set), unless [`any`](Self::any) is set.
@@ -266,7 +267,7 @@ impl AttackAttrSet {
 /// `value2` = slot 2), each with its own `time`. A slot is **active** while
 /// [`time_remaining`](Self::time_remaining) `> 0`; an inactive slot blocks
 /// nothing. A hit must pass **both** slots (see [`InvulnMask::blocks`]).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InvulnSlot {
     /// The parsed attack-attribute set this slot filters against.
     pub attrs: AttackAttrSet,
@@ -328,7 +329,7 @@ impl InvulnSlot {
 ///
 /// See the [module docs](crate::invuln) for the grammar, match rule, and
 /// fail-safe edge semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InvulnMask {
     /// Slot 1 — set from the controller's `value` parameter.
     pub slot1: InvulnSlot,

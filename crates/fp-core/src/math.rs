@@ -1,5 +1,6 @@
 //! Math primitives for 2D game engine operations.
 
+use serde::{Deserialize, Serialize};
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
 /// A 2D vector with generic scalar type.
@@ -18,7 +19,7 @@ use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 /// let next_pos = position + velocity;
 /// assert_eq!(next_pos, Vec2::new(103.0, 195.0));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Vec2<T> {
     /// The horizontal component.
     pub x: T,
@@ -160,7 +161,7 @@ impl<T: Div<Output = T> + Copy> Div<T> for Vec2<T> {
 /// let b = Rect::new(5.0, 5.0, 10.0, 10.0);
 /// assert!(a.overlaps(&b));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     /// Left edge X coordinate.
     pub x: f32,
