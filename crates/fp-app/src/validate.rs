@@ -723,6 +723,7 @@ mod tests {
             cmd: None,
             // A `.snd` is optional; we only flip the flag, never build a SndFile.
             snd: if has_snd { build_min_snd() } else { None },
+            palettes: Vec::new(),
         }
     }
 

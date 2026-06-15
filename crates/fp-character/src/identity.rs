@@ -201,6 +201,7 @@ mod tests {
             },
             cmd: None,
             snd: None,
+            palettes: Vec::new(),
         }
     }
 
