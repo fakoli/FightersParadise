@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <strong>Status: Playable.</strong> A two-character fighter driven by real Kung Fu Man data — CNS state machine, combat, throws, supers, best-of-3 rounds, and audio all run end to end. ~1,769 tests pass; <code>clippy -D warnings</code> is clean; CI is green.
+  <strong>Status: Playable.</strong> A two-character fighter driven by real Kung Fu Man data — CNS state machine, combat, throws, supers, best-of-3 rounds, and audio all run end to end. ~2,045 tests pass; <code>clippy -D warnings</code> is clean; CI is green.
 </p>
 
-The engine is real and the match is playable. Some presentation layers are not finished yet — stage backgrounds, real lifebar screenpacks, and on-screen text are not implemented, and SFF v1 art renders without colors. See [Known Issues](docs/known-issues.md) for the honest gap list.
+The engine is real and the match is playable. The presentation layers now exist too — parallax stage backgrounds, a `fight.def` lifebar screenpack, on-screen text, and intro/ending storyboards are all wired in — but several are partial or asset-blocked (e.g. the screenpack falls back to a quad HUD without a `fight.def`, and there's no bundled Elecbyte stage/screenpack/font fixture yet). SFF v1 art now renders with its extracted palette, and modern PNG sprites decode. See [Known Issues](docs/known-issues.md) for the honest gap list.
 
 ## Quickstart
 
@@ -77,7 +77,7 @@ Player 1 is keyboard-driven; Player 2 is an idle dummy in this milestone (no sec
 
 Driven by genuine Kung Fu Man content end to end:
 
-- **CNS state machine** — every trigger and controller parameter is compiled to an expression at load time and executed by a per-tick, MUGEN-order executor (special states −3/−2/−1, then the current state). ~30 state controllers are dispatched; unimplemented ones fall to a logged no-op rather than crashing.
+- **CNS state machine** — every trigger and controller parameter is compiled to an expression at load time and executed by a per-tick, MUGEN-order executor (special states −3/−2/−1, then the current state). ~40 state controllers are dispatched (including `AssertSpecial`, `Width`, `SprPriority`, `Pause`/`SuperPause`, `PalFX`/`AfterImage`, `HitOverride`, and the get-hit-vel set); unimplemented ones fall to a logged no-op rather than crashing.
 - **Combat** — `Clsn1`×`Clsn2` hit detection, a faithful Guard / Hit / Miss resolution ladder, mirrored knockback, and per-side damage application.
 - **Throws** — `TargetState` / `TargetBind` / `TargetLifeAdd` / `TargetFacing` / `TargetVelSet` plus the attacker's `p1stateno`, applied via the engine's deferred target-op pass (KFM's signature throw works).
 - **Supers & meter** — a power bar fed by `PowerAdd` / `TargetPowerAdd`, carried across rounds within a match.
@@ -92,41 +92,41 @@ Cross-entity triggers (`P2Dist`, `P2BodyDist`, edge distances, `p2`/`enemy`/`roo
 
 ## Architecture
 
-Cargo workspace, edition 2021, 14 crates under `crates/`. Only `fp-stage` and `fp-ui` remain true stubs.
+Cargo workspace, edition 2021, 14 crates under `crates/`. No crate is a true stub anymore — `fp-stage`, `fp-ui`, and `fp-storyboard` have all graduated (some of their presentation features are still partial — see [Known Issues](docs/known-issues.md)).
 
 ```
-fp-app (binary: SDL2 window, 60Hz loop, CLI, HUD, audio routing)
-  ├── fp-engine        two-player Match coordinator, round/best-of-N flow
+fp-app (binary: SDL2 window, 60Hz loop, CLI + validate, HUD, audio routing, debug overlay)
+  ├── fp-engine        two-player Match coordinator, round/best-of-N flow, freeze, hit-spark effects
   │     ├── fp-character  loader + Character entity + per-tick executor + cross-entity eval  ← largest crate
   │     │     ├── fp-vm      CNS expression parser + tree-walk evaluator (triggers, redirects)
-  │     │     ├── fp-combat  HitDef model, Clsn hit primitive, resolve_hit → HitOutcome (depends on fp-physics)
+  │     │     ├── fp-combat  HitDef model, Clsn hit primitive, resolve_hit/resolve_clash (depends on fp-physics)
   │     │     └── fp-input   60-frame ring buffer + MUGEN command recognition
   │     └── fp-physics    Euler integration, gravity, ground plane, push/bounds (also used by fp-combat)
-  ├── fp-render        wgpu palette-lookup sprite renderer (256-color indexed)
+  ├── fp-render        wgpu palette-lookup sprite renderer (256-color indexed) + PalFX tint + text/glyphs
   ├── fp-audio         rodio WAV decode + channel-managed playback
-  ├── fp-formats       parsers: SFF (v1 PCX + v2), AIR, CMD, DEF, CNS, SND
-  ├── fp-storyboard    storyboard .def parser + typed scene model (parser only)
-  ├── fp-stage         STUB — no background/camera parser yet
-  ├── fp-ui            STUB — HUD is hand-rolled quads in fp-app, not a screenpack
+  ├── fp-formats       parsers: SFF (v1 PCX+palette, v2 RLE/LZ5/PNG), AIR, CMD, DEF, CNS, SND, FNT, ACT
+  ├── fp-storyboard    storyboard .def parser + scene model + StoryboardPlayer (intro/ending overlay)
+  ├── fp-stage         stage .def parser ([BGDef]/[BG]/[Camera]/[StageInfo]) + parallax render
+  ├── fp-ui            fight.def screenpack model/parser + ScreenpackHud renderer (quad-HUD fallback)
   └── fp-core          shared types: Vec2, Rect, SpriteId, FpError/FpResult
 ```
 
 | Crate | Status | Tests | Role |
 |-------|--------|------:|------|
-| `fp-character` | Implemented | 620 | Loader, `Character` entity, per-tick executor, cross-entity eval (the biggest crate) |
-| `fp-vm` | Implemented | 463 | CNS expression lexer + Pratt parser + tree-walk evaluator |
-| `fp-formats` | Implemented | 142 | SFF v1/v2, AIR, CMD, DEF, CNS, SND parsers |
-| `fp-input` | Implemented | 102 | Ring buffer + command recognition (`~ / $ > +`) |
-| `fp-engine` | Implemented | 96 | Two-player `Match`, round + best-of-N flow |
-| `fp-physics` | Implemented | 79 | Euler integration, gravity, ground plane, push/bounds |
-| `fp-combat` | Implemented | 60 | `HitDef` data model + `resolve_hit` decision |
-| `fp-app` | Implemented | 49 | SDL2 window, 60Hz loop, CLI, HUD, match wiring |
-| `fp-storyboard` | Parser only | 44 | Storyboard `.def` parser + scene model (no tick/render) |
-| `fp-audio` | Implemented | 32 | rodio playback, channel cut-off, hardened WAV decode |
-| `fp-render` | Implemented | 22 | wgpu renderer, WGSL palette-lookup shader |
-| `fp-core` | Implemented | 15 | Shared types (`Vec2`, `Rect`, `SpriteId`, `FpError`) |
-| `fp-stage` | **Stub** | 0 | Stage `.def` + background rendering (planned) |
-| `fp-ui` | **Stub** | 0 | Real lifebars / `fight.def` screenpack (planned) |
+| `fp-character` | Implemented | 692 | Loader, `Character` entity, per-tick executor, cross-entity eval (the biggest crate) |
+| `fp-vm` | Implemented | 491 | CNS expression lexer + Pratt parser + tree-walk evaluator (+ proptest fuzz) |
+| `fp-formats` | Implemented | 182 | SFF v1 (+palette)/v2 (+PNG), AIR, CMD, DEF, CNS, SND, FNT, ACT parsers |
+| `fp-engine` | Implemented | 121 | Two-player `Match`, round + best-of-N flow, freeze, hit-spark effects |
+| `fp-input` | Implemented | 103 | Ring buffer + command recognition (`~ / $ > +`) |
+| `fp-physics` | Implemented | 90 | Euler integration, gravity, ground plane, push/bounds |
+| `fp-app` | Implemented | 89 | SDL2 window, 60Hz loop, CLI + `validate`, HUD, debug overlay, match wiring |
+| `fp-combat` | Implemented | 84 | `HitDef` data model + `resolve_hit`/`resolve_clash` decision |
+| `fp-storyboard` | Implemented | 63 | Storyboard `.def` parser + scene model + `StoryboardPlayer` (intro/ending overlay) |
+| `fp-render` | Implemented | 46 | wgpu renderer, WGSL palette-lookup + PalFX-tint shader, text/glyphs |
+| `fp-audio` | Implemented | 34 | rodio playback, channel cut-off, hardened WAV decode |
+| `fp-core` | Implemented | 20 | Shared types (`Vec2`, `Rect`, `SpriteId`, `FpError`) |
+| `fp-ui` | Implemented | 17 | `fight.def` screenpack model/parser + `ScreenpackHud` renderer (quad-HUD fallback) |
+| `fp-stage` | Implemented | 13 | Stage `.def` parser + parallax background rendering |
 
 > **Naming note:** `fp-vm` is named for a "bytecode VM," but the current implementation is a tree-walk evaluator over an AST — there is no bytecode or stack machine. The behavior (compile-at-load, evaluate-per-tick, never panic) matches the design intent. See [Architecture](docs/architecture.md).
 
@@ -136,7 +136,7 @@ fp-app (binary: SDL2 window, 60Hz loop, CLI, HUD, audio routing)
 - **Struct-based entities** (not ECS), so the expression evaluator has direct field access.
 - **CNS expressions compiled at load** and evaluated per tick; every error path resolves to `0` and never panics.
 - **Cross-entity eval context** — a `Copy` `EvalEnv` threads the opponent/stage/anim through the executor so redirects (`p2`/`enemy`/`root`), `P2Dist`/`P2BodyDist`, and edge triggers work.
-- **Deferred effects** — a tick cannot `&mut` another entity, so it emits requests (sound requests, target ops) into a `TickReport` that the `Match` applies.
+- **Deferred effects** — a tick cannot `&mut` another entity or the match, so it emits requests (sound requests, target ops, `Pause`/`SuperPause` freeze requests) into a `TickReport` that the `Match` applies; the `Match` also spawns hit-spark effect entities on a connecting hit.
 - **Never crash on bad content** — parsers warn-and-skip malformed input and substitute safe defaults.
 
 ## Documentation
@@ -155,9 +155,9 @@ fp-app (binary: SDL2 window, 60Hz loop, CLI, HUD, audio routing)
 
 ## MUGEN compatibility
 
-The goal is a **completely customizable** fighting-game engine: bring your own characters in the original MUGEN formats. All six core formats parse real content today — SFF (v1 inline-PCX and v2 with RLE8/RLE5/LZ5), AIR, CMD, DEF, CNS, and SND.
+The goal is a **completely customizable** fighting-game engine: bring your own characters in the original MUGEN formats. All six core formats parse real content today — SFF (v1 inline-PCX with trailing-palette extraction, and v2 with RLE8/RLE5/LZ5 **plus PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, and SND. The bitmap-font (**FNT v1**) and palette (**ACT**) formats now parse as well.
 
-Known format gaps: **SFF v1 palette extraction** (WinMUGEN-era art currently renders colorless), **PNG sprite decode** (modern HD characters), and **FNT/ACT** (fonts and palette files are not parsed yet). For the full picture of what loads and runs, see [MUGEN Compatibility](docs/mugen-compatibility.md); for guidance on authoring or porting characters, see the [Content Guide](docs/content-guide.md).
+Remaining gaps are mostly about *consuming* what parses rather than parsing it: there's no bundled Elecbyte stage/screenpack/font fixture, ACT palettes aren't yet applied at runtime, and team/turns/tag modes are unimplemented. For the full picture of what loads and runs, see [MUGEN Compatibility](docs/mugen-compatibility.md); for guidance on authoring or porting characters, see the [Content Guide](docs/content-guide.md).
 
 ## Contributing
 
@@ -168,11 +168,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-See [CONTRIBUTING](CONTRIBUTING.md) and [Development](docs/development.md) for conventions. Note that the real-content tests are **asset-gated**: without local KFM content under `test-assets/`, they skip cleanly (this is also why CI's real-content tests run as no-ops — see [Known Issues](docs/known-issues.md)).
+See [CONTRIBUTING](CONTRIBUTING.md) and [Development](docs/development.md) for conventions. Note that the real-*KFM* tests are **asset-gated**: without local KFM content under `test-assets/`, they skip cleanly (which is why CI's KFM-specific tests run as no-ops — see [Known Issues](docs/known-issues.md)). CI is no longer blind to real content, though: it loads, matches, and runs the `validate` CLI against the shipped original `assets/trainingdummy` character on every push.
 
 ## Clean-room & content
 
-Fighters Paradise is a **clean-room** project: **no Elecbyte/MUGEN engine source or copyrighted assets are shipped or tracked.** Kung Fu Man (CC BY-NC 3.0, by Elecbyte) is used **locally only** for testing — `test-assets/` is a gitignored symlink, and zero asset files are committed. Please do not commit any third-party content.
+Fighters Paradise is a **clean-room** project: **no Elecbyte/MUGEN engine source or copyrighted assets are shipped or tracked.** The only tracked content is the project's own **original** assets — `assets/banner.png` and the from-scratch MIT conformance character under `assets/trainingdummy/` (the shippable default and CI fixture). Kung Fu Man (CC BY-NC 3.0, by Elecbyte) is used **locally only** for testing — `test-assets/` is a gitignored symlink, and no third-party asset files are committed. Please do not commit any third-party content.
 
 ## License
 

@@ -7,10 +7,12 @@ reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen_(game_engine
 two-character match** off real Kung Fu Man data.
 
 > Status snapshot (2026-06): a playable best-of-3 fight (P1 keyboard, P2 idle
-> dummy), real KFM data end to end, ~1,724 `#[test]` functions across 14 crates
-> (~1,769 passing including doc/integration tests). Only `fp-stage` and `fp-ui`
-> are still true stubs. See [Known issues](known-issues.md) and the
-> [Roadmap](roadmap.md). For the per-feature MUGEN-fidelity ledger see the
+> dummy), real KFM data end to end, ~2,000 `#[test]` functions across 14 crates
+> (full suite ~2,045 passing including doc/integration tests). **No crate is a
+> true stub anymore** — `fp-stage`, `fp-ui`, and `fp-storyboard` have all
+> graduated; several presentation features are wired but partial or asset-blocked.
+> See [Known issues](known-issues.md) and the [Roadmap](roadmap.md). For the
+> per-feature MUGEN-fidelity ledger see the
 > [faithfulness audit](knowledge-base/08-faithfulness-audit.md).
 
 Related docs: root [README](../README.md) · [MUGEN compatibility](mugen-compatibility.md)
@@ -57,10 +59,11 @@ the root `Cargo.toml` `[workspace.dependencies]` and inherited via
                                                     │          │  SpriteId, FpError
                                                     └──────────┘
 
-Not yet wired into the runtime loop:
-  fp-stage      (STUB — no [BGDef]/[BG]/[Camera] parser)
-  fp-ui         (STUB — HUD is hand-rolled quads in fp-app, not a screenpack)
-  fp-storyboard (parser-only; no consumer crate depends on it)
+Presentation crates (now graduated, consumed by fp-app):
+  fp-stage      (typed [BGDef]/[BG]/[Camera] parser + parallax-camera render)
+  fp-ui         (typed fight.def screenpack model + ScreenpackHud renderer;
+                 falls back to the hand-rolled quad HUD when no fight.def)
+  fp-storyboard (StoryboardPlayer — intro/ending overlay driven by fp-app)
 ```
 
 Edges below are read directly from each crate's `Cargo.toml`:
@@ -77,9 +80,9 @@ Edges below are read directly from each crate's `Cargo.toml`:
 | `fp-engine` | `fp-core`, `fp-character`, `fp-physics`, `fp-input` (+dev `fp-formats`, `fp-combat`) | Two-player `Match` coordinator, round/best-of-N flow |
 | `fp-render` | `fp-core`, `fp-formats` | wgpu palette-lookup sprite renderer |
 | `fp-audio` | `fp-core` | rodio WAV decode + channel-managed playback |
-| `fp-stage` | `fp-core` | **STUB** — stage background/camera |
-| `fp-ui` | `fp-core` | **STUB** — lifebars/screenpack |
-| `fp-storyboard` | `fp-core`, `fp-formats` | Storyboard `.def` parser + typed scene model (no tick/render) |
+| `fp-stage` | `fp-core` | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax-camera render |
+| `fp-ui` | `fp-core` | `fight.def` screenpack model/parser + `ScreenpackHud` renderer (quad-HUD fallback) |
+| `fp-storyboard` | `fp-core`, `fp-formats` | Storyboard `.def` parser + typed scene model + `StoryboardPlayer` (intro/ending playback) |
 | `fp-app` | `fp-core`, `fp-formats`, `fp-character`, `fp-engine`, `fp-audio`, `fp-input`, `fp-physics`, `fp-render` | The binary: window, loop, CLI, HUD, audio routing |
 
 `fp-vm` keeps `fp-formats` as a **dev-only** dependency so its integration tests
@@ -216,22 +219,24 @@ its triggers. This lives in the executor.
 - **Hitpause freeze:** while frozen, only `ignorehitpause`-flagged controllers
   run; animation, state `Time`, and physics are frozen; `shaketime` and invuln
   decrement — `crates/fp-character/src/executor.rs:405-420`.
-- **Dispatch:** a single `eq_ignore_ascii_case` if/else chain handles ~30
+- **Dispatch:** a single `eq_ignore_ascii_case` if/else chain handles ~40
   controller types; anything else falls to a **debug-logged safe no-op** —
-  `crates/fp-character/src/executor.rs:900-981`.
+  `crates/fp-character/src/executor.rs`.
 - After controllers: the air-jump engine built-in
   (`update_air_jump`, `:516`), then `apply_physics` → `integrate_position`
   (ground clamp) → `advance_time` → `advance_animation`.
 
-Dispatched controllers (the ~30 with real arms) include `ChangeState`,
+Dispatched controllers (the ~40 with real arms) include `ChangeState`,
 `SelfState`, `VelSet/VelAdd/VelMul`, `PosSet/PosAdd`, `CtrlSet`,
 `ChangeAnim(+ChangeAnim2)`, `VarSet/VarAdd/VarRangeSet`, `PowerAdd/PowerSet`,
 `AttackMulSet/DefenceMulSet`, `StateTypeSet`, `Turn`, `PlaySnd`, `HitDef`,
-`NotHitBy/HitBy`, and the `Target*` family. Notable **no-ops / missing arms**:
-`Width`, `AssertSpecial`, `SprPriority`, `Pause/SuperPause`, `AfterImage/PalFX`,
-`HitVelSet/HitFallSet/HitFallVel/HitFallDamage`, `LifeAdd`, `Helper`,
-`Projectile`, `Explod`, `EnvShake` — see the
-[audit](knowledge-base/08-faithfulness-audit.md) and [Known issues](known-issues.md).
+`NotHitBy/HitBy`, the `Target*` family, and the formerly-missing
+`Width`, `AssertSpecial`, `SprPriority`, `Pause/SuperPause`,
+`PalFX/AfterImage/AfterImageTime`, `HitOverride`, and the get-hit-vel set
+(`HitVelSet/HitFallSet/HitFallVel/HitFallDamage`) — all now dispatched.
+Still **no-ops / missing arms**: `LifeAdd`, `Helper`, `Projectile`, `Explod`,
+`EnvShake` — see the [audit](knowledge-base/08-faithfulness-audit.md) and
+[Known issues](known-issues.md).
 
 The loader also builds the state graph the executor runs: it merges all CNS files
 first-wins (with `stcommon` last), then merges the `.cmd` `[Statedef -1]`
@@ -290,14 +295,17 @@ the tick returns. This mirrors the read-side keystone (§2.5): cross-entity
 **reads** go through `Option<&EvalCtx>`; cross-entity/global **writes** go through
 `TickReport`.
 
-- `TickReport { sound_requests: Vec<SoundRequest>, target_ops: Vec<TargetOp> }`
-  — `crates/fp-character/src/executor.rs:296-321`.
-- `PlaySnd` pushes a `SoundRequest` (`:201`, emitted at `:1432`) — the `Match`
-  surfaces it to `fp-audio`.
-- `Target*` controllers push a `TargetOp` (`:244`, emitted e.g. at `:1485`) — the
-  `Match` applies them to the opponent via `apply_target_ops`
-  (`crates/fp-engine/src/lib.rs:711-733, 1305-1351`). `Target*` controllers are
-  no-ops when `has_target == false`.
+- `TickReport { sound_requests, target_ops, freeze_request, .. }`
+  — `crates/fp-character/src/executor.rs:372`.
+- `PlaySnd` pushes a `SoundRequest` — the `Match` surfaces it to `fp-audio`.
+- `Target*` controllers push a `TargetOp` — the `Match` applies them to the
+  opponent via `apply_target_ops` (`crates/fp-engine/src/lib.rs`). `Target*`
+  controllers are no-ops when `has_target == false`.
+- `Pause`/`SuperPause` push a `FreezeRequest` onto `freeze_request`
+  (`crates/fp-character/src/executor.rs:2441`) — the `Match` arms its whole-match
+  `Freeze` timer from it (audit #24).
+- On a connecting hit the `Match` also spawns hit-spark `Effect` entities at the
+  contact anchor (attacker-own sparks only; see §3 for why KFM shows none).
 
 `sound_requests` are **replaced** (not accumulated) each tick, so the accessors
 always reflect only the latest tick.
@@ -371,11 +379,15 @@ MUGEN-faithful defaults (`hitflag='MAF'`, `chainid=-1`, `hittimes air=20`,
 type data). Note `animtype` *is* now populated (`= (airborne ? air_animtype :
 animtype).code()`, `combat.rs:232`).
 
-**Not yet implemented in combat** (see [Known issues](known-issues.md)):
-priority/trade clash arbitration (`PriorityType` is data only; combat runs
-strictly sequentially P1→P2 then P2→P1), global `Pause/SuperPause` freeze (only
-per-character hitpause exists), hit-spark spawning/rendering (anchor is computed
-but never emitted), and on-hit power gain/transfer (`getpower`/`givepower`).
+**Now implemented since the audit run:** priority/trade clash arbitration
+(`fp-combat::resolve_clash` + an `fp-engine` reconciled pass, audit #20), global
+`Pause/SuperPause` freeze (an `fp-engine` whole-match `Freeze` timer, #24), and
+on-hit power gain/transfer (`getpower`/`givepower` in `resolve_attack`, #18).
+**Hit-spark spawning** has effect-entity infrastructure (the contact anchor is
+emitted and the attacker-own spark path spawns/ticks/expires), but it stays
+**dark for conventional content**: KFM authors *common*-`fightfx` `sparkno` and
+no `fightfx.sff` loader exists yet, so KFM shows no visible spark (audit #17,
+Partial — see [Known issues](known-issues.md)).
 
 ---
 
@@ -424,8 +436,9 @@ time-over compares life; a draw credits neither. First to `rounds_to_win`
 
 > **Super meter** is carried across rounds within a match: `reset_fighter_for_round`
 > deliberately does *not* reset `power` (`crates/fp-engine/src/lib.rs:1186-1222`).
-> Power is added by `PowerAdd`/`PowerSet` controllers and `TargetPowerAdd`; there
-> is no power bar in the HUD yet, and no on-hit power gain.
+> Power is added by `PowerAdd`/`PowerSet` controllers, `TargetPowerAdd`, and the
+> HitDef `getpower`/`givepower` on-hit gain (audit #18). The HUD now draws a blue
+> **power bar** under each life bar (audit #26).
 
 ---
 
@@ -454,14 +467,21 @@ does the palette lookup, so palette swaps are cheap (no texture re-upload).
 > pass and a fresh bind group per sprite (fine for two fighters + a few HUD
 > quads, won't scale to many sprites). The `AnimController` and `TextureAtlas`
 > helpers are implemented and tested but **unwired** (the app advances animation
-> cursors itself). SFF v1 inline palettes are not yet extracted, so WinMUGEN-era
-> art renders colorless (audit #25); PNG-encoded SFF sprites are an explicit
-> unsupported stub (audit #35).
+> cursors itself). SFF v1 inline palettes and PNG-encoded SFF v2 sprites
+> (Png8/24/32) now **decode**, so both WinMUGEN-era and modern HD art render
+> (audit #25/#35, both Resolved).
 
-The HUD today (`Hud`, `crates/fp-app/src/main.rs:627-731`) is **hand-rolled solid
-quads** — two life bars + a centered KO/win marker drawn from 1×1 indexed quads —
-*not* a `fight.def`/`fight.sff` screenpack, and there is no text rendering (no FNT
-parser yet). The real screenpack belongs to `fp-ui` (still a stub).
+There are now **two HUD paths**. The real screenpack lives in `fp-ui`: it parses
+a `fight.def` into a typed `ScreenpackLayout` and draws life bars, power bars,
+names, the round announcer, and the timer from `fight.sff` + FNT fonts via
+`ScreenpackHud` (`crates/fp-ui/src/{screenpack,renderer}.rs`); `fp-app` loads it
+when a `fight.def` is found (or via `FP_SCREENPACK`). When no `fight.def` is
+present it falls back to the **hand-rolled quad HUD** (`Hud`,
+`crates/fp-app/src/main.rs`) — life bars + a blue power bar + a centered KO/win
+marker from 1×1 indexed quads. A MUGEN bitmap-font **FNT v1 parser** and a
+`fp-render` `draw_text`/glyph path now exist and feed the screenpack; the legacy
+quad HUD is not yet wired to `draw_text`, and FNT is asset-blocked (no real
+`.fnt` fixture ships) — see audit #30/#31, both Partial.
 
 ---
 

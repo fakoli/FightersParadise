@@ -7,8 +7,10 @@ characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 > **Current state (not v0.1.0 stubs):** this is a **playable two-character fighter**. `fp-app` renders a
 > two-character `fp_engine::Match` (P1 = keyboard), a life HUD, KO/winner readout, and best-of-3 rounds,
 > driven by **real Kung Fu Man data**. KFM's signature throw, supers (meter), hitpause, i-frames, hit
-> reactions, jump/airjump/land, and damage multipliers all work end to end. Only `fp-stage` and `fp-ui`
-> are still true stubs. See [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md)
+> reactions, jump/airjump/land, and damage multipliers all work end to end. **No crate is a true stub
+> anymore** — `fp-stage` (parallax backgrounds), `fp-ui` (`fight.def` screenpack), and `fp-storyboard`
+> (intro/ending playback) have all graduated; several presentation features are wired but
+> partial/asset-blocked. See [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md)
 > for what's missing.
 
 ## Build & Run
@@ -18,7 +20,8 @@ cargo build --workspace                              # Build everything
 cargo run -p fp-app                                  # Default: two-KFM match (test-assets/kfm/kfm.def)
 cargo run -p fp-app -- p1.def [p2.def]               # Two-character match (one .def = same char both sides)
 cargo run -p fp-app -- file.sff [file.air]           # Legacy sprite/animation viewer
-cargo test --workspace                               # Run all tests (~1769 pass incl. doc tests)
+cargo test --workspace                               # Run all tests (~2045 pass incl. doc tests)
+cargo run -p fp-app -- validate char.def             # Character validator (lints a .def's assets/states)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
 ```
 
@@ -38,25 +41,26 @@ cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
 ## Project Structure
 
 Cargo workspace, 14 crates under `crates/` (edition 2021, resolver v2, MIT). Deps are declared once in the
-root `[workspace.dependencies]` and inherited via `.workspace = true`. **Only `fp-stage` and `fp-ui` are
-stubs** (7-line module-doc files); everything else is implemented and tested.
+root `[workspace.dependencies]` and inherited via `.workspace = true`. **No crate is a stub anymore** —
+`fp-stage`, `fp-ui`, and `fp-storyboard` have all graduated; everything is implemented and tested (a few
+presentation features are partial/asset-blocked — see "Architecture Notes" and the doc table).
 
 | Crate | Tests | Status | Purpose |
 |-------|------:|--------|---------|
-| `fp-character` | 620 | Implemented | Loader (`.def`→`LoadedCharacter`) + live `Character` entity + per-tick MUGEN-order executor (~30 state controllers) + cross-entity `EvalContext`. **Largest crate.** |
-| `fp-vm` | 463 | Implemented | CNS expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). Triggers, redirects, `Value` model. |
-| `fp-formats` | 142 | Implemented | Parsers: SFF v1 (PCX) + SFF v2 (RLE8/RLE5/LZ5/raw), AIR, CMD, DEF, CNS, SND. **PNG decode, SFF v1 palette, FNT/ACT pending.** |
-| `fp-input` | 102 | Implemented | 60-frame ring buffer + command recognition (incl. `~` `/` `$` `>` `+` symbols). |
-| `fp-engine` | 96 | Implemented | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op application. |
-| `fp-physics` | 79 | Implemented | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. No friction (that's `fp-character`). |
-| `fp-combat` | 60 | Implemented | `HitDef` data model, `Clsn1`×`Clsn2` hit primitive, pure `resolve_hit` → `HitOutcome`, `GetHitVars`. Pure data/geometry/decision leaf. |
-| `fp-app` | 49 | Implemented | SDL2 window, 60Hz accumulator loop, CLI args, hand-rolled HUD, two-player match wiring, audio routing. |
-| `fp-storyboard` | 44 | Parser only | Storyboard `.def` parser + typed scene model. **No tick/render, no consumer.** |
-| `fp-audio` | 32 | Implemented | rodio WAV decode + channel-managed playback (`PlaySnd` + HitDef impact sounds); `NullBackend` headless fallback. |
-| `fp-render` | 22 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent). |
-| `fp-core` | 15 | Implemented | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |
-| `fp-stage` | 0 | **Stub** | Empty — no `[BGDef]`/`[BG]`/`[Camera]` parser; matches render over a flat clear color. |
-| `fp-ui` | 0 | **Stub** | Empty — HUD is hand-rolled solid quads in `fp-app`, not a `fight.def`/`fight.sff` screenpack. |
+| `fp-character` | 692 | Implemented | Loader (`.def`→`LoadedCharacter`) + live `Character` entity + per-tick MUGEN-order executor (~40 state controllers) + cross-entity `EvalContext`. **Largest crate.** |
+| `fp-vm` | 491 | Implemented | CNS expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). Triggers, redirects, `Value` model, proptest fuzz, arith NaN→Bottom. |
+| `fp-formats` | 182 | Implemented | Parsers: SFF v1 (PCX **+ trailing-palette extraction**) + SFF v2 (RLE8/RLE5/LZ5/raw **+ PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, SND, **FNT v1, ACT palette**. |
+| `fp-input` | 103 | Implemented | 60-frame ring buffer + command recognition (incl. `~` `/` `$` `>` `+` symbols). |
+| `fp-engine` | 121 | Implemented | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op application, clash/trade resolution, Pause/SuperPause freeze, hit-spark effect entities. |
+| `fp-physics` | 90 | Implemented | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. No friction (that's `fp-character`). |
+| `fp-combat` | 84 | Implemented | `HitDef` data model, `Clsn1`×`Clsn2` hit primitive, pure `resolve_hit` → `HitOutcome`, `resolve_clash`, `GetHitVars`. Pure data/geometry/decision leaf. |
+| `fp-app` | 89 | Implemented | SDL2 window, 60Hz accumulator loop, CLI args (incl. `validate`), hand-rolled HUD, two-player match wiring, audio routing, Clsn debug overlay (F1). |
+| `fp-storyboard` | 63 | Implemented | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. (Per-scene fade/clearcolor/BGM not yet applied.) |
+| `fp-audio` | 34 | Implemented | rodio WAV decode + channel-managed playback (`PlaySnd` + HitDef impact sounds); `NullBackend` headless fallback. |
+| `fp-render` | 46 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent), PalFX color-tint uniform, debug-box + `draw_text`/glyph primitives. |
+| `fp-core` | 20 | Implemented | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |
+| `fp-stage` | 13 | Implemented | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax camera render in `fp-app`. (Tile/velocity/mask/`type=anim` and vertical-follow parsed-not-rendered; no real stage fixture.) |
+| `fp-ui` | 17 | Implemented | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it (falls back to the quad HUD when absent). ([Combo]/[Face] parsed-not-drawn; single bg layer; no real fixture.) |
 
 ~59,000 LOC across 14 crates. Dependency graph: `fp-app` → `fp-engine` → `fp-character` → `fp-vm` /
 `fp-combat` / `fp-physics` / `fp-input`; `fp-combat` depends only on `fp-core` + `fp-physics`; everything
@@ -82,14 +86,16 @@ These are the keystones a new session (or maintainer) must understand first.
   `EvalContext` (`redirect()` always `None`); the `EvalCtx` wrapper resolves `p2`/`enemy`/`enemynear`→opponent
   and `root`→self, and computes `P2Dist`/`P2BodyDist`/edge distances/`ScreenPos`/`SelfAnimExist`/`P2Life`.
   `parent`/`helper`/`target`/`partner`/`playerid` resolve to `None` (no helper graph / teams yet).
-- **Deferred-effects pattern (`TickReport`).** A tick cannot `&mut` another entity, so a character emits
-  requests — `sound_requests` (`PlaySnd`) and `target_ops` (`Target*` throw controllers) — into a
-  `TickReport`, and `fp-engine`'s `Match` applies them after both characters tick. Same idea for
-  cross-entity *reads* via `Option<&dyn EvalContext>`.
-- **Executor dispatch** is one `eq_ignore_ascii_case` if/else chain (executor.rs:900-981). ~30 controllers
-  are handled; **any unhandled controller falls to a debug-logged safe no-op** (this is how missing
-  features like `Width`, `AssertSpecial`, `SprPriority`, `Pause`/`SuperPause`, `AfterImage`/`PalFX`,
-  get-hit vel controllers currently behave).
+- **Deferred-effects pattern (`TickReport`).** A tick cannot `&mut` another entity (or the match itself),
+  so a character emits requests — `sound_requests` (`PlaySnd`), `target_ops` (`Target*` throw controllers),
+  and `freeze_request` (`Pause`/`SuperPause`, a `FreezeRequest`) — into a `TickReport`, and `fp-engine`'s
+  `Match` applies them after both characters tick (it also spawns hit-spark `Effect` entities on a
+  connecting hit). Same idea for cross-entity *reads* via `Option<&dyn EvalContext>`.
+- **Executor dispatch** is one `eq_ignore_ascii_case` if/else chain. ~40 controllers are now handled —
+  including `AssertSpecial`, `Width`, `SprPriority`, `Pause`/`SuperPause`, `PalFX`/`AfterImage`/
+  `AfterImageTime`, `HitOverride`, and the get-hit-vel set (`HitVelSet`/`HitFallSet`/`HitFallVel`/
+  `HitFallDamage`), all of which used to fall through to the no-op. **Any still-unhandled controller falls
+  to a debug-logged safe no-op.**
 - **Hit application lives in `fp-character`, not `fp-combat`/`fp-engine`.** `fp-combat` is the pure
   data + geometry + `resolve_hit` decision; the detect→resolve→**apply** bridge (`GetHitVars`, hitpause,
   damage multipliers, knockback, invuln gating) is `fp_character::combat::resolve_attack` (combat.rs).
@@ -106,23 +112,29 @@ These are the keystones a new session (or maintainer) must understand first.
 | `Character` entity, `EvalContext`/`EvalCtx`, triggers, `resolve_const` | `crates/fp-character/src/lib.rs` |
 | Hit application (`resolve_attack`, GetHitVars, multipliers) | `crates/fp-character/src/combat.rs` |
 | NotHitBy/HitBy i-frame windows | `crates/fp-character/src/invuln.rs` |
-| Two-player `Match`, tick order, round flow, `apply_target_ops` | `crates/fp-engine/src/lib.rs` |
-| `HitDef`, `detect_hit`/`detect_hit_contact`, pure `resolve_hit` | `crates/fp-combat/src/lib.rs` |
+| Two-player `Match`, tick order, round flow, `apply_target_ops`, freeze, `Effect` spawns | `crates/fp-engine/src/lib.rs` |
+| `HitDef`, `detect_hit`/`detect_hit_contact`, pure `resolve_hit`, `resolve_clash` | `crates/fp-combat/src/lib.rs` |
 | Expression lexer / parser / evaluator | `crates/fp-vm/src/lexer.rs` · `parser.rs` · `evaluator.rs` |
 | `Value` model + `EvalContext` trait (the seam) | `crates/fp-vm/src/eval.rs` |
-| SFF orchestration + version detect + decode dispatch | `crates/fp-formats/src/sff/mod.rs` |
-| SFF codecs (RLE8/RLE5/LZ5 + PNG stub) | `crates/fp-formats/src/sff/compression.rs` |
-| SFF v1 PCX container (note: no palette extraction) | `crates/fp-formats/src/sff/v1.rs` |
+| SFF orchestration + version detect + decode dispatch (`decode_sprite_rgba`) | `crates/fp-formats/src/sff/mod.rs` |
+| SFF codecs (RLE8/RLE5/LZ5 + PNG8/24/32 decode) | `crates/fp-formats/src/sff/compression.rs` |
+| SFF v1 PCX container + trailing-palette extraction | `crates/fp-formats/src/sff/v1.rs` |
 | CNS parser (largest text parser) | `crates/fp-formats/src/cns.rs` |
 | AIR / CMD / DEF / SND parsers | `crates/fp-formats/src/{air,cmd,def,snd}.rs` |
+| FNT v1 bitmap-font parser + ACT palette parser | `crates/fp-formats/src/{fnt,act}.rs` |
 | Command compile + backward-scan matcher | `crates/fp-input/src/command.rs` |
 | Input ring buffer | `crates/fp-input/src/buffer.rs` |
 | Physics integration + ground plane | `crates/fp-physics/src/lib.rs` |
 | AABB collision + `place_clsn` facing mirror | `crates/fp-physics/src/collision.rs` |
-| wgpu renderer + 3 blend pipelines | `crates/fp-render/src/renderer.rs` |
-| Palette-lookup fragment shader | `crates/fp-render/src/shaders/palette.wgsl` |
+| wgpu renderer + 3 blend pipelines + debug-box primitive | `crates/fp-render/src/renderer.rs` |
+| Palette-lookup + PalFX-tint fragment shader | `crates/fp-render/src/shaders/palette.wgsl` |
+| Text / glyph rendering (`draw_text`) | `crates/fp-render/src/text.rs` |
 | Audio backend + cut-off policy | `crates/fp-audio/src/system.rs` |
+| Stage `[BGDef]`/`[BG]`/`[Camera]` parser + parallax model | `crates/fp-stage/src/lib.rs` |
+| `fight.def` screenpack model/parser + `ScreenpackHud` renderer | `crates/fp-ui/src/{screenpack,renderer}.rs` |
+| Storyboard `StoryboardPlayer` (intro/ending playback) | `crates/fp-storyboard/src/player.rs` |
 | App: CLI modes, 60Hz loop, HUD, audio routing | `crates/fp-app/src/main.rs` |
+| Character validator CLI (`validate` subcommand) | `crates/fp-app/src/validate.rs` |
 
 ## Code Conventions
 
@@ -156,15 +168,17 @@ MUGEN community content is messy. Parsers and the evaluator must:
 
 ### Game Loop
 - Fixed 60Hz timestep (16.667ms/tick); `accumulator` pattern; render after update, outside the tick loop.
-- Known gap (#27): input is currently sampled *inside* the catch-up loop, so a multi-tick frame re-reads
-  the same keyboard state.
+- Keyboard is sampled **once per frame** (before the catch-up loop), so a multi-tick frame reuses one
+  consistent input snapshot rather than re-reading the keyboard per tick (audit #27, done).
 
 ### Testing
 - Unit tests per module via `#[cfg(test)] mod tests`; binary parsers tested with synthetic byte arrays.
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` must both pass clean.
-- **CI caveat (#36):** real-content tests are asset-gated and `test-assets/` is gitignored with no CI fetch
-  step, so the real-KFM regression net runs as **green no-ops on CI** — only synthetic tests truly execute
-  there. Run the suite locally with KFM linked to actually exercise real content.
+- **CI note:** the real-*KFM* regression tests are still asset-gated (`test-assets/` is gitignored with no
+  CI fetch step), so they run as **green no-ops on CI** — run the suite locally with KFM linked to exercise
+  real KFM. But CI is no longer blind to real content (audit #36, done): it loads, matches, and runs the
+  `validate` CLI against the shipped original `assets/trainingdummy` character and fails the build on
+  regressions. Those trainingdummy tests are **not** asset-gated.
 
 ## Dev Loop, Worktrees & Clean-Room
 
