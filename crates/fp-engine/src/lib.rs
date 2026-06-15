@@ -66,7 +66,8 @@ use fp_combat::{
 use fp_core::{Rect, SpriteId, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
-    logical_direction, Button, CommandDef, CommandMatcher, Direction, InputBuffer, InputState,
+    logical_direction, AiObservation, Button, CommandDef, CommandMatcher, Direction, InputBuffer,
+    InputState,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,30 @@ impl MatchInput {
             x: false,
             y: false,
             z: false,
+        }
+    }
+}
+
+impl From<InputState> for MatchInput {
+    /// Folds a raw [`fp_input::InputState`] (the snapshot a keyboard sampler or
+    /// the [`fp_input::CpuAi`] produces) into a [`MatchInput`] (T018).
+    ///
+    /// Both carry absolute screen directions + the six attack buttons, so this is
+    /// a straight field copy. It lets the CPU-AI controller, which emits an
+    /// `InputState`, drive [`Match::tick`] without the caller hand-mapping each
+    /// field. `Start` is intentionally dropped — `tick` takes no pause signal.
+    fn from(s: InputState) -> Self {
+        MatchInput {
+            left: s.direction.left,
+            right: s.direction.right,
+            up: s.direction.up,
+            down: s.direction.down,
+            a: s.button(Button::A),
+            b: s.button(Button::B),
+            c: s.button(Button::C),
+            x: s.button(Button::X),
+            y: s.button(Button::Y),
+            z: s.button(Button::Z),
         }
     }
 }
@@ -1329,6 +1354,30 @@ impl Match {
     #[must_use]
     pub fn p2(&self) -> &Player {
         &self.p2
+    }
+
+    /// The [`fp_input::AiObservation`] a CPU AI controlling **player 2** sees this
+    /// frame: where player 1 (its opponent) is relative to it (T018).
+    ///
+    /// Pair with a [`fp_input::CpuAi`]: call this each frame, feed it to
+    /// [`fp_input::CpuAi::decide`], and pass the resulting `InputState` (via
+    /// `MatchInput::from`) as the `p2_input` to [`Match::tick`]. This is the
+    /// glue that lets an idle P2 slot be driven by the baseline AI.
+    #[must_use]
+    pub fn ai_observation_for_p2(&self) -> AiObservation {
+        AiObservation {
+            opponent_dx: self.p1.pos().x - self.p2.pos().x,
+        }
+    }
+
+    /// The [`fp_input::AiObservation`] a CPU AI controlling **player 1** sees this
+    /// frame: where player 2 is relative to it (mirror of
+    /// [`Match::ai_observation_for_p2`], for an AI-vs-AI / demo match).
+    #[must_use]
+    pub fn ai_observation_for_p1(&self) -> AiObservation {
+        AiObservation {
+            opponent_dx: self.p2.pos().x - self.p1.pos().x,
+        }
     }
 
     /// Consumes the match and returns its two [`Player`]s as `(p1, p2)`, dropping
@@ -8694,6 +8743,225 @@ time = 1
         assert_eq!(
             m.p1().character.vars[0], 1,
             "`target` redirect resolved to the hit opponent (life > 0), not 0"
+        );
+    }
+
+    // ---- T018: baseline CPU AI drives an otherwise-idle player 2 ------------
+
+    /// The minimal `.cmd` for the AI integration tests: the four facing-relative
+    /// hold commands the engine locomotion reads, plus a `punch = a` button
+    /// command matching the attack button the [`fp_input::CpuAi`] presses.
+    const AI_CMD: &str = "\
+[Command]
+name = \"holdfwd\"
+command = /$F
+time = 1
+
+[Command]
+name = \"holdback\"
+command = /$B
+time = 1
+
+[Command]
+name = \"holdup\"
+command = /$U
+time = 1
+
+[Command]
+name = \"holddown\"
+command = /$D
+time = 1
+
+[Command]
+name = \"punch\"
+command = a
+time = 1
+";
+
+    /// Builds a [`Match`] where P2 carries [`AI_CMD`] so its real
+    /// [`CommandMatcher`] recognizes the AI's emitted inputs, driven into the
+    /// live fight phase. P1 sits on the left, P2 on the right (facing each other).
+    fn ai_match() -> Match {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_type = StateType::Standing;
+        p1c.move_type = MoveType::Idle;
+
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.state_type = StateType::Standing;
+        p2c.move_type = MoveType::Idle;
+
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, loaded_with_cmd(air_with(0, vec![], vec![]), AI_CMD));
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Acceptance: an out-of-range CPU AI on P2 emits inputs that the engine
+    /// recognizes as P2's `holdfwd` — i.e. it moves *toward* the opponent. P2
+    /// faces left (P1 is to its left), so "toward" is screen-left; the AI sees
+    /// P1 to its left via the observation and holds left, which P2's
+    /// facing-relative matcher resolves to `holdfwd`.
+    #[test]
+    fn ai_approaches_when_out_of_range() {
+        let mut m = ai_match();
+        assert_eq!(m.p2().facing(), Facing::Left, "P2 faces P1 (to its left)");
+        // Wide gap -> out of range for Normal (attack_range 60).
+        assert!(
+            (m.p1().pos().x - m.p2().pos().x).abs() > 60.0,
+            "fixture must start out of attack range"
+        );
+
+        // No-jump tuning so the approach direction is unambiguous.
+        let mut ai = {
+            let mut t = fp_input::AiTuning::for_difficulty(fp_input::AiDifficulty::Normal);
+            t.jump_chance = 0;
+            fp_input::CpuAi::with_tuning(1, t)
+        };
+
+        let mut approached = false;
+        for _ in 0..30 {
+            let obs = m.ai_observation_for_p2();
+            assert!(
+                obs.opponent_dx < 0.0,
+                "P1 is to P2's left, so observed dx must be negative"
+            );
+            let p2_input: MatchInput = ai.decide(obs).into();
+            assert!(
+                p2_input.left && !p2_input.right,
+                "out of range the AI holds left (toward P1)"
+            );
+            m.tick(MatchInput::none(), p2_input);
+            if m.p2().character.commands.is_active("holdfwd") {
+                approached = true;
+            }
+        }
+        assert!(
+            approached,
+            "the AI's toward-opponent input must activate P2's `holdfwd` command"
+        );
+    }
+
+    /// Acceptance: an in-range CPU AI on P2 attacks — its emitted input fires
+    /// P2's `punch` (light-punch `a`) button command on the great majority of
+    /// frames (occasionally it guards, per difficulty).
+    #[test]
+    fn ai_attacks_when_in_range() {
+        let mut m = ai_match();
+        // Force point-blank so the AI is clearly in attack range.
+        m.p1.character.pos.x = -5.0;
+        m.p2.character.pos.x = 5.0;
+
+        // Suppress jumps so the in-range decision is purely attack-vs-block.
+        let mut ai = {
+            let mut t = fp_input::AiTuning::for_difficulty(fp_input::AiDifficulty::Normal);
+            t.jump_chance = 0;
+            fp_input::CpuAi::with_tuning(7, t)
+        };
+
+        let frames = 60;
+        let mut punch_frames = 0;
+        for _ in 0..frames {
+            // Keep the two point-blank each frame (the synthetic chars have no
+            // walk locomotion to drift them apart, but push could).
+            m.p1.character.pos.x = -5.0;
+            m.p2.character.pos.x = 5.0;
+            let obs = m.ai_observation_for_p2();
+            assert!(
+                obs.distance() <= 60.0,
+                "fixture must keep the AI in attack range"
+            );
+            let p2_input: MatchInput = ai.decide(obs).into();
+            m.tick(MatchInput::none(), p2_input);
+            if m.p2().character.commands.is_active("punch") {
+                punch_frames += 1;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        // The AI pulses (presses at most every other frame) and occasionally
+        // guards, so it lands the `punch` command on a large minority of frames.
+        assert!(
+            punch_frames > frames / 4,
+            "in range the AI must attack on many frames; punched {punch_frames}/{frames}"
+        );
+    }
+
+    /// Replay safety: two matches driven by two CPU AIs seeded identically, each
+    /// fed the live observation from its own match, stay bit-identical across
+    /// many frames (deterministic given the same seed + state).
+    #[test]
+    fn ai_driven_match_is_deterministic_for_a_fixed_seed() {
+        let mut a = ai_match();
+        let mut b = ai_match();
+        let mut ai_a = fp_input::CpuAi::new(99, fp_input::AiDifficulty::Hard);
+        let mut ai_b = fp_input::CpuAi::new(99, fp_input::AiDifficulty::Hard);
+
+        for _ in 0..120 {
+            let in_a: MatchInput = ai_a.decide(a.ai_observation_for_p2()).into();
+            let in_b: MatchInput = ai_b.decide(b.ai_observation_for_p2()).into();
+            assert_eq!(in_a, in_b, "same-seed AIs must emit identical inputs");
+            a.tick(MatchInput::none(), in_a);
+            b.tick(MatchInput::none(), in_b);
+            // Whole-match state stays in lockstep.
+            assert_eq!(a.p2().pos(), b.p2().pos());
+            assert_eq!(a.p2().life(), b.p2().life());
+            assert_eq!(a.p1().life(), b.p1().life());
+            assert_eq!(a.round_state(), b.round_state());
+        }
+    }
+
+    /// The `InputState -> MatchInput` bridge copies every field straight through.
+    #[test]
+    fn input_state_into_match_input_round_trips() {
+        let mut s = InputState::default();
+        s.direction.left = true;
+        s.direction.up = true;
+        s.set_button(Button::A, true);
+        s.set_button(Button::Z, true);
+        let m: MatchInput = s.into();
+        assert!(m.left && m.up && m.a && m.z);
+        assert!(!m.right && !m.down && !m.b && !m.c && !m.x && !m.y);
+    }
+
+    /// KFM-gated (skips without the fixture): a real-character match where P2 is
+    /// driven only by the baseline AI physically closes the gap on P1 — the
+    /// strongest form of "approaches and attacks for a given opponent distance".
+    #[test]
+    fn ai_closes_the_gap_on_a_real_kfm_opponent() {
+        let Some(mut m) = two_kfm_match() else {
+            return;
+        };
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
+        let gap_before = (m.p1().pos().x - m.p2().pos().x).abs();
+
+        // No-jump AI so it walks straight in rather than hopping.
+        let mut ai = {
+            let base = fp_input::CpuAi::new(3, fp_input::AiDifficulty::Hard);
+            let mut t = base.tuning();
+            t.jump_chance = 0;
+            fp_input::CpuAi::with_tuning(3, t)
+        };
+
+        for _ in 0..120 {
+            let p2_input: MatchInput = ai.decide(m.ai_observation_for_p2()).into();
+            m.tick(MatchInput::none(), p2_input);
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        let gap_after = (m.p1().pos().x - m.p2().pos().x).abs();
+        assert!(
+            gap_after < gap_before,
+            "the AI-driven P2 must close the gap on P1 ({gap_before} -> {gap_after})"
         );
     }
 }
