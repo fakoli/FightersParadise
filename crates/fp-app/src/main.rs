@@ -664,7 +664,16 @@ fn build_player(
     entity.ctrl = true;
     entity.anim = STATE_STAND; // action 0 == stand
 
-    // Apply the requested `.act` palette override (FL2b). A selection that the
+    // Pick the costume palette. An explicit `--p1-pal`/`--p2-pal` flag wins;
+    // otherwise fall back to the character's DEFAULT costume — MUGEN renders the
+    // first `pal.defaults` / `pal1` `.act` palette by default, not the SFF-embedded
+    // one. That default is what makes CvS-style characters (e.g. evilken, whose
+    // embedded palette is a dark placeholder) render in real colors instead of
+    // near-black. A character that ships no `.act` palettes (Kung Fu Man) yields
+    // `None` here and keeps its SFF-embedded palette exactly as before.
+    let pal_selection = pal_selection.or_else(|| loaded.default_palette_index());
+
+    // Apply the chosen `.act` palette override (FL2b). A selection that the
     // character cannot honor (no such override slot) is warn-logged and left as
     // the embedded palette so the costume swap never crashes or shows blank.
     if let Some(sel) = pal_selection {
@@ -6014,6 +6023,36 @@ mod tests {
         // And no selection leaves the embedded palette too.
         let plain = build_player(&def, P1_START_X, None).expect("kfm loads");
         assert_eq!(plain.character.active_palette(), None);
+    }
+
+    /// With NO explicit `--pN-pal` flag, a character that ships `.act` palettes
+    /// (evilken) defaults to its costume palette (pal1, index 0) rather than the
+    /// SFF-embedded one — the black-screen fix. An explicit flag still overrides
+    /// the default. Gated on the local evilken asset.
+    #[test]
+    fn build_player_defaults_to_costume_palette_when_act_present() {
+        let def = test_asset("evilken/evilken.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        // No flag → defaults to pal1 (the costume), not the SFF-embedded palette.
+        let Ok(defaulted) = build_player(&def, P1_START_X, None) else {
+            eprintln!("skipping: evilken.def failed to build");
+            return;
+        };
+        assert_eq!(
+            defaulted.character.active_palette(),
+            Some(0),
+            "evilken must default to its costume palette (pal1) so it renders in color"
+        );
+        // An explicit flag still wins over the default.
+        let chosen = build_player(&def, P1_START_X, Some(3)).expect("evilken builds");
+        assert_eq!(
+            chosen.character.active_palette(),
+            Some(3),
+            "an explicit --pN-pal flag must override the default costume"
+        );
     }
 
     // ---- common-effects (fightfx) load path (audit #17) ----------------------
