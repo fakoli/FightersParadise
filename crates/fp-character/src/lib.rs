@@ -913,6 +913,138 @@ impl Default for AfterImageState {
     }
 }
 
+/// A live screen-shake effect armed by the `EnvShake` state controller (T015).
+///
+/// MUGEN's `EnvShake` shakes the camera for [`time`](Self::time) ticks at a
+/// vertical [`ampl`](Self::ampl)itude (pixels) and [`freq`](Self::freq)uency,
+/// optionally [`phase`](Self::phase)-offset. The screen shake itself is a
+/// camera-level effect owned by the renderer (`fp-app`), so this models the
+/// controllable parameters and counts the duration down each tick; the renderer
+/// reads [`Character::env_shake`] and offsets the camera while it is active.
+/// Inactive ([`time`](Self::time) `<= 0`) by default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EnvShake {
+    /// Remaining shake duration in ticks. `0` (or less) = inactive.
+    pub time: i32,
+    /// Shake frequency, MUGEN units `0..180` (degrees of phase advance per tick).
+    pub freq: f32,
+    /// Vertical shake amplitude in pixels (MUGEN default `-4`).
+    pub ampl: f32,
+    /// Phase offset in degrees (MUGEN default `0`).
+    pub phase: f32,
+}
+
+impl EnvShake {
+    /// The inactive default: no shake.
+    pub const INACTIVE: Self = Self {
+        time: 0,
+        freq: 60.0,
+        ampl: -4.0,
+        phase: 0.0,
+    };
+
+    /// Returns `true` while the shake is still running ([`time`](Self::time) `> 0`).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.time > 0
+    }
+
+    /// Counts the shake down by one tick, clearing it when it expires. Called
+    /// once per non-hit-paused tick.
+    pub fn tick(&mut self) {
+        if self.time > 0 {
+            self.time -= 1;
+            if self.time <= 0 {
+                *self = Self::INACTIVE;
+            }
+        }
+    }
+}
+
+impl Default for EnvShake {
+    fn default() -> Self {
+        Self::INACTIVE
+    }
+}
+
+/// A live full-screen color flash armed by the `EnvColor` state controller (T015).
+///
+/// MUGEN's `EnvColor` fills the screen with a solid [`col`](Self::col)or for
+/// [`time`](Self::time) ticks (the classic "super flash" white-out). `under`
+/// selects whether the fill is drawn *under* the characters (`true`) or over
+/// everything (`false`, the default). This is a screen-level effect owned by the
+/// renderer (`fp-app`); this models the parameters and counts the duration down.
+/// Inactive ([`time`](Self::time) `<= 0`) by default.
+///
+/// MUGEN's `EnvColor time = -1` ("until cleared") is modeled as a long but
+/// finite window so it always expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvColor {
+    /// Remaining fill duration in ticks. `0` (or less) = inactive.
+    pub time: i32,
+    /// The fill color as a `[r, g, b]` triple in `0..=255` (MUGEN default white).
+    pub col: [u8; 3],
+    /// Draw the fill *under* the characters (`true`) or over everything
+    /// (`false`, MUGEN's default).
+    pub under: bool,
+}
+
+impl EnvColor {
+    /// The inactive default: no fill.
+    pub const INACTIVE: Self = Self {
+        time: 0,
+        col: [255, 255, 255],
+        under: false,
+    };
+
+    /// Returns `true` while the fill is still running ([`time`](Self::time) `> 0`).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.time > 0
+    }
+
+    /// Counts the fill down by one tick, clearing it when it expires. Called once
+    /// per non-hit-paused tick.
+    pub fn tick(&mut self) {
+        if self.time > 0 {
+            self.time -= 1;
+            if self.time <= 0 {
+                *self = Self::INACTIVE;
+            }
+        }
+    }
+}
+
+impl Default for EnvColor {
+    fn default() -> Self {
+        Self::INACTIVE
+    }
+}
+
+/// A palette-remap selection armed by the `RemapPal` state controller (T015).
+///
+/// MUGEN's `RemapPal` swaps the character's palette to a different `(group, item)`
+/// in the palette table (`source = sg, si` → `dest = dg, di`), used for alternate
+/// costume colors mid-match. We model the selection so the renderer can pick the
+/// matching loaded palette; a `dest` of `(-1, -1)` (or a [`None`]) restores the
+/// default palette. The actual palette pixels live on the static
+/// [`LoadedCharacter`](crate::LoadedCharacter), so this stores only the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RemapPal {
+    /// The source palette `(group, item)`, or `None` for the sprite default.
+    pub source: Option<(i32, i32)>,
+    /// The destination palette `(group, item)`, or `None` to restore the default.
+    pub dest: Option<(i32, i32)>,
+}
+
+impl RemapPal {
+    /// Returns `true` while a non-default remap is selected.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.dest.is_some()
+    }
+}
+
 /// The number of `HitOverride` slots a character carries (MUGEN's `slot = 0..7`).
 pub const NUM_HIT_OVERRIDE_SLOTS: usize = 8;
 
@@ -1603,6 +1735,107 @@ pub struct Character {
     /// snapshot. An index past the end of the loaded palettes resolves to `None`
     /// (the SFF-embedded palette), never a panic.
     pub active_palette: Option<usize>,
+
+    /// The character's live `EnvShake` camera-shake effect (T015).
+    ///
+    /// Set by the `EnvShake` controller and counted down each non-hit-paused
+    /// tick. The renderer (`fp-app`) reads [`Character::env_shake`] and offsets
+    /// the camera while it is active. Inactive by default. See [`EnvShake`].
+    pub env_shake: EnvShake,
+
+    /// The character's live `EnvColor` full-screen color flash (T015).
+    ///
+    /// Set by the `EnvColor` controller and counted down each non-hit-paused
+    /// tick. The renderer (`fp-app`) reads [`Character::env_color`] and fills the
+    /// screen while it is active. Inactive by default. See [`EnvColor`].
+    pub env_color: EnvColor,
+
+    /// The character's live `RemapPal` palette-remap selection (T015).
+    ///
+    /// Set by the `RemapPal` controller; persists until changed or reset. The
+    /// renderer reads [`Character::remap_pal`] to pick the matching loaded
+    /// palette. Inactive (`dest = None`) by default. See [`RemapPal`].
+    pub remap_pal: RemapPal,
+
+    /// The character's debug clipboard text (MUGEN `DisplayToClipboard` /
+    /// `AppendToClipboard` / `ClearClipboard`; T015).
+    ///
+    /// MUGEN renders this string in the debug overlay. We store the most recent
+    /// formatted text so a host can surface it; `DisplayToClipboard` replaces it,
+    /// `AppendToClipboard` appends, and `ClearClipboard` empties it. Empty by
+    /// default.
+    pub clipboard: String,
+
+    /// The most recent `VictoryQuote` selection index (MUGEN `VictoryQuote`;
+    /// T015), or `None` if none has been requested.
+    ///
+    /// `value = n` selects victory quote `n`; `value = -1` (MUGEN's "random")
+    /// is stored verbatim for a host to interpret. The win-screen presenter
+    /// reads this to pick which quote to show. `None` by default.
+    pub victory_quote: Option<i32>,
+
+    /// Per-tick draw-angle override set by the `AngleDraw` / `AngleSet` /
+    /// `AngleAdd` / `AngleMul` controllers (T015).
+    ///
+    /// MUGEN rotates the sprite by this angle (degrees) for the tick in which
+    /// `AngleDraw` fires. `AngleSet`/`AngleAdd`/`AngleMul` mutate the stored
+    /// angle; `AngleDraw` arms the draw for this tick (and may override the angle
+    /// with its own `value`). Like [`cur_width`](Self::cur_width) the *arm* flag
+    /// is transient (cleared at the top of each tick); the angle itself persists.
+    /// See [`DrawAngle`].
+    pub draw_angle: DrawAngle,
+
+    /// Per-tick position-freeze flag set by the `PosFreeze` controller (T015).
+    ///
+    /// MUGEN's `PosFreeze` holds the character's position for one tick (skips
+    /// position integration) — used by hit-flash / charge effects. Cleared at the
+    /// top of each tick and set by `PosFreeze` during it; the executor skips
+    /// [`integrate_position`](crate::executor) while it is set.
+    pub pos_frozen: bool,
+
+    /// Per-tick transparency override set by the `Trans` controller (T015).
+    ///
+    /// MUGEN's `Trans` selects a blend mode (`none`/`add`/`add1`/`sub`/`addalpha`)
+    /// for the tick in which it fires. Cleared at the top of each tick. The
+    /// renderer reads [`Character::cur_trans`] to pick the sprite blend. See
+    /// [`TransMode`].
+    pub cur_trans: Option<TransMode>,
+}
+
+/// A sprite-draw rotation set by the `AngleDraw` family of controllers (T015).
+///
+/// `angle` is the rotation in degrees; `active` is the per-tick arm flag set by
+/// `AngleDraw` (the only controller that actually requests a rotated draw). The
+/// renderer applies `angle` while `active` is `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct DrawAngle {
+    /// The current draw angle in degrees (mutated by `AngleSet`/`AngleAdd`/`AngleMul`).
+    pub angle: f32,
+    /// Whether a rotated draw is armed for this tick (set by `AngleDraw`).
+    pub active: bool,
+}
+
+/// The blend mode selected by the `Trans` state controller (T015).
+///
+/// Mirrors MUGEN's `Trans` `trans` parameter. `AddAlpha` carries the source/dest
+/// alpha pair the controller specified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransMode {
+    /// Opaque (no blending).
+    None,
+    /// Additive blending.
+    Add,
+    /// MUGEN's `add1` (additive at half source intensity).
+    Add1,
+    /// Subtractive blending.
+    Sub,
+    /// Alpha blending with explicit source/dest alpha (`0..=256` MUGEN scale).
+    AddAlpha {
+        /// Source alpha (`0..=256`).
+        src: i32,
+        /// Destination alpha (`0..=256`).
+        dst: i32,
+    },
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1707,6 +1940,15 @@ impl Default for Character {
             // No external palette override by default: render with the
             // SFF-embedded palette, byte-identical to today.
             active_palette: None,
+            // T015 screen / palette / draw effects, all inactive by default.
+            env_shake: EnvShake::INACTIVE,
+            env_color: EnvColor::INACTIVE,
+            remap_pal: RemapPal::default(),
+            clipboard: String::new(),
+            victory_quote: None,
+            draw_angle: DrawAngle::default(),
+            pos_frozen: false,
+            cur_trans: None,
         }
     }
 }
