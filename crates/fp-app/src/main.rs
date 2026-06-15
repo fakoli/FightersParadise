@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```text
-//! cargo run -p fp-app                          # two KFMs in a match (P1 keyboard, P2 idle)
+//! cargo run -p fp-app                          # two KFMs in a match (P1 keyboard, P2 baseline CPU AI)
 //! cargo run -p fp-app -- <p1.def>              # P1 = that character, P2 = same character
 //! cargo run -p fp-app -- <p1.def> <p2.def>     # P1 and P2 from two .def files
 //! cargo run -p fp-app -- <file.sff> <file.air> # legacy SFF+AIR animation viewer (demo mode)
@@ -70,7 +70,10 @@ use std::time::{Duration, Instant};
 use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
-use fp_engine::{EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner};
+use fp_engine::{
+    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds,
+    Winner, DEFAULT_MATCH_SEED,
+};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_render::{
@@ -78,7 +81,10 @@ use fp_render::{
 };
 use fp_stage::{BgLayer, Stage};
 use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout, SelectDef, SystemDef};
-use fp_input::{map_controller, Button as PadButton, ControllerInput, RawController, DEADZONE_DEFAULT};
+use fp_input::{
+    map_controller, AiDifficulty, Button as PadButton, ControllerInput, CpuAi, RawController,
+    DEADZONE_DEFAULT,
+};
 use sdl2::controller::{Axis, Button as SdlPadButton, GameController};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, KeyboardState, Scancode};
@@ -2763,6 +2769,13 @@ struct MatchRun {
     /// clear-color path is unchanged). A real loaded stage takes precedence and
     /// this stays `None`.
     background: Option<fp_render::ImageTexture>,
+    /// The baseline CPU AI brain driving **player 2** when no human input reaches
+    /// it (T018). When a second controller is plugged in and asserts something,
+    /// that human input takes precedence and the AI is bypassed for that frame
+    /// (so a two-human match is unaffected); otherwise this brain reads the live
+    /// opponent position each tick and emits an approach/attack/block/jump input.
+    /// Seeded deterministically from the match seed so the demo replays.
+    cpu_ai: Option<CpuAi>,
 }
 
 /// Which storyboard overlay (if any) is *active* for the current frame, given the
@@ -3081,6 +3094,14 @@ fn load_match_or_fallback(
                 intro_storyboard_done: false,
                 common_fx,
                 background,
+                // Drive the otherwise-idle P2 with the baseline CPU AI (T018),
+                // seeded deterministically (P2's derived per-player seed) so the
+                // demo replays identically. A second human controller, when
+                // present, overrides it per-frame in `tick_match_run`.
+                cpu_ai: Some(CpuAi::new(
+                    derive_player_seed(DEFAULT_MATCH_SEED, 1),
+                    AiDifficulty::Normal,
+                )),
             }))
         }
         Err(e) => {
@@ -3539,10 +3560,55 @@ fn to_menu_text(s: &str) -> String {
     s.to_ascii_uppercase()
 }
 
+/// Whether a [`MatchInput`] asserts nothing — no direction held and no button
+/// pressed. Used to decide whether the human second player is actually providing
+/// input this frame (if not, the CPU AI drives P2).
+fn match_input_is_idle(i: MatchInput) -> bool {
+    i == MatchInput::none()
+}
+
+/// Picks player 2's input for a tick from the human input, an optional CPU AI,
+/// and the AI's world observation (T018). Pure (no [`MatchRun`]/SDL) so the
+/// override rule is unit-testable:
+/// - a non-idle human input always wins (a second controller overrides the AI);
+/// - otherwise the AI's decision drives P2;
+/// - with no AI and an idle human, P2 stays idle (pre-T018 behaviour).
+fn pick_p2_input(
+    p2_human: MatchInput,
+    cpu_ai: Option<&mut CpuAi>,
+    obs: fp_input::AiObservation,
+) -> MatchInput {
+    if !match_input_is_idle(p2_human) {
+        return p2_human;
+    }
+    match cpu_ai {
+        Some(ai) => ai.decide(obs).into(),
+        None => p2_human,
+    }
+}
+
+/// Resolves player 2's input for a tick: the human `p2_human` input when it
+/// asserts anything, otherwise the CPU AI's decision (T018) reading the live
+/// opponent position. When no AI is installed and the human is idle, P2 stays
+/// idle (the pre-T018 behaviour). Thin wrapper over [`pick_p2_input`] that reads
+/// the live observation off the run.
+fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
+    // Observe BEFORE borrowing the AI mutably (both live on `run`).
+    let obs = run.m.ai_observation_for_p2();
+    pick_p2_input(p2_human, run.cpu_ai.as_mut(), obs)
+}
+
 /// Advances a [`MatchRun`] one 60Hz tick and plays the frame's surfaced sound
 /// requests (P1 then P2). Factored out of the run loop so both the direct-CLI
 /// match path and the menu Fight screen drive a match identically.
+///
+/// `p2_input` is the *human* second-player input (a second controller, if any).
+/// When it asserts nothing AND a CPU AI is installed (T018), P2's input for this
+/// tick is taken from the AI instead — so the otherwise-idle P2 approaches,
+/// attacks, blocks, and jumps. A human second controller therefore transparently
+/// overrides the AI on any frame it presses something.
 fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput) {
+    let p2_input = resolve_p2_input(run, p2_input);
     run.m.tick(p1_input, p2_input);
     // AFTER the tick: play this frame's surfaced sound requests, P1 then P2, each
     // from its own decoded-sound cache. Graceful throughout — a silent backend or
@@ -3849,7 +3915,8 @@ fn run() -> fp_core::FpResult<()> {
         //
         // P1 acts from the keyboard OR controller 0 (either source can assert any
         // bit). If a second controller is present, it drives P2 for a real
-        // two-human match; otherwise P2 stays an idle dummy as before.
+        // two-human match; otherwise the baseline CPU AI drives P2 (T018, resolved
+        // per-frame in `tick_match_run`/`resolve_p2_input`).
         let kbd_input = match_input_from_keyboard(&event_pump.keyboard_state());
         let pad0 = controllers
             .as_ref()
@@ -6906,5 +6973,64 @@ mod tests {
         };
         let fb = resolve_select_path(&system_path, &bad, fallback);
         assert_eq!(fb, fallback, "missing declared select -> fallback path");
+    }
+
+    // ---- T018: P2 input resolution (human overrides the CPU AI) -------------
+
+    #[test]
+    fn match_input_is_idle_detects_neutral_and_pressed() {
+        assert!(match_input_is_idle(MatchInput::none()));
+        assert!(!match_input_is_idle(MatchInput {
+            right: true,
+            ..MatchInput::none()
+        }));
+        assert!(!match_input_is_idle(MatchInput {
+            a: true,
+            ..MatchInput::none()
+        }));
+    }
+
+    #[test]
+    fn pick_p2_input_human_overrides_ai() {
+        // A non-idle human input wins regardless of the AI/observation.
+        let mut ai = CpuAi::new(1, AiDifficulty::Normal);
+        let human = MatchInput {
+            x: true,
+            ..MatchInput::none()
+        };
+        let got = pick_p2_input(
+            human,
+            Some(&mut ai),
+            fp_input::AiObservation { opponent_dx: 5.0 },
+        );
+        assert_eq!(got, human, "a pressed human input must override the AI");
+    }
+
+    #[test]
+    fn pick_p2_input_idle_human_uses_ai() {
+        // Idle human + out-of-range opponent on the right => AI walks right.
+        let mut ai = {
+            let mut t = fp_input::AiTuning::for_difficulty(AiDifficulty::Normal);
+            t.jump_chance = 0;
+            CpuAi::with_tuning(1, t)
+        };
+        let got = pick_p2_input(
+            MatchInput::none(),
+            Some(&mut ai),
+            fp_input::AiObservation {
+                opponent_dx: 300.0,
+            },
+        );
+        assert!(got.right && !got.left, "AI approaches toward a right opponent");
+    }
+
+    #[test]
+    fn pick_p2_input_no_ai_idle_human_stays_idle() {
+        let got = pick_p2_input(
+            MatchInput::none(),
+            None,
+            fp_input::AiObservation { opponent_dx: 5.0 },
+        );
+        assert_eq!(got, MatchInput::none(), "no AI + idle human => P2 idle");
     }
 }

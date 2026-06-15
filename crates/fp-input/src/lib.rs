@@ -6,11 +6,13 @@
 
 #![warn(missing_docs)]
 
+pub mod ai;
 pub mod buffer;
 pub mod command;
 pub mod controller;
 pub mod state;
 
+pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
 pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
 pub use command::{
