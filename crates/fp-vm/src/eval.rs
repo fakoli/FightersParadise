@@ -503,6 +503,29 @@ pub trait EvalContext {
         false
     }
 
+    /// Answers the two-argument `HitDefAttr = <standtype>, <attr-list>` trigger
+    /// (Task A): whether the character's currently-active `HitDef` has a stand-type
+    /// matching `standtype` **and** an attack-attribute code present in
+    /// `attr_codes`.
+    ///
+    /// This is the seam for MUGEN's `HitDefAttr` trigger, which tests the active
+    /// `HitDef`'s `attr` (e.g. `S, NA`). `standtype` is a single upper-cased letter
+    /// (`"S"` standing / `"C"` crouching / `"A"` air); `attr_codes` is a list of
+    /// upper-cased 2-char attack codes (`"NA"`, `"SA"`, `"HA"`, `"NT"`, `"ST"`,
+    /// `"HT"`, `"NP"`, `"SP"`, `"HP"`) of which the active `HitDef`'s code must
+    /// match at least one. Both parts are pre-normalized to upper-case by the
+    /// parser ([`Expr::HitDefAttrTail`](crate::parser::Expr::HitDefAttrTail)).
+    ///
+    /// The default implementation returns `false` for every query, so a context
+    /// that does not model a `HitDef` (a leaf entity, the test doubles) reports no
+    /// match — i.e. `HitDefAttr = C, NA` evaluates to `0` rather than firing. A
+    /// concrete entity overrides this to test its active `HitDef`'s attribute. Like
+    /// every other method here it is infallible and must never panic.
+    fn hitdef_attr_matches(&self, standtype: &str, attr_codes: &[String]) -> bool {
+        let _ = (standtype, attr_codes);
+        false
+    }
+
     /// Draws one deterministic pseudo-random value for the `random` trigger.
     ///
     /// This is the **RNG seam**. The evaluator never owns RNG state — for

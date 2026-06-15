@@ -983,9 +983,11 @@ fn gap_forms_end_to_end_against_mock_cover_all_four_acceptance_criteria() {
 //   (a) GetHitVar member-arg STRING key — distinct member names → distinct
 //       values, proving the name (not a collapsed numeric value) reaches the
 //       context.
-//   (b) TimeMod / AnimElemNo are NOT the AnimElemTime comparison-tail family —
-//       a `<name> = N, op M` for either degrades to a recoverable ParseError,
-//       so it can never be evaluated with the wrong semantics.
+//   (b) AnimElemNo is NOT a comma-tail family and TimeMod has no `, op M`
+//       comparison-tail form, so `AnimElemNo = N, …` and `TimeMod = N, op M`
+//       degrade to a recoverable ParseError (never wrong AnimElemTime semantics).
+//   (b2) TimeMod's two-argument BARE-remainder form `TimeMod = d, c` (the real
+//       evilken form) now parses to its own node and means `(Time % d) == c`.
 //   (c) AnimElem tail binds the secondary operand at relational precedence, so a
 //       trailing `&& …` / `|| …` is a separate conjunct, asserted semantically
 //       (not just by tree shape).
@@ -1006,23 +1008,39 @@ fn task_4_11_three_followups_end_to_end_asset_independent() {
     // It composes in a real-shape comparison (a HitDef-style guard).
     assert_eq!(run("GetHitVar(fall.yvel) < 0", &ctx), Value::Int(1));
 
-    // ---- (b) TimeMod / AnimElemNo comma-tail degrade to a recoverable error ----
+    // ---- (b) the AnimElem *comparison-tail* (`op M`) shape and AnimElemNo
+    //          still degrade to a recoverable error; TimeMod's *bare-remainder*
+    //          form now parses to its own node (see (b2) below) ----
+    // `TimeMod = N, op M` (operator form) is NOT supported — TimeMod takes a bare
+    // remainder `, c`, not a comparison `, op M` — so the operator form strands
+    // the comma and surfaces as a recoverable trailing-token error. `AnimElemNo`
+    // is the function-form trigger `AnimElemNo(t)`, not any comma-tail family, so
+    // both its forms degrade. Never a panic, never a silently-wrong tree.
     for src in [
-        "TimeMod = 2, >= 0",
-        "timemod = 4, 1",
+        "TimeMod = 2, >= 0",  // TimeMod has no `, op M` operator form
         "AnimElemNo = 2, >= 0",
         "ANIMELEMNO = 3, 1",
     ] {
         let _ = tokenize(src); // never panics
         let err = parse_str(src).expect_err(
-            "TimeMod/AnimElemNo comma-tail is NOT the AnimElem family; must be a ParseError",
+            "TimeMod operator-form / AnimElemNo comma-tail is not a tail family; must be a ParseError",
         );
         assert!(
             matches!(err, ParseError::UnexpectedToken { .. }),
             "{src:?} must degrade cleanly, got {err:?}"
         );
     }
-    // Their bare equalities still evaluate as ordinary trigger comparisons.
+
+    // ---- (b2) TimeMod's two-argument bare-remainder form `TimeMod = d, c` now
+    //          parses (the real evilken form, e.g. `TimeMod = 20, 19`) and means
+    //          `(Time % d) == c` — distinct from AnimElem element-time semantics.
+    let ctx = Ctx::new().with_trigger("Time", &[], Value::Int(9));
+    assert_eq!(run("TimeMod = 4, 1", &ctx), Value::Int(1)); // 9 % 4 == 1 → true
+    let ctx = Ctx::new().with_trigger("Time", &[], Value::Int(8));
+    assert_eq!(run("TimeMod = 4, 1", &ctx), Value::Int(0)); // 8 % 4 == 0 ≠ 1 → false
+
+    // The bare equalities (no comma tail) still evaluate as ordinary trigger
+    // comparisons — only the (now-supported) comma-tail behavior changed.
     let ctx = Ctx::new().with_trigger("TimeMod", &[], Value::Int(2));
     assert_eq!(run("TimeMod = 2", &ctx), Value::Int(1));
     let ctx = Ctx::new().with_trigger("AnimElemNo", &[], Value::Int(3));
@@ -1049,17 +1067,29 @@ fn task_4_11_three_followups_end_to_end_asset_independent() {
     let ctx = Ctx::new().with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(2));
     assert_eq!(run("AnimElem = 2, >= 1 + 1", &ctx), Value::Int(1));
 
-    // Parenthesized / left-side tail forms degrade cleanly (no silent wrong tree).
-    for src in [
-        "(AnimElem = 2, >= 0)",
-        "(AnimElem = 2, >= 0) && Time > 0",
-        "Time > 0 && AnimElem = 2, >= 0",
-    ] {
+    // Parenthesized tail forms still degrade cleanly: inside `( )` a comma is a
+    // range separator, so the comma-tail fold is suppressed and the trailing
+    // `op M` strands (no silent wrong tree).
+    for src in ["(AnimElem = 2, >= 0)", "(AnimElem = 2, >= 0) && Time > 0"] {
         assert!(
             matches!(parse_str(src), Err(ParseError::UnexpectedToken { .. })),
             "{src:?} should cleanly degrade to a recoverable parse error"
         );
     }
+
+    // A tail in the MIDDLE of a boolean chain now folds correctly (the fold runs
+    // at every recursion depth, not just the top level): `Time > 0 && AnimElem =
+    // 2, >= 0` is `(Time > 0) && (AnimElem tail)`, asserted semantically — the
+    // tail is TRUE (element-time 0 >= 0) and Time>0 is TRUE → 1; flip Time to make
+    // the left conjunct FALSE → 0, proving the `&&` binds the folded tail.
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("Time", &[], Value::Int(5));
+    assert_eq!(run("Time > 0 && AnimElem = 2, >= 0", &ctx), Value::Int(1));
+    let ctx = Ctx::new()
+        .with_trigger("AnimElemTime", &[Value::Int(2)], Value::Int(0))
+        .with_trigger("Time", &[], Value::Int(0));
+    assert_eq!(run("Time > 0 && AnimElem = 2, >= 0", &ctx), Value::Int(0));
 }
 
 #[test]
