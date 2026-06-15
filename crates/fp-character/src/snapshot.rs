@@ -235,7 +235,7 @@ impl CharacterSnapshot {
             asserted: ch.asserted.clone(),
             cur_width: ch.cur_width,
             cur_palfx: ch.cur_palfx,
-            afterimage: ch.afterimage,
+            afterimage: ch.afterimage.clone(),
             hit_overrides: ch.hit_overrides.clone(),
             rng_seed: ch.rng_seed.get(),
             round_view: ch.round_view,
@@ -296,7 +296,7 @@ impl CharacterSnapshot {
         ch.asserted = self.asserted.clone();
         ch.cur_width = self.cur_width;
         ch.cur_palfx = self.cur_palfx;
-        ch.afterimage = self.afterimage;
+        ch.afterimage = self.afterimage.clone();
         ch.hit_overrides = self.hit_overrides.clone();
         ch.rng_seed.set(self.rng_seed);
         ch.round_view = self.round_view;

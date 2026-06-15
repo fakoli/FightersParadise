@@ -9,6 +9,7 @@
 
 #![warn(missing_docs)]
 
+mod afterimage;
 mod animation;
 pub mod atlas;
 mod params;
@@ -17,6 +18,7 @@ mod text;
 mod texture;
 mod vertex;
 
+pub use afterimage::{ghost_alpha, ghost_palfx, AfterImageModulation, TrailTrans};
 pub use animation::AnimController;
 pub use atlas::{AtlasRegion, TextureAtlas};
 pub use params::{apply_palfx, BlendMode, PalFx, SpriteDrawParams};
