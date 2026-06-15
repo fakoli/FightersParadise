@@ -667,7 +667,11 @@ impl Player {
     fn spawn_helpers(&mut self, spawns: &[HelperSpawn], opponent_x: f32, stage: StageView) {
         for spawn in spawns {
             if self.helpers.len() >= MAX_HELPERS_PER_PLAYER {
-                tracing::warn!(
+                // debug, not warn: a character that spawns helpers faster than they
+                // are destroyed (e.g. evilken — `DestroySelf` is still a deferred
+                // no-op, so its helpers never self-retire) saturates the bounded
+                // slot-map and would emit this every tick, flooding the log.
+                tracing::debug!(
                     "helper slot-map full ({MAX_HELPERS_PER_PLAYER}); dropping spawn id={}",
                     spawn.helper_id
                 );
@@ -725,7 +729,10 @@ impl Player {
     fn spawn_projectiles(&mut self, spawns: &[ProjectileSpawn]) {
         for spawn in spawns {
             if self.projectiles.len() >= MAX_PROJECTILES_PER_PLAYER {
-                tracing::warn!(
+                // debug, not warn: same rationale as the helper slot-map — avoid a
+                // per-tick log flood when a character spawns projectiles faster than
+                // they retire.
+                tracing::debug!(
                     "projectile slot-map full ({MAX_PROJECTILES_PER_PLAYER}); dropping spawn id={}",
                     spawn.id
                 );
