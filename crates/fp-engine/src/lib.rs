@@ -1033,19 +1033,29 @@ impl Match {
     }
 
     /// The engine-global round / match clock the characters' `RoundState`,
-    /// `GameTime`, and `MatchOver` triggers read this tick (audit #21).
+    /// `GameTime`, `MatchOver`, `RoundNo`, and `RoundsExisted` triggers read this
+    /// tick (audits #21 and T016).
     ///
     /// Built from the live round phase ([`RoundState::trigger_code`]), the
-    /// monotonic [`game_time`](Match::game_time) counter, and whether the match is
-    /// over ([`MatchState::Over`]). [`Match::tick`] installs this on each character
-    /// via [`Character::set_round_view`](fp_character::Character::set_round_view)
+    /// monotonic [`game_time`](Match::game_time) counter, whether the match is
+    /// over ([`MatchState::Over`]), the 1-based [`round_number`](Match::round_number)
+    /// (`RoundNo`), and the count of rounds already completed (`RoundsExisted`).
+    /// [`Match::tick`] installs this on each character via
+    /// [`Character::set_round_view`](fp_character::Character::set_round_view)
     /// before ticking it, so both fighters see the same coordinator view.
+    ///
+    /// Both fighters are present from the opening round, so each player's
+    /// `RoundsExisted` is the number of rounds completed so far, i.e.
+    /// `round_number - 1` (`0` during round 1, clamped to `0` so it is never
+    /// negative). When per-player spawning/teams land this can diverge per side.
     #[must_use]
     pub fn round_view(&self) -> RoundView {
         RoundView::new(
             self.round_state.trigger_code(),
             self.game_time,
             self.match_state == MatchState::Over,
+            self.round_number,
+            (self.round_number - 1).max(0),
         )
     }
 
@@ -3179,6 +3189,68 @@ time = 1
         );
         assert!(m.p2().character.round_view.match_over);
         assert!(m.game_time() > gt_before, "GameTime keeps advancing past match end");
+    }
+
+    // ---- T016: RoundNo / RoundsExisted threaded to triggers across rounds ----
+
+    /// The `round_view()` the coordinator builds carries the live `RoundNo`
+    /// (1-based) and `RoundsExisted` (`RoundNo - 1` for fighters present since
+    /// round 1) directly from `round_number`.
+    #[test]
+    fn round_view_carries_round_number_and_rounds_existed() {
+        let m = basic_match();
+        // Fresh match: round 1, no rounds completed yet.
+        assert_eq!(m.round_number(), 1);
+        let v = m.round_view();
+        assert_eq!(v.round_no, 1, "opening round is RoundNo 1");
+        assert_eq!(v.rounds_existed, 0, "no rounds completed in round 1");
+    }
+
+    /// `RoundNo` climbs 1 -> 2 -> 3 across a best-of-three split, and
+    /// `RoundsExisted` (= RoundNo - 1) trails it by one, with both pushed onto the
+    /// characters' installed `round_view` each tick. This is the multi-round
+    /// assertion the task asks for.
+    #[test]
+    fn round_no_and_rounds_existed_advance_across_a_multi_round_match() {
+        let mut m = basic_match();
+
+        // --- Round 1 ---
+        into_fight(&mut m);
+        assert_eq!(m.round_number(), 1);
+        // Both characters' installed view reads RoundNo 1 / RoundsExisted 0.
+        let v1 = m.p1().character.round_view;
+        let v2 = m.p2().character.round_view;
+        assert_eq!(v1, v2, "both characters get the same coordinator view");
+        assert_eq!(v1.round_no, 1, "round 1: RoundNo 1");
+        assert_eq!(v1.rounds_existed, 0, "round 1: RoundsExisted 0");
+        // The mapping field->trigger is pinned in fp-character; here we confirm
+        // `RoundsExisted == RoundNo - 1`, the relationship a fighter present from
+        // the start always sees.
+        assert_eq!(v1.rounds_existed, v1.round_no - 1);
+
+        // P1 wins round 1 (best-of-three, so the match continues into round 2).
+        ko_p2_and_settle(&mut m);
+        assert_eq!(m.round_number(), 2, "advanced to round 2");
+        assert_eq!(m.p1_round_wins(), 1);
+        // The first tick of round 2 installs RoundNo 2 / RoundsExisted 1.
+        m.tick(MatchInput::none(), MatchInput::none());
+        let v = m.p1().character.round_view;
+        assert_eq!(v.round_no, 2, "round 2: RoundNo 2");
+        assert_eq!(v.rounds_existed, 1, "one round completed -> RoundsExisted 1");
+        assert_eq!(v.rounds_existed, v.round_no - 1);
+
+        // --- Round 2: split it so the match reaches round 3 (P2 wins this one) ---
+        into_fight(&mut m);
+        ko_p1_and_settle(&mut m);
+        assert_eq!(m.round_number(), 3, "the split advances to round 3");
+        assert_eq!(m.p1_round_wins(), 1);
+        assert_eq!(m.p2_round_wins(), 1);
+        // Round 3's view: RoundNo 3 / RoundsExisted 2.
+        m.tick(MatchInput::none(), MatchInput::none());
+        let v = m.p2().character.round_view;
+        assert_eq!(v.round_no, 3, "round 3: RoundNo 3");
+        assert_eq!(v.rounds_existed, 2, "two rounds completed -> RoundsExisted 2");
+        assert_eq!(v.rounds_existed, v.round_no - 1);
     }
 
     #[test]
