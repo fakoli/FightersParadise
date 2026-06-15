@@ -3420,33 +3420,21 @@ impl Character {
 /// Returns the contiguous prefix of numbered trigger groups starting at
 /// `trigger1`, stopping at the first gap (CB6).
 ///
-/// MUGEN numbers groups from 1. Groups are sorted by number; the prefix
+/// MUGEN numbers groups from 1. Groups are considered by number; the prefix
 /// `1, 2, 3, …` is taken until a number is missing. With `1, 2, 4` the result
 /// is `[1, 2]` (group 4 and anything after it is dropped). A set that does not
 /// start at `1` yields an empty slice (no `trigger1` → cannot fire).
+///
+/// The contiguity rule itself lives in [`fp_vm::triggers::active_group_indices`]
+/// so the executor, validators, and any other trigger consumer share one
+/// definition; this wrapper just maps the active indices back to the original
+/// [`CompiledTriggerGroup`] references in ascending-number order.
 fn contiguous_groups(groups: &[CompiledTriggerGroup]) -> Vec<&CompiledTriggerGroup> {
-    // Sort references by group number so file order does not matter.
-    let mut sorted: Vec<&CompiledTriggerGroup> = groups.iter().collect();
-    sorted.sort_by_key(|g| g.number);
-
-    let mut out: Vec<&CompiledTriggerGroup> = Vec::new();
-    let mut expected: u32 = 1;
-    for g in sorted {
-        if g.number < expected {
-            // Duplicate number (already consumed as `expected - 1`): the CNS
-            // parser ANDs same-number lines into one group, so this is rare, but
-            // skip defensively without breaking contiguity.
-            continue;
-        }
-        if g.number == expected {
-            out.push(g);
-            expected += 1;
-        } else {
-            // Gap: stop here (CB6).
-            break;
-        }
-    }
-    out
+    let numbers: Vec<u32> = groups.iter().map(|g| g.number).collect();
+    fp_vm::triggers::active_group_indices(&numbers)
+        .into_iter()
+        .map(|i| &groups[i])
+        .collect()
 }
 
 /// Decides whether a controller fires on its `count`-th qualifying tick given

@@ -18,6 +18,9 @@
 //! 4. **Evaluator** ([`evaluator`]) — walks the [`Expr`] AST against an
 //!    [`EvalContext`], producing a [`Value`] with faithful MUGEN numeric
 //!    semantics. Implemented (4.4).
+//! 5. **Trigger grouping** ([`triggers`]) — the `triggerall` / `trigger1..n`
+//!    contiguity rule that decides which numbered groups are active before any
+//!    are evaluated (the OR-over-groups half of a controller's gate; CB6).
 //!
 //! The lexer is deliberately tolerant: malformed input never panics, in keeping
 //! with the engine-wide "never crash on bad content" rule. The evaluator upholds
@@ -30,8 +33,10 @@ pub mod eval;
 pub mod evaluator;
 pub mod lexer;
 pub mod parser;
+pub mod triggers;
 
 pub use eval::{EvalContext, Redirect, Value};
 pub use evaluator::{eval, Rng};
 pub use lexer::{tokenize, Token, TokenKind};
 pub use parser::{parse, parse_str, BinaryOp, Bound, Expr, ParseError, UnaryOp};
+pub use triggers::{active_group_indices, any_active_group_true};
