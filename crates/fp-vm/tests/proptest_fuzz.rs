@@ -22,8 +22,10 @@
 //!   `Expr` trees rendered back to source text* is panic-free and deterministic.
 //!
 //! Case counts are kept CI-reasonable (256–1024 per property) so the suite stays
-//! fast while still covering a large adversarial space. A fixed RNG seed (set via
-//! `ProptestConfig`) keeps failures reproducible.
+//! fast while still covering a large adversarial space. proptest seeds each run
+//! from OS entropy by default; when a case fails it persists the **failing seed**
+//! to `proptest-regressions/` so the exact counterexample replays deterministically
+//! on the next run.
 
 use std::collections::HashMap;
 
@@ -130,12 +132,13 @@ impl EvalContext for FuzzCtx {
 /// Compares two evaluation results for **bit-identical determinism**.
 ///
 /// `Value` derives `PartialEq`, which compares floats with IEEE-754 semantics
-/// where `NaN != NaN`. The evaluator can legitimately (and *deterministically*)
-/// produce a `Value::Float(NaN)` — e.g. `0 * -inf` — so a plain `a == b` would
-/// spuriously report "non-determinism" for two bit-identical NaN results. This
-/// helper instead compares the *bit patterns* of float values (so two NaNs of the
-/// same bit pattern are equal), which is the correct notion of "the evaluator
-/// returned the same thing both times".
+/// where `NaN != NaN`. Arithmetic no longer synthesizes a NaN (audit #19 funnels
+/// a non-finite `+ - *` result to bottom → `0`), but a `Value::Float(NaN)` can
+/// still enter evaluation deterministically through a trigger / `fvar` lookup,
+/// and a plain `a == b` would then spuriously report "non-determinism" for two
+/// bit-identical NaN results. This helper instead compares the *bit patterns* of
+/// float values (so two NaNs of the same bit pattern are equal), which is the
+/// correct notion of "the evaluator returned the same thing both times".
 fn same_value(a: Value, b: Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -387,7 +390,8 @@ fn render(expr: &Expr) -> String {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        // CI-reasonable case count; fixed RNG seed keeps any failure reproducible.
+        // CI-reasonable case count; a failing seed is persisted to
+        // proptest-regressions/ so any failure replays deterministically.
         cases: 1024,
         ..ProptestConfig::default()
     })]
@@ -477,10 +481,13 @@ proptest! {
     #[test]
     fn eval_never_panics(expr in expr_strategy()) {
         let ctx = FuzzCtx::populated();
-        let v = eval(&expr, &ctx);
-        // The value is one of the two MUGEN numeric variants (no `Bottom` leaks
-        // to the public boundary).
-        prop_assert!(v.is_int() || v.is_float());
+        // The real assertion is that this call *returns* at all: any panic
+        // (unwind / abort) inside `eval` fails the proptest. `Value` has only the
+        // `Int`/`Float` variants by construction — the internal `Bottom` sentinel
+        // is collapsed to `Int(0)` before it can reach the public boundary — so
+        // simply binding the result here is what proves the never-panic contract;
+        // there is no third variant a runtime check could catch.
+        let _v = eval(&expr, &ctx);
     }
 
     /// `eval` is deterministic: the same `Expr` against the same (fixed) context
@@ -499,19 +506,17 @@ proptest! {
     /// The safety contract that protects downstream consumers holds for **every**
     /// evaluated `Value`: its `as_bool()` and `to_int()` coercions are total and
     /// honor the "an erroring expression never fires a trigger" rule —
-    /// specifically, a NaN result reads as **false** (never fires) and narrows to
-    /// `0`, never to garbage, and neither coercion panics.
+    /// specifically, any NaN result would read as **false** (never fires) and
+    /// narrow to `0`, never to garbage, and neither coercion panics.
     ///
-    /// Note: this is the assertion the audit's "div/mod by 0 → 0, overflow
-    /// saturates" goal really turns on. A *stronger* "eval never returns a public
-    /// `Value::Float(NaN)`" claim does **not** hold — ordinary float arithmetic
-    /// such as `0 * -inf` (an unknown trigger times an overflowing float literal)
-    /// can leak a `Value::Float(NaN)` because the generic `+ - *` path does not
-    /// funnel NaN to bottom the way `**`, `ln`, and the transcendentals do. That
-    /// leak is benign precisely because of the invariant asserted here (every
-    /// consumer reads through `as_bool` / `to_int`, both NaN-guarded), but it is
-    /// recorded as an open concern; see `nan_can_leak_from_float_multiply` for the
-    /// pinned reproduction.
+    /// As of audit #19 the evaluator also funnels a non-finite float result from
+    /// the generic `+ - *` path to bottom (collapsing to `0`), matching `**` /
+    /// `ln` / the transcendentals, so `eval` no longer returns a public
+    /// `Value::Float(NaN)` — see `nan_leak_from_float_multiply_is_closed` for the
+    /// regression pin. The NaN-guard assertions below are retained as
+    /// defense-in-depth: they must hold for *any* float a `Value` could carry
+    /// (e.g. one sourced directly from a trigger / `fvar` lookup), independent of
+    /// whether arithmetic can still synthesize one.
     #[test]
     fn eval_coercions_are_total_and_nan_safe(expr in expr_strategy()) {
         let ctx = FuzzCtx::populated();
@@ -586,28 +591,19 @@ fn unknown_token_is_recoverable_error_not_panic() {
 }
 
 #[test]
-fn nan_can_leak_from_float_multiply() {
-    // Finding (via the `eval_coercions_are_total_and_nan_safe` property): the
-    // generic `+ - *` float path does NOT funnel a NaN to bottom (only `**`,
-    // `ln`, and the transcendentals do). An unknown trigger (`0`) multiplied by
-    // a float literal that overflows f32 to -inf yields `0 * -inf == NaN`, and
-    // that NaN escapes as a public `Value::Float(NaN)`.
-    //
-    // This is pinned as a known, benign behavior rather than fixed here: the leak
-    // is harmless because every downstream consumer reads through `as_bool`
-    // (NaN → false) or `to_int` (NaN → 0), both of which are NaN-guarded. Whether
-    // the `+ - *` path should also funnel NaN → bottom (for full parity with the
-    // other ops) is left as an open concern for the evaluator owners.
+fn nan_leak_from_float_multiply_is_closed() {
+    // Regression for audit #19: the generic `+ - *` float path now funnels a
+    // non-finite (`NaN` / `±inf`) result to the internal bottom sentinel, exactly
+    // like the `**`, `ln`, and transcendental paths. Previously this expression
+    // leaked a public `Value::Float(NaN)` (an unknown trigger `0` times a float
+    // literal that overflows f32 to `-inf` → `0 * -inf == NaN`); now the bottom
+    // collapses to the safe default `Value::Int(0)` at the public boundary, so no
+    // public NaN escapes `eval`.
     let ctx = FuzzCtx::populated();
-    // `A` is an unknown trigger → Int(0); the literal overflows f32 to -inf.
+    // `A` is an unknown trigger → Int(0); the literal overflows f32 to -inf, so
+    // the multiply is non-finite and funnels to bottom → 0.
     let v = eval(&parse_str("A * -5.8751624776690396e128").unwrap(), &ctx);
-    match v {
-        Value::Float(f) => {
-            assert!(f.is_nan(), "expected the documented NaN leak, got {f}");
-            // The safety net that makes the leak benign:
-            assert!(!v.as_bool(), "a leaked NaN must still read as false");
-            assert_eq!(v.to_int(), 0, "a leaked NaN must narrow to 0");
-        }
-        other => panic!("expected Value::Float(NaN), got {other:?}"),
-    }
+    assert_eq!(v, Value::Int(0), "the NaN leak must now collapse to 0, got {v:?}");
+    // No public NaN survived: the result is a plain finite integer.
+    assert!(!matches!(v, Value::Float(f) if f.is_nan()), "no public NaN may escape eval");
 }
