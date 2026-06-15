@@ -34,5 +34,5 @@
 mod player;
 mod storyboard;
 
-pub use player::{StoryboardDraw, StoryboardPlayer};
+pub use player::{SceneFade, StoryboardDraw, StoryboardPlayer};
 pub use storyboard::{BgGroup, BgLayer, Scene, SceneLayer, Storyboard};

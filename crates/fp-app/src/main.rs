@@ -2238,7 +2238,6 @@ impl StoryboardKind {
 fn load_character_storyboard(
     char_def: &Path,
     kind: StoryboardKind,
-    renderer: &Renderer,
 ) -> Option<StoryboardOverlay> {
     let def = match fp_formats::def::DefFile::load(char_def) {
         Ok(d) => d,
@@ -2264,7 +2263,7 @@ fn load_character_storyboard(
         );
         return None;
     }
-    StoryboardOverlay::load(&sb_path, renderer)
+    StoryboardOverlay::load(&sb_path)
 }
 
 /// A playable storyboard overlay: a `fp-storyboard` [`StoryboardPlayer`] paired
@@ -2282,12 +2281,11 @@ struct StoryboardOverlay {
     sff: SffFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
-    /// An opaque full-window clear quad behind the overlay, built once at load
-    /// from the storyboard's start-scene `clearcolor` (or black when absent). The
-    /// renderer exposes no per-draw quad recolor, so this is pre-built rather than
-    /// tinted per frame; per-scene clearcolor changes are not tracked (a small,
-    /// documented fidelity gap — the cutscene art itself is what reads).
-    clear: HudColor,
+    /// Per-RGB-color full-window quad cache (index 1 = the color). The renderer
+    /// exposes no per-draw quad recolor, so a quad is built once per distinct
+    /// color and reused; this backs both the per-scene `clearcolor` backdrop and
+    /// the per-scene fade overlay, whose colors vary scene to scene (T011).
+    color_quads: HashMap<(u8, u8, u8), HudColor>,
 }
 
 impl StoryboardOverlay {
@@ -2299,9 +2297,9 @@ impl StoryboardOverlay {
     /// (no regression). `Storyboard::load` itself never panics; a parse problem
     /// degrades to an empty scene model which is rejected here. Never panics.
     ///
-    /// `renderer` is used only to pre-build the opaque clear quad from the
-    /// storyboard's start-scene `clearcolor`.
-    fn load(def_path: &Path, renderer: &Renderer) -> Option<Self> {
+    /// Per-scene clear-color and fade-overlay quads are built lazily during
+    /// [`draw`](Self::draw) (and cached by RGB), so no `renderer` is needed here.
+    fn load(def_path: &Path) -> Option<Self> {
         let storyboard = match fp_storyboard::Storyboard::load(def_path) {
             Ok(sb) => sb,
             Err(e) => {
@@ -2345,22 +2343,11 @@ impl StoryboardOverlay {
             storyboard.scenes.len(),
             sff.sprites.len(),
         );
-        // Build the opaque clear backdrop from the start scene's clearcolor (the
-        // first scene shown), defaulting to black when it declares none.
-        let start = storyboard
-            .start_scene
-            .clamp(0, storyboard.scenes.len() as i32 - 1) as usize;
-        let (cr, cg, cb) = storyboard
-            .scenes
-            .get(start)
-            .and_then(|s| s.clearcolor)
-            .unwrap_or((0, 0, 0));
-        let clear = HudColor::new(renderer, cr, cg, cb);
         Some(Self {
             player: fp_storyboard::StoryboardPlayer::new(storyboard),
             sff,
             sprite_cache: HashMap::new(),
-            clear,
+            color_quads: HashMap::new(),
         })
     }
 
@@ -2370,25 +2357,59 @@ impl StoryboardOverlay {
     }
 
     /// Advances the storyboard one tick. A no-op once done.
+    ///
+    /// Also polls the per-scene BGM transition ([`StoryboardPlayer::bgm_to_start`]):
+    /// when a scene declares a new `bgm` it is reported once, on that scene's first
+    /// tick. The audio layer has no streaming/music backend yet (it only plays
+    /// decoded WAV one-shots), so the requested track is logged rather than played
+    /// — the player-side transition is computed and tested in `fp-storyboard`, and
+    /// hooking it to real music playback is a follow-up once a music backend lands.
     fn tick(&mut self) {
+        // Poll BGM *before* advancing so the current scene's track is offered on
+        // its first tick (a fresh player arms scene 0; each roll-over arms the new
+        // scene). Then advance the scene cursor.
+        if let Some(bgm) = self.player.bgm_to_start() {
+            tracing::info!("storyboard: scene BGM transition -> {bgm} (no music backend; not played)");
+        }
         self.player.tick();
     }
 
-    /// Pre-decodes this tick's draw-list sprites into the GPU cache. Run once per
-    /// frame **before** `begin_frame` (decoding needs `&Renderer`, which a live
-    /// [`fp_render::RenderFrame`] holds borrowed). Missing/undecodable sprites are
-    /// skipped (logged once via the cache), never fatal.
+    /// Pre-decodes this tick's draw-list sprites into the GPU cache, and ensures
+    /// the current scene's clear-color and fade-overlay quads exist. Run once per
+    /// frame **before** `begin_frame` (building GPU resources needs `&Renderer`,
+    /// which a live [`fp_render::RenderFrame`] holds borrowed). Missing/undecodable
+    /// sprites are skipped (logged once via the cache), never fatal.
     fn cache_sprites(&mut self, renderer: &Renderer) {
         let ids: Vec<SpriteId> = self.player.draw_list().iter().map(|d| d.sprite).collect();
         for sprite_id in ids {
             cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
         }
+        // Build the per-scene clear-color quad (defaults to black) and, when a
+        // fade is active this tick, its colored overlay quad. Both are cached by
+        // RGB so a steady scene reuses a single quad across frames.
+        let clear_rgb = self.player.clearcolor();
+        self.color_quads
+            .entry(clear_rgb)
+            .or_insert_with(|| HudColor::new(renderer, clear_rgb.0, clear_rgb.1, clear_rgb.2));
+        if let Some(fade) = self.player.fade() {
+            self.color_quads
+                .entry(fade.color)
+                .or_insert_with(|| HudColor::new(renderer, fade.color.0, fade.color.1, fade.color.2));
+        }
     }
 
-    /// Draws the storyboard's current frame: the pre-built opaque clear backdrop
-    /// covering the whole window, then each [`StoryboardDraw`] mapped from
-    /// storyboard-local coordinates into the window. A missing/uncached sprite is
-    /// skipped.
+    /// Draws the storyboard's current frame: the **current scene's** clear-color
+    /// backdrop covering the whole window, then each [`StoryboardDraw`] mapped from
+    /// storyboard-local coordinates into the window, then the current scene's
+    /// **fade overlay** on top (when one is active). A missing/uncached sprite (or
+    /// an un-built color quad) is skipped.
+    ///
+    /// The clear color and the fade follow the active scene per
+    /// [`StoryboardPlayer::clearcolor`] / [`StoryboardPlayer::fade`], so a per-scene
+    /// `clearcolor` change is reflected immediately and a scene fades in/out over
+    /// its declared `fadein.time` / `fadeout.time` (T011). The colored quads are
+    /// looked up from the cache filled by [`cache_sprites`](Self::cache_sprites);
+    /// drawing only reads it (the renderer is borrowed by `frame` here).
     ///
     /// Storyboard-local coordinates use the `[Info] localcoord` frame (Y-down,
     /// origin top-left); this scales that frame to fill the window so the cutscene
@@ -2396,17 +2417,21 @@ impl StoryboardOverlay {
     /// match (it is a full-screen cutscene), so the caller invokes it *after* the
     /// fighters/stage and instead of (not under) the normal scene.
     fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, win_h: f32) {
-        // Cover the whole window with the clear color so the cutscene reads as a
-        // full-screen overlay rather than compositing over the live fight.
         let cover = HudRect { x: 0.0, y: 0.0, w: win_w, h: win_h };
-        let params = SpriteDrawParams {
-            x: cover.x,
-            y: cover.y,
-            scale_x: cover.w.max(0.0),
-            scale_y: cover.h.max(0.0),
-            ..Default::default()
-        };
-        frame.draw_sprite(&self.clear.quad, &self.clear.palette, &params);
+
+        // Cover the whole window with the current scene's clear color so the
+        // cutscene reads as a full-screen overlay rather than compositing over the
+        // live fight. Opaque (alpha defaults to 1.0).
+        if let Some(clear) = self.color_quads.get(&self.player.clearcolor()) {
+            let params = SpriteDrawParams {
+                x: cover.x,
+                y: cover.y,
+                scale_x: cover.w.max(0.0),
+                scale_y: cover.h.max(0.0),
+                ..Default::default()
+            };
+            frame.draw_sprite(&clear.quad, &clear.palette, &params);
+        }
 
         // Map storyboard-local coords into the window. localcoord defaults to
         // (320, 240); guard against a zero/degenerate coordinate space.
@@ -2433,6 +2458,24 @@ impl StoryboardOverlay {
                 ..Default::default()
             };
             frame.draw_sprite(&cached.texture, &cached.palette, &params);
+        }
+
+        // Fade overlay on top of everything: a solid color quad covering the
+        // window at the computed alpha (alpha-blended). Skipped when no fade is
+        // active or its quad was not built.
+        if let Some(fade) = self.player.fade() {
+            if let Some(quad) = self.color_quads.get(&fade.color) {
+                let params = SpriteDrawParams {
+                    x: cover.x,
+                    y: cover.y,
+                    scale_x: cover.w.max(0.0),
+                    scale_y: cover.h.max(0.0),
+                    blend: fp_render::BlendMode::Normal,
+                    alpha: fade.alpha.clamp(0.0, 1.0),
+                    ..Default::default()
+                };
+                frame.draw_sprite(&quad.quad, &quad.palette, &params);
+            }
         }
     }
 }
@@ -3005,9 +3048,8 @@ fn load_match_or_fallback(
             // Intro/ending storyboards (audit #32) are P1's own declarations,
             // loaded best-effort: a character without them (or with an unloadable
             // SFF) simply plays no overlay — the normal intro/match is unchanged.
-            let intro_storyboard = load_character_storyboard(p1_def, StoryboardKind::Intro, renderer);
-            let ending_storyboard =
-                load_character_storyboard(p1_def, StoryboardKind::Ending, renderer);
+            let intro_storyboard = load_character_storyboard(p1_def, StoryboardKind::Intro);
+            let ending_storyboard = load_character_storyboard(p1_def, StoryboardKind::Ending);
             Mode::Match(Box::new(MatchRun {
                 m: Box::new(m),
                 p1_render: FighterRender::default(),

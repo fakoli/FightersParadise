@@ -89,7 +89,7 @@ presentation features are partial/asset-blocked — see "Architecture Notes" and
 | `fp-physics` | 90 | Implemented | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. No friction (that's `fp-character`). |
 | `fp-combat` | 84 | Implemented | `HitDef` data model, `Clsn1`×`Clsn2` hit primitive, pure `resolve_hit` → `HitOutcome`, `resolve_clash`, `GetHitVars`. Pure data/geometry/decision leaf. |
 | `fp-app` | 89 | Implemented | SDL2 window, 60Hz accumulator loop, CLI args (incl. `validate`), hand-rolled HUD, two-player match wiring, audio routing, Clsn debug overlay (F1). |
-| `fp-storyboard` | 63 | Implemented | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. (Per-scene fade/clearcolor/BGM not yet applied.) |
+| `fp-storyboard` | 65 | Implemented | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. Per-scene `clearcolor` + `fadein`/`fadeout` (alpha ramp) are computed by the player and applied by `fp-app`; per-scene `bgm` transitions are computed/logged (no music-streaming backend yet). |
 | `fp-audio` | 34 | Implemented | rodio WAV decode + channel-managed playback (`PlaySnd` + HitDef impact sounds); `NullBackend` headless fallback. |
 | `fp-render` | 46 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent), PalFX color-tint uniform, debug-box + `draw_text`/glyph primitives. |
 | `fp-core` | 20 | Implemented | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |

@@ -31,6 +31,31 @@
 //! `[starttime, endtime]` of its scene. An animated layer advances its own AIR
 //! element cursor each tick, looping at the action's `loopstart` like the in-match
 //! animator.
+//!
+//! # Per-scene presentation: fade, clearcolor, BGM
+//!
+//! Beyond *which* sprites to draw, each scene carries presentation state the
+//! player computes per tick:
+//!
+//! * **Clear color** ([`StoryboardPlayer::clearcolor`]) — the current scene's
+//!   `clearcolor`, the solid backdrop drawn behind the layers. This can change
+//!   from scene to scene; the player always reports the *active* scene's value
+//!   (falling back to black when a scene declares none).
+//! * **Fade** ([`StoryboardPlayer::fade`]) — a full-screen overlay of a solid
+//!   color with a `[0.0, 1.0]` alpha, computed from the scene's
+//!   `fadein.time`/`fadeout.time` (and `fadein.col`/`fadeout.col`). A scene fades
+//!   **in** from full color to clear over its first `fadein.time` ticks, plays
+//!   clear in the middle, then fades **out** from clear back to full color over
+//!   its last `fadeout.time` ticks. Returns `None` when no fade is active.
+//! * **BGM** ([`StoryboardPlayer::bgm_to_start`]) — the path of a per-scene `bgm`
+//!   track that should *begin* this tick. A consumer polls it each tick and starts
+//!   playback when it returns `Some`; it fires once per scene that declares a
+//!   `bgm`, on that scene's first tick.
+//!
+//! All three are pure functions of the parsed [`Storyboard`] and the player's
+//! `(scene_index, scene_time)` cursor, so they are unit-testable without a GPU or
+//! an audio backend. Scene advancement itself is driven by each scene's
+//! storyboard-defined `end.time` length (see [`StoryboardPlayer::tick`]).
 
 use std::collections::HashMap;
 
@@ -65,6 +90,31 @@ pub struct StoryboardDraw {
     /// Exposed so a consumer can apply a stable per-layer draw order if desired;
     /// the list is already returned in ascending layer order.
     pub layer: u32,
+}
+
+/// The fade overlay to draw over the storyboard for the current tick.
+///
+/// MUGEN fades a scene by drawing a solid-color full-screen quad on top of the
+/// scene art, with an opacity that ramps over the scene's `fadein.time` /
+/// `fadeout.time`:
+///
+/// * During the first `fadein.time` ticks the overlay starts fully opaque
+///   (`alpha == 1.0`, the scene fully hidden behind `fadein.col`) and ramps down
+///   to clear (`alpha == 0.0`).
+/// * During the last `fadeout.time` ticks it ramps from clear back to fully
+///   opaque (`fadeout.col`).
+///
+/// A consumer maps `color` + `alpha` onto a screen-covering quad. The player
+/// returns `None` (from [`StoryboardPlayer::fade`]) when no fade is active for the
+/// current tick, so a consumer draws no overlay at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneFade {
+    /// The solid fade color `(r, g, b)`. Defaults to black `(0, 0, 0)` when the
+    /// scene declares no `fadein.col` / `fadeout.col`.
+    pub color: (u8, u8, u8),
+    /// Overlay opacity in `[0.0, 1.0]`: `1.0` fully hides the scene behind
+    /// `color`, `0.0` is fully transparent (the scene fully visible).
+    pub alpha: f32,
 }
 
 /// The live animation cursor for one animated storyboard layer.
@@ -103,6 +153,10 @@ pub struct StoryboardPlayer {
     /// Latches `true` once playback runs past the final scene (or starts with no
     /// scenes at all), so [`is_done`](Self::is_done) is stable.
     done: bool,
+    /// Whether the current scene's `bgm` has already been reported by
+    /// [`bgm_to_start`](Self::bgm_to_start). Set to `false` on `new` and on every
+    /// scene roll-over so each scene's BGM is offered exactly once.
+    bgm_consumed: bool,
 }
 
 impl StoryboardPlayer {
@@ -135,6 +189,7 @@ impl StoryboardPlayer {
             scene_time: 0,
             cursors,
             done,
+            bgm_consumed: false,
         }
     }
 
@@ -210,6 +265,10 @@ impl StoryboardPlayer {
             // This scene is finished; advance to the next.
             self.scene_index += 1;
             self.scene_time = 0;
+            // The new scene's BGM has not been offered yet; arm it for the next
+            // `bgm_to_start` poll (even across zero-length scenes stepped over in
+            // this same loop — the final landed scene's BGM is the one armed).
+            self.bgm_consumed = false;
             if self.scene_index >= self.storyboard.scenes.len() {
                 self.done = true;
                 self.cursors.clear();
@@ -304,6 +363,115 @@ impl StoryboardPlayer {
             }
         }
         (0.0, 0.0)
+    }
+
+    /// The scene currently showing, or `None` once the player is
+    /// [`done`](Self::is_done) (or there were no scenes).
+    #[must_use]
+    pub fn current_scene(&self) -> Option<&Scene> {
+        if self.done {
+            return None;
+        }
+        self.storyboard.scenes.get(self.scene_index)
+    }
+
+    /// The active scene's background clear color `(r, g, b)`.
+    ///
+    /// This is the solid backdrop a consumer fills behind the scene's overlay
+    /// layers. It tracks the *current* scene, so a per-scene `clearcolor` change
+    /// is reflected the moment playback rolls into the new scene. Falls back to
+    /// black `(0, 0, 0)` for a scene that declares no `clearcolor`, and once the
+    /// player is [`done`](Self::is_done).
+    #[must_use]
+    pub fn clearcolor(&self) -> (u8, u8, u8) {
+        self.current_scene()
+            .and_then(|s| s.clearcolor)
+            .unwrap_or((0, 0, 0))
+    }
+
+    /// The fade overlay for the current tick, or `None` when no fade is active.
+    ///
+    /// Computes the MUGEN fade ramp from the active scene's `fadein.time` /
+    /// `fadeout.time` against the current `scene_time`:
+    ///
+    /// * For `scene_time` in `[0, fadein.time)` the scene is fading **in**: the
+    ///   overlay opacity ramps linearly from `1.0` (fully `fadein.col`) down to
+    ///   `0.0` (clear). At `scene_time == 0` with `fadein.time > 0` the alpha is
+    ///   `1.0`; just before `fadein.time` it approaches `0.0`.
+    /// * For `scene_time` in the scene's last `fadeout.time` ticks
+    ///   (`[end - fadeout.time, end)`) the scene is fading **out**: opacity ramps
+    ///   from `0.0` up to `1.0` (fully `fadeout.col`) at the final tick.
+    /// * Otherwise (the steady middle of the scene, or a scene with no fades)
+    ///   there is no overlay and this returns `None`.
+    ///
+    /// The fade-out window is clamped so it never overlaps the fade-in window on a
+    /// short scene; if both would cover a tick, the fade-out (end-of-scene) takes
+    /// precedence. Returns `None` once the player is [`done`](Self::is_done).
+    #[must_use]
+    pub fn fade(&self) -> Option<SceneFade> {
+        let scene = self.current_scene()?;
+        let end = scene.end_time.max(0);
+        let fadein = scene.fadein_time.max(0);
+        let fadeout = scene.fadeout_time.max(0);
+        let t = self.scene_time;
+
+        // Fade-out window: the last `fadeout` ticks of the scene, i.e.
+        // `[end - fadeout, end)`. Clamp the start at 0 so it cannot precede the
+        // scene; on a very short scene this lets fade-out win the overlapping
+        // ticks (checked first below) since it is the more recent transition.
+        if fadeout > 0 && end > 0 {
+            let fadeout_start = (end - fadeout).max(0);
+            if t >= fadeout_start && t < end {
+                // Ticks elapsed into the fade-out (0-based). At the last tick
+                // (`t == end - 1`) the overlay is fully opaque.
+                let into = (t - fadeout_start) as f32;
+                let span = (end - fadeout_start).max(1) as f32;
+                let alpha = ((into + 1.0) / span).clamp(0.0, 1.0);
+                return Some(SceneFade {
+                    color: scene.fadeout_col.unwrap_or((0, 0, 0)),
+                    alpha,
+                });
+            }
+        }
+
+        // Fade-in window: the first `fadein` ticks of the scene, `[0, fadein)`.
+        // At `t == 0` the overlay is fully opaque; it ramps to clear by `fadein`.
+        if fadein > 0 && t >= 0 && t < fadein {
+            let remaining = (fadein - t) as f32;
+            let alpha = (remaining / fadein as f32).clamp(0.0, 1.0);
+            return Some(SceneFade {
+                color: scene.fadein_col.unwrap_or((0, 0, 0)),
+                alpha,
+            });
+        }
+
+        None
+    }
+
+    /// The BGM track to *start* this tick, consuming it so it fires once per scene.
+    ///
+    /// Returns `Some(path)` exactly once per scene that declares a non-empty
+    /// `bgm`, on the first poll after the player enters that scene (a fresh
+    /// [`new`](Self::new) arms scene 0; each [`tick`](Self::tick) roll-over arms
+    /// the scene it lands on). Subsequent polls within the same scene return
+    /// `None` until the next scene with a `bgm` begins. A scene that declares no
+    /// `bgm` yields `None` and leaves any currently-playing track alone.
+    ///
+    /// This is a *mutating* poll (it latches the consumed state), so a consumer
+    /// should call it once per tick and start playback whenever it returns `Some`.
+    pub fn bgm_to_start(&mut self) -> Option<String> {
+        if self.bgm_consumed || self.done {
+            return None;
+        }
+        let bgm = self
+            .storyboard
+            .scenes
+            .get(self.scene_index)
+            .and_then(|s| s.bgm.clone());
+        // Mark the scene's BGM as offered regardless of whether it declared one,
+        // so we never re-scan it every tick; the next scene re-arms on roll-over.
+        self.bgm_consumed = true;
+        bgm
     }
 
     /// Builds the single [`StoryboardDraw`] for one visible layer, or `None` if it
@@ -782,5 +950,277 @@ end.time = 100
         }
         assert!(player.is_done(), "KFM intro plays to completion");
         assert!(player.draw_list().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T011: per-scene fade / clearcolor / BGM and length-driven timing.
+    // -----------------------------------------------------------------------
+
+    /// Scene advancement is driven by each scene's storyboard-defined `end.time`,
+    /// not a fixed count: a long scene holds for its full length and a short one
+    /// rolls early. Two scenes of differing lengths roll over exactly on their
+    /// own `end.time`.
+    #[test]
+    fn scene_timing_follows_defined_length() {
+        let text = "\
+[Scene 0]
+end.time = 7
+layer0.spriteno = 1,0
+[Scene 1]
+end.time = 2
+layer0.spriteno = 2,0
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // Scene 0 must hold for exactly 7 ticks.
+        for t in 1..7 {
+            player.tick();
+            assert_eq!(player.scene_index(), 0, "still scene 0 at t={t} (<7)");
+        }
+        player.tick(); // t reaches 7 -> roll to scene 1
+        assert_eq!(player.scene_index(), 1, "scene 0 ends exactly at its end.time");
+        assert_eq!(player.scene_time(), 0);
+        // Scene 1 holds for exactly 2 ticks.
+        player.tick(); // t=1 in scene 1
+        assert_eq!(player.scene_index(), 1, "scene 1 still showing at t=1 (<2)");
+        player.tick(); // t=2 -> past the last scene
+        assert!(player.is_done(), "scene 1 ends at its own end.time, then done");
+    }
+
+    /// Clearcolor tracks the *current* scene and changes when playback rolls into
+    /// a scene that declares a different `clearcolor`. A scene with none falls back
+    /// to black; once done it is black too.
+    #[test]
+    fn clearcolor_tracks_current_scene() {
+        let text = "\
+[Scene 0]
+end.time = 2
+clearcolor = 255,0,0
+[Scene 1]
+end.time = 2
+clearcolor = 0,255,0
+[Scene 2]
+end.time = 2
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        assert_eq!(player.clearcolor(), (255, 0, 0), "scene 0 clearcolor");
+        player.tick();
+        player.tick(); // -> scene 1
+        assert_eq!(player.scene_index(), 1);
+        assert_eq!(player.clearcolor(), (0, 255, 0), "scene 1 clearcolor changed");
+        player.tick();
+        player.tick(); // -> scene 2 (no clearcolor)
+        assert_eq!(player.scene_index(), 2);
+        assert_eq!(player.clearcolor(), (0, 0, 0), "scene 2 declares none -> black");
+        player.tick();
+        player.tick(); // done
+        assert!(player.is_done());
+        assert_eq!(player.clearcolor(), (0, 0, 0), "done -> black");
+    }
+
+    /// Fade-in: at the scene start the overlay is fully opaque and ramps linearly
+    /// to clear over `fadein.time` ticks, then there is no fade in the steady
+    /// middle. The fade uses `fadein.col`.
+    #[test]
+    fn fade_in_ramps_from_opaque_to_clear() {
+        let text = "\
+[Scene 0]
+end.time = 100
+fadein.time = 4
+fadein.col = 10,20,30
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // t=0: fully opaque (scene fully hidden behind fadein.col).
+        let f0 = player.fade().expect("fade active at scene start");
+        assert_eq!(f0.color, (10, 20, 30));
+        assert_eq!(f0.alpha, 1.0, "t=0 alpha is fully opaque");
+        player.tick(); // t=1
+        let f1 = player.fade().expect("still fading in at t=1");
+        assert!((f1.alpha - 0.75).abs() < 1e-6, "t=1 -> 3/4, got {}", f1.alpha);
+        player.tick(); // t=2
+        let f2 = player.fade().expect("still fading in at t=2");
+        assert!((f2.alpha - 0.5).abs() < 1e-6, "t=2 -> 1/2, got {}", f2.alpha);
+        player.tick(); // t=3
+        let f3 = player.fade().expect("still fading in at t=3");
+        assert!((f3.alpha - 0.25).abs() < 1e-6, "t=3 -> 1/4, got {}", f3.alpha);
+        player.tick(); // t=4: fade-in complete -> no overlay
+        assert!(player.fade().is_none(), "t=4 == fadein.time -> fade-in done");
+    }
+
+    /// Fade-out: in the scene's last `fadeout.time` ticks the overlay ramps from
+    /// clear up to fully opaque at the final tick, using `fadeout.col`. Outside
+    /// that window (the steady middle) there is no fade.
+    #[test]
+    fn fade_out_ramps_to_opaque_at_scene_end() {
+        let text = "\
+[Scene 0]
+end.time = 10
+fadeout.time = 4
+fadeout.col = 5,6,7
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // Steady middle (before the fade-out window [6,10)): no overlay.
+        for _ in 0..6 {
+            assert!(player.fade().is_none(), "no fade before fadeout window");
+            player.tick();
+        }
+        // t=6: first fade-out tick -> 1/4 opaque.
+        let f6 = player.fade().expect("fading out at t=6");
+        assert_eq!(f6.color, (5, 6, 7));
+        assert!((f6.alpha - 0.25).abs() < 1e-6, "t=6 -> 1/4, got {}", f6.alpha);
+        player.tick(); // t=7
+        let f7 = player.fade().expect("fading out at t=7");
+        assert!((f7.alpha - 0.5).abs() < 1e-6, "t=7 -> 1/2, got {}", f7.alpha);
+        player.tick(); // t=8
+        let f8 = player.fade().expect("fading out at t=8");
+        assert!((f8.alpha - 0.75).abs() < 1e-6, "t=8 -> 3/4, got {}", f8.alpha);
+        player.tick(); // t=9 (final tick of the scene)
+        let f9 = player.fade().expect("fading out at the final tick");
+        assert!((f9.alpha - 1.0).abs() < 1e-6, "t=9 -> fully opaque, got {}", f9.alpha);
+    }
+
+    /// A scene with neither `fadein.time` nor `fadeout.time` never reports a fade.
+    #[test]
+    fn no_fade_when_times_zero() {
+        let text = "\
+[Scene 0]
+end.time = 5
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        for _ in 0..5 {
+            assert!(player.fade().is_none(), "no fade times -> never a fade");
+            player.tick();
+        }
+    }
+
+    /// Fade defaults the color to black when the scene omits `fadein.col` /
+    /// `fadeout.col` (only the time is set).
+    #[test]
+    fn fade_color_defaults_to_black() {
+        let text = "\
+[Scene 0]
+end.time = 50
+fadein.time = 2
+";
+        let sb = Storyboard::from_def(text);
+        let player = StoryboardPlayer::new(sb);
+        let f = player.fade().expect("fade active");
+        assert_eq!(f.color, (0, 0, 0), "absent fadein.col -> black");
+    }
+
+    /// On a short scene where the fade-in and fade-out windows would overlap, the
+    /// fade-out (the end-of-scene transition) wins the overlapping ticks so the
+    /// scene still ends fully opaque.
+    #[test]
+    fn fade_out_wins_overlap_on_short_scene() {
+        // end.time = 3, fadein.time = 3, fadeout.time = 3: every tick is in both
+        // windows; fade-out must take precedence and reach full opacity at t=2.
+        let text = "\
+[Scene 0]
+end.time = 3
+fadein.time = 3
+fadein.col = 1,1,1
+fadeout.time = 3
+fadeout.col = 9,9,9
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // Fade-out window is [0,3); it wins all three ticks.
+        let f0 = player.fade().expect("fade at t=0");
+        assert_eq!(f0.color, (9, 9, 9), "fade-out color wins the overlap");
+        assert!((f0.alpha - (1.0 / 3.0)).abs() < 1e-6, "t=0 -> 1/3, got {}", f0.alpha);
+        player.tick(); // t=1
+        let f1 = player.fade().expect("fade at t=1");
+        assert!((f1.alpha - (2.0 / 3.0)).abs() < 1e-6, "t=1 -> 2/3, got {}", f1.alpha);
+        player.tick(); // t=2 (final tick)
+        let f2 = player.fade().expect("fade at t=2");
+        assert!((f2.alpha - 1.0).abs() < 1e-6, "t=2 -> fully opaque, got {}", f2.alpha);
+    }
+
+    /// BGM is offered exactly once per scene that declares one, on the scene's
+    /// first poll, and each later scene re-arms its own BGM on roll-over. A scene
+    /// without `bgm` yields `None`.
+    #[test]
+    fn bgm_starts_once_per_scene() {
+        let text = "\
+[Scene 0]
+end.time = 2
+bgm = intro.mp3
+[Scene 1]
+end.time = 2
+[Scene 2]
+end.time = 2
+bgm = theme.mp3
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // Scene 0 offers its BGM once.
+        assert_eq!(player.bgm_to_start().as_deref(), Some("intro.mp3"));
+        assert_eq!(player.bgm_to_start(), None, "scene 0 BGM consumed");
+        player.tick(); // t=1, still scene 0
+        assert_eq!(player.bgm_to_start(), None, "no re-fire within a scene");
+        player.tick(); // -> scene 1 (no bgm)
+        assert_eq!(player.scene_index(), 1);
+        assert_eq!(player.bgm_to_start(), None, "scene 1 declares no bgm");
+        player.tick();
+        player.tick(); // -> scene 2 (bgm)
+        assert_eq!(player.scene_index(), 2);
+        assert_eq!(
+            player.bgm_to_start().as_deref(),
+            Some("theme.mp3"),
+            "scene 2 re-arms its own BGM on roll-over"
+        );
+        assert_eq!(player.bgm_to_start(), None, "scene 2 BGM consumed");
+    }
+
+    /// When a single tick rolls past one or more zero-length scenes, only the
+    /// final landed scene's BGM is armed (the stepped-over scenes' BGM is skipped,
+    /// matching MUGEN — they never actually play).
+    #[test]
+    fn bgm_armed_for_landed_scene_across_zero_length() {
+        let text = "\
+[Scene 0]
+end.time = 0
+bgm = skipped.mp3
+[Scene 1]
+end.time = 5
+bgm = landed.mp3
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        // Scene 0 is zero-length; its BGM is offered before the first tick (it is
+        // still the start scene until we tick), but we tick straight past it.
+        // Consume scene 0's offer first to model a per-tick poll at t=0.
+        assert_eq!(player.bgm_to_start().as_deref(), Some("skipped.mp3"));
+        player.tick(); // rolls through scene 0 (end.time 0) into scene 1
+        assert_eq!(player.scene_index(), 1);
+        assert_eq!(
+            player.bgm_to_start().as_deref(),
+            Some("landed.mp3"),
+            "landed scene re-arms its own BGM"
+        );
+    }
+
+    /// `current_scene` exposes the active scene and is `None` once done.
+    #[test]
+    fn current_scene_none_when_done() {
+        let text = "\
+[Scene 0]
+end.time = 1
+clearcolor = 1,2,3
+";
+        let sb = Storyboard::from_def(text);
+        let mut player = StoryboardPlayer::new(sb);
+        assert!(player.current_scene().is_some());
+        assert_eq!(player.current_scene().unwrap().clearcolor, Some((1, 2, 3)));
+        player.tick(); // done
+        assert!(player.is_done());
+        assert!(player.current_scene().is_none());
+        assert!(player.fade().is_none(), "done -> no fade");
+        assert_eq!(player.bgm_to_start(), None, "done -> no bgm");
     }
 }
