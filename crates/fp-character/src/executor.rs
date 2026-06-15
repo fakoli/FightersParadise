@@ -124,7 +124,7 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    AfterImageState, AnimSet, Character, CurPalFx, EnvColor, EnvShake, EvalCtx, Facing,
+    AfterImageState, AnimSet, Character, CurPalFx, EntityGraph, EnvColor, EnvShake, EvalCtx, Facing,
     LoadedCharacter, MoveType, Physics, StageView, StateType, TransMode, NUM_FVARS, NUM_VARS,
 };
 
@@ -157,6 +157,12 @@ struct EvalEnv<'a> {
     /// `SelfAnimExist` degrades to `0` there. A shared reference keeps `EvalEnv`
     /// `Copy`.
     anim: AnimSet<'a>,
+    /// The helper-entity graph this character resolves `parent`/`root`/
+    /// `helper(id)` redirects against (T012). Empty (the
+    /// [`EntityGraph::default`]) for a root player with no spawning chain — then
+    /// `root` resolves to self and `parent`/`helper(id)` to `0`. A helper's tick
+    /// supplies its chain via [`Character::tick_as_helper`].
+    graph: EntityGraph<'a>,
 }
 
 impl EvalEnv<'_> {
@@ -170,6 +176,7 @@ impl EvalEnv<'_> {
             opponent: None,
             stage: StageView::default(),
             anim: AnimSet::default(),
+            graph: EntityGraph::default(),
         }
     }
 }
@@ -388,6 +395,96 @@ pub struct FreezeRequest {
     pub time: i32,
 }
 
+/// How a [`Helper`](HelperSpawn)'s spawn position is interpreted, mirroring
+/// MUGEN's `Helper` `postype` parameter (T012).
+///
+/// The `pos = x, y` offset is resolved against one of these anchors by the
+/// downstream spawner (`fp-engine`), which owns both players' world positions
+/// and so is the only place that can turn a `postype` + offset into an absolute
+/// world position. `fp-character` only *classifies* the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelperPosType {
+    /// `postype = p1` (the MUGEN default): the offset is relative to the
+    /// **spawning** player's axis, in that player's facing direction.
+    #[default]
+    P1,
+    /// `postype = p2`: relative to the opponent's axis.
+    P2,
+    /// `postype = front`: relative to the front edge of the screen (the edge the
+    /// spawner faces).
+    Front,
+    /// `postype = back`: relative to the back edge of the screen.
+    Back,
+    /// `postype = left`: relative to the left edge of the screen.
+    Left,
+    /// `postype = right`: relative to the right edge of the screen.
+    Right,
+}
+
+impl HelperPosType {
+    /// Parses a MUGEN `postype` token (case-insensitive), defaulting to
+    /// [`HelperPosType::P1`] on an absent / unrecognized token (MUGEN's default).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        let t = raw.trim();
+        if t.eq_ignore_ascii_case("p2") {
+            Self::P2
+        } else if t.eq_ignore_ascii_case("front") {
+            Self::Front
+        } else if t.eq_ignore_ascii_case("back") {
+            Self::Back
+        } else if t.eq_ignore_ascii_case("left") {
+            Self::Left
+        } else if t.eq_ignore_ascii_case("right") {
+            Self::Right
+        } else {
+            // "p1" and anything unrecognized → the MUGEN default.
+            Self::P1
+        }
+    }
+}
+
+/// A deferred request, emitted by a `Helper` controller, to spawn a child helper
+/// entity owned by this character (T012).
+///
+/// `fp-character` ticks one entity at a time and cannot create — or own — another
+/// live entity from inside a single character's tick, so the `Helper` controller
+/// does not spawn inline. Instead it records the request on
+/// [`TickReport::helper_spawns`], and the entity owner (`fp-engine`'s `Player`,
+/// which holds the slot-map of live helpers) reads it after the tick and inserts
+/// the new helper into the slot-map. This mirrors how `PlaySnd` defers a
+/// [`SoundRequest`] and `Target*` defers a [`TargetOp`], keeping the executor a
+/// single-entity, deterministic, panic-free simulation.
+///
+/// The fields are the subset of MUGEN's `Helper` parameters needed to bring a
+/// helper to life and address it: the [`helper_id`](Self::helper_id) it is
+/// addressable by (`helper(id)`), the [`state_no`](Self::state_no) it starts in,
+/// and the [`pos_type`](Self::pos_type) + [`pos`](Self::pos) offset the spawner
+/// resolves into a world position. The remaining MUGEN parameters
+/// (`name`/`keyctrl`/`ownpal`/`size.*`/`super.movetime`/…) are not modeled here
+/// yet; a missing parameter takes its MUGEN default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HelperSpawn {
+    /// The helper's id, used to address it via the `helper(id)` redirect. From
+    /// MUGEN's `id` parameter; defaults to `0` when absent (MUGEN's default).
+    pub helper_id: i32,
+    /// The state number the helper begins executing in (MUGEN's `stateno`).
+    /// Defaults to `0` when absent.
+    pub state_no: i32,
+    /// How [`pos`](Self::pos) is anchored (MUGEN's `postype`); see
+    /// [`HelperPosType`].
+    pub pos_type: HelperPosType,
+    /// The `(x, y)` spawn offset relative to the [`pos_type`](Self::pos_type)
+    /// anchor, in the spawner's facing-relative convention on X (MUGEN's `pos`).
+    /// The spawner (`fp-engine`) applies the facing mirroring, exactly as it does
+    /// for `Target*` ops.
+    pub pos: (f32, f32),
+    /// The helper's facing relative to the spawner (MUGEN's `facing`): `1` faces
+    /// the **same** way as the spawner, `-1` the **opposite** way. Any other
+    /// value is clamped to `1` (MUGEN's default).
+    pub facing: i32,
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
@@ -432,6 +529,13 @@ pub struct TickReport {
     /// the affected players + the round timer / `GameTime`, exempting the
     /// [`SuperPause`](FreezeKind::SuperPause) triggerer).
     pub freeze_request: Option<FreezeRequest>,
+    /// Helper-spawn requests emitted by `Helper` controllers this tick, in fire
+    /// order (T012). Empty on a tick with no firing `Helper`, and (like the other
+    /// request fields) never carried across ticks because a fresh [`TickReport`]
+    /// is built per tick. `fp-character` only *describes* each spawn; the entity
+    /// owner (`fp-engine`'s `Player`, which holds the slot-map of live helpers)
+    /// reads them after the tick and inserts each new helper into the slot-map.
+    pub helper_spawns: Vec<HelperSpawn>,
 }
 
 impl Character {
@@ -463,6 +567,25 @@ impl Character {
         self.tick_with(&loaded.states, &loaded.air, opponent, stage)
     }
 
+    /// Advances this character as a **helper** (T012): exactly like
+    /// [`Character::tick`], but with the spawning chain ([`EntityGraph`]) installed
+    /// so the helper's `parent` / `root` / `helper(id)` redirects resolve to the
+    /// owning player (and any sibling helpers) instead of bottoming out at `0`.
+    ///
+    /// The owner (`fp-engine`'s `Player`, which holds the helper slot-map) builds
+    /// the `graph` for the span of this tick from immutable references to the root
+    /// player, the helper's parent, and the sibling helpers. A helper otherwise
+    /// runs the same state machine as a full player against `loaded`.
+    pub fn tick_as_helper(
+        &mut self,
+        loaded: &LoadedCharacter,
+        opponent: Option<&Character>,
+        stage: StageView,
+        graph: EntityGraph<'_>,
+    ) -> TickReport {
+        self.tick_with_graph(&loaded.states, &loaded.air, opponent, stage, graph)
+    }
+
     /// The executor core, parameterized over just the data it needs: the
     /// compiled state graph and the animation set.
     ///
@@ -470,12 +593,31 @@ impl Character {
     /// split keeps the executor independent of the (binary-only)
     /// [`SffFile`](fp_formats::sff::SffFile), so unit tests can drive the state
     /// machine from a hand-built state map and AIR file without a sprite asset.
+    ///
+    /// Equivalent to [`Character::tick_with_graph`] with an empty
+    /// [`EntityGraph`] — i.e. a root player with no spawning chain, so `root`
+    /// resolves to self and `parent`/`helper(id)` to `0`.
     pub fn tick_with(
         &mut self,
         states: &HashMap<i32, CompiledState>,
         air: &AirFile,
         opponent: Option<&Character>,
         stage: StageView,
+    ) -> TickReport {
+        self.tick_with_graph(states, air, opponent, stage, EntityGraph::default())
+    }
+
+    /// The graph-aware executor core: [`Character::tick_with`] plus the helper
+    /// entity [`graph`](EntityGraph) the `parent`/`root`/`helper(id)` redirects
+    /// resolve against (T012). [`Character::tick_with`] passes the empty graph;
+    /// [`Character::tick_as_helper`] passes the spawning chain.
+    pub fn tick_with_graph(
+        &mut self,
+        states: &HashMap<i32, CompiledState>,
+        air: &AirFile,
+        opponent: Option<&Character>,
+        stage: StageView,
+        graph: EntityGraph<'_>,
     ) -> TickReport {
         let mut report = TickReport::default();
 
@@ -527,6 +669,7 @@ impl Character {
             opponent: opp_ctx.as_ref(),
             stage,
             anim,
+            graph,
         };
 
         // Hit-pause gate (task 6.5): while frozen by a connecting hit, the engine
@@ -963,7 +1106,7 @@ impl Character {
     /// reference comes from `env` (built once for the whole tick), so this is a
     /// cheap reborrow + struct build, no allocation and no `unsafe`.
     fn eval_ctx<'a>(&'a self, env: EvalEnv<'a>) -> EvalCtx<'a> {
-        EvalCtx::with_anim(self, env.opponent, env.stage, env.anim)
+        EvalCtx::with_anim(self, env.opponent, env.stage, env.anim).with_graph(env.graph)
     }
 
     /// Evaluates a compiled expression against this character (with its opponent /
@@ -1203,6 +1346,8 @@ impl Character {
             self.ctrl_move_hit_reset();
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
+        } else if kind.eq_ignore_ascii_case("Helper") {
+            self.ctrl_helper(ctrl, env, report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
             // run because it depends on an unbuilt subsystem (helpers, explods,
@@ -1700,6 +1845,72 @@ impl Character {
         tracing::debug!(
             "tick: PlaySnd group={group} sample={sample} channel={channel} \
              volscale={volume_scale} loop={looping} common={common} in state {}",
+            ctrl.state_number
+        );
+    }
+
+    /// `Helper`: emit a [`HelperSpawn`] request to bring a child helper entity to
+    /// life, owned by this character (T012).
+    ///
+    /// `fp-character` ticks a single entity and cannot create — or own — another
+    /// live entity inside one tick, so (exactly like `PlaySnd` and the `Target*`
+    /// controllers) this defers: it pushes a [`HelperSpawn`] onto
+    /// [`TickReport::helper_spawns`] and the entity owner (`fp-engine`'s `Player`,
+    /// which holds the slot-map of live helpers) inserts the new helper after the
+    /// tick.
+    ///
+    /// Reads the subset of MUGEN's `Helper` parameters needed to spawn and address
+    /// the child: `id` (the [`helper_id`](HelperSpawn::helper_id) for the
+    /// `helper(id)` redirect; MUGEN default `0`), `stateno` (the starting state;
+    /// default `0`), `pos = x, y` (the spawn offset, each axis defaulting to `0`),
+    /// `postype` (the [`HelperPosType`] anchor; default `p1`), and `facing` (`1` =
+    /// same as the spawner, `-1` = opposite; any other value clamps to `1`). A
+    /// missing parameter takes its MUGEN default; nothing here panics.
+    fn ctrl_helper(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        let helper_id = ctrl
+            .params
+            .get("id")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let state_no = ctrl
+            .params
+            .get("stateno")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let pos_type = ctrl
+            .params
+            .get("postype")
+            .map_or(HelperPosType::default(), |p| {
+                HelperPosType::parse(p.raw())
+            });
+        let pos_param = ctrl.params.get("pos");
+        let pos_x = pos_param
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(0.0, |v| v.to_float());
+        let pos_y = pos_param
+            .and_then(|p| self.eval_param_component(p, 1, env))
+            .map_or(0.0, |v| v.to_float());
+        // MUGEN `facing` is 1 (same as spawner) or -1 (opposite); clamp anything
+        // else to the default 1.
+        let facing = match ctrl
+            .params
+            .get("facing")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int())
+        {
+            -1 => -1,
+            _ => 1,
+        };
+        report.helper_spawns.push(HelperSpawn {
+            helper_id,
+            state_no,
+            pos_type,
+            pos: (pos_x, pos_y),
+            facing,
+        });
+        tracing::debug!(
+            "tick: Helper id={helper_id} stateno={state_no} postype={pos_type:?} \
+             pos=({pos_x},{pos_y}) facing={facing} spawned from state {}",
             ctrl.state_number
         );
     }
@@ -3545,11 +3756,13 @@ fn strip_quotes(raw: &str) -> &str {
 ///
 /// The blocking subsystems (and their tasks):
 ///
-/// - **Helpers / explods / projectiles** (`Helper`, `DestroySelf`, `Explod`,
+/// - **Helper lifecycle / explods / projectiles** (`DestroySelf`, `Explod`,
 ///   `ModifyExplod`, `RemoveExplod`, `Projectile`, `BindToParent`,
-///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — the multi-entity slot-map
-///   (T012/T013) does not exist yet, so there is no child entity to spawn or
-///   address.
+///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — these need helper *lifecycle*
+///   management (self-destruction, binding, cross-entity var writes) and the
+///   explod/projectile entity kinds, which the slot-map does not own yet (T013).
+///   (`Helper` itself is now handled — it emits a [`HelperSpawn`] request the
+///   entity owner inserts into the slot-map; T012.)
 /// - **Target/partner redirects beyond the flat 1-v-1** (`BindToTarget`) — T014.
 /// - **Stage/background ownership** (`BGPalFX`) — the background lives in
 ///   `fp-stage`/`fp-app`, not on a `Character`, so a per-character tick cannot
@@ -3571,8 +3784,9 @@ fn strip_quotes(raw: &str) -> &str {
 /// `MoveHitReset` (clears the move-connection flags).
 fn is_tracked_deferred_controller(kind: &str) -> bool {
     const DEFERRED: &[&str] = &[
-        // Multi-entity (helpers / explods / projectiles) — T012/T013.
-        "Helper",
+        // Multi-entity (explods / projectiles) — T013. (`Helper` itself is now
+        // handled: it emits a `HelperSpawn` request on the `TickReport` for the
+        // entity owner to spawn into the slot-map — see `ctrl_helper`, T012.)
         "DestroySelf",
         "Explod",
         "ModifyExplod",
@@ -12078,14 +12292,138 @@ mod tests {
         assert_eq!(ch2.life, 100);
     }
 
-    /// A documented-but-deferred controller (e.g. `Explod`, `Helper`, `BGPalFX`)
+    // ---- T012: Helper controller emits a HelperSpawn request ---------------
+
+    /// `Helper` is handled (not deferred): it pushes a [`HelperSpawn`] onto
+    /// [`TickReport::helper_spawns`] carrying its id / stateno / postype / pos /
+    /// facing. Mirrors how `PlaySnd` and `Target*` defer their effects.
+    #[test]
+    fn helper_controller_emits_spawn_request() {
+        let lc = one_ctrl_synth(
+            "Helper",
+            &[
+                ("id", "1234"),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "20, -5"),
+                ("facing", "1"),
+            ],
+        );
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.helper_spawns.len(), 1, "exactly one helper spawned");
+        let spawn = report.helper_spawns[0];
+        assert_eq!(spawn.helper_id, 1234);
+        assert_eq!(spawn.state_no, 1000);
+        assert_eq!(spawn.pos_type, HelperPosType::P1);
+        assert_eq!(spawn.pos, (20.0, -5.0));
+        assert_eq!(spawn.facing, 1);
+    }
+
+    /// A bare `Helper` with no parameters spawns with every MUGEN default
+    /// (`id=0`, `stateno=0`, `postype=p1`, `pos=(0,0)`, `facing=1`) and never
+    /// panics.
+    #[test]
+    fn helper_controller_defaults_are_mugen_defaults() {
+        let lc = one_ctrl_synth("Helper", &[]);
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.helper_spawns.len(), 1);
+        let spawn = report.helper_spawns[0];
+        assert_eq!(spawn.helper_id, 0);
+        assert_eq!(spawn.state_no, 0);
+        assert_eq!(spawn.pos_type, HelperPosType::P1);
+        assert_eq!(spawn.pos, (0.0, 0.0));
+        assert_eq!(spawn.facing, 1, "default facing is 1 (same as spawner)");
+    }
+
+    /// `postype` parses every documented anchor (case-insensitive), and `facing`
+    /// clamps anything that is not `-1` to `1`.
+    #[test]
+    fn helper_postype_parses_and_facing_clamps() {
+        for (token, expected) in [
+            ("p1", HelperPosType::P1),
+            ("P2", HelperPosType::P2),
+            ("front", HelperPosType::Front),
+            ("BACK", HelperPosType::Back),
+            ("left", HelperPosType::Left),
+            ("Right", HelperPosType::Right),
+            ("bogus", HelperPosType::P1), // unrecognized → MUGEN default
+        ] {
+            assert_eq!(HelperPosType::parse(token), expected, "postype `{token}`");
+        }
+
+        // facing = -1 stays -1 (opposite); any other value clamps to 1.
+        let opp = one_ctrl_synth("Helper", &[("facing", "-1")]);
+        let mut ch = Character::new();
+        assert_eq!(opp.tick(&mut ch).helper_spawns[0].facing, -1);
+
+        let weird = one_ctrl_synth("Helper", &[("facing", "5")]);
+        let mut ch2 = Character::new();
+        assert_eq!(
+            weird.tick(&mut ch2).helper_spawns[0].facing,
+            1,
+            "out-of-range facing clamps to 1"
+        );
+    }
+
+    /// A tick with no `Helper` controller produces no spawn requests (the field
+    /// is rebuilt empty per tick).
+    #[test]
+    fn no_helper_means_no_spawn_requests() {
+        let lc = one_ctrl_synth("Null", &[]);
+        let mut ch = Character::new();
+        assert!(lc.tick(&mut ch).helper_spawns.is_empty());
+    }
+
+    /// `tick_with_graph` installs the spawning-chain graph so a helper's
+    /// controllers can read `root` / `parent` through the redirect path — the
+    /// executor-side seam `fp-engine` ticks helpers through. The redirects are
+    /// read via **trigger conditions** (each a single compiled expression, so the
+    /// redirect comma survives, unlike a comma-split param value).
+    #[test]
+    fn tick_with_graph_resolves_parent_and_root_redirects() {
+        // var(0) = 1 iff `root, Life == 555`; var(1) = 1 iff `parent, Life == 321`.
+        let set_root_flag = ctrl(0, "VarSet", &[], &[(1, &["root, Life = 555"])], None, &[("v", "0"), ("value", "1")]);
+        let set_parent_flag = ctrl(0, "VarSet", &[], &[(1, &["parent, Life = 321"])], None, &[("v", "1"), ("value", "1")]);
+        let st0 = stand_n(0, vec![set_root_flag, set_parent_flag]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+
+        // The owning chain: a root and a parent with distinctive lives.
+        let mut root = Character::new();
+        root.life = 555;
+        let mut parent = Character::new();
+        parent.life = 321;
+
+        let mut helper = Character::new();
+        let graph = EntityGraph::new(Some(&parent), Some(&root), &[]);
+        helper.tick_with_graph(
+            &lc.states,
+            &lc.air,
+            Some(&root),
+            StageView::default(),
+            graph,
+        );
+
+        assert_eq!(helper.vars[0], 1, "`root, Life` redirect resolved to the root");
+        assert_eq!(helper.vars[1], 1, "`parent, Life` redirect resolved to the parent");
+
+        // Without the graph (a plain tick), the same redirects bottom out: the
+        // gating conditions are false, so neither flag is set.
+        let mut lone = Character::new();
+        lone.tick_with(&lc.states, &lc.air, Some(&root), StageView::default());
+        assert_eq!(lone.vars[0], 0, "no graph: `root, Life` (a helper's root) does not match 555");
+        assert_eq!(lone.vars[1], 0, "no graph: `parent` resolves to None → 0");
+    }
+
+    /// A documented-but-deferred controller (e.g. `Explod`, `BGPalFX`)
     /// is recognized by [`is_tracked_deferred_controller`] — it routes to the
     /// tracked WARN no-op, not the silent fall-through — while a genuine
     /// non-controller string is not.
     #[test]
     fn deferred_controllers_are_tracked() {
         for kind in [
-            "Helper", "Explod", "ModifyExplod", "RemoveExplod", "Projectile",
+            "Explod", "ModifyExplod", "RemoveExplod", "Projectile",
             "BGPalFX", "AllPalFX", "BindToParent", "BindToRoot", "BindToTarget",
             "DestroySelf", "MakeDust", "ForceFeedback",
             // T015 follow-up review: documented controllers that depend on an
@@ -12103,10 +12441,11 @@ mod tests {
             assert!(is_tracked_deferred_controller(&kind.to_lowercase()));
         }
         // Newly-handled controllers are NOT in the deferred set (including the
-        // reasonably-implementable self-field writes implemented in T015).
+        // reasonably-implementable self-field writes implemented in T015 and the
+        // `Helper` spawn-request emitter added in T012).
         for handled in [
             "EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw",
-            "Gravity", "VarRandom", "MoveHitReset",
+            "Gravity", "VarRandom", "MoveHitReset", "Helper",
         ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
