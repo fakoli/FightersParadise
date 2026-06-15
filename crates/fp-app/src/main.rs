@@ -50,6 +50,7 @@
 //! pattern. Missing or unloadable assets degrade gracefully to the test pattern
 //! with a clear log message; the app never panics.
 
+mod screens;
 mod validate;
 
 use std::collections::HashMap;
@@ -66,7 +67,7 @@ use fp_render::{
     BlendMode, GlyphFont, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture, TextDrawParams,
 };
 use fp_stage::{BgLayer, Stage};
-use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout};
+use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout, SelectDef, SystemDef};
 use fp_input::{map_controller, Button as PadButton, ControllerInput, RawController, DEADZONE_DEFAULT};
 use sdl2::controller::{Axis, Button as SdlPadButton, GameController};
 use sdl2::event::Event;
@@ -105,6 +106,17 @@ const COMMON_FX_AIR: &str = "assets/data/fightfx.air";
 /// relative to the process working directory; a missing/bad font degrades the HUD
 /// to its solid-color quad markers (no panic, no regression).
 const HUD_FONT_FNT: &str = "assets/data/font.fnt";
+
+/// The shipped default motif `system.def` (the title menu + select grid
+/// geometry). Resolved relative to the process working directory. When absent or
+/// unparseable the title menu degrades to a built-in fallback (VS / TRAINING /
+/// EXIT) over the shipped trainingdummy roster — see [`screens::TitleMenu::fallback`].
+const DEFAULT_SYSTEM_DEF: &str = "assets/data/system.def";
+
+/// The shipped fallback `select.def` roster, used when the motif `system.def`
+/// declares no usable `[Files] select` (or it cannot be read). The default motif
+/// points its `select` at this same file.
+const DEFAULT_SELECT_DEF: &str = "assets/data/select.def";
 
 /// MUGEN common stand (idle) state number.
 const STATE_STAND: i32 = 0;
@@ -2295,6 +2307,33 @@ fn is_def_path(p: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("def"))
 }
 
+/// The top-level launch route chosen from the (palette-flag-stripped) positional
+/// CLI args. See [`cli_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliRoute {
+    /// Launch the in-app Title menu (no file args, or an explicit `menu`).
+    Menu,
+    /// A direct content path (`p1.def [p2.def]`, `file.sff [file.air]`, ...)
+    /// handled by [`select_mode`] exactly as before — the menu is skipped.
+    Direct,
+}
+
+/// Decides whether the (palette-flag-stripped) positional `args` launch the
+/// in-app Title menu or a direct content view.
+///
+/// `args[0]` is the program name. The Title menu launches when there is **no**
+/// file argument (a fresh clean-room run) or the first argument is an explicit
+/// `menu` token; any other first argument (a `.def`/`.sff`/...) routes to the
+/// legacy direct path so the existing CLI is preserved exactly. Pure and
+/// unit-tested.
+fn cli_route(args: &[String]) -> CliRoute {
+    match args.get(1) {
+        None => CliRoute::Menu,
+        Some(a) if a.eq_ignore_ascii_case("menu") => CliRoute::Menu,
+        Some(_) => CliRoute::Direct,
+    }
+}
+
 /// Per-player `.act` palette selection from the `--p1-pal N` / `--p2-pal N` CLI
 /// flags (FL2b). Each is a 0-based index into the character's loaded `.act`
 /// overrides; `None` (the default) renders the SFF-embedded palette, so omitting
@@ -2790,6 +2829,417 @@ fn round_label(state: RoundState, winner: Option<Winner>, round_number: i32) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// In-app screen state machine (Menu-2): Title -> Select -> Fight -> Title
+// ---------------------------------------------------------------------------
+//
+// The pure menu/cursor/transition logic lives in `screens` (headless, unit-
+// tested). This section is the GPU/SDL glue: it loads the motif (`system.def` +
+// `select.def`) and the menu font once, owns the live [`RunScreen`], samples one
+// rising-edge menu input per frame, and renders the Title/Select screens as text
+// over a solid background. The Fight screen reuses the existing [`MatchRun`]
+// render/HUD path unchanged.
+
+/// The loaded default motif content the menu flow draws from: the parsed
+/// `system.def` (title menu + select geometry), the parsed `select.def` roster,
+/// and the `select.def`'s own path (so a roster `.def` resolves relative to it).
+///
+/// Every field has a sensible fallback: a missing/unparseable `system.def`
+/// yields [`SystemDef::default`] (the title menu then uses its built-in
+/// fallback), and a missing/unparseable roster yields an empty [`SelectDef`].
+struct Motif {
+    /// The parsed motif `system.def`.
+    system: SystemDef,
+    /// The parsed roster `select.def`.
+    select: SelectDef,
+    /// The on-disk path of the `select.def`, used to resolve roster `.def`s.
+    select_path: PathBuf,
+}
+
+impl Motif {
+    /// Loads the default motif best-effort from [`DEFAULT_SYSTEM_DEF`].
+    ///
+    /// Reads `system.def` (degrading to [`SystemDef::default`] when absent/bad),
+    /// resolves its `[Files] select` relative to the `system.def` (falling back to
+    /// the shipped [`DEFAULT_SELECT_DEF`] when it declares none or the file is
+    /// missing), and parses the roster (degrading to an empty roster on a read
+    /// error). Never panics — every failure logs and substitutes a default.
+    fn load_default() -> Self {
+        Self::load_from(Path::new(DEFAULT_SYSTEM_DEF), Path::new(DEFAULT_SELECT_DEF))
+    }
+
+    /// Loads a motif from an explicit `system.def` path, falling back to
+    /// `fallback_select` when the motif declares/has no usable `select.def`. Split
+    /// from [`Motif::load_default`] so the resolution logic is unit-testable by
+    /// absolute path. Never panics.
+    fn load_from(system_path: &Path, fallback_select: &Path) -> Self {
+        let system = match fp_formats::def::DefFile::load(system_path) {
+            Ok(def) => {
+                tracing::info!("Loaded motif system.def: {}", system_path.display());
+                SystemDef::parse(&def)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "motif {} not loaded ({e}); using built-in fallback menu",
+                    system_path.display()
+                );
+                SystemDef::default()
+            }
+        };
+
+        // Resolve the roster path: the motif's `[Files] select` relative to the
+        // system.def, else the shipped fallback select.def.
+        let select_path = resolve_select_path(system_path, &system, fallback_select);
+        let select = match std::fs::read_to_string(&select_path) {
+            Ok(text) => {
+                tracing::info!("Loaded roster select.def: {}", select_path.display());
+                SelectDef::parse(&text)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "roster {} not loaded ({e}); using empty roster",
+                    select_path.display()
+                );
+                SelectDef::default()
+            }
+        };
+
+        Self {
+            system,
+            select,
+            select_path,
+        }
+    }
+}
+
+/// Resolves the roster `select.def` path for a motif: the motif's `[Files]
+/// select` resolved relative to the `system.def` directory if it names one and
+/// that file exists, else the shipped `fallback` path. Pure given the filesystem;
+/// split out so the fallback logic is unit-testable.
+fn resolve_select_path(system_path: &Path, system: &SystemDef, fallback: &Path) -> PathBuf {
+    let declared = system.select_file.trim();
+    if !declared.is_empty() {
+        let resolved = fp_formats::def::DefFile::resolve_path(system_path, declared);
+        if resolved.exists() {
+            return resolved;
+        }
+        tracing::warn!(
+            "motif declares select = {declared} but {} is missing; using fallback roster",
+            resolved.display()
+        );
+    }
+    fallback.to_path_buf()
+}
+
+/// The live in-app screen. The menu flow starts in [`RunScreen::Title`] and
+/// transitions Title -> Select -> Fight -> Title; [`RunScreen::Quit`] ends the
+/// loop. The Fight variant carries the same [`MatchRun`] the direct-CLI match
+/// path uses, so the fight renders identically.
+enum RunScreen {
+    /// The title-screen main menu.
+    Title(screens::TitleMenu),
+    /// The character-select grid.
+    Select(screens::SelectScreen),
+    /// A running two-player match. On match-over the flow returns to Title.
+    Fight(Box<MatchRun>),
+    /// Leave the application.
+    Quit,
+}
+
+/// The whole menu-mode runtime: the loaded motif, the menu font, and the live
+/// screen. Owns the transitions between Title/Select/Fight.
+struct MenuApp {
+    /// The loaded default motif (title menu + roster).
+    motif: Motif,
+    /// The bitmap font used to draw the text menus (the shipped HUD font).
+    /// `None` when the font is absent — the menus then draw nothing but the flow
+    /// still works (and logs), so a missing font never traps the app.
+    font: Option<GlyphFont>,
+    /// The current screen.
+    screen: RunScreen,
+}
+
+impl MenuApp {
+    /// Builds the menu runtime: loads the default motif + menu font and starts on
+    /// the Title screen built from the motif (or its built-in fallback).
+    fn new(renderer: &Renderer) -> Self {
+        let motif = Motif::load_default();
+        let title = screens::TitleMenu::from_system(&motif.system);
+        Self {
+            motif,
+            font: load_hud_font(renderer),
+            screen: RunScreen::Title(title),
+        }
+    }
+
+    /// Whether the app should keep running (false once the menu requested Quit).
+    fn running(&self) -> bool {
+        !matches!(self.screen, RunScreen::Quit)
+    }
+
+    /// Enters the character-select screen for the given mode.
+    fn enter_select(&mut self, mode: screens::SelectMode) {
+        let screen = screens::SelectScreen::new(
+            mode,
+            &self.motif.select,
+            &self.motif.system.select_info,
+            &self.motif.select_path,
+        );
+        if screen.is_empty() {
+            tracing::warn!("roster has no choosable characters; returning to title");
+            self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+        } else {
+            self.screen = RunScreen::Select(screen);
+        }
+    }
+
+    /// Builds the two-player match for a completed [`screens::MatchPick`] and
+    /// enters the Fight screen, or returns to Title on a load failure (so a bad
+    /// roster `.def` never crashes the flow).
+    fn enter_fight(&mut self, pick: screens::MatchPick, renderer: &Renderer) {
+        tracing::info!(
+            "Starting match: P1={} ({}) vs P2={} ({})",
+            pick.p1_name,
+            pick.p1_def.display(),
+            pick.p2_name,
+            pick.p2_def.display(),
+        );
+        match build_match_run(&pick.p1_def, &pick.p2_def, renderer) {
+            Some(run) => self.screen = RunScreen::Fight(Box::new(run)),
+            None => {
+                tracing::warn!("could not start match; returning to title");
+                self.screen =
+                    RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+            }
+        }
+    }
+
+    /// Returns to the Title screen (fresh cursor).
+    fn return_to_title(&mut self) {
+        self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+    }
+}
+
+/// Builds a [`MatchRun`] (match + per-run render/audio/HUD resources) for two
+/// character `.def`s, mirroring the direct-CLI match path but without a stage or
+/// screenpack search (the menu flow ships none). Returns `None` on a character
+/// load failure so the caller can fall back to the title menu. Never panics.
+fn build_match_run(p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Option<MatchRun> {
+    match load_match_or_fallback(p1_def, p2_def, None, PalSelection::default(), renderer) {
+        Mode::Match(run) => Some(*run),
+        // A character that fails to load degrades to the test pattern in
+        // `load_match_or_fallback`; the menu flow treats that as "couldn't start"
+        // and returns to the title rather than showing a checkerboard.
+        _ => None,
+    }
+}
+
+/// Draws the Title screen: the motif name (when present) and each menu item as a
+/// line of text, the highlighted item prefixed with a cursor marker, over the
+/// already-cleared solid background. A no-op when no font is loaded.
+fn draw_title_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    menu: &screens::TitleMenu,
+    title_name: &str,
+    win_w: f32,
+) {
+    /// Menu text scale (the ~7px font at 3x ≈ 21px lines).
+    const SCALE: f32 = 3.0;
+    /// Title-name scale, a touch larger than the items.
+    const TITLE_SCALE: f32 = 4.0;
+    let line_h = font.line_height() as f32 * SCALE;
+
+    // Motif name as a header near the top.
+    let mut y = 60.0;
+    if !title_name.is_empty() {
+        draw_centered_text(frame, font, &to_menu_text(title_name), win_w, y, TITLE_SCALE, 1.0);
+    }
+
+    // Menu items, vertically stacked and centered, the cursor item marked.
+    y = 180.0;
+    for (i, entry) in menu.entries.iter().enumerate() {
+        let selected = i == menu.cursor;
+        // A leading "> " marks the highlighted item; others are indented to match
+        // so the labels line up. The font is uppercase-only, so upcase the label.
+        let line = if selected {
+            format!("> {}", to_menu_text(&entry.label))
+        } else {
+            format!("  {}", to_menu_text(&entry.label))
+        };
+        let alpha = if selected { 1.0 } else { 0.6 };
+        draw_centered_text(frame, font, &line, win_w, y, SCALE, alpha);
+        y += line_h + 8.0;
+    }
+}
+
+/// Draws the character-select screen: a header, the roster as a centered text
+/// list (one cell per line) with the P1 (and, in Versus, P2) cursor markers, and
+/// each player's locked-in pick. A no-op when no font is loaded.
+fn draw_select_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    screen: &screens::SelectScreen,
+    win_w: f32,
+) {
+    /// Roster text scale.
+    const SCALE: f32 = 2.5;
+    let line_h = font.line_height() as f32 * SCALE;
+
+    draw_centered_text(frame, font, "SELECT", win_w, 40.0, 3.0, 1.0);
+
+    let mut y = 120.0;
+    for (i, cell) in screen.cells.iter().enumerate() {
+        let name = match cell {
+            screens::RosterCell::Character(e) => to_menu_text(&e.name),
+            screens::RosterCell::Random => "RANDOM".to_string(),
+        };
+        // Cursor markers: P1 marks its cell, P2 marks its own (Versus only). When
+        // both land on the same cell show a combined marker.
+        let p1_here = !screen.is_empty() && screen.p1_cursor == i;
+        let p2_here = screen.mode == screens::SelectMode::Versus && screen.p2_cursor == i;
+        let marker = match (p1_here, p2_here) {
+            (true, true) => "P12",
+            (true, false) => "P1 ",
+            (false, true) => "P2 ",
+            (false, false) => "   ",
+        };
+        let locked = screen.p1_locked == Some(i) || screen.p2_locked == Some(i);
+        let line = if locked {
+            format!("{marker} {name} *")
+        } else {
+            format!("{marker} {name}")
+        };
+        let alpha = if p1_here || p2_here { 1.0 } else { 0.6 };
+        draw_centered_text(frame, font, &line, win_w, y, SCALE, alpha);
+        y += line_h + 6.0;
+    }
+
+    // A short hint at the bottom.
+    let hint = match screen.mode {
+        screens::SelectMode::Versus => "P1 THEN P2 PICK",
+        screens::SelectMode::Training => "PICK FIGHTER",
+    };
+    draw_centered_text(frame, font, hint, win_w, y + 20.0, 2.0, 0.8);
+}
+
+/// Upcases `s` into the menu font's supported glyph set (the shipped FNT covers
+/// `0-9 A-Z`, space, and colon). Lowercase becomes uppercase; any character the
+/// font can't draw is harmlessly skipped by `draw_text`'s missing-glyph
+/// fallback, so this only needs to fold case for readability.
+fn to_menu_text(s: &str) -> String {
+    s.to_ascii_uppercase()
+}
+
+/// Advances a [`MatchRun`] one 60Hz tick and plays the frame's surfaced sound
+/// requests (P1 then P2). Factored out of the run loop so both the direct-CLI
+/// match path and the menu Fight screen drive a match identically.
+fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput) {
+    run.m.tick(p1_input, p2_input);
+    // AFTER the tick: play this frame's surfaced sound requests, P1 then P2, each
+    // from its own decoded-sound cache. Graceful throughout — a silent backend or
+    // a missing sound is a no-op.
+    run.p1_audio
+        .play_requests(&mut run.audio, run.m.p1(), run.m.p1_sound_requests());
+    run.p2_audio
+        .play_requests(&mut run.audio, run.m.p2(), run.m.p2_sound_requests());
+}
+
+/// Decodes everything a [`MatchRun`] needs to draw this frame (both fighters'
+/// current sprites, live hit-spark sprites, stage background sprites, and the
+/// active storyboard overlay) into the GPU caches. Must run BEFORE `begin_frame`
+/// because decoding needs `&Renderer`, which a live `RenderFrame` holds borrowed.
+/// Factored out of the run loop so the Fight screen caches identically.
+fn cache_match_run(run: &mut MatchRun, renderer: &Renderer) {
+    cache_player_sprite(&mut run.p1_render, run.m.p1(), renderer);
+    cache_player_sprite(&mut run.p2_render, run.m.p2(), renderer);
+    cache_effect_sprites(run, renderer);
+    if let Some(stage) = run.stage.as_mut() {
+        stage.cache_sprites(renderer);
+    }
+    run.tick_storyboard(renderer);
+}
+
+/// Draws a whole [`MatchRun`] frame: stage layers, both fighters (sprpriority
+/// ordered), hit-sparks, the optional Clsn debug overlay, the HUD (screenpack or
+/// quad), and any active storyboard overlay. Factored out of the run loop so the
+/// menu Fight screen renders byte-identically to the direct-CLI match path.
+fn draw_match_run(
+    frame: &mut fp_render::RenderFrame<'_>,
+    run: &MatchRun,
+    hud: &Hud,
+    overlay_enabled: bool,
+    win_wf: f32,
+    win_hf: f32,
+) {
+    // Camera follows the fighters' midpoint, clamped to the stage's horizontal
+    // bounds. With no stage the camera stays at 0 (flat-background path).
+    let camera_x = run
+        .stage
+        .as_ref()
+        .map(|s| s.stage.camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x))
+        .unwrap_or(0.0);
+
+    // Back background layers first (behind the fighters).
+    if let Some(stage) = run.stage.as_ref() {
+        stage.draw_layer(frame, BgLayer::Back, camera_x, win_wf, win_hf);
+    }
+
+    // Draw both fighters ordered by sprite-draw priority (MUGEN `sprpriority`,
+    // audit #16): the lower priority is drawn FIRST (behind), the higher OVER it.
+    // A tie keeps P1 behind P2 (stable, deterministic order).
+    if p1_draws_behind_p2(
+        run.m.p1().character.cur_sprpriority,
+        run.m.p2().character.cur_sprpriority,
+    ) {
+        draw_player(frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+        draw_player(frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+    } else {
+        draw_player(frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+        draw_player(frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+    }
+
+    // Hit-spark effects (audit #17), drawn OVER both fighters, under front BG/HUD.
+    draw_effects(
+        frame,
+        EffectRenders {
+            p1_render: &run.p1_render,
+            p2_render: &run.p2_render,
+            common_render: run.common_fx.as_ref().map(|c| &c.render),
+        },
+        &run.m,
+        camera_x,
+        win_wf,
+        win_hf,
+    );
+
+    // Front background layers, over the fighters but under the HUD.
+    if let Some(stage) = run.stage.as_ref() {
+        stage.draw_layer(frame, BgLayer::Front, camera_x, win_wf, win_hf);
+    }
+
+    // Optional Clsn debug overlay (F1).
+    if overlay_enabled {
+        draw_player_clsn(frame, run.m.p1(), camera_x, win_wf, win_hf);
+        draw_player_clsn(frame, run.m.p2(), camera_x, win_wf, win_hf);
+    }
+
+    // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
+    match run.screenpack.as_ref() {
+        Some(screenpack) => {
+            let state = match_hud_state(&run.m);
+            screenpack.draw(frame, &state);
+        }
+        None => hud.draw(frame, win_wf, &run.m),
+    }
+
+    // Intro/ending storyboard overlay (audit #32), drawn LAST and only while one
+    // is active.
+    if let Some(overlay) = run.storyboard_to_draw() {
+        overlay.draw(frame, win_wf, win_hf);
+    }
+}
+
 fn run() -> fp_core::FpResult<()> {
     // --- SDL2 setup ---
     let sdl = sdl2::init().map_err(|e| fp_core::FpError::Other(format!("SDL2 init: {e}")))?;
@@ -2843,11 +3293,33 @@ fn run() -> fp_core::FpResult<()> {
     // FL2b) first; the remaining positional args drive file routing as before.
     let raw_args: Vec<String> = std::env::args().collect();
     let (pal, args) = parse_pal_flags(&raw_args);
-    let mut mode = select_mode(&args, pal, &renderer);
 
-    // The minimal match HUD (life bars + KO marker). Built once; only drawn in
-    // the two-player match mode.
+    // The top-level launch route: no file args (or an explicit `menu`) launches
+    // the in-app Title menu; any direct content path (p1.def/sff/...) keeps the
+    // legacy direct view exactly as before. This REPLACES the old no-args default
+    // (a two-KFM match) with the menu, so a fresh clean-room checkout boots into
+    // the title screen over the shipped trainingdummy roster (no KFM needed).
+    let route = cli_route(&args);
+    let mut menu_app = match route {
+        CliRoute::Menu => Some(MenuApp::new(&renderer)),
+        CliRoute::Direct => None,
+    };
+    // The direct-CLI content mode, only built on the Direct route.
+    let mut mode = match route {
+        CliRoute::Direct => Some(select_mode(&args, pal, &renderer)),
+        CliRoute::Menu => None,
+    };
+
+    // The minimal match HUD (life bars + KO marker). Built once; drawn in the
+    // two-player match mode and the menu Fight screen.
     let hud = Hud::new(&renderer);
+
+    // Edge-detection state for the text menus: last frame's held menu controls.
+    // Updated once per real frame so a held key moves the cursor one cell.
+    let mut prev_menu_held = screens::HeldMenuInput::default();
+    // A monotonic frame counter, used as the deterministic-friendly RNG seed for
+    // RandomSelect on the character-select screen.
+    let mut frame_counter: u64 = 0;
 
     // --- Main loop ---
     let mut event_pump = sdl
@@ -2863,15 +3335,33 @@ fn run() -> fp_core::FpResult<()> {
     let mut overlay_enabled = false;
 
     while running {
+        // Per-frame edge flags driven from discrete key events (below).
+        // `esc_pressed` doubles as the menu "back" in menu mode (back out a
+        // screen) and a hard quit in direct mode; `confirm_pressed` (Enter/Space)
+        // confirms a menu item. These are edges by construction (one KeyDown per
+        // physical press), complementing the held-state directions sampled below.
+        let mut esc_pressed = false;
+        let mut confirm_key_pressed = false;
         // Poll events
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
+                Event::Quit { .. } => {
+                    // A window close is always a hard quit, in any mode.
+                    running = false;
+                }
+                Event::KeyDown {
                     keycode: Some(Keycode::Escape),
+                    repeat: false,
                     ..
                 } => {
-                    running = false;
+                    esc_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Return | Keycode::Space),
+                    repeat: false,
+                    ..
+                } => {
+                    confirm_key_pressed = true;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::F1),
@@ -2939,53 +3429,108 @@ fn run() -> fp_core::FpResult<()> {
             .map(|c| controller_to_match_input(&c))
             .unwrap_or_else(MatchInput::none);
 
-        while accumulator >= TICK_DURATION {
-            match mode {
-                Mode::Match(ref mut run) => {
-                    // P1 = keyboard OR controller 0; P2 = controller 1 if present,
-                    // else an idle dummy.
-                    run.m.tick(p1_input, p2_input);
+        frame_counter = frame_counter.wrapping_add(1);
 
-                    // AFTER the tick: play this frame's surfaced sound requests,
-                    // P1 then P2, each from its own decoded-sound cache. Graceful
-                    // throughout — a silent backend or a missing sound is a no-op.
-                    run.p1_audio
-                        .play_requests(&mut run.audio, run.m.p1(), run.m.p1_sound_requests());
-                    run.p2_audio
-                        .play_requests(&mut run.audio, run.m.p2(), run.m.p2_sound_requests());
+        // --- Menu screen update (menu mode only) ---
+        // Build the rising-edge menu input for this frame: directions from the
+        // held P1 input (keyboard OR controller 0), confirm from Enter/Space OR a
+        // controller face/attack button, back from Esc OR controller B. A held
+        // direction yields exactly one cursor step thanks to edge detection.
+        if let Some(app) = menu_app.as_mut() {
+            // Held state this frame (for direction edges).
+            let held = screens::HeldMenuInput {
+                up: p1_input.up,
+                down: p1_input.down,
+                left: p1_input.left,
+                right: p1_input.right,
+                // A held confirm/back is also fine — edge detection makes it
+                // one-shot. Map controller A (a) to confirm, B (b) to back.
+                confirm: p1_input.a,
+                back: p1_input.b,
+            };
+            let mut menu_in = screens::MenuInput::from_edges(held, prev_menu_held);
+            // Fold in the discrete key-event edges (these are already one-shot).
+            menu_in.confirm = menu_in.confirm || confirm_key_pressed;
+            menu_in.back = menu_in.back || esc_pressed;
+            prev_menu_held = held;
+
+            // Drive the active menu screen. The Fight screen is driven by the
+            // normal match tick path below (not here); Title/Select consume the
+            // menu input and may transition.
+            match app.screen {
+                RunScreen::Title(ref mut menu) => {
+                    if let Some(action) = menu.update(menu_in) {
+                        match action {
+                            screens::TitleAction::Select(mode) => app.enter_select(mode),
+                            screens::TitleAction::Quit => app.screen = RunScreen::Quit,
+                            screens::TitleAction::NoOp => {}
+                        }
+                    }
                 }
-                Mode::Viewer(ref mut v) => v.tick(),
-                Mode::Static(..) | Mode::TestPattern(..) => {}
+                RunScreen::Select(ref mut select) => {
+                    match select.update(menu_in, frame_counter) {
+                        screens::SelectOutcome::Pending => {}
+                        screens::SelectOutcome::Cancelled => app.return_to_title(),
+                        screens::SelectOutcome::Done(pick) => app.enter_fight(pick, &renderer),
+                    }
+                }
+                RunScreen::Fight(_) | RunScreen::Quit => {}
+            }
+
+            if !app.running() {
+                running = false;
+            }
+        } else if esc_pressed {
+            // Direct CLI modes keep the original Esc-quits behaviour.
+            running = false;
+        }
+
+        // --- Fixed-timestep tick (catch-up loop) ---
+        // Both the direct-CLI match and the menu Fight screen drive their match at
+        // a fixed 60Hz here; the Title/Select menu screens are event-driven (no
+        // per-tick simulation), so they only need a render below. Viewer/Static/
+        // TestPattern tick as before.
+        while accumulator >= TICK_DURATION {
+            match mode.as_mut() {
+                Some(Mode::Match(run)) => tick_match_run(run, p1_input, p2_input),
+                Some(Mode::Viewer(v)) => v.tick(),
+                Some(Mode::Static(..)) | Some(Mode::TestPattern(..)) | None => {}
+            }
+            // The menu Fight screen advances its match here too.
+            if let Some(RunScreen::Fight(run)) =
+                menu_app.as_mut().map(|a| &mut a.screen)
+            {
+                tick_match_run(run, p1_input, p2_input);
             }
             accumulator -= TICK_DURATION;
+        }
+
+        // After the catch-up loop: if the menu's match is over, return to the
+        // title screen (Menu-2 deliverable 4). Done outside the tick loop so the
+        // transition happens once per real frame, after all sub-ticks.
+        if let Some(app) = menu_app.as_mut() {
+            if let RunScreen::Fight(run) = &app.screen {
+                if run.m.match_winner().is_some() {
+                    tracing::info!("Match over; returning to title menu");
+                    app.return_to_title();
+                }
+            }
         }
 
         // Ensure the current animation frame's sprite is cached before rendering.
         // Caching needs `&Renderer`, which a live `RenderFrame` would hold
         // borrowed, so it must happen before `begin_frame`.
-        match mode {
-            Mode::Match(ref mut run) => {
-                cache_player_sprite(&mut run.p1_render, run.m.p1(), &renderer);
-                cache_player_sprite(&mut run.p2_render, run.m.p2(), &renderer);
-                // Decode any live hit-spark sprites (audit #17) into the owning
-                // side's cache, also before `begin_frame` borrows the renderer.
-                cache_effect_sprites(run, &renderer);
-                // Decode the stage's background sprites too (also needs `&Renderer`
-                // before the frame borrows it). A no-op when there is no stage.
-                if let Some(stage) = run.stage.as_mut() {
-                    stage.cache_sprites(&renderer);
-                }
-                // Advance + decode the active intro/ending storyboard overlay
-                // (audit #32). A no-op when no overlay is active, so the normal
-                // intro/match path is unchanged.
-                run.tick_storyboard(&renderer);
-            }
-            Mode::Viewer(ref mut v) => {
+        match mode.as_mut() {
+            Some(Mode::Match(run)) => cache_match_run(run, &renderer),
+            Some(Mode::Viewer(v)) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
                     v.get_or_create_sprite(sid, &renderer);
                 }
             }
-            Mode::Static(..) | Mode::TestPattern(..) => {}
+            Some(Mode::Static(..)) | Some(Mode::TestPattern(..)) | None => {}
+        }
+        if let Some(RunScreen::Fight(run)) = menu_app.as_mut().map(|a| &mut a.screen) {
+            cache_match_run(run, &renderer);
         }
 
         // Render
@@ -2993,92 +3538,15 @@ fn run() -> fp_core::FpResult<()> {
         frame.clear(0.1, 0.1, 0.15);
 
         let (win_w, win_h) = window.size();
+        let win_wf = win_w as f32;
+        let win_hf = win_h as f32;
 
-        match mode {
-            Mode::Match(ref run) => {
-                let win_wf = win_w as f32;
-                let win_hf = win_h as f32;
-
-                // Camera follows the fighters' midpoint, clamped to the stage's
-                // horizontal bounds. With no stage the camera stays at 0, so the
-                // fighters render exactly as before (flat-background path).
-                let camera_x = run
-                    .stage
-                    .as_ref()
-                    .map(|s| s.stage.camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x))
-                    .unwrap_or(0.0);
-
-                // Back background layers first (behind the fighters).
-                if let Some(stage) = run.stage.as_ref() {
-                    stage.draw_layer(&mut frame, BgLayer::Back, camera_x, win_wf, win_hf);
-                }
-
-                // Draw both fighters from their current AIR frame, each via its
-                // own per-character texture cache (populated above), offset by the
-                // camera so the playfield scrolls. The two are ordered by their
-                // sprite-draw priority (MUGEN `sprpriority`, audit #16): the lower
-                // priority is drawn FIRST (behind), the higher one OVER it. A tie
-                // keeps P1 behind P2 (stable, deterministic order).
-                if p1_draws_behind_p2(
-                    run.m.p1().character.cur_sprpriority,
-                    run.m.p2().character.cur_sprpriority,
-                ) {
-                    draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
-                    draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
-                } else {
-                    draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
-                    draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
-                }
-
-                // Hit-spark effects (audit #17), drawn OVER both fighters at their
-                // contact points (additive glow), but under the front BG and HUD.
-                draw_effects(
-                    &mut frame,
-                    EffectRenders {
-                        p1_render: &run.p1_render,
-                        p2_render: &run.p2_render,
-                        common_render: run.common_fx.as_ref().map(|c| &c.render),
-                    },
-                    &run.m,
-                    camera_x,
-                    win_wf,
-                    win_hf,
-                );
-
-                // Front background layers, over the fighters but under the HUD.
-                if let Some(stage) = run.stage.as_ref() {
-                    stage.draw_layer(&mut frame, BgLayer::Front, camera_x, win_wf, win_hf);
-                }
-
-                // Optional Clsn debug overlay (F1): both fighters' attack (red)
-                // and hurt (blue) boxes, drawn over the sprites but under the HUD.
-                if overlay_enabled {
-                    draw_player_clsn(&mut frame, run.m.p1(), camera_x, win_wf, win_hf);
-                    draw_player_clsn(&mut frame, run.m.p2(), camera_x, win_wf, win_hf);
-                }
-                // HUD on top. A loaded `fight.def` screenpack draws the real
-                // lifebars/power/text; absent one, the hand-rolled quad HUD draws
-                // (life bars + KO/round indicator) exactly as before — no
-                // regression for the default (screenpack-less) match.
-                match run.screenpack.as_ref() {
-                    Some(screenpack) => {
-                        let state = match_hud_state(&run.m);
-                        screenpack.draw(&mut frame, &state);
-                    }
-                    None => hud.draw(&mut frame, win_wf, &run.m),
-                }
-
-                // Intro/ending storyboard overlay (audit #32), drawn LAST and only
-                // while one is active: a full-screen cutscene that paints over the
-                // fight (its own opaque clear-color cover blocks what is behind it).
-                // When no overlay is active this is a no-op, so the fighters/HUD/
-                // screenpack drawn above are exactly the normal match — no
-                // regression.
-                if let Some(overlay) = run.storyboard_to_draw() {
-                    overlay.draw(&mut frame, win_wf, win_hf);
-                }
+        // Direct-CLI content modes render exactly as before.
+        match mode.as_ref() {
+            Some(Mode::Match(run)) => {
+                draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
             }
-            Mode::Viewer(ref v) => {
+            Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
                     if let Some(cached) = v.sprite_cache.get(&anim_frame.sprite) {
                         let center_x = win_w as f32 / 2.0;
@@ -3101,14 +3569,37 @@ fn run() -> fp_core::FpResult<()> {
                     }
                 }
             }
-            Mode::Static(ref sprite_tex, ref palette_tex)
-            | Mode::TestPattern(ref sprite_tex, ref palette_tex) => {
+            Some(Mode::Static(sprite_tex, palette_tex))
+            | Some(Mode::TestPattern(sprite_tex, palette_tex)) => {
                 let params = SpriteDrawParams {
                     x: (win_w as f32 - sprite_tex.width as f32) / 2.0,
                     y: (win_h as f32 - sprite_tex.height as f32) / 2.0,
                     ..Default::default()
                 };
                 frame.draw_sprite(sprite_tex, palette_tex, &params);
+            }
+            None => {}
+        }
+
+        // Menu-mode screens render over the solid clear color: Title/Select as
+        // text, Fight via the shared match draw path (identical to the direct
+        // match render above).
+        if let Some(app) = menu_app.as_ref() {
+            match &app.screen {
+                RunScreen::Title(menu) => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_title_screen(&mut frame, font, menu, &app.motif.system.name, win_wf);
+                    }
+                }
+                RunScreen::Select(select) => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_select_screen(&mut frame, font, select, win_wf);
+                    }
+                }
+                RunScreen::Fight(run) => {
+                    draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
+                }
+                RunScreen::Quit => {}
             }
         }
 
@@ -5633,5 +6124,193 @@ mod tests {
             saw_common,
             "a real KFM hit (common sparkno) must spawn a common fightfx spark with the asset loaded"
         );
+    }
+
+    // =====================================================================
+    // Menu-2 — in-app screen state machine (Title -> Select -> Fight -> Title)
+    // =====================================================================
+
+    /// Resolves a path under the workspace `assets/` directory (the shipped,
+    /// clean-room default motif). `CARGO_MANIFEST_DIR` is `crates/fp-app`.
+    fn shipped_asset(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(rel)
+    }
+
+    /// No file argument routes to the Title menu; an explicit `menu` token does
+    /// too. Any direct content path keeps the legacy direct route (no menu), so
+    /// the existing CLI is preserved.
+    #[test]
+    fn cli_route_menu_vs_direct() {
+        // No args -> Menu.
+        assert_eq!(cli_route(&["fp-app".to_string()]), CliRoute::Menu);
+        // Explicit `menu` (case-insensitive) -> Menu.
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "menu".to_string()]),
+            CliRoute::Menu
+        );
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "MENU".to_string()]),
+            CliRoute::Menu
+        );
+        // A character .def -> Direct (the legacy two-player path).
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "kfm.def".to_string()]),
+            CliRoute::Direct
+        );
+        // Two .defs -> Direct.
+        assert_eq!(
+            cli_route(&[
+                "fp-app".to_string(),
+                "p1.def".to_string(),
+                "p2.def".to_string()
+            ]),
+            CliRoute::Direct
+        );
+        // An .sff (viewer) -> Direct.
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "kfm.sff".to_string()]),
+            CliRoute::Direct
+        );
+    }
+
+    /// The default motif loads its declared roster (the shipped `select.def`,
+    /// which lists Training Dummy twice + a randomselect icon), so the title menu
+    /// and select grid build from real shipped content. Asset-gated on the shipped
+    /// motif (always present in this worktree); skips cleanly if absent.
+    #[test]
+    fn default_motif_loads_shipped_roster() {
+        let system_path = shipped_asset("data/system.def");
+        let fallback = shipped_asset("data/select.def");
+        if !system_path.exists() {
+            eprintln!("skipping: {} not present", system_path.display());
+            return;
+        }
+        let motif = Motif::load_from(&system_path, &fallback);
+        // The shipped system.def enables VS MODE / TRAINING / EXIT.
+        let title = screens::TitleMenu::from_system(&motif.system);
+        let labels: Vec<&str> = title.entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"VS MODE"), "title has VS MODE: {labels:?}");
+        assert!(labels.contains(&"TRAINING"), "title has TRAINING");
+        assert!(labels.contains(&"EXIT"), "title has EXIT");
+        // The roster has at least one choosable character (Training Dummy).
+        let select = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        assert!(!select.is_empty(), "shipped roster has a choosable character");
+    }
+
+    /// A missing motif resolves to the built-in fallback title menu (VS /
+    /// TRAINING / EXIT) over an empty roster, without panicking — the clean-room
+    /// degradation path.
+    #[test]
+    fn missing_motif_uses_fallback_menu() {
+        let motif = Motif::load_from(
+            Path::new("/no/such/system.def"),
+            Path::new("/no/such/select.def"),
+        );
+        let title = screens::TitleMenu::from_system(&motif.system);
+        // Built-in fallback ships exactly VS / TRAINING / EXIT.
+        assert_eq!(title.entries.len(), 3);
+        assert_eq!(title.entries[0].label, "VS MODE");
+        // Empty roster: the select screen reports empty (the app would stay on
+        // title), never a panic.
+        let select = screens::SelectScreen::new(
+            screens::SelectMode::Versus,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        assert!(select.is_empty(), "no roster -> empty select screen");
+    }
+
+    /// End-to-end headless flow: select the shipped trainingdummy roster (the
+    /// Training-mode single confirm), resolve the pick to its `.def`, load it, and
+    /// build + drive a real two-player [`Match`] for a few ticks. Verifies the
+    /// menu's roster-pick -> load -> Match wiring actually produces a runnable
+    /// match over the shipped clean-room character (no KFM needed). Asset-gated on
+    /// the shipped motif/character.
+    #[test]
+    fn training_pick_builds_and_drives_a_match() {
+        let system_path = shipped_asset("data/system.def");
+        let fallback = shipped_asset("data/select.def");
+        if !system_path.exists() {
+            eprintln!("skipping: {} not present", system_path.display());
+            return;
+        }
+        let motif = Motif::load_from(&system_path, &fallback);
+        let mut select = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        // Single confirm in Training picks P1 (cell 0) and mirrors P2.
+        let confirm = screens::MenuInput {
+            confirm: true,
+            ..screens::MenuInput::default()
+        };
+        let screens::SelectOutcome::Done(pick) = select.update(confirm, 0) else {
+            panic!("training confirm should complete the select screen");
+        };
+        // The pick resolves to a real, existing trainingdummy .def under assets/.
+        assert_eq!(
+            pick.p1_def, pick.p2_def,
+            "training mirrors P1 onto P2 (idle dummy)"
+        );
+        assert!(
+            pick.p1_def.exists(),
+            "picked .def resolves to an existing file: {}",
+            pick.p1_def.display()
+        );
+        // Build the same two-player Match the menu Fight screen builds, and drive
+        // a handful of ticks. It must not panic and must start in the intro phase
+        // with both fighters at full life.
+        let mut m = build_two_player_match(&pick.p1_def, &pick.p2_def, PalSelection::default())
+            .expect("trainingdummy match builds");
+        assert_eq!(m.round_state(), RoundState::Intro);
+        assert_eq!(m.p1().life(), m.p1().life_max());
+        assert!(m.match_winner().is_none(), "no winner at the start");
+        for _ in 0..30 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        // After a few ticks the match is still coherent (no panic; both alive).
+        assert!(m.p1().life() >= 0);
+        assert!(m.p2().life() >= 0);
+    }
+
+    /// `resolve_select_path` prefers the motif's declared `[Files] select`
+    /// (resolved relative to the system.def) when it exists, and falls back to the
+    /// shipped path otherwise. Uses the shipped motif where `select = select.def`
+    /// sits next to `system.def`.
+    #[test]
+    fn resolve_select_path_prefers_declared_then_fallback() {
+        let system_path = shipped_asset("data/system.def");
+        if !system_path.exists() {
+            eprintln!("skipping: {} not present", system_path.display());
+            return;
+        }
+        let def = fp_formats::def::DefFile::load(&system_path).expect("load system.def");
+        let system = SystemDef::parse(&def);
+        let fallback = Path::new("/no/such/fallback-select.def");
+        let resolved = resolve_select_path(&system_path, &system, fallback);
+        // The shipped motif's declared select.def sits next to system.def.
+        assert!(resolved.exists(), "declared select.def resolved: {}", resolved.display());
+        assert!(
+            resolved.ends_with("select.def"),
+            "resolved to the declared select.def"
+        );
+
+        // A motif declaring a missing select falls back to the given path.
+        let bad = SystemDef {
+            select_file: "definitely-missing.def".to_string(),
+            ..SystemDef::default()
+        };
+        let fb = resolve_select_path(&system_path, &bad, fallback);
+        assert_eq!(fb, fallback, "missing declared select -> fallback path");
     }
 }
