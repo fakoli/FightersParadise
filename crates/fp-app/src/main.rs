@@ -1843,6 +1843,10 @@ struct StageRender {
     stage: Stage,
     /// The stage's decoded sprite file (`[BGdef] spr`), used to draw BG elements.
     sff: SffFile,
+    /// The stage's AIR animations, parsed from the inline `[Begin Action N]`
+    /// blocks of the stage `.def` itself (MUGEN stages declare `type = anim` BG
+    /// element actions there). Empty when the `.def` has no actions.
+    air: AirFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
 }
@@ -1853,13 +1857,31 @@ impl StageRender {
     /// no sprite file, or the SFF fails to load — the caller degrades to a flat
     /// clear color rather than failing the whole app. Never panics.
     fn load(path: &Path) -> Option<Self> {
-        let stage = match Stage::load(path) {
-            Ok(s) => s,
+        // Read the `.def` once: the stage model AND its inline `[Begin Action N]`
+        // animations both come from this text.
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!("stage {} failed to parse: {e}; using flat background", path.display());
+                tracing::warn!(
+                    "stage {} failed to read: {e}; using flat background",
+                    path.display()
+                );
                 return None;
             }
         };
+        let stage = Stage::parse(&text, path.parent());
+        // Stage animations (`type = anim` BG elements) are driven by the `.def`'s
+        // inline AIR actions. A `.def` with none parses to an empty action set;
+        // a parse hiccup degrades to no animations rather than dropping the stage.
+        let air = AirFile::from_str(&text).unwrap_or_else(|e| {
+            tracing::warn!(
+                "stage {} AIR actions failed to parse: {e}; animated layers will hold frame 0",
+                path.display()
+            );
+            AirFile {
+                actions: HashMap::new(),
+            }
+        });
         let Some(spr_path) = stage.bgdef.sprite_path.clone() else {
             tracing::warn!(
                 "stage {} has no [BGdef] spr sprite file; using flat background",
@@ -1886,8 +1908,23 @@ impl StageRender {
         Some(Self {
             stage,
             sff,
+            air,
             sprite_cache: HashMap::new(),
         })
+    }
+
+    /// Resolves the `(group, image)` sprite a background element currently draws,
+    /// honoring [`fp_stage::BgType::Anim`]: an animated element returns the sprite
+    /// of its current AIR frame (selected from its running animation clock), and
+    /// every other element returns its static `spriteno`. An anim element whose
+    /// action is missing falls back to its static sprite. Pure (no GPU state).
+    fn current_bg_sprite(&self, bg: &fp_stage::BgElement) -> Vec2<i32> {
+        if bg.kind == fp_stage::BgType::Anim {
+            if let Some(action) = bg.action_no.and_then(|n| self.air.action(n)) {
+                return bg.current_anim_sprite(action);
+            }
+        }
+        bg.sprite
     }
 
     /// Pre-decodes every BG element's sprite into the GPU cache. Run once per
@@ -1901,7 +1938,10 @@ impl StageRender {
             .stage
             .backgrounds
             .iter()
-            .filter_map(|bg| bg_sprite_id(bg.sprite.x, bg.sprite.y))
+            .filter_map(|bg| {
+                let s = self.current_bg_sprite(bg);
+                bg_sprite_id(s.x, s.y)
+            })
             .collect();
         for sprite_id in ids {
             cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
@@ -1927,18 +1967,35 @@ impl StageRender {
         });
     }
 
+    /// Advances every `type = anim` background layer's animation clock one tick,
+    /// resolving each element's parsed `actionno` against this stage's inline AIR
+    /// actions. Static layers are untouched. Delegates to
+    /// [`fp_stage::Stage::advance_anim`]. Driven once per fixed tick so multi-tick
+    /// catch-up frames animate the right amount; missing actions hold the frame.
+    fn advance_anim(&mut self) {
+        let air = &self.air;
+        self.stage.advance_anim(|action_no| air.action(action_no));
+    }
+
     /// Draws every BG element on `layer`, in file order, applying each element's
     /// parallax against the camera, its accumulated auto-scroll offset, and its
     /// tiling. A missing/uncached sprite is skipped.
     ///
-    /// `camera_x` is the camera's world X (from [`Stage::camera_follow_x`]).
-    /// Each element's world X after parallax is
-    /// [`fp_stage::parallax_screen_x`]`(start.x, delta.x, camera_x)`, mapped into
-    /// the window with the same [`world_to_screen_x`] the fighters use so the
+    /// `camera_x`/`camera_y` are the camera's world position (from
+    /// [`Stage::camera_follow_x`] / [`Stage::camera_follow_y`]). Each element's
+    /// world X after parallax is
+    /// [`fp_stage::parallax_screen_x`]`(start.x, delta.x, camera_x)` and its world Y
+    /// is [`fp_stage::parallax_screen_y`]`(start.y, delta.y, camera_y)`, both mapped
+    /// into the window with the same [`world_to_screen_x`] the fighters use so the
     /// background and fighters share one coordinate frame, then shifted by the
-    /// element's running auto-scroll offset (`bg.scroll`). Vertical follow is not
-    /// yet implemented, so `camera_y` is `0` and `start.y` is anchored to the same
-    /// ground line the fighters stand on.
+    /// element's running auto-scroll offset (`bg.scroll`). `camera_y` follows the
+    /// fighters' height scaled by `[Camera] verticalfollow` so distant layers
+    /// parallax-track a jump; `start.y` is anchored to the same ground line the
+    /// fighters stand on.
+    ///
+    /// An animated (`type = anim`) layer draws the AIR frame its animation clock
+    /// currently selects (via [`current_bg_sprite`](StageRender::current_bg_sprite));
+    /// every other layer draws its static `spriteno`.
     ///
     /// Tiling: when `bg.tile.x`/`.y` is non-`1`, the element repeats across the
     /// viewport via [`fp_stage::tile_rects`] (`0` = fill the viewport, `n` = exactly
@@ -1948,12 +2005,16 @@ impl StageRender {
         frame: &mut fp_render::RenderFrame<'_>,
         layer: BgLayer,
         camera_x: f32,
+        camera_y: f32,
         win_w: f32,
         win_h: f32,
     ) {
         let ground_y = win_h * 0.8;
         for bg in self.stage.backgrounds.iter().filter(|b| b.layer == layer) {
-            let Some(sprite_id) = bg_sprite_id(bg.sprite.x, bg.sprite.y) else {
+            // Animated layers draw the current AIR frame's sprite; others their
+            // static spriteno.
+            let drawn = self.current_bg_sprite(bg);
+            let Some(sprite_id) = bg_sprite_id(drawn.x, drawn.y) else {
                 continue;
             };
             let Some(cached) = self.sprite_cache.get(&sprite_id) else {
@@ -1964,10 +2025,12 @@ impl StageRender {
             // shifted by the running auto-scroll offset.
             let world_x = fp_stage::parallax_screen_x(bg.start.x, bg.delta.x, camera_x);
             let screen_x = world_to_screen_x(world_x, win_w) + bg.scroll.x;
-            // Vertical follow is unimplemented (camera_y = 0); anchor start.y to
-            // the ground line, Y down (matching the fighter draw convention).
-            let screen_y =
-                ground_y + fp_stage::parallax_screen_y(bg.start.y, bg.delta.y, 0.0) + bg.scroll.y;
+            // Vertical follow: anchor start.y to the ground line, parallax-tracked
+            // against the camera's vertical offset (Y down, matching the fighter
+            // draw convention).
+            let screen_y = ground_y
+                + fp_stage::parallax_screen_y(bg.start.y, bg.delta.y, camera_y)
+                + bg.scroll.y;
 
             // Anchor by the sprite's axis like the fighters do — this is the
             // top-left of the first tile.
@@ -3394,6 +3457,9 @@ fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput
     // path, so multi-tick catch-up frames scroll the right amount.
     if let Some(stage) = run.stage.as_mut() {
         stage.advance_scroll();
+        // Advance animated (`type = anim`) BG layers' AIR clocks one tick too, so a
+        // multi-tick catch-up frame animates the right amount.
+        stage.advance_anim();
     }
 }
 
@@ -3424,13 +3490,21 @@ fn draw_match_run(
     win_wf: f32,
     win_hf: f32,
 ) {
-    // Camera follows the fighters' midpoint, clamped to the stage's horizontal
-    // bounds. With no stage the camera stays at 0 (flat-background path).
-    let camera_x = run
+    // Camera follows the fighters' midpoint, clamped to the stage's bounds — X
+    // horizontally and Y vertically (scaled by `[Camera] verticalfollow`). With no
+    // stage the camera stays at the origin (flat-background path).
+    let (camera_x, camera_y) = run
         .stage
         .as_ref()
-        .map(|s| s.stage.camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x))
-        .unwrap_or(0.0);
+        .map(|s| {
+            (
+                s.stage
+                    .camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x),
+                s.stage
+                    .camera_follow_y(run.m.p1().pos().y, run.m.p2().pos().y),
+            )
+        })
+        .unwrap_or((0.0, 0.0));
 
     // Full-color background image first of all (behind everything), when no MUGEN
     // stage is loaded. Scaled to fill the whole window.
@@ -3440,7 +3514,7 @@ fn draw_match_run(
 
     // Back background layers first (behind the fighters).
     if let Some(stage) = run.stage.as_ref() {
-        stage.draw_layer(frame, BgLayer::Back, camera_x, win_wf, win_hf);
+        stage.draw_layer(frame, BgLayer::Back, camera_x, camera_y, win_wf, win_hf);
     }
 
     // Draw both fighters ordered by sprite-draw priority (MUGEN `sprpriority`,
@@ -3473,7 +3547,7 @@ fn draw_match_run(
 
     // Front background layers, over the fighters but under the HUD.
     if let Some(stage) = run.stage.as_ref() {
-        stage.draw_layer(frame, BgLayer::Front, camera_x, win_wf, win_hf);
+        stage.draw_layer(frame, BgLayer::Front, camera_x, camera_y, win_wf, win_hf);
     }
 
     // Optional Clsn debug overlay (F1).
