@@ -230,9 +230,11 @@ rationale in 08). Drive these top-down; they supersede ad-hoc probing.
   state). Implement in task 4.4.
 - **CB5** **`fp-vm` prelude/error type** — if the VM needs its own `VmError`, wire it into `FpError`
   (`thiserror` `#[from]`) so the never-panic contract holds end-to-end. *(added 4.1 iter)*
-- **CB6** Enforce MUGEN **trigger-group contiguity** (a gap in `trigger1,2,4…` numbering kills later
-  groups) when compiling/evaluating `StateController::triggers` — the CNS parser deliberately keeps
-  all groups (documented on the field). Apply at trigger-compile (task 4.6). *(added 4.2/4.5 iter)*
+- **CB6** ✅ DONE (T023). MUGEN **trigger-group contiguity** (a gap in `trigger1,2,4…` numbering kills
+  later groups) is enforced at evaluation time. The rule lives in `fp_vm::triggers::active_group_indices`
+  (the shared trigger engine) and `fp-character`'s executor (`contiguous_groups`) delegates to it; the CNS
+  parser still deliberately keeps all groups. Unit-tested in fp-vm incl. the non-contiguous `1,2,4` case.
+  *(added 4.2/4.5 iter; resolved T023)*
 - **CB7** Make baseline/CI clippy run `--all-targets` (it caught a latent `useless_vec` in fp-render
   tests + `manual_repeat_n` in sff/compression that plain `cargo test` missed). CI already does;
   keep it. *(added 4.2/4.5 iter — fixed)*

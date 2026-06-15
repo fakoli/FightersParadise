@@ -131,13 +131,14 @@ pub struct StateController {
     /// number. The controller fires if any group is satisfied (OR), provided
     /// every [`triggerall`](StateController::triggerall) condition is also true.
     ///
-    /// **Deviation from MUGEN, deferred to trigger-compilation (backlog CB6):**
+    /// **Parser scope (the contiguity rule is the consumer's, CB6 — done):**
     /// MUGEN truncates the active groups at the first *gap* in the numbering — with
     /// `trigger1`, `trigger2`, `trigger4` (no `trigger3`), `trigger4` is dead and
     /// ignored. This parser intentionally preserves **all** numbered groups it sees
-    /// and does not drop post-gap groups; the contiguity rule must be applied by the
-    /// consumer that compiles/evaluates these triggers. Treating every group here as
-    /// live could fire a controller on inputs MUGEN would ignore.
+    /// and does not drop post-gap groups; the contiguity rule is applied by the
+    /// trigger consumer at evaluation time (`fp_vm::triggers::active_group_indices`,
+    /// used by `fp-character`'s executor). Treating every group here as live could
+    /// fire a controller on inputs MUGEN would ignore — so consumers must apply it.
     pub triggers: Vec<TriggerGroup>,
     /// `ignorehitpause` universal parameter (raw expression), if present.
     pub ignorehitpause: Option<String>,
