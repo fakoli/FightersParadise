@@ -202,9 +202,16 @@ MUGEN community content is messy. Parsers and the evaluator must:
   an original `[Title Info]` text menu, `[Select Info]` grid geometry, and a `[Characters]` roster pointing
   at the shipped `assets/trainingdummy`; no Elecbyte motif art or text, parsed by `fp-ui`'s
   `system_def`/`select_def`). `.def` files are not globally gitignored, so these two are tracked directly.
+  One more **original text** asset ships under `assets/data/`: `assets/data/common1.cns` (MIT — the
+  engine-default common-state library, an independent reimplementation of the documented MUGEN engine-common
+  states: the get-hit reaction family 5000-series plus the prefall/fall/downed/getup chain. NOT derived from
+  Elecbyte's or any character's `common1.cns`). The loader falls back to it when a character's
+  `stcommon` reference resolves to a missing file (e.g. evilken's `stcommon = common1.cns`); a character
+  that bundles its own common1 (KFM) is unaffected. `.cns` is not globally gitignored, so it is tracked
+  directly.
   Beyond these originals, `git ls-files` shows zero third-party `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
   files — the only tracked such files are the originals named above (the `assets/trainingdummy/*` character
-  set incl. `trainingdummy.def`, the `assets/data/` effects/font, and `assets/data/system.def` +
+  set incl. `trainingdummy.def`, the `assets/data/` effects/font/common-states, and `assets/data/system.def` +
   `assets/data/select.def`).
   Real KFM content (CC BY-NC 3.0, Elecbyte) is **local-only** behind the gitignored `test-assets`
   symlink. Never commit or ship it.

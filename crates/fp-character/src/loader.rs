@@ -555,12 +555,24 @@ impl LoadedCharacter {
 
         // `stcommon` last: fill-missing only (handled by the same first-wins
         // merge, since the character states are already in place).
+        //
+        // `stcommon` names the ENGINE's shared common-state library (MUGEN ships
+        // `data/common1.cns`); a character that does not bundle its own copy (e.g.
+        // evilken's `stcommon = common1.cns`) resolves to a file that does not
+        // exist next to its `.def`. When that happens we fall back to the engine
+        // default shipped under `assets/data/common1.cns`, so the character still
+        // gets the standard get-hit / fall / getup states. A character that DOES
+        // bundle its own common1 (e.g. KFM) is unaffected: its file is present,
+        // merges normally, and is never overridden by the default. The fallback
+        // also fills in only the common states the character did not author
+        // (first-wins merge), preserving `stcommon`'s fill-missing semantics.
         if let Some(common_ref) = def.get("Files", "stcommon") {
-            merge_cns(
-                &mut states,
-                &DefFile::resolve_path(def_path, common_ref),
-                common_ref,
-            );
+            let resolved = DefFile::resolve_path(def_path, common_ref);
+            if resolved.exists() {
+                merge_cns(&mut states, &resolved, common_ref);
+            } else {
+                merge_default_common_states(&mut states, common_ref, &resolved);
+            }
         }
 
         // ---- CMD statedefs: the command->state bridge -----------------------
@@ -832,6 +844,106 @@ fn merge_cns(states: &mut HashMap<i32, CompiledState>, path: &Path, rel: &str) {
         "merged {added} new states from {rel} ({} statedefs in file)",
         cns.statedefs.len()
     );
+}
+
+/// Relative path (from a workspace/install root) to the shipped engine-default
+/// common-state library. This is the original, clean-room `common1.cns` Fighters
+/// Paradise authors and ships under `assets/data/`.
+const ENGINE_DEFAULT_COMMON1: &str = "assets/data/common1.cns";
+
+/// Fills in the engine-default common states when a character's `stcommon`
+/// (or a `st*` slot pointing at the common library) reference resolves to a
+/// **missing** file.
+///
+/// `common_ref` is the raw reference text (for diagnostics) and `resolved` is
+/// the (absent) path it resolved to next to the `.def`. This locates the shipped
+/// engine default (`assets/data/common1.cns`) via [`engine_default_common1_path`]
+/// and merges it with the same first-wins / fill-missing semantics as a normal
+/// `stcommon` merge: only common states the character did not author are added.
+///
+/// If even the shipped default cannot be found or parsed, this is a warn-logged
+/// no-op (never a panic) — the character simply loads without common states, the
+/// same as before this fallback existed.
+fn merge_default_common_states(
+    states: &mut HashMap<i32, CompiledState>,
+    common_ref: &str,
+    resolved: &Path,
+) {
+    match engine_default_common1_path() {
+        Some(default_path) => {
+            tracing::warn!(
+                "common state file {common_ref} not found at {} \
+                 (character bundles none); using engine default {}",
+                resolved.display(),
+                default_path.display(),
+            );
+            merge_cns(states, &default_path, ENGINE_DEFAULT_COMMON1);
+        }
+        None => {
+            tracing::warn!(
+                "common state file {common_ref} not found at {} and the engine \
+                 default {ENGINE_DEFAULT_COMMON1} is also absent; loading without \
+                 common states",
+                resolved.display(),
+            );
+        }
+    }
+}
+
+/// Locates the shipped engine-default `assets/data/common1.cns`, returning its
+/// path if found.
+///
+/// Asset resolution is best-effort and robust to where the process is launched
+/// from, mirroring how `fp-app` references its shipped `assets/data/*` files
+/// relative to the working directory. Candidate roots are tried in order:
+///
+/// 1. The current working directory (`./assets/data/common1.cns`) — the path the
+///    app and tooling use when run from the workspace root.
+/// 2. Each ancestor of the current working directory (so a process launched from
+///    a subdirectory still finds the workspace's `assets/`).
+/// 3. Each ancestor of the running executable's directory (so an installed/`target`
+///    binary finds the `assets/` shipped alongside or above it).
+///
+/// The first candidate that exists wins. Returns `None` if no candidate exists,
+/// in which case the caller falls back to loading without common states (with a
+/// warning) rather than panicking.
+#[must_use]
+fn engine_default_common1_path() -> Option<PathBuf> {
+    // 1. Working-directory relative (the common case for `cargo run` / tooling).
+    let cwd_relative = PathBuf::from(ENGINE_DEFAULT_COMMON1);
+    if cwd_relative.exists() {
+        return Some(cwd_relative);
+    }
+
+    // 2. Walk up the working directory's ancestors.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(found) = find_in_ancestors(&cwd) {
+            return Some(found);
+        }
+    }
+
+    // 3. Walk up the executable's ancestors (installed / `target/...` layouts).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            if let Some(found) = find_in_ancestors(exe_dir) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns `<ancestor>/assets/data/common1.cns` for the first ancestor of
+/// `start` (inclusive) under which that file exists, else `None`.
+fn find_in_ancestors(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir.join(ENGINE_DEFAULT_COMMON1);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Parses the `.cmd` file as a CNS state file and merges its statedefs into
@@ -4214,5 +4326,206 @@ mod tests {
                 "custom air state 5050 must NOT be auto-landed by the 50/51-only built-in"
             );
         }
+    }
+
+    // ---- Engine-default common1.cns (Task C) --------------------------------
+    //
+    // The shipped, original `assets/data/common1.cns` is committed (clean-room),
+    // so these are NOT gated on test-assets — they exercise content that is
+    // always present in the workspace.
+
+    /// Resolves the shipped engine-default `assets/data/common1.cns`.
+    /// `CARGO_MANIFEST_DIR` points at `crates/fp-character`; go up two levels to
+    /// the workspace root.
+    fn shipped_common1() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/data/common1.cns")
+    }
+
+    #[test]
+    fn shipped_common1_parses_and_defines_key_states() {
+        let path = shipped_common1();
+        assert!(
+            path.exists(),
+            "engine default common1.cns must be shipped at {}",
+            path.display()
+        );
+        let cns = CnsFile::load(&path).expect("shipped common1.cns must parse");
+        let numbers: std::collections::HashSet<i32> =
+            cns.statedefs.iter().map(|d| d.number).collect();
+        // The essential get-hit / fall / land / death / getup states must exist.
+        for n in [5000, 5010, 5020, 5030, 5040, 5050, 5070, 5100, 5110, 5120, 5150, 5160, 5170, 5200]
+        {
+            assert!(
+                numbers.contains(&n),
+                "shipped common1.cns must define [Statedef {n}]"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_default_common1_path_finds_shipped_asset() {
+        // The resolver walks CWD then ancestors; tests run with CWD at the crate
+        // dir (`crates/fp-character`), so the workspace `assets/data/common1.cns`
+        // is found by walking up. (If for some reason it is not on disk, the
+        // resolver returns None — which the fallback handles gracefully — so we
+        // only assert when the shipped file is genuinely present.)
+        if shipped_common1().exists() {
+            let found = engine_default_common1_path();
+            assert!(
+                found.is_some(),
+                "engine_default_common1_path must locate the shipped common1.cns"
+            );
+            assert!(found.unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn find_in_ancestors_walks_up_to_shipped_default_and_handles_absence() {
+        // From the crate dir, `find_in_ancestors` walks up to the workspace root
+        // where `assets/data/common1.cns` is committed, returning that path.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if shipped_common1().exists() {
+            let found =
+                find_in_ancestors(crate_dir).expect("walks up to the shipped default common1.cns");
+            assert!(
+                found.ends_with(ENGINE_DEFAULT_COMMON1),
+                "found path must end with {ENGINE_DEFAULT_COMMON1}, got {}",
+                found.display()
+            );
+            assert!(found.exists());
+        }
+        // A start path with no `assets/data/common1.cns` in any ancestor returns
+        // `None` (never panics) — the filesystem root has no such file.
+        assert!(find_in_ancestors(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn missing_stcommon_falls_back_to_engine_default() {
+        // A character graph with NO common states. The fallback must fill in the
+        // engine default's common states (e.g. 5000) from the shipped asset.
+        if !shipped_common1().exists() {
+            eprintln!("skipping: shipped common1.cns absent");
+            return;
+        }
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        states.insert(0, CompiledState::from_parsed(&Statedef::default()));
+        assert!(
+            !states.contains_key(&5000),
+            "precondition: no common get-hit state yet"
+        );
+
+        // Reference resolves to a path that does NOT exist (as evilken's does).
+        let missing = Path::new("/nonexistent/dir/common1.cns");
+        merge_default_common_states(&mut states, "common1.cns", missing);
+
+        for n in [5000, 5020, 5050, 5070, 5100] {
+            assert!(
+                states.contains_key(&n),
+                "default common1.cns should have supplied [Statedef {n}]"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_default_is_not_fatal() {
+        // If even the shipped default cannot be found, the fallback is a no-op,
+        // never a panic. We can only force the "default absent" branch when the
+        // shipped asset is genuinely missing; otherwise assert the graph is at
+        // least never corrupted (states added, never removed).
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        states.insert(0, CompiledState::from_parsed(&Statedef::default()));
+        let missing = Path::new("/nonexistent/dir/common1.cns");
+        // Must not panic regardless of whether the default is present.
+        merge_default_common_states(&mut states, "common1.cns", missing);
+        assert!(states.contains_key(&0), "existing states are preserved");
+    }
+
+    #[test]
+    fn character_bundled_common_states_win_over_default() {
+        // A character that authors its OWN 5000 must keep it; the fallback only
+        // fills states the character did not define (first-wins). Simulate by
+        // pre-populating 5000 with a recognizable marker controller, then running
+        // the default fallback: the marker must survive.
+        if !shipped_common1().exists() {
+            eprintln!("skipping: shipped common1.cns absent");
+            return;
+        }
+        let own_5000 = CnsFile::from_str(
+            "[Statedef 5000]\ntype = S\nmovetype = H\nphysics = N\n\n\
+             [State 5000, marker]\ntype = Null\ntrigger1 = 1\n",
+        )
+        .expect("synthetic own-5000 compiles");
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        for d in &own_5000.statedefs {
+            states.insert(d.number, CompiledState::from_parsed(d));
+        }
+        let own_ctrl_count = states[&5000].controllers.len();
+
+        merge_default_common_states(&mut states, "common1.cns", Path::new("/nope/common1.cns"));
+
+        // 5000 is unchanged (the character's own definition won, first-wins).
+        assert_eq!(
+            states[&5000].controllers.len(),
+            own_ctrl_count,
+            "character's own 5000 must not be overridden by the default"
+        );
+        // But states the character did NOT author are filled from the default.
+        assert!(
+            states.contains_key(&5050),
+            "default still fills the states the character omitted"
+        );
+    }
+
+    #[test]
+    fn real_fixture_evilken_gets_default_common_states() {
+        // evilken.def has `stcommon = common1.cns` but bundles no common1.cns of
+        // its own. Before the fallback, evilken loaded with NO common get-hit
+        // states. With it, the engine default supplies them. Gated on test-assets.
+        let def = test_asset("evilken/evilken.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        // Precondition: evilken really does not bundle its own common1.cns.
+        assert!(
+            !test_asset("evilken/common1.cns").exists(),
+            "test premise: evilken bundles no common1.cns"
+        );
+
+        let loaded = LoadedCharacter::load(&def).expect("evilken.def should load");
+        // The engine-default common states must now be present.
+        for n in [5000, 5020, 5050, 5070, 5100] {
+            assert!(
+                loaded.state(n).is_some(),
+                "evilken should inherit default common [Statedef {n}]"
+            );
+        }
+    }
+
+    #[test]
+    fn real_fixture_kfm_uses_own_common_not_default() {
+        // KFM bundles its own common1.cns, so the default fallback must NOT fire:
+        // KFM's own common states load. The presence of common state 0 (Stand)
+        // and the get-hit family proves the merge worked from KFM's own file (the
+        // `else` default branch is only taken when the reference is MISSING, and
+        // KFM's is present). Gated on test-assets.
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        // Premise: KFM DOES bundle its own common1.cns (so no fallback is needed).
+        assert!(
+            test_asset("kfm/common1.cns").exists(),
+            "test premise: KFM bundles its own common1.cns"
+        );
+        let loaded = LoadedCharacter::load(&def).expect("kfm.def should load");
+        // KFM's own common1 defines Stand (0) and the get-hit family.
+        assert!(loaded.state(0).is_some(), "KFM's own common Stand 0 loads");
+        assert!(
+            loaded.state(5000).is_some(),
+            "KFM's own common get-hit 5000 loads"
+        );
     }
 }

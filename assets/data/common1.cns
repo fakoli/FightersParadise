@@ -1,0 +1,599 @@
+;==========================================================================
+; Fighters Paradise - engine-default common state library (common1.cns)
+;--------------------------------------------------------------------------
+; ORIGINAL, clean-room content. Copyright (c) 2025 Sekou Doumbouya. MIT.
+;
+; This file is NOT derived from Elecbyte's data/common1.cns nor from any
+; bundled-character common1.cns. It is an independent reimplementation of the
+; DOCUMENTED MUGEN engine-common states, authored from the published behavioral
+; contract (state numbers, move/state types, and the get-hit reaction chain).
+;
+; MUGEN ships a shared common-state library (data/common1.cns) that every
+; character inherits via `stcommon = common1.cns`. Characters that do not bundle
+; their own copy (e.g. evilken) rely on the engine to supply it. Fighters
+; Paradise ships THIS file as that engine default; the loader falls back to it
+; when a character's `stcommon`/`st*` reference resolves to a missing file.
+;
+; Scope: the essential states a character needs to take a hit and recover -
+; the get-hit reaction family (5000-series) plus the prefall/fall/downed/getup
+; chain. These reference the standard MUGEN get-hit animation numbers
+; (5000-5210). A character that lacks a given anim simply freezes on its current
+; one (a missing ChangeAnim target is a safe no-op in this engine), so the state
+; logic stays correct for the common case. Two scoping caveats worth knowing:
+;   * This default supplies ONLY the 5000-series get-hit/fall/getup states. The
+;     recovery ChangeState targets - the stand/crouch movement states 0/11/12 -
+;     are NOT defined here; the consumer character must provide them (every real
+;     MUGEN character authors its own 0/11/12, and the loader's first-wins merge
+;     keeps them). A truly bare character would recover into an undefined state
+;     (a no-op stall, never a crash).
+;   * Recovery from the standing/crouching reactions is dual-gated on hit-stun
+;     elapsing AND the reaction anim finishing (AnimTime = 0). For a character
+;     whose animation set omits BOTH the get-hit and the settle anim, AnimTime
+;     can stay pinned non-zero and recovery may stall - a pathological-sparse-set
+;     edge, not the common case.
+;
+; Engine notes (Fighters Paradise specifics):
+; * Coordinate system: Y = 0 is the ground plane, Y < 0 is airborne (up is
+;   negative), gravity is positive (pulls toward Y = 0). So `Pos Y < 0` means
+;   above the ground and `Vel Y > 0` means moving downward.
+; * Recovery from the standing/crouching reactions is timed off the hit-stun
+;   window (`Time >= GetHitVar(hittime)`) and the reaction animation finishing
+;   (`AnimTime = 0`), both of which this engine evaluates faithfully. The
+;   air-recovery `HitOver`/`CanRecover`/`HitFall` triggers are not yet modeled
+;   (they read 0), so the fall/downed chain is driven off ground contact
+;   (`Pos Y >= 0`) and elapsed time instead - a documented, faithful-for-the-
+;   common-case substitution.
+;==========================================================================
+
+;==========================================================================
+; GET-HIT REACTIONS (5000-series)
+;==========================================================================
+
+;--------------------------------------------------------------------------
+; 5000 - Stand get-hit, initial (hit-shake)
+; Entered by the engine when a standing character is hit. Picks the reaction
+; animation from GetHitVar(animtype), holds through hit-shake, then branches to
+; the knock-back reaction (5001) on the ground or the fall chain (5020/5030) in
+; the air.
+[Statedef 5000]
+type    = S
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5000, anim light..hard]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = GetHitVar(animtype) != [3,5]
+value = 5000 + GetHitVar(animtype)
+
+[State 5000, anim back]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = GetHitVar(animtype) = [3,5]
+value = 5030
+
+[State 5000, freeze anim during shake]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+[State 5000, go aerial if knocked up]
+type = StateTypeSet
+trigger1 = GetHitVar(yvel) != 0 || GetHitVar(fall)
+trigger2 = Pos Y < 0
+statetype = A
+
+[State 5000, to air gethit]
+type = ChangeState
+trigger1 = HitShakeOver
+trigger1 = GetHitVar(yvel) != 0 || GetHitVar(fall) || Pos Y < 0
+value = 5020
+
+[State 5000, to stand knockback]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 5001
+
+;--------------------------------------------------------------------------
+; 5001 - Stand get-hit, knocked back (sliding to a stop, then recover)
+[Statedef 5001]
+type    = S
+movetype= H
+physics = S
+
+[State 5001, keep facing]
+type = HitVelSet
+trigger1 = Time = 0
+x = 1
+
+[State 5001, settle anim]
+type = ChangeAnim
+trigger1 = AnimTime = 0
+value = 5005 + GetHitVar(animtype)
+
+[State 5001, friction after slide]
+type = VelMul
+trigger1 = Time >= GetHitVar(slidetime)
+x = .6
+
+[State 5001, stop]
+type = VelSet
+trigger1 = Time >= GetHitVar(hittime)
+x = 0
+
+[State 5001, recover]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 5002 - Stand get-hit, hard knock-back variant (shares the 5001 recovery)
+[Statedef 5002]
+type    = S
+movetype= H
+physics = S
+
+[State 5002, keep facing]
+type = HitVelSet
+trigger1 = Time = 0
+x = 1
+
+[State 5002, friction]
+type = VelMul
+trigger1 = Time >= GetHitVar(slidetime)
+x = .5
+
+[State 5002, stop]
+type = VelSet
+trigger1 = Time >= GetHitVar(hittime)
+x = 0
+
+[State 5002, recover]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 5010 - Crouch get-hit, initial (hit-shake)
+[Statedef 5010]
+type    = C
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5010, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = GetHitVar(animtype) != [3,5]
+value = 5010 + GetHitVar(animtype)
+
+[State 5010, anim back]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = GetHitVar(animtype) = [3,5]
+value = 5030
+
+[State 5010, freeze anim during shake]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+[State 5010, go aerial if knocked up]
+type = StateTypeSet
+trigger1 = GetHitVar(yvel) != 0 || GetHitVar(fall)
+trigger2 = Pos Y < 0
+statetype = A
+
+[State 5010, to air gethit]
+type = ChangeState
+trigger1 = HitShakeOver
+trigger1 = GetHitVar(yvel) != 0 || GetHitVar(fall) || Pos Y < 0
+value = 5020
+
+[State 5010, to crouch knockback]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 5011
+
+;--------------------------------------------------------------------------
+; 5011 - Crouch get-hit, knocked back (slides, then recover to crouch)
+[Statedef 5011]
+type    = C
+movetype= H
+physics = C
+
+[State 5011, keep facing]
+type = HitVelSet
+trigger1 = Time = 0
+x = 1
+
+[State 5011, settle anim]
+type = ChangeAnim
+trigger1 = AnimTime = 0
+value = 5015 + GetHitVar(animtype)
+
+[State 5011, friction]
+type = VelMul
+trigger1 = Time >= GetHitVar(slidetime)
+x = .6
+
+[State 5011, stop]
+type = VelSet
+trigger1 = Time >= GetHitVar(hittime)
+x = 0
+
+[State 5011, recover]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 11
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 5012 - Crouch get-hit, hard variant (shares 5011 recovery path)
+[Statedef 5012]
+type    = C
+movetype= H
+physics = C
+
+[State 5012, keep facing]
+type = HitVelSet
+trigger1 = Time = 0
+x = 1
+
+[State 5012, friction]
+type = VelMul
+trigger1 = Time >= GetHitVar(slidetime)
+x = .5
+
+[State 5012, recover]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 11
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 5020 - Air get-hit, initial (hit-shake while airborne)
+[Statedef 5020]
+type    = A
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5020, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+value = 5020 + GetHitVar(animtype)
+
+[State 5020, freeze anim during shake]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+[State 5020, to fall once shake is over]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 5030
+
+;--------------------------------------------------------------------------
+; 5030 - Air transition / tripped (knocked into the air, falling arc begins)
+[Statedef 5030]
+type    = A
+movetype= H
+physics = N
+
+[State 5030, restore fall velocity after shake]
+type = HitVelSet
+trigger1 = Time = 0
+x = 1
+y = 1
+
+[State 5030, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5030)
+value = 5030
+
+[State 5030, to prefall]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 5040
+
+;--------------------------------------------------------------------------
+; 5040 - Prefall (the rising/cresting part of the fall arc, before descent)
+[Statedef 5040]
+type    = A
+movetype= H
+physics = N
+
+[State 5040, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5040)
+value = 5040
+
+[State 5040, to fall when descending]
+type = ChangeState
+trigger1 = Vel Y > 0
+value = 5050
+
+;--------------------------------------------------------------------------
+; 5050 - Fall (descending toward the ground)
+[Statedef 5050]
+type    = A
+movetype= H
+physics = N
+
+[State 5050, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5050)
+value = 5050
+
+[State 5050, mark falling]
+type = HitFallSet
+trigger1 = Time = 0
+value = 1
+
+[State 5050, to air-fall hold]
+type = ChangeState
+trigger1 = Pos Y < 0
+trigger1 = Time >= 1
+value = 5070
+
+[State 5050, land if already grounded]
+type = ChangeState
+trigger1 = Pos Y >= 0
+value = 5100
+
+;--------------------------------------------------------------------------
+; 5070 - Air fall (in the air, falling, awaiting ground contact)
+[Statedef 5070]
+type    = A
+movetype= H
+physics = N
+
+[State 5070, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5070)
+value = 5070
+
+[State 5070, hold fall anim]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+[State 5070, land]
+type = ChangeState
+trigger1 = Pos Y >= 0
+value = 5100
+
+;--------------------------------------------------------------------------
+; 5071 - Air fall recovery (reserved). Without the recover-input model this
+; engine cannot trigger a tech-roll yet, so this state simply rejoins the fall.
+; Documented stub: it stays faithful by behaving as a normal fall.
+[Statedef 5071]
+type    = A
+movetype= H
+physics = N
+
+[State 5071, rejoin fall]
+type = ChangeState
+trigger1 = Time = 0
+value = 5070
+
+;--------------------------------------------------------------------------
+; 5080 - Fall recovery in air (reserved, same documented stub as 5071)
+[Statedef 5080]
+type    = A
+movetype= H
+physics = N
+
+[State 5080, rejoin fall]
+type = ChangeState
+trigger1 = Time = 0
+value = 5070
+
+;--------------------------------------------------------------------------
+; 5100 - Landing from a fall / hit the ground
+[Statedef 5100]
+type    = L
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5100, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5100)
+value = 5100
+
+[State 5100, apply fall damage on landing]
+type = HitFallDamage
+trigger1 = Time = 0
+
+[State 5100, stop on the ground]
+type = VelSet
+trigger1 = Time = 0
+x = 0
+y = 0
+
+[State 5100, snap to ground]
+type = PosSet
+trigger1 = Time = 0
+y = 0
+
+[State 5100, die if out of life]
+type = ChangeState
+trigger1 = Time >= 1
+trigger1 = !Alive
+value = 5150
+
+[State 5100, to lie down]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 5110
+
+;--------------------------------------------------------------------------
+; 5110 - Hit the ground / downed (lying, the brief bounce-settle)
+[Statedef 5110]
+type    = L
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5110, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5110)
+value = 5110
+
+[State 5110, snap to ground]
+type = PosSet
+trigger1 = Time = 0
+y = 0
+
+[State 5110, die if out of life]
+type = ChangeState
+trigger1 = Time >= 1
+trigger1 = !Alive
+value = 5150
+
+[State 5110, to lie down]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 5120
+
+;--------------------------------------------------------------------------
+; 5120 - Lie down (downed on the ground, waiting out the getup delay)
+[Statedef 5120]
+type    = L
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5120, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5120)
+value = 5120
+
+[State 5120, die if out of life]
+type = ChangeState
+trigger1 = !Alive
+value = 5150
+
+[State 5120, getup after lie time]
+; MUGEN reads the per-character [Data] liedown.time here. This engine does not
+; surface that constant to const(...) yet (it would read 0 and snap up instantly),
+; so use the MUGEN default of 60 ticks (1s) as a faithful fixed delay.
+type = ChangeState
+trigger1 = Time >= 60
+value = 5160
+
+;--------------------------------------------------------------------------
+; 5150 - Death (knocked out, fall to a lying KO pose)
+[Statedef 5150]
+type    = L
+movetype= H
+physics = N
+
+[State 5150, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5150)
+value = 5150
+
+[State 5150, stop]
+type = VelSet
+trigger1 = Pos Y >= 0
+x = 0
+y = 0
+
+[State 5150, snap to ground]
+type = PosSet
+trigger1 = Pos Y >= 0
+y = 0
+
+[State 5150, settle into dead]
+type = ChangeState
+trigger1 = AnimTime = 0
+trigger1 = Pos Y >= 0
+value = 5160
+
+;--------------------------------------------------------------------------
+; 5160 - Downed getup (stand back up). If dead, route to the final dead pose
+; (5170) and stay down; otherwise rise to stand (state 0) with control.
+[Statedef 5160]
+type    = L
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5160, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5160)
+value = 5160
+
+[State 5160, stay dead]
+type = ChangeState
+trigger1 = !Alive
+value = 5170
+
+[State 5160, get up to stand]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 5170 - Dead (final KO pose, no recovery)
+[Statedef 5170]
+type    = L
+movetype= H
+physics = N
+velset  = 0,0
+
+[State 5170, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5170)
+value = 5170
+
+[State 5170, hold]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+;--------------------------------------------------------------------------
+; 5200 - Continue / recover (round reset back to a controllable stand).
+[Statedef 5200]
+type    = S
+movetype= I
+physics = S
+
+[State 5200, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(5200)
+value = 5200
+
+[State 5200, stop]
+type = VelSet
+trigger1 = Time = 0
+x = 0
+y = 0
+
+[State 5200, to stand]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
