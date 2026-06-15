@@ -926,6 +926,22 @@ fn draw_player(
     };
 
     let (render_blend, alpha) = map_blend_mode(&anim_frame.blend);
+
+    // AfterImage trail (audit #33): draw a fading row of ghost frames BEHIND the
+    // sprite first, so the live frame is drawn over them. We do not capture frame
+    // history, so the trail re-uses the current frame, stepped back along the
+    // character's facing with decaying alpha and the trail's color tint. Drawn
+    // before the main sprite so it sits behind it.
+    let afterimage = player.character.afterimage();
+    if afterimage.is_active() {
+        draw_afterimage_trail(
+            frame, cached, &afterimage, draw_x, draw_y, flip_h, anim_frame.flip_v, facing_right,
+        );
+    }
+
+    // PalFX color tint (audit #33): the character's active tint (identity when
+    // none, so an untinted sprite is byte-identical to before this feature).
+    let palfx = char_palfx_to_render(player.character.palfx());
     let params = SpriteDrawParams {
         x: draw_x,
         y: draw_y,
@@ -933,9 +949,80 @@ fn draw_player(
         flip_v: anim_frame.flip_v,
         blend: render_blend,
         alpha,
+        palfx,
         ..Default::default()
     };
     frame.draw_sprite(&cached.texture, &cached.palette, &params);
+}
+
+/// Converts the character-side [`fp_character::CurPalFx`] into the renderer's
+/// [`fp_render::PalFx`] color tint (audit #33).
+///
+/// The `add`/`mul`/`color` fields pass straight through (both sides use the same
+/// normalized float scale). No `is_active` gate is needed here: callers obtain the
+/// effect from [`fp_character::Character::palfx`] /
+/// [`fp_character::AfterImageState::palfx`], which already collapse an inactive
+/// effect to [`fp_character::CurPalFx::IDENTITY`] — and that value's
+/// `add`/`mul`/`color` are exactly [`fp_render::PalFx::IDENTITY`], so an inactive
+/// effect still maps to the guaranteed no-op draw.
+fn char_palfx_to_render(fx: fp_character::CurPalFx) -> fp_render::PalFx {
+    fp_render::PalFx {
+        add: fx.add,
+        mul: fx.mul,
+        color: fx.color,
+    }
+}
+
+/// How far apart (in screen pixels) successive AfterImage ghost frames are
+/// stepped behind the sprite. A small offset gives a readable motion smear
+/// without scattering the trail across the screen.
+const AFTERIMAGE_STEP_PX: f32 = 6.0;
+
+/// The most ghost frames drawn for an AfterImage trail, regardless of the
+/// controller's authored `length`. Caps per-frame draw cost.
+const AFTERIMAGE_MAX_GHOSTS: i32 = 8;
+
+/// Draws the AfterImage ghost trail behind a fighter's live sprite (audit #33).
+///
+/// We have no captured frame history, so the trail is faked from the *current*
+/// frame: each ghost `i` (1-based, oldest last) is the same sprite stepped back
+/// [`AFTERIMAGE_STEP_PX`] per ghost opposite the facing direction, drawn additive
+/// with a linearly decaying alpha and the trail's [`palfx`](fp_character::AfterImageState::palfx)
+/// color tint. Ghosts are drawn far-to-near so nearer (brighter) ghosts overlay
+/// farther ones. The number of ghosts is the trail `length` clamped to
+/// [`AFTERIMAGE_MAX_GHOSTS`]. Pure draw calls; never panics.
+#[allow(clippy::too_many_arguments)]
+fn draw_afterimage_trail(
+    frame: &mut fp_render::RenderFrame<'_>,
+    cached: &CachedSprite,
+    afterimage: &fp_character::AfterImageState,
+    base_x: f32,
+    base_y: f32,
+    flip_h: bool,
+    flip_v: bool,
+    facing_right: bool,
+) {
+    let ghosts = afterimage.length.clamp(1, AFTERIMAGE_MAX_GHOSTS);
+    // Step trails opposite the facing direction (the sprite "leaves" them behind).
+    let dir = if facing_right { -1.0 } else { 1.0 };
+    let palfx = char_palfx_to_render(afterimage.palfx);
+    // Draw the farthest (faintest) ghost first so nearer ghosts overlay it.
+    for i in (1..=ghosts).rev() {
+        // Decaying alpha: nearest ghost ~0.5, fading to ~0 at the tail.
+        let t = i as f32 / (ghosts as f32 + 1.0);
+        let alpha = 0.5 * (1.0 - t);
+        let params = SpriteDrawParams {
+            x: base_x + dir * AFTERIMAGE_STEP_PX * i as f32,
+            y: base_y,
+            flip_h,
+            flip_v,
+            blend: fp_render::BlendMode::Additive,
+            alpha,
+            palfx,
+            ..Default::default()
+        };
+        frame.draw_sprite(&cached.texture, &cached.palette, &params);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3684,5 +3771,30 @@ mod tests {
         // Equal priorities: stable, deterministic default — P1 behind P2.
         assert!(p1_draws_behind_p2(2, 2), "a tie keeps P1 behind P2 (stable order)");
         assert!(p1_draws_behind_p2(0, 0), "default-priority tie keeps P1 behind");
+    }
+
+    #[test]
+    fn char_palfx_to_render_inactive_maps_to_identity() {
+        // The accessors hand back CurPalFx::IDENTITY when nothing is active; that
+        // must convert to the renderer's no-op identity (no is_active gate needed).
+        let out = char_palfx_to_render(fp_character::CurPalFx::IDENTITY);
+        assert_eq!(out, fp_render::PalFx::IDENTITY);
+        assert!(out.is_identity(), "inactive effect renders byte-identically");
+    }
+
+    #[test]
+    fn char_palfx_to_render_passes_active_fields_through() {
+        // An active tint's add/mul/color cross the crate boundary unchanged.
+        let fx = fp_character::CurPalFx {
+            add: [0.5, -0.25, 0.0],
+            mul: [0.5, 1.0, 2.0],
+            color: 0.25,
+            remaining: 12,
+        };
+        let out = char_palfx_to_render(fx);
+        assert_eq!(out.add, [0.5, -0.25, 0.0]);
+        assert_eq!(out.mul, [0.5, 1.0, 2.0]);
+        assert!((out.color - 0.25).abs() < 1e-6);
+        assert!(!out.is_identity(), "an active tint is not the no-op");
     }
 }

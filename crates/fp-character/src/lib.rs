@@ -789,6 +789,125 @@ impl WidthOverride {
     }
 }
 
+/// A live MUGEN-style color tint the character is currently displaying (the
+/// `PalFX` controller's effect; faithfulness audit #33).
+///
+/// MUGEN's `PalFX` recolors the character for a number of ticks: a per-channel
+/// signed `add`, a per-channel `mul`tiply, and a grayscale-blend `color` (`256`
+/// = full color, `0` = grayscale). The values are normalized here to the
+/// renderer's float scale — `add` is a signed fraction (`±1.0` = ±255 MUGEN
+/// units), `mul` a plain multiplier (`1.0` = unchanged), and `color` a
+/// `0.0..=1.0` color-retention fraction — so [`Character::palfx`] can hand them
+/// straight to the renderer's `fp_render::PalFx` without further conversion.
+///
+/// [`remaining`](Self::remaining) is the countdown in ticks; while `> 0` the
+/// effect is active and ticks down each (non-hit-paused) frame. A
+/// [`Default`]/[`IDENTITY`](Self::IDENTITY) effect (`remaining = 0`) is a no-op:
+/// [`Character::palfx`] returns the identity tint, so the sprite renders
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurPalFx {
+    /// Signed per-channel add, as a fraction of full scale (`±1.0` = ±255).
+    pub add: [f32; 3],
+    /// Per-channel multiply (`1.0` = unchanged).
+    pub mul: [f32; 3],
+    /// Color-retention fraction in `0.0..=1.0` (`1.0` = full color, `0.0` =
+    /// grayscale). Mirrors MUGEN's `PalFX color = 0..256`.
+    pub color: f32,
+    /// Remaining active duration in ticks. `0` (or less) = inactive / no-op.
+    pub remaining: i32,
+}
+
+impl CurPalFx {
+    /// The identity (no-op) tint: full color, unit multiply, zero add, not
+    /// active. [`Character::palfx`] returns this when nothing is active.
+    pub const IDENTITY: Self = Self {
+        add: [0.0, 0.0, 0.0],
+        mul: [1.0, 1.0, 1.0],
+        color: 1.0,
+        remaining: 0,
+    };
+
+    /// Returns `true` while the effect is still running ([`remaining`](Self::remaining)
+    /// `> 0`).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Counts the effect down by one tick, expiring it (resetting to the
+    /// identity tint) when it reaches zero. Called once per non-hit-paused tick.
+    pub fn tick(&mut self) {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            if self.remaining <= 0 {
+                *self = Self::IDENTITY;
+            }
+        }
+    }
+}
+
+impl Default for CurPalFx {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// The live `AfterImage` trail effect a character is displaying (faithfulness
+/// audit #33).
+///
+/// MUGEN's `AfterImage` draws a fading trail of the character's recent frames
+/// behind the sprite for [`time`](Self::time) ticks; `AfterImageTime` re-arms or
+/// cancels the duration. We model the controllable parameters — duration,
+/// trail [`length`](Self::length) (number of ghost frames), and the per-ghost
+/// color [`palfx`](Self::palfx) tint — leaving the actual frame-history capture
+/// and decay to the renderer (`fp-app`), which fakes the trail from the current
+/// frame at decreasing alpha. While [`time`](Self::time) `> 0` the trail is
+/// active and counts down each (non-hit-paused) tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AfterImageState {
+    /// Remaining trail duration in ticks. `0` (or less) = inactive.
+    pub time: i32,
+    /// Number of ghost frames in the trail (MUGEN `length`, default `20`,
+    /// clamped to a sane small cap by the controller).
+    pub length: i32,
+    /// The color tint applied to the trail ghosts (the controller's
+    /// `PalAdd`/`PalMul`/`PalBright` etc., folded into a single [`CurPalFx`]).
+    pub palfx: CurPalFx,
+}
+
+impl AfterImageState {
+    /// The inactive default: no trail.
+    pub const INACTIVE: Self = Self {
+        time: 0,
+        length: 0,
+        palfx: CurPalFx::IDENTITY,
+    };
+
+    /// Returns `true` while the trail is still running ([`time`](Self::time) `> 0`).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.time > 0
+    }
+
+    /// Counts the trail down by one tick, clearing it when it expires. Called
+    /// once per non-hit-paused tick.
+    pub fn tick(&mut self) {
+        if self.time > 0 {
+            self.time -= 1;
+            if self.time <= 0 {
+                *self = Self::INACTIVE;
+            }
+        }
+    }
+}
+
+impl Default for AfterImageState {
+    fn default() -> Self {
+        Self::INACTIVE
+    }
+}
+
 /// The number of `HitOverride` slots a character carries (MUGEN's `slot = 0..7`).
 pub const NUM_HIT_OVERRIDE_SLOTS: usize = 8;
 
@@ -1394,6 +1513,25 @@ pub struct Character {
     /// `[Size] ground.front`/`ground.back` constants. See [`WidthOverride`].
     pub cur_width: WidthOverride,
 
+    /// The character's live `PalFX` color tint (faithfulness audit #33).
+    ///
+    /// Unlike [`cur_width`](Self::cur_width) this is **not** per-tick: the
+    /// `PalFX` controller arms it for a `time` window, and the executor counts it
+    /// down each non-hit-paused tick. The renderer (`fp-app`) reads
+    /// [`Character::palfx`] and passes the active tint into the player's
+    /// `fp_render::SpriteDrawParams`; when inactive, `palfx()` returns the
+    /// identity (no-op) tint so the sprite renders unchanged. See [`CurPalFx`].
+    pub cur_palfx: CurPalFx,
+
+    /// The character's live `AfterImage` trail (faithfulness audit #33).
+    ///
+    /// Set by the `AfterImage` controller and re-armed/cancelled by
+    /// `AfterImageTime`; counts down each non-hit-paused tick. The renderer
+    /// (`fp-app`) reads [`Character::afterimage`] and, when active, draws a
+    /// fading trail of recent frames behind the sprite. Inactive by default. See
+    /// [`AfterImageState`].
+    pub afterimage: AfterImageState,
+
     /// The 8-slot `HitOverride` table (faithfulness audit #9b).
     ///
     /// Unlike [`asserted`](Self::asserted) and [`cur_width`](Self::cur_width),
@@ -1524,6 +1662,8 @@ impl Default for Character {
             invuln: InvulnMask::default(),
             asserted: AssertedFlags::default(),
             cur_width: WidthOverride::default(),
+            cur_palfx: CurPalFx::default(),
+            afterimage: AfterImageState::default(),
             hit_overrides: HitOverrides::default(),
             attack_mul: 1.0,
             defence_mul: 1.0,
@@ -1639,6 +1779,38 @@ impl Character {
     /// character directly. Writes the [`hitpause`](Character::hitpause) field.
     pub fn set_hitpause_time(&mut self, ticks: i32) {
         self.hitpause = ticks.max(0);
+    }
+
+    /// Returns the character's current `PalFX` color tint (faithfulness audit
+    /// #33).
+    ///
+    /// When a `PalFX` effect is active ([`CurPalFx::is_active`]) this is its
+    /// `add`/`mul`/`color` with the live countdown; otherwise it is the
+    /// **identity** tint ([`CurPalFx::IDENTITY`]), a guaranteed no-op so the
+    /// sprite renders byte-identically. The renderer (`fp-app`) converts the
+    /// returned effect into the renderer's `fp_render::PalFx` and passes it
+    /// into the player's `SpriteDrawParams`. Kept renderer-agnostic (returns a
+    /// `fp-character` type) so this low-level crate does not depend on
+    /// `fp-render`. Always returns a valid effect (never panics).
+    #[must_use]
+    pub fn palfx(&self) -> CurPalFx {
+        if self.cur_palfx.is_active() {
+            self.cur_palfx
+        } else {
+            CurPalFx::IDENTITY
+        }
+    }
+
+    /// Returns the character's live `AfterImage` trail state (faithfulness audit
+    /// #33).
+    ///
+    /// The renderer (`fp-app`) reads this and, while
+    /// [`AfterImageState::is_active`], draws a fading trail of recent frames
+    /// behind the sprite using the trail's [`palfx`](AfterImageState::palfx)
+    /// tint. Inactive ([`AfterImageState::INACTIVE`]) when no trail is running.
+    #[must_use]
+    pub const fn afterimage(&self) -> AfterImageState {
+        self.afterimage
     }
 
     /// Computes MUGEN's `AnimElemTime(n)` for the **one-based** element index

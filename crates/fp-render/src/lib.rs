@@ -19,7 +19,7 @@ mod vertex;
 
 pub use animation::AnimController;
 pub use atlas::{AtlasRegion, TextureAtlas};
-pub use params::{BlendMode, SpriteDrawParams};
+pub use params::{apply_palfx, BlendMode, PalFx, SpriteDrawParams};
 pub use renderer::{DebugBox, RenderFrame, Renderer};
 pub use text::{layout_text, GlyphFont, PlacedGlyph, TextDrawParams};
 pub use texture::{PaletteTexture, SpriteTexture};

@@ -15,6 +15,30 @@ struct Uniforms {
 @group(1) @binding(2) var palette_texture: texture_2d<f32>;
 @group(1) @binding(3) var palette_sampler: sampler;
 
+// MUGEN PalFX / AfterImage color tint (audit #33). `add.xyz` is a signed
+// per-channel add, `mul.xyz` a per-channel multiply, `color.x` the grayscale-
+// retention fraction (1.0 = full color, 0.0 = luminance). The identity value
+// {add=0, mul=1, color=1} leaves the looked-up color exactly unchanged.
+struct PalFx {
+    add: vec4<f32>,
+    mul: vec4<f32>,
+    color: vec4<f32>,
+}
+
+@group(1) @binding(4) var<uniform> palfx: PalFx;
+
+// Rec. 601 luma weights — must match `LUMA_WEIGHTS` in params.rs so the CPU
+// reference (`apply_palfx`) and this shader agree pixel-for-pixel.
+const LUMA_WEIGHTS = vec3<f32>(0.299, 0.587, 0.114);
+
+// Applies the PalFX tint to a linear RGB color: grayscale blend (color) →
+// multiply (mul) → signed add (add), clamped to 0..1. Mirrors `apply_palfx`.
+fn apply_palfx(rgb: vec3<f32>) -> vec3<f32> {
+    let luma = dot(rgb, LUMA_WEIGHTS);
+    let blended = mix(vec3<f32>(luma), rgb, palfx.color.x);
+    return clamp(blended * palfx.mul.xyz + palfx.add.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -47,5 +71,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let color = textureSample(palette_texture, palette_sampler, vec2<f32>(palette_index, 0.5));
-    return vec4<f32>(color.rgb, color.a * in.alpha);
+    // Apply the PalFX color tint (identity = unchanged), then alpha.
+    let tinted = apply_palfx(color.rgb);
+    return vec4<f32>(tinted, color.a * in.alpha);
 }
