@@ -1429,11 +1429,27 @@ impl Character {
             // the full PalFX modulation). Tracked to a named, WARN-logged no-op
             // (NOT the silent debug fall-through below) so the gap is visible and
             // attributable to its blocking task. See `is_tracked_deferred_controller`.
-            tracing::warn!(
-                "tick: controller {kind:?} in state {} is recognized but deferred \
-                 (blocked on an unbuilt subsystem; see T007-T014)",
-                ctrl.state_number
-            );
+            // Log each deferred controller kind ONCE, not every tick. A deferred
+            // controller in a persistent state (e.g. state -2, which runs every
+            // frame — evilken's `RemoveExplod` does exactly this) would otherwise
+            // emit thousands of WARN lines per second, flooding the terminal and
+            // stalling the 60Hz loop (the "stuck / blocked by unbuilt systems"
+            // symptom). The gap stays visible (first occurrence warns) and remains
+            // documented in `is_tracked_deferred_controller`, without the spam.
+            thread_local! {
+                static WARNED_DEFERRED: std::cell::RefCell<std::collections::HashSet<String>> =
+                    std::cell::RefCell::new(std::collections::HashSet::new());
+            }
+            let first_seen =
+                WARNED_DEFERRED.with(|w| w.borrow_mut().insert(kind.to_ascii_lowercase()));
+            if first_seen {
+                tracing::warn!(
+                    "controller {kind:?} (first seen in state {}) is recognized but \
+                     deferred to a no-op; further occurrences are silenced \
+                     (blocked on an unbuilt subsystem; see T007-T014)",
+                    ctrl.state_number
+                );
+            }
         } else {
             // Genuinely unrecognized type (a typo or a non-MUGEN extension) → safe
             // no-op, debug-logged.
