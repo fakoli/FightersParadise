@@ -4,21 +4,23 @@ A clean-room reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen
 fighting engine in Rust, aiming for a **completely customizable fighting-game engine**: bring your own
 characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 
-> **Current state (not v0.1.0 stubs):** a **playable two-character fighter that now renders on screen.**
-> `fp-app` draws a two-character `fp_engine::Match` (P1 = keyboard) **over a full-color stage background**,
-> with a life HUD, KO/winner readout, and best-of-3 rounds. The engine logic — throws, supers (meter),
-> hitpause, i-frames, hit reactions, jump/airjump/land, damage multipliers — is implemented and
-> unit-tested (~2210 tests).
+> **Current state (2026-06-15 — MUGEN-parity wave complete):** a **playable two-character fighter that
+> renders on screen in full color**, with a broad MUGEN feature set. `fp-app` draws a two-character
+> `fp_engine::Match` (P1 = keyboard, P2 = baseline CPU AI or keyboard) **over a full-color stage
+> background**, with a life/power HUD, combo counter + portraits, KO/winner readout, and best-of-3 rounds.
+> The engine logic — throws, supers (meter), hitpause, i-frames, hit reactions, jump/airjump/land, damage
+> multipliers, plus **helpers + projectiles, `target`/`parent`/`root`/`helper`/`partner`/`playerid`
+> redirects, full PalFX modulation, true AfterImage frame-history, per-frame AIR scale/angle/Interpolate,
+> team Simul/Turns, and deterministic state serialization + record/replay** — is implemented and
+> unit-tested (**~2439 tests**; `cargo fmt --check` is now a CI gate).
 >
-> ⚠️ **Visual rendering was a latent gap until 2026-06-15** — important context before trusting older
-> "it renders" claims. A live run (driven via compute-use; see "Live-debugging the windowed app" below)
-> showed the sprite vertex buffer overwrote every quad but the last, so **fighters never appeared** —
-> CPU tests passed but the screen was wrong. `#40` fixed it (bump-allocation) and `#41` added the
-> full-color RGBA stage-background path. Now: **SFF v1 characters (the bundled `evilken`) render in full
-> color**; **`KFM` is SFF v2 and currently renders as black silhouettes** — its sprites decode and the
-> shapes are correct, but the v2 palette parser is buggy (open task #32; precise root cause in the
-> **newest `docs/handoffs/` file**). **No crate is a true stub** — `fp-stage`, `fp-ui`, `fp-storyboard`
-> graduated. See [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md).
+> ✅ **SFF v2 palette fixed (PR #44 / T001):** v2 palettes are RGBA quadruplets (not RGB triplets), so
+> KFM now decodes to full color (regression-tested) — this closes the old "KFM renders as black
+> silhouettes" bug (former task #32). SFF v1 (evilken) also renders in full color (#40/#41). **No crate is
+> a true stub.** A full parity wave (25 tasks, PRs #44–#67) landed on 2026-06-15 — see the **newest
+> `docs/handoffs/` file** for the run summary and remaining follow-ups (Proj* triggers, partner-in-1v1,
+> fp-app TeamMode wiring, `.snd` ADX). See [docs/known-issues.md](docs/known-issues.md) and
+> [docs/roadmap.md](docs/roadmap.md).
 
 ## Build & Run
 
