@@ -73,9 +73,11 @@ use serde::{Deserialize, Serialize};
 
 mod replay;
 mod snapshot;
+mod team;
 
 pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
+pub use team::{Side, TeamMatch, TeamMatchState, TeamMode};
 
 /// The horizontal extent of the playfield, in world pixels.
 ///
@@ -626,6 +628,23 @@ impl Player {
         }
     }
 
+    /// Advances this player's character one frame **standalone**: no opponent, no
+    /// input, just its own state machine against its own loaded assets (T017).
+    ///
+    /// Used by the team-match coordinator ([`TeamMatch`]) in [`TeamMode::Simul`] to
+    /// tick the *reserve* fighters that are not part of the active pair, so a
+    /// team's off-screen members keep running their idle/standing states (and any
+    /// self-driven animation) rather than freezing. The reserve sees no opponent
+    /// (its `p2`/`enemy` redirects resolve to `0`) and is fed an empty command
+    /// source (no input drives it), exactly like a frozen-world non-acting entity.
+    /// Its deferred [`TickReport`] is discarded — a reserve cannot grab/hit anyone
+    /// while off the active stage. Never panics.
+    fn tick_standalone(&mut self, stage: StageView) {
+        self.character
+            .set_command_source(Box::new(fp_character::NoCommands));
+        let _ = self.character.tick(&self.loaded, None, stage);
+    }
+
     /// The character's world position in pixels (`Pos X`/`Pos Y`).
     #[must_use]
     pub fn pos(&self) -> Vec2<f32> {
@@ -1114,6 +1133,33 @@ impl Match {
     #[must_use]
     pub fn p2(&self) -> &Player {
         &self.p2
+    }
+
+    /// Consumes the match and returns its two [`Player`]s as `(p1, p2)`, dropping
+    /// all round/timer/effect state (T017).
+    ///
+    /// Used by the team-match coordinator ([`TeamMatch`]) to recover the active
+    /// fighters from the inner 1v1 match so a Turns hand-off can swap a knocked-out
+    /// fighter for a reserve and rebuild a fresh [`Match`] between the new active
+    /// pair. The two returned players carry their live [`Character`] state (life,
+    /// position, meter, …) so a surviving fighter keeps its progress across the
+    /// hand-off.
+    #[must_use]
+    pub fn into_players(self) -> (Player, Player) {
+        (self.p1, self.p2)
+    }
+
+    /// Mutable access to player 1 (test-only), so the team-flow tests can force a
+    /// deterministic life/KO without landing a real hit.
+    #[cfg(test)]
+    pub(crate) fn p1_mut_for_test(&mut self) -> &mut Player {
+        &mut self.p1
+    }
+
+    /// Mutable access to player 2 (test-only). See [`Match::p1_mut_for_test`].
+    #[cfg(test)]
+    pub(crate) fn p2_mut_for_test(&mut self) -> &mut Player {
+        &mut self.p2
     }
 
     /// The two players' stable identity fingerprints, `(p1, p2)` (#38).
@@ -2599,6 +2645,114 @@ fn facing_opposite(facing: Facing) -> Facing {
     match facing {
         Facing::Right => Facing::Left,
         Facing::Left => Facing::Right,
+    }
+}
+
+/// Shared synthetic test fixtures used by both this crate's unit tests and the
+/// [`team`] module's tests (T017). Authored from scratch — no external assets.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::{Match, Player, Side, TeamMatch};
+    use fp_character::{
+        Character, CharacterConstants, Facing, LoadedCharacter, MoveType, StateType,
+    };
+    use fp_core::{Rect, SpriteId, Vec2};
+    use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode};
+    use fp_formats::sff::SffFile;
+    use std::collections::HashMap;
+
+    /// Builds a minimal valid SFF v1 container in memory carrying a single linked
+    /// (data-less) sprite, so a headless [`LoadedCharacter`] needs no asset on
+    /// disk. Mirrors the `empty_sff` helper in `mod tests`.
+    fn empty_sff() -> SffFile {
+        const SUBHEADER_OFFSET: usize = 64;
+        let mut buf = vec![0u8; SUBHEADER_OFFSET + 32];
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[15] = 1; // SFF v1
+        buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // num_groups
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // num_images
+        buf[24..28].copy_from_slice(&(SUBHEADER_OFFSET as u32).to_le_bytes());
+        SffFile::from_bytes(&buf).expect("synthetic SFF v1 must parse")
+    }
+
+    /// A one-action, one-frame AIR with a single hurt box on action 0, enough for
+    /// the headless team-flow tests (no real sprites are read).
+    fn simple_air() -> AirFile {
+        let frame = AnimFrame {
+            sprite: SpriteId::new(0, 0),
+            offset: Vec2::new(0, 0),
+            ticks: 1,
+            flip_h: false,
+            flip_v: false,
+            blend: BlendMode::Normal,
+            clsn1: Vec::new(),
+            clsn2: vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![frame],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// A synthetic [`LoadedCharacter`] with an empty state graph and a simple AIR.
+    fn simple_loaded() -> LoadedCharacter {
+        LoadedCharacter {
+            name: "test".to_string(),
+            localcoord: (320, 240),
+            constants: CharacterConstants::default(),
+            states: HashMap::new(),
+            sff: empty_sff(),
+            air: simple_air(),
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        }
+    }
+
+    /// Builds a fresh headless [`Player`] positioned at world X `x` — a default
+    /// [`Character`] (full life) wrapping the synthetic [`simple_loaded`] assets.
+    /// Faces right when on the left half of the stage, else left, so two such
+    /// players square off.
+    pub(crate) fn make_player(x: f32) -> Player {
+        let mut c = Character::new();
+        c.pos = Vec2::new(x, 0.0);
+        c.facing = if x < 0.0 { Facing::Right } else { Facing::Left };
+        c.state_type = StateType::Standing;
+        c.move_type = MoveType::Idle;
+        Player::new(c, simple_loaded())
+    }
+
+    /// Test-only mutators on [`TeamMatch`], used to drive deterministic KO / damage
+    /// scenarios without having to land a real hit through the combat pipeline.
+    impl TeamMatch {
+        /// Forces the active fighter on `side` to `0` life (a KO) for the next
+        /// resolution.
+        pub(crate) fn kill_active(&mut self, side: Side) {
+            self.set_active_life(side, 0);
+        }
+
+        /// Sets the active fighter on `side` to exactly `life`.
+        pub(crate) fn set_active_life(&mut self, side: Side, life: i32) {
+            let inner: &mut Match = self.inner_mut_for_test();
+            match side {
+                Side::P1 => inner.p1_mut_for_test().character.life = life,
+                Side::P2 => inner.p2_mut_for_test().character.life = life,
+            }
+        }
+
+        /// Forces the `idx`-th reserve fighter on `side` to `0` life (a KO).
+        pub(crate) fn kill_reserve(&mut self, side: Side, idx: usize) {
+            if let Some(p) = self.reserve_mut_for_test(side, idx) {
+                p.character.life = 0;
+            }
+        }
     }
 }
 
