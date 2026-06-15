@@ -8,9 +8,11 @@
 
 pub mod buffer;
 pub mod command;
+pub mod controller;
 pub mod state;
 
 pub use buffer::{InputBuffer, InputBufferSnapshot};
+pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
 pub use command::{
     compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,
     InputModifier,
