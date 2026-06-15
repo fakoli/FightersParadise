@@ -462,6 +462,53 @@ impl EvalContext for EmptyCtx {
 }
 
 // -----------------------------------------------------------------------------
+// T016: RoundNo / RoundsExisted evaluate from the context across a multi-round
+// match. These are ordinary engine triggers (the round coordinator supplies
+// their values via `EvalContext`), so the VM only needs to lex/parse them and
+// read them back — exactly like `RoundState` above. Seeding the synthetic `Ctx`
+// with successive round states proves the pipeline computes real semantics on
+// these names on every `cargo test -p fp-vm`, asset-gate or not.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn round_no_and_rounds_existed_evaluate_across_a_multi_round_match() {
+    // Round 1: RoundNo 1, RoundsExisted 0.
+    let r1 = Ctx::new()
+        .with_trigger("RoundNo", &[], Value::Int(1))
+        .with_trigger("RoundsExisted", &[], Value::Int(0));
+    assert_eq!(run("RoundNo", &r1), Value::Int(1));
+    assert_eq!(run("RoundsExisted", &r1), Value::Int(0));
+    assert_eq!(run("RoundNo = 1", &r1), Value::Int(1));
+    assert_eq!(run("RoundsExisted = 0", &r1), Value::Int(1));
+    // The MUGEN identity a fighter present since round 1 always satisfies.
+    assert_eq!(run("RoundsExisted = RoundNo - 1", &r1), Value::Int(1));
+    // Case-insensitivity, as stock content spells these freely.
+    assert_eq!(run("roundno = 1 && roundsexisted = 0", &r1), Value::Int(1));
+
+    // Round 2: RoundNo 2, RoundsExisted 1 (one round completed).
+    let r2 = Ctx::new()
+        .with_trigger("RoundNo", &[], Value::Int(2))
+        .with_trigger("RoundsExisted", &[], Value::Int(1));
+    assert_eq!(run("RoundNo = 2", &r2), Value::Int(1));
+    assert_eq!(run("RoundsExisted = 1", &r2), Value::Int(1));
+    assert_eq!(run("RoundsExisted = RoundNo - 1", &r2), Value::Int(1));
+    // A "first round only" gate (RoundNo = 1) is now false in round 2.
+    assert_eq!(run("RoundNo = 1", &r2), Value::Int(0));
+
+    // Round 3 of a best-of-three: RoundNo 3, RoundsExisted 2.
+    let r3 = Ctx::new()
+        .with_trigger("RoundNo", &[], Value::Int(3))
+        .with_trigger("RoundsExisted", &[], Value::Int(2));
+    assert_eq!(run("RoundNo > 2", &r3), Value::Int(1));
+    assert_eq!(run("RoundsExisted = 2", &r3), Value::Int(1));
+    assert_eq!(run("RoundsExisted = RoundNo - 1", &r3), Value::Int(1));
+
+    // Unseeded context (no coordinator): both read the safe default 0.
+    assert_eq!(run("RoundNo", &EmptyCtx), Value::Int(0));
+    assert_eq!(run("RoundsExisted", &EmptyCtx), Value::Int(0));
+}
+
+// -----------------------------------------------------------------------------
 // AC2 (hardening): the never-crash contract on ADVERSARIAL synthetic input.
 //
 // The asset-gated test proves no panic on real content; this proves no panic on
