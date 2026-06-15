@@ -315,18 +315,24 @@ pub fn derive_player_seed(match_seed: i32, player_index: u32) -> i32 {
     z as i32
 }
 
-/// Which fighter's SFF/AIR a hit-spark [`Effect`] draws from (audit #17).
+/// Which sprite/animation source a hit-spark [`Effect`] draws from (audit #17).
 ///
 /// A MUGEN attacker-own spark (`sparkno` negative / `S`-prefixed) plays an action
 /// from the **attacker's own** sprite/animation set, so an [`Effect`] records the
 /// attacking side and a renderer resolves its frames against that fighter's
-/// [`LoadedCharacter::sff`](fp_character::LoadedCharacter)/`air`.
+/// [`LoadedCharacter::sff`](fp_character::LoadedCharacter)/`air`. A **common**
+/// spark (bare non-negative `sparkno`) draws from the shared common-effects
+/// (`fightfx`) set loaded onto the [`Match`] instead (see [`Match::set_common_fx`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectSide {
     /// The spark draws from player 1's SFF/AIR.
     P1,
     /// The spark draws from player 2's SFF/AIR.
     P2,
+    /// The spark draws from the shared common-effects (`fightfx`) SFF/AIR loaded
+    /// on the [`Match`] (the standard MUGEN common hit/guard sparks). A renderer
+    /// resolves its frames against the common-effects atlas, not a fighter's SFF.
+    Common,
 }
 
 /// A short-lived hit-spark / `Explod`-like effect entity spawned on a connecting
@@ -338,23 +344,23 @@ pub enum EffectSide {
 /// animation finishes — a minimal, self-contained effect system (no general
 /// `Explod` graph, helper tree, or binding yet).
 ///
-/// # Sprite source — own-sparks only today (important)
+/// # Sprite source — own and common sparks (audit #17)
 ///
-/// An [`Effect`] is **only** spawned for an *attacker-own* spark (see
-/// [`SparkSource::Own`]): its frames come from the **attacker's own** SFF/AIR (see
-/// [`EffectSide`] / [`Effect::side`]). A *common* `fightfx` spark
-/// ([`SparkSource::Common`]) has **no asset loaded**, so [`Match`] does **not**
-/// spawn an effect for it — a documented best-effort skip that never blocks the
-/// hit (see [`Match::tick`]).
+/// An [`Effect`] is spawned for both spark kinds:
 ///
-/// In practice this means **conventional characters render no hit-spark yet**: the
-/// own-spark path is reached only by a *literal-negative* `sparkno`, and real
-/// content (Kung Fu Man's `sparkno` values are all `0/1/2/3/40` plus one `-1`)
-/// authors only common-`fightfx` values — partly because the upstream parser
-/// strips the `S`-prefix that would mark an own-spark (see [`SparkSource`] and
-/// `docs/known-issues.md`, audit #17). So in the default KFM-vs-KFM match this
-/// list stays **empty**; this is *own-spark infrastructure*, not a working KFM
-/// spark, until a `fightfx` set is wired or the parser preserves `S`.
+/// - An *attacker-own* spark ([`SparkSource::Own`]) draws its frames from the
+///   **attacker's own** SFF/AIR ([`EffectSide::P1`]/[`EffectSide::P2`]).
+/// - A *common* `fightfx` spark ([`SparkSource::Common`]) draws from the shared
+///   common-effects set loaded on the [`Match`] (see [`Match::set_common_fx`]),
+///   recorded as [`EffectSide::Common`]. When no common-effects asset is loaded
+///   the common spark is a documented best-effort **skip** (logged, never a
+///   panic) — exactly the pre-asset behavior.
+///
+/// With the shipped `assets/data/fightfx.*` common-effects asset loaded, the
+/// default Kung Fu Man match (whose `sparkno` values are all `0/1/2/3/40`) now
+/// shows a visible hit-spark on each connect. The `S`-prefix → own-spark
+/// distinction is preserved by `fp-character`'s `parse_sparkno` (an `S`-prefixed
+/// `sparkno` encodes negative → own).
 ///
 /// The owning side's [`fp_formats::air::AirFile`] action id is [`Effect::anim`];
 /// the resolved current-frame [`fp_core::SpriteId`] is [`Effect::sprite`]. All
@@ -662,10 +668,18 @@ pub struct Match {
     ///
     /// Each connecting hit whose attacker authored an own-spark (`sparkno`
     /// negative / `S`-prefixed) pushes one [`Effect`] here; a common-`fightfx`
-    /// spark is skipped (no asset loaded). Expired effects are removed in-place, so
-    /// this only ever holds the sparks visible *this* frame. Cleared at the start
-    /// of each round. Read it via [`Match::effects`].
+    /// spark pushes one sourced from [`common_fx`](Match::common_fx) when that
+    /// asset is loaded (else it is skipped). Expired effects are removed in-place,
+    /// so this only ever holds the sparks visible *this* frame. Cleared at the
+    /// start of each round. Read it via [`Match::effects`].
     effects: Vec<Effect>,
+    /// The shared common-effects (`fightfx`) animation set, when loaded (audit
+    /// #17). Holds the [`AirFile`] whose actions resolve a common
+    /// ([`EffectSide::Common`]) spark's frames; `None` means no common-effects
+    /// asset is wired, so common sparks are a best-effort skip (the pre-asset
+    /// behavior). Install it with [`Match::set_common_fx`]; a renderer pairs it
+    /// with the matching `fightfx.sff` it loaded separately.
+    common_fx: Option<AirFile>,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -826,7 +840,32 @@ impl Match {
             game_time: 0,
             freeze: Freeze::inactive(),
             effects: Vec::new(),
+            common_fx: None,
         }
+    }
+
+    /// Installs the shared common-effects (`fightfx`) animation set used to
+    /// resolve common ([`EffectSide::Common`]) hit-spark frames (audit #17).
+    ///
+    /// `air` is the parsed common-effects [`AirFile`] (the engine-shipped
+    /// `assets/data/fightfx.air`, or any caller-supplied set). Once installed, a
+    /// connecting hit with a bare non-negative `sparkno` spawns a common spark
+    /// whose frames come from this set; a renderer pairs it with the matching
+    /// `fightfx.sff` it loaded separately. Calling this is **optional** — with no
+    /// common set installed, common sparks are a best-effort skip (no panic, no
+    /// regression). Replaces any previously installed set.
+    pub fn set_common_fx(&mut self, air: AirFile) {
+        self.common_fx = Some(air);
+    }
+
+    /// The installed common-effects (`fightfx`) animation set, if any (audit #17).
+    ///
+    /// Returns the [`AirFile`] a renderer needs to resolve a common
+    /// ([`EffectSide::Common`]) spark's current frame against the matching
+    /// `fightfx.sff`, or `None` when no common set is loaded.
+    #[must_use]
+    pub fn common_fx(&self) -> Option<&AirFile> {
+        self.common_fx.as_ref()
     }
 
     /// Overrides the number of round wins needed to win the match, clamping a
@@ -1034,7 +1073,9 @@ impl Match {
     /// when its animation finishes, so this slice holds exactly the sparks visible
     /// this frame (empty when nothing is connecting). A renderer (`fp-app`) draws
     /// each effect's [`Effect::sprite`] at its [`Effect::pos`], resolving the
-    /// sprite against the owning side's ([`Effect::side`]) SFF.
+    /// sprite against the owning side's ([`Effect::side`]) SFF — a fighter's SFF
+    /// for [`EffectSide::P1`]/[`EffectSide::P2`], or the shared common-effects
+    /// (`fightfx`) SFF for [`EffectSide::Common`].
     #[must_use]
     pub fn effects(&self) -> &[Effect] {
         &self.effects
@@ -1723,41 +1764,53 @@ impl Match {
     /// anchor. The spark source is classified via [`SparkSource`]:
     ///
     /// - [`SparkSource::None`] (`-1`): no spark — nothing spawned.
-    /// - [`SparkSource::Own`]: play that action from the attacker's own AIR. The
-    ///   first frame's sprite/offset are resolved immediately so the spark is
-    ///   visible the frame it spawns; a missing/empty action logs and spawns nothing.
-    /// - [`SparkSource::Common`]: a common-`fightfx` spark — no `fightfx` asset is
-    ///   loaded yet, so this is a documented best-effort **skip** (logged once at
-    ///   debug). It never panics and never blocks the hit.
+    /// - [`SparkSource::Own`]: play that action from the **attacker's own** AIR
+    ///   (recorded with `attacker_side`). The first frame's sprite/offset are
+    ///   resolved immediately so the spark is visible the frame it spawns; a
+    ///   missing/empty action logs and spawns nothing.
+    /// - [`SparkSource::Common`]: play that action from the shared common-effects
+    ///   set ([`Match::common_fx`], recorded as [`EffectSide::Common`]). When no
+    ///   common-effects asset is loaded this is a documented best-effort **skip**
+    ///   (logged at debug). It never panics and never blocks the hit.
     ///
     /// The effect's lifetime is the action's total frame ticks, clamped to
     /// [`EFFECT_MAX_LIFETIME`] (so an infinite-hold final frame cannot leak).
-    fn spawn_effect(&mut self, side: EffectSide, raw_sparkno: i32, pos: Vec2<f32>) {
-        let anim = match SparkSource::classify(raw_sparkno) {
+    fn spawn_effect(&mut self, attacker_side: EffectSide, raw_sparkno: i32, pos: Vec2<f32>) {
+        // Resolve the effect's animation source (which AIR + which side to record)
+        // from the spark classification.
+        let (side, anim, air) = match SparkSource::classify(raw_sparkno) {
             SparkSource::None => return,
-            SparkSource::Common { anim } => {
-                tracing::debug!(
-                    sparkno = raw_sparkno,
-                    anim,
-                    "common fightfx spark requested but no fightfx.sff is loaded; skipping spark"
-                );
-                return;
+            SparkSource::Own { anim } => {
+                let air = match attacker_side {
+                    EffectSide::P1 => &self.p1.loaded.air,
+                    EffectSide::P2 => &self.p2.loaded.air,
+                    // The attacker side is always P1/P2; Common is never passed in
+                    // as an attacker. Defensive: treat as no spark.
+                    EffectSide::Common => return,
+                };
+                (attacker_side, anim, air)
             }
-            SparkSource::Own { anim } => anim,
+            SparkSource::Common { anim } => {
+                let Some(air) = self.common_fx.as_ref() else {
+                    tracing::debug!(
+                        sparkno = raw_sparkno,
+                        anim,
+                        "common fightfx spark requested but no common-fx asset is loaded; skipping"
+                    );
+                    return;
+                };
+                (EffectSide::Common, anim, air)
+            }
         };
 
-        // Resolve the owning side's AIR action; an absent/empty action means there
-        // is nothing to draw, so spawn no effect (best-effort, never a panic).
-        let air = match side {
-            EffectSide::P1 => &self.p1.loaded.air,
-            EffectSide::P2 => &self.p2.loaded.air,
-        };
+        // Resolve the chosen AIR action; an absent/empty action means there is
+        // nothing to draw, so spawn no effect (best-effort, never a panic).
         let Some(action) = air.action(anim) else {
-            tracing::debug!(?side, anim, "own spark action not found in AIR; skipping spark");
+            tracing::debug!(?side, anim, "spark action not found in AIR; skipping spark");
             return;
         };
         let Some(first) = action.frames.first() else {
-            tracing::debug!(?side, anim, "own spark action has no frames; skipping spark");
+            tracing::debug!(?side, anim, "spark action has no frames; skipping spark");
             return;
         };
 
@@ -1784,10 +1837,11 @@ impl Match {
     /// sprite/offset), and remove it once its lifetime hits `0` or its action can
     /// no longer be resolved. Pure field writes over a bounded list; never panics.
     fn tick_effects(&mut self) {
-        // Snapshot the two AIR files once (immutable) so the closure can resolve
+        // Snapshot the AIR sources once (immutable) so the closure can resolve
         // each effect's frames without re-borrowing `self` mutably per element.
         let p1_air = &self.p1.loaded.air;
         let p2_air = &self.p2.loaded.air;
+        let common_air = self.common_fx.as_ref();
         self.effects.retain_mut(|fx| {
             fx.remaining -= 1;
             if fx.remaining <= 0 {
@@ -1796,6 +1850,12 @@ impl Match {
             let air = match fx.side {
                 EffectSide::P1 => p1_air,
                 EffectSide::P2 => p2_air,
+                // A common spark only exists if the common set was loaded when it
+                // spawned; if it has since gone (it cannot, it is immutable), drop.
+                EffectSide::Common => match common_air {
+                    Some(air) => air,
+                    None => return false,
+                },
             };
             advance_effect_frame(fx, air)
         });
@@ -6483,8 +6543,9 @@ time = 1
         assert!(ticked <= 6, "expiry is bounded by the action lifetime, took {ticked}");
     }
 
-    /// A common (`fightfx`) spark — a non-negative `sparkno` — spawns nothing today
-    /// (no fightfx asset is loaded), but the hit still connects and deals damage.
+    /// A common (`fightfx`) spark — a non-negative `sparkno` — spawns nothing when
+    /// NO common-effects asset is loaded, but the hit still connects and deals
+    /// damage (the best-effort skip; no panic, no regression).
     #[test]
     fn common_spark_spawns_nothing_but_hit_lands() {
         let mut hd = sample_hitdef();
@@ -6496,8 +6557,74 @@ time = 1
         assert!(m.p2().life() < 1000, "a common-spark hit still connects + damages");
         assert!(
             m.effects().is_empty(),
-            "no fightfx asset loaded → common spark is a best-effort skip"
+            "no common-fx asset loaded → common spark is a best-effort skip"
         );
+    }
+
+    /// A synthetic common-effects [`AirFile`] with a spark action at `anim`
+    /// (3 frames, sprites (`anim`,0)/(`anim`,1)/(`anim`,2), 2 ticks each), so a
+    /// common spark sourced from it is observable without the shipped asset.
+    fn common_fx_air(anim: i32) -> AirFile {
+        let mk = |img: u16| AnimFrame {
+            sprite: SpriteId::new(anim as u16, img),
+            offset: Vec2::new(0, 0),
+            ticks: 2,
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        actions.insert(
+            anim,
+            AnimAction {
+                action_number: anim,
+                frames: vec![mk(0), mk(1), mk(2)],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// With a common-effects asset loaded, a connecting hit whose `sparkno` is a
+    /// bare non-negative value spawns ONE effect sourced from the common set
+    /// ([`EffectSide::Common`]), playing the matching action — NOT the attacker's
+    /// own SFF. This is the core FL2a fix: common sparks now render.
+    #[test]
+    fn common_spark_spawns_from_loaded_common_fx() {
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = 2; // bare non-negative → common fightfx action 2
+        // The attacker's OWN AIR carries spark action 5 (which must NOT be used).
+        let mut m = spark_match(hd, 5);
+        // Install a common set whose action 2 is the spark to draw.
+        m.set_common_fx(common_fx_air(2));
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the common-spark hit connects + damages");
+        assert_eq!(m.effects().len(), 1, "exactly one common spark spawned");
+        let fx = &m.effects()[0];
+        assert_eq!(
+            fx.side,
+            EffectSide::Common,
+            "the spark is sourced from the common-fx set, not a fighter"
+        );
+        assert_eq!(fx.anim, 2, "the common spark plays common action 2");
+        // Current frame is action 2's first sprite (group 2), confirming it
+        // resolved against the common set, not the attacker's group-10 own spark.
+        assert_eq!(fx.sprite, SpriteId::new(2, 0));
+    }
+
+    /// A common spark whose action is MISSING from the loaded common set spawns
+    /// nothing (best-effort), and the hit still lands — never a panic.
+    #[test]
+    fn common_spark_missing_action_in_loaded_set_spawns_nothing() {
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = 7; // common action 7, NOT authored in the set below
+        let mut m = spark_match(hd, 5);
+        m.set_common_fx(common_fx_air(2)); // only action 2 exists
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the hit lands even when the common action is missing");
+        assert!(m.effects().is_empty(), "a missing common action spawns nothing");
     }
 
     /// `sparkno = -1` (the MUGEN "no spark" sentinel) spawns nothing, and a missing
@@ -6602,6 +6729,88 @@ time = 1
         assert!(
             hit,
             "a real KFM punch must connect through Match::tick and drop P2's life; P2 at {} ({:?})",
+            m.p2().life(),
+            m.round_state()
+        );
+    }
+
+    /// Resolves a path inside the shipped (committed) `assets/data/` directory.
+    fn shipped_asset(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/data")
+            .join(rel)
+    }
+
+    /// FL2a headline (gated, skip-if-KFM-missing): with the SHIPPED common-effects
+    /// (`fightfx`) asset installed, a real KFM punch — whose `sparkno` is a common
+    /// value (`0/1/2/3/40`) — now spawns a VISIBLE common spark sourced from the
+    /// `fightfx` set ([`EffectSide::Common`]), driven through the real
+    /// command+combat tick path. This is the regression net for "KFM hits show a
+    /// spark": it asserts the connecting hit produces a common-fx-sourced effect,
+    /// not the empty list of the pre-asset world.
+    #[test]
+    fn real_kfm_hit_spawns_common_fightfx_spark() {
+        // The fightfx asset SHIPS, so it must be present (not gated on it). KFM is
+        // the gated half — skip cleanly when the fixture is absent.
+        let Some(mut m) = two_kfm_match() else {
+            return; // fixture absent; helper already logged the skip
+        };
+        // Install the shipped common-effects AIR so common sparks resolve.
+        let air = AirFile::load(&shipped_asset("fightfx.air"))
+            .expect("shipped fightfx.air must load");
+        // Sanity: the set authors KFM's common spark indices.
+        for g in [0, 1, 2, 3, 40] {
+            assert!(air.action(g).is_some(), "fightfx.air must author action {g}");
+        }
+        m.set_common_fx(air);
+
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(m.effects().is_empty(), "no spark before the fight is driven");
+        let p2_life_before = m.p2().life();
+
+        // Walk into range.
+        for _ in 0..240 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
+                break;
+            }
+        }
+        // Throw light punches until one connects; on the connecting tick a common
+        // spark must appear (sourced from the loaded fightfx set).
+        let mut saw_common_spark = false;
+        for i in 0..400 {
+            let inp = if i % 3 == 0 {
+                MatchInput { x: true, ..MatchInput::none() }
+            } else {
+                MatchInput::none()
+            };
+            m.tick(inp, MatchInput::none());
+            // Any spark spawned by a real KFM hit must be a COMMON (fightfx) spark,
+            // never a fighter-own one (KFM authors no own-sparks).
+            if let Some(fx) = m.effects().first() {
+                assert_eq!(
+                    fx.side,
+                    EffectSide::Common,
+                    "a real KFM spark must source from the common fightfx set"
+                );
+                saw_common_spark = true;
+            }
+            if m.p2().life() < p2_life_before {
+                // The hit landed; by now (spawn runs before tick_effects) a common
+                // spark exists for this connect.
+                assert!(
+                    saw_common_spark,
+                    "a connecting KFM hit must have spawned a common fightfx spark"
+                );
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert!(
+            saw_common_spark,
+            "a real KFM punch must connect and spawn a common fightfx spark; P2 at {} ({:?})",
             m.p2().life(),
             m.round_state()
         );

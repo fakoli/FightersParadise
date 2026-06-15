@@ -1,0 +1,36 @@
+; Common hit-spark effects — Fighters Paradise (ORIGINAL, clean-room).
+; (c) 2025 Sekou Doumbouya, MIT. No Elecbyte/MUGEN assets are used.
+; Each action N draws the common spark at group N (images 0,1,2),
+; a short non-looping burst. sparkno = N selects action N here.
+;   0 small white  1 yellow  2 orange  3 mixed  40 super  120 guard
+
+[Begin Action 0]   ; small white hit spark
+0,0, 0,0, 3, , A
+0,1, 0,0, 3, , A
+0,2, 0,0, 3, , A
+
+[Begin Action 1]   ; yellow hit spark
+1,0, 0,0, 3, , A
+1,1, 0,0, 3, , A
+1,2, 0,0, 3, , A
+
+[Begin Action 2]   ; orange hit spark
+2,0, 0,0, 3, , A
+2,1, 0,0, 3, , A
+2,2, 0,0, 3, , A
+
+[Begin Action 3]   ; mixed bright spark
+3,0, 0,0, 3, , A
+3,1, 0,0, 3, , A
+3,2, 0,0, 3, , A
+
+[Begin Action 40]   ; super spark
+40,0, 0,0, 3, , A
+40,1, 0,0, 3, , A
+40,2, 0,0, 3, , A
+
+[Begin Action 120]   ; guard spark
+120,0, 0,0, 3, , A
+120,1, 0,0, 3, , A
+120,2, 0,0, 3, , A
+

@@ -1890,11 +1890,15 @@ impl Character {
         }
 
         // Spark id. `sparkno` may carry a leading `S` (use the character's own
-        // AIR set rather than the common set). The `S` prefix is not modelled in
-        // `fp_combat::HitResources`, so we strip it and keep the numeric id; an
-        // absent / non-numeric id keeps the default (`-1`).
+        // AIR set rather than the common `fightfx` set). MUGEN distinguishes the
+        // two: a bare non-negative `N` selects common-`fightfx` action `N`, while
+        // `Sn` selects the attacker's OWN action `n`. We preserve that distinction
+        // by folding the `S`-prefix into a NEGATIVE encoding (the convention
+        // [`fp_combat::SparkSource::classify`] reads: negative magnitude = own
+        // action). See [`parse_sparkno`]. An absent / non-numeric id keeps the
+        // default (`-1`, the "no spark" sentinel).
         if let Some(src) = raw_param(ctrl, "sparkno") {
-            hd.resources.sparkno = parse_resource_id(src, hd.resources.sparkno);
+            hd.resources.sparkno = parse_sparkno(src, hd.resources.sparkno);
         }
         // Hit / guard sounds. These are a `group, sample` pair (the sample was
         // dropped by the old single-`i32` model). Unlike `PlaySnd`, these default
@@ -3116,18 +3120,42 @@ fn parse_priority_type(raw: &str) -> Option<fp_combat::PriorityType> {
     }
 }
 
-/// Parses a spark / sound resource id from its raw source, tolerating a leading
-/// `S` prefix (MUGEN's "use my own AIR/SND set" marker, not yet modelled). The
-/// numeric id is taken from the first comma-separated component; an absent or
+/// Parses a `HitDef` `sparkno`, preserving MUGEN's own-vs-common distinction.
+///
+/// MUGEN's `sparkno` selects the hit-spark animation when an attack connects:
+/// a bare non-negative `N` means "use the **common** `fightfx` set, action `N`",
+/// while an `S`-prefixed `Sn` means "use **my own** SFF/AIR set, action `n`".
+/// `-1` is the documented "no spark" sentinel.
+///
+/// `fp_combat::HitResources::sparkno` is a single `i32`, so we encode the source
+/// in its **sign** using the convention [`fp_combat::SparkSource::classify`]
+/// reads downstream: a **non-negative** value is a common spark at that id, and a
+/// **negative** value is an own spark whose action id is its magnitude. We
+/// therefore fold an `S`-prefix into a negative number:
+///
+/// - bare `N` (`N >= 0`) → `N` (common action `N`).
+/// - `Sn` (`n >= 1`) → `-n` (own action `n`).
+/// - a literal negative `-N` → kept as-is (own action `N`; `-1` = no spark).
+///
+/// `S0` (own action 0) cannot be represented as a distinct negative (`-0 == 0`,
+/// which would read as common action 0), so it degrades to common action `0` —
+/// an acceptable edge: an own-spark action `0` is effectively never authored, and
+/// this never panics or loses the realistic `Sn` (`n >= 1`) own-spark cases.
+///
+/// The id is taken from the first comma-separated component; an absent or
 /// non-numeric id keeps `fallback` (the field's current default).
-fn parse_resource_id(raw: &str, fallback: i32) -> i32 {
+fn parse_sparkno(raw: &str, fallback: i32) -> i32 {
     let first = raw.split(',').next().unwrap_or("").trim();
-    // Strip an optional leading `S` / `s` prefix.
-    let digits = first
-        .strip_prefix(['S', 's'])
-        .map(str::trim)
-        .unwrap_or(first);
-    digits.parse::<i32>().unwrap_or(fallback)
+    // An explicit `S` / `s` prefix marks an attacker-OWN spark.
+    if let Some(rest) = first.strip_prefix(['S', 's']) {
+        let n = rest.trim().parse::<i32>().unwrap_or(fallback);
+        // Negate so the sign carries the "own" marker (see `SparkSource`). `S0`
+        // can't be negated distinctly; it falls through as common action 0.
+        return if n > 0 { -n } else { n };
+    }
+    // No prefix: a bare number is taken verbatim (non-negative = common spark,
+    // a literal negative = own spark / `-1` = no spark).
+    first.parse::<i32>().unwrap_or(fallback)
 }
 
 /// Interprets a `PlaySnd` `loop` flag token as a boolean.
@@ -8287,8 +8315,10 @@ mod tests {
         assert!(hd.fall);
         assert_eq!(hd.priority.value, 5);
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss);
-        // `S`-prefixed sparkno: prefix stripped, numeric id kept.
-        assert_eq!(hd.resources.sparkno, 2);
+        // `S`-prefixed sparkno: the own-spark marker is preserved as a NEGATIVE
+        // encoding (`S2` → `-2`), so `SparkSource::classify` reads it as own
+        // action 2 (the attacker's own SFF/AIR), not common `fightfx` action 2.
+        assert_eq!(hd.resources.sparkno, -2);
         // `hitsound = 5, 0` (no prefix) → the common/fight sound file, group 5.
         assert_eq!(
             hd.resources.hitsound,
@@ -8717,22 +8747,29 @@ mod tests {
         assert_eq!(hd.ground_type, fp_combat::HitType::Low, "mixed-case ground.type key found");
     }
 
-    // ---- helper-fn unit coverage: parse_resource_id --------------------------
+    // ---- helper-fn unit coverage: parse_sparkno ------------------------------
 
     #[test]
-    fn parse_resource_id_handles_prefix_and_garbage() {
-        // Plain numeric id.
-        assert_eq!(parse_resource_id("3", -1), 3);
-        // Upper- and lower-case `S` prefix stripped.
-        assert_eq!(parse_resource_id("S2", -1), 2);
-        assert_eq!(parse_resource_id("s7", -1), 7);
+    fn parse_sparkno_preserves_own_vs_common() {
+        // Plain non-negative id → common `fightfx` spark (kept positive).
+        assert_eq!(parse_sparkno("3", -1), 3);
+        assert_eq!(parse_sparkno("0", -1), 0);
+        // `S`-prefix (upper/lower) → OWN spark, encoded NEGATIVE so the sign
+        // carries the own marker for `SparkSource::classify` (`-n` = own action n).
+        assert_eq!(parse_sparkno("S2", -1), -2);
+        assert_eq!(parse_sparkno("s7", -1), -7);
         // Only the first comma-separated component is read.
-        assert_eq!(parse_resource_id("S5, 0", -1), 5);
+        assert_eq!(parse_sparkno("S5, 0", -1), -5);
+        // A literal negative is kept verbatim (already an own / no-spark value).
+        assert_eq!(parse_sparkno("-4", -1), -4);
+        assert_eq!(parse_sparkno("-1", 0), -1);
+        // `S0` cannot encode a distinct negative → degrades to common action 0.
+        assert_eq!(parse_sparkno("S0", -1), 0);
         // Non-numeric → fallback preserved (the field's current default).
-        assert_eq!(parse_resource_id("nope", -1), -1);
-        assert_eq!(parse_resource_id("", 42), 42);
+        assert_eq!(parse_sparkno("nope", -1), -1);
+        assert_eq!(parse_sparkno("", 42), 42);
         // A bare `S` with no digits → fallback.
-        assert_eq!(parse_resource_id("S", -1), -1);
+        assert_eq!(parse_sparkno("S", -1), -1);
     }
 
     // ---- helper-fn unit coverage: parse_hit_type -----------------------------
