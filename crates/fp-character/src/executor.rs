@@ -124,9 +124,9 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    AfterImageFrame, AfterImageState, AnimSet, Character, CurPalFx, EntityGraph, EnvColor, EnvShake,
-    EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType, TrailBlend,
-    TransMode, NUM_FVARS, NUM_VARS,
+    AfterImageFrame, AfterImageState, AnimSet, AnimTransform, Character, CurPalFx, EntityGraph,
+    EnvColor, EnvShake, EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType,
+    TrailBlend, TransMode, NUM_FVARS, NUM_VARS,
 };
 
 /// The per-tick **cross-entity evaluation environment**: the opponent's context
@@ -3733,6 +3733,100 @@ impl Character {
         }
         self.anim_table_action = Some(self.anim);
     }
+
+    /// Resolves the [`AnimTransform`] (per-frame scale + rotation, interpolated)
+    /// to apply to this character's sprite for the current tick (T009).
+    ///
+    /// Reads the current AIR frame's optional `scale` (`xscale, yscale`) and
+    /// `angle`, defaulting unset values to unit scale / no rotation. When the
+    /// current frame requests `Interpolate Scale` / `Interpolate Angle`, the
+    /// requested transforms are linearly blended from the *previous* element's
+    /// value across the current element's duration, using this character's own
+    /// [`anim_elem`](Character::anim_elem) / [`anim_elem_time`](Character::anim_elem_time)
+    /// cursor as the blend fraction (`anim_elem_time / ticks`, `0.0` at the
+    /// element's first tick approaching `1.0` at its last). A frame with no
+    /// interpolate flag snaps to its own value, so a plain AIR renders
+    /// byte-identically to before this feature.
+    ///
+    /// Returns [`AnimTransform::IDENTITY`] for an unknown/empty action or an
+    /// out-of-range element cursor — never panics, never indexes out of bounds.
+    #[must_use]
+    pub fn anim_transform(&self, air: &AirFile) -> AnimTransform {
+        let Some(action) = air.action(self.anim) else {
+            return AnimTransform::IDENTITY;
+        };
+        let frames = &action.frames;
+        if frames.is_empty() {
+            return AnimTransform::IDENTITY;
+        }
+        let cur_idx = clamp_index(self.anim_elem, frames.len());
+        let Some(cur) = frames.get(cur_idx) else {
+            return AnimTransform::IDENTITY;
+        };
+        // Previous element of this action (None on element 0 — nothing to blend
+        // from). MUGEN interpolation only ever blends from the immediately
+        // preceding element.
+        let prev = cur_idx.checked_sub(1).and_then(|i| frames.get(i));
+        let t = if cur.ticks > 0 {
+            self.anim_elem_time as f32 / cur.ticks as f32
+        } else {
+            // Hold-forever / zero-duration element: no progress to blend, so use
+            // the destination value directly.
+            0.0
+        };
+        interpolate_anim_transform(prev, cur, t)
+    }
+}
+
+/// The resolved (defaulted) transform a single AIR frame requests, ignoring any
+/// interpolation: `scale` defaults to `(1.0, 1.0)` and `angle` to `0.0` when the
+/// frame omits them.
+fn frame_anim_transform(frame: &fp_formats::air::AnimFrame) -> AnimTransform {
+    AnimTransform {
+        scale: frame.scale.unwrap_or(Vec2::new(1.0, 1.0)),
+        angle_deg: frame.angle.unwrap_or(0.0),
+    }
+}
+
+/// Linearly interpolates the [`AnimTransform`] from `prev` into `cur` by fraction
+/// `t` (clamped to `0.0..=1.0`), honoring `cur.interpolate`.
+///
+/// Mirrors `fp_render`'s `interpolated_transform`: a transform whose interpolate
+/// flag is set blends `lerp(prev, cur, t)`; one whose flag is unset snaps to
+/// `cur`'s own value. With no previous frame (`None`) there is nothing to blend
+/// from, so `cur`'s value is used directly.
+fn interpolate_anim_transform(
+    prev: Option<&fp_formats::air::AnimFrame>,
+    cur: &fp_formats::air::AnimFrame,
+    t: f32,
+) -> AnimTransform {
+    let t = t.clamp(0.0, 1.0);
+    let cur_tf = frame_anim_transform(cur);
+    let Some(prev) = prev else {
+        return cur_tf;
+    };
+    let prev_tf = frame_anim_transform(prev);
+    let interp = cur.interpolate;
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    AnimTransform {
+        scale: Vec2::new(
+            if interp.scale {
+                lerp(prev_tf.scale.x, cur_tf.scale.x)
+            } else {
+                cur_tf.scale.x
+            },
+            if interp.scale {
+                lerp(prev_tf.scale.y, cur_tf.scale.y)
+            } else {
+                cur_tf.scale.y
+            },
+        ),
+        angle_deg: if interp.angle {
+            lerp(prev_tf.angle_deg, cur_tf.angle_deg)
+        } else {
+            cur_tf.angle_deg
+        },
+    }
 }
 
 /// Returns the contiguous prefix of numbered trigger groups starting at
@@ -4135,7 +4229,7 @@ mod tests {
         StateType,
     };
     use fp_core::Vec2;
-    use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode};
+    use fp_formats::air::{AirFile, AnimAction, AnimFrame, BlendMode, Interpolate};
     use fp_formats::cns::CnsFile;
     use fp_vm::EvalContext;
     use std::collections::HashMap;
@@ -13070,5 +13164,175 @@ mod tests {
         ch.state_type = StateType::Standing; // grounded
         lc.tick(&mut ch);
         assert_eq!(ch.juggle_points, 15, "grounded tick refills the juggle pool");
+    }
+
+    // ---- T009: per-frame scale/angle + Interpolate at render time ----------
+
+    fn xform_approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    /// One frame spec for [`scale_angle_air`]:
+    /// `(ticks, (xscale, yscale), angle_deg, interp_scale, interp_angle)`.
+    type FrameSpec = (i32, (f32, f32), f32, bool, bool);
+
+    /// Builds a single-action AIR (action `0`) from a list of frame specs.
+    fn scale_angle_air(frames: &[FrameSpec]) -> AirFile {
+        let frames: Vec<AnimFrame> = frames
+            .iter()
+            .map(|&(ticks, scale, angle, interp_scale, interp_angle)| AnimFrame {
+                ticks,
+                scale: Some(Vec2::new(scale.0, scale.1)),
+                angle: Some(angle),
+                interpolate: Interpolate {
+                    scale: interp_scale,
+                    angle: interp_angle,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+        let mut actions = HashMap::new();
+        actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames,
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    #[test]
+    fn anim_transform_frame_scale_angle_resolves() {
+        // A frame carrying scale + angle (no interpolation) resolves to exactly
+        // that transform — what the renderer hands to its sprite params.
+        let air = scale_angle_air(&[(4, (2.0, 0.5), 90.0, false, false)]);
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+        let tf = ch.anim_transform(&air);
+        assert!(xform_approx(tf.scale.x, 2.0));
+        assert!(xform_approx(tf.scale.y, 0.5));
+        assert!(xform_approx(tf.angle_deg, 90.0));
+        assert!(xform_approx(tf.angle_rad(), 90.0_f32.to_radians()));
+    }
+
+    #[test]
+    fn anim_transform_defaults_to_identity_without_columns() {
+        // A plain AIR (no scale/angle columns) resolves to the no-op transform,
+        // keeping a vanilla character byte-identical to before this feature.
+        let air = tiny_air(0, &[5]);
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+        assert_eq!(ch.anim_transform(&air), AnimTransform::IDENTITY);
+    }
+
+    #[test]
+    fn anim_transform_interpolates_at_mid_keyframe() {
+        // Two keyframes: elem 0 = (scale 1.0, angle 0), elem 1 requests
+        // Interpolate Scale + Angle to (scale (2.0, 4.0), angle 90) over 4 ticks.
+        // At a tick midway through element 1 (anim_elem_time = 2, t = 0.5), the
+        // transform is the linear blend between the two keyframes.
+        let air = scale_angle_air(&[
+            (4, (1.0, 1.0), 0.0, false, false),
+            (4, (2.0, 4.0), 90.0, true, true),
+        ]);
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 1; // on the second element
+        ch.anim_elem_time = 2; // halfway through its 4-tick duration → t = 0.5
+
+        let tf = ch.anim_transform(&air);
+        // scale.x: lerp(1.0, 2.0, 0.5) = 1.5; scale.y: lerp(1.0, 4.0, 0.5) = 2.5
+        assert!(xform_approx(tf.scale.x, 1.5), "scale.x = {}", tf.scale.x);
+        assert!(xform_approx(tf.scale.y, 2.5), "scale.y = {}", tf.scale.y);
+        // angle: lerp(0, 90, 0.5) = 45
+        assert!(xform_approx(tf.angle_deg, 45.0), "angle = {}", tf.angle_deg);
+    }
+
+    #[test]
+    fn anim_transform_interpolates_via_real_tick_advance() {
+        // Drive the interpolation through the actual executor tick loop (not by
+        // poking the cursor): play element 0 out, land in element 1, and tick
+        // partway through it, then assert the blended transform. This proves the
+        // anim_elem_time the executor maintains feeds the render-time transform.
+        let st = state(
+            0,
+            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            vec![],
+        );
+        let air = scale_angle_air(&[
+            (4, (1.0, 1.0), 0.0, false, false),
+            (4, (3.0, 3.0), 60.0, true, true),
+        ]);
+        let lc = loaded(vec![st], air.clone());
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+        // 4 ticks finish element 0 (lands on element 1, anim_elem_time 0).
+        for _ in 0..4 {
+            lc.tick(&mut ch);
+        }
+        assert_eq!(ch.anim_elem, 1, "advanced onto the second element");
+        // Two more ticks → anim_elem_time = 2 → t = 0.5 mid-keyframe.
+        lc.tick(&mut ch);
+        lc.tick(&mut ch);
+        assert_eq!(ch.anim_elem_time, 2, "halfway through the 4-tick element");
+
+        let tf = ch.anim_transform(&air);
+        assert!(xform_approx(tf.scale.x, 2.0), "scale.x = {}", tf.scale.x);
+        assert!(xform_approx(tf.scale.y, 2.0), "scale.y = {}", tf.scale.y);
+        assert!(xform_approx(tf.angle_deg, 30.0), "angle = {}", tf.angle_deg);
+    }
+
+    #[test]
+    fn anim_transform_without_interpolate_snaps() {
+        // Same two keyframes but WITHOUT Interpolate flags: the transform snaps to
+        // element 1's own value regardless of how far into the element we are.
+        let air = scale_angle_air(&[
+            (4, (1.0, 1.0), 0.0, false, false),
+            (4, (2.0, 4.0), 90.0, false, false),
+        ]);
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 1;
+        ch.anim_elem_time = 2;
+        let tf = ch.anim_transform(&air);
+        assert!(xform_approx(tf.scale.x, 2.0));
+        assert!(xform_approx(tf.scale.y, 4.0));
+        assert!(xform_approx(tf.angle_deg, 90.0));
+    }
+
+    #[test]
+    fn anim_transform_first_element_has_no_blend_source() {
+        // On element 0 there is no previous frame to blend from, so the transform
+        // is the element's own value even with the interpolate flags set.
+        let air = scale_angle_air(&[(4, (2.5, 2.5), 30.0, true, true)]);
+        let mut ch = Character::new();
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 2;
+        let tf = ch.anim_transform(&air);
+        assert!(xform_approx(tf.scale.x, 2.5));
+        assert!(xform_approx(tf.angle_deg, 30.0));
+    }
+
+    #[test]
+    fn anim_transform_unknown_action_is_identity() {
+        // An anim id absent from the AIR file yields the no-op transform — no
+        // panic, no out-of-bounds index.
+        let air = scale_angle_air(&[(4, (2.0, 2.0), 45.0, false, false)]);
+        let mut ch = Character::new();
+        ch.anim = 999; // not in the AIR file
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+        assert_eq!(ch.anim_transform(&air), AnimTransform::IDENTITY);
     }
 }
