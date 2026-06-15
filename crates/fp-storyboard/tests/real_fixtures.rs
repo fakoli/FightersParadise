@@ -171,7 +171,9 @@ fn credits_def_bg_grouping_excludes_controllers() {
     assert_eq!(scene.fadeout_col, Some((0, 0, 0)));
     assert_eq!(scene.bg_name.as_deref(), Some("BG0"));
     assert_eq!(scene.bgm.as_deref(), Some("credits.mp3"));
-    assert_eq!(scene.layerall_pos, (0.0, 0.0));
+    // credits.def declares `layerall.pos = 0,0` explicitly, so it is `Some((0,0))`
+    // (an explicit value, which must NOT inherit), not `None` (omitted -> inherit).
+    assert_eq!(scene.layerall_pos, Some((0.0, 0.0)));
     // layer0.anim=10, layer1.anim=11.
     assert_eq!(scene.layers.len(), 2, "two overlay layers");
     assert_eq!(scene.layers[0].index, 0);

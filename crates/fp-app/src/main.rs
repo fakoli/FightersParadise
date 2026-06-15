@@ -1400,6 +1400,257 @@ fn cache_sff_sprite(
 }
 
 // ---------------------------------------------------------------------------
+// Intro / ending storyboard overlay (audit #32)
+// ---------------------------------------------------------------------------
+//
+// A self-contained overlay path that plays a character's declared intro/ending
+// storyboard over the match. It is *purely additive*: the normal intro timer,
+// fighters, HUD, and screenpack are untouched, and when no storyboard (or its
+// SFF) is available the overlay is simply absent — no regression to the normal
+// intro. The driver lives in `fp-storyboard` (`StoryboardPlayer`); this layer
+// only loads the SFF, caches GPU textures, and blits each `StoryboardDraw`.
+
+/// The character-`.def` section MUGEN declares intro/ending storyboards under.
+///
+/// Both `intro.storyboard` and `ending.storyboard` live in the `[Arcade]` section
+/// (the arcade-mode story bookends), not `[Files]`.
+const STORYBOARD_SECTION: &str = "Arcade";
+
+/// Which storyboard a character declares in its `.def` `[Arcade]` section.
+///
+/// MUGEN character `.def`s declare `intro.storyboard = <file>` and
+/// `ending.storyboard = <file>`; these select which key to read.
+#[derive(Debug, Clone, Copy)]
+enum StoryboardKind {
+    /// The `intro.storyboard` declaration — played during the pre-fight intro.
+    Intro,
+    /// The `ending.storyboard` declaration — played when the match is over.
+    Ending,
+}
+
+impl StoryboardKind {
+    /// The `[Arcade]` key this kind reads from the character `.def`.
+    fn def_key(self) -> &'static str {
+        match self {
+            StoryboardKind::Intro => "intro.storyboard",
+            StoryboardKind::Ending => "ending.storyboard",
+        }
+    }
+}
+
+/// Loads the declared intro/ending storyboard overlay for a character `.def`, or
+/// `None` if the character declares none or it cannot be loaded.
+///
+/// `LoadedCharacter` does not retain the raw `.def` (and `fp-character` is not
+/// ours to change for this task), so we re-read the small character `.def` here to
+/// recover its `intro.storyboard`/`ending.storyboard` declaration, resolve it
+/// relative to the `.def` directory, and hand it to [`StoryboardOverlay::load`].
+/// Every failure path (unreadable `.def`, absent key, unloadable storyboard/SFF)
+/// returns `None` so the match simply renders no extra overlay — never a panic,
+/// never a regression to the normal intro.
+fn load_character_storyboard(
+    char_def: &Path,
+    kind: StoryboardKind,
+    renderer: &Renderer,
+) -> Option<StoryboardOverlay> {
+    let def = match fp_formats::def::DefFile::load(char_def) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "could not re-read character def {} for storyboard: {e}",
+                char_def.display()
+            );
+            return None;
+        }
+    };
+    let rel = def
+        .get(STORYBOARD_SECTION, kind.def_key())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let sb_path = fp_formats::def::DefFile::resolve_path(char_def, rel);
+    if !sb_path.exists() {
+        tracing::warn!(
+            "character {} declares {} = {rel} but {} is missing; skipping overlay",
+            char_def.display(),
+            kind.def_key(),
+            sb_path.display()
+        );
+        return None;
+    }
+    StoryboardOverlay::load(&sb_path, renderer)
+}
+
+/// A playable storyboard overlay: a `fp-storyboard` [`StoryboardPlayer`] paired
+/// with the storyboard's own sprite (SFF) file and a lazily-populated per-sprite
+/// GPU texture cache.
+///
+/// Built best-effort with [`StoryboardOverlay::load`]; a missing/unparseable
+/// storyboard `.def` or a missing/unloadable SFF yields `None`, and the caller
+/// then renders nothing extra (the normal intro/match is unchanged). One overlay
+/// is held per kind (intro, ending) on a [`MatchRun`].
+struct StoryboardOverlay {
+    /// The tick driver over the parsed storyboard scene model.
+    player: fp_storyboard::StoryboardPlayer,
+    /// The storyboard's own sprite container (`[SceneDef] spr`).
+    sff: SffFile,
+    /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
+    sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// An opaque full-window clear quad behind the overlay, built once at load
+    /// from the storyboard's start-scene `clearcolor` (or black when absent). The
+    /// renderer exposes no per-draw quad recolor, so this is pre-built rather than
+    /// tinted per frame; per-scene clearcolor changes are not tracked (a small,
+    /// documented fidelity gap — the cutscene art itself is what reads).
+    clear: HudColor,
+}
+
+impl StoryboardOverlay {
+    /// Loads a storyboard overlay from a storyboard `.def` at `def_path`, resolving
+    /// its `[SceneDef] spr` SFF relative to that `.def`'s directory.
+    ///
+    /// Returns `None` (with a log) when the storyboard has no scenes, declares no
+    /// sprite file, or the SFF fails to load — the caller then draws nothing extra
+    /// (no regression). `Storyboard::load` itself never panics; a parse problem
+    /// degrades to an empty scene model which is rejected here. Never panics.
+    ///
+    /// `renderer` is used only to pre-build the opaque clear quad from the
+    /// storyboard's start-scene `clearcolor`.
+    fn load(def_path: &Path, renderer: &Renderer) -> Option<Self> {
+        let storyboard = match fp_storyboard::Storyboard::load(def_path) {
+            Ok(sb) => sb,
+            Err(e) => {
+                tracing::warn!(
+                    "storyboard {} failed to load: {e}; skipping overlay",
+                    def_path.display()
+                );
+                return None;
+            }
+        };
+        if storyboard.scenes.is_empty() {
+            tracing::warn!(
+                "storyboard {} has no scenes; skipping overlay",
+                def_path.display()
+            );
+            return None;
+        }
+        if storyboard.sprite_path.is_empty() {
+            tracing::warn!(
+                "storyboard {} has no [SceneDef] spr; skipping overlay",
+                def_path.display()
+            );
+            return None;
+        }
+        // Resolve the SFF relative to the storyboard .def directory (same rule the
+        // screenpack/stage loaders use).
+        let sff_path = fp_formats::def::DefFile::resolve_path(def_path, &storyboard.sprite_path);
+        let sff = match SffFile::load(&sff_path) {
+            Ok(sff) => sff,
+            Err(e) => {
+                tracing::warn!(
+                    "storyboard SFF {} failed to load: {e}; skipping overlay",
+                    sff_path.display()
+                );
+                return None;
+            }
+        };
+        tracing::info!(
+            "storyboard overlay loaded: {} ({} scenes, {} sprites)",
+            def_path.display(),
+            storyboard.scenes.len(),
+            sff.sprites.len(),
+        );
+        // Build the opaque clear backdrop from the start scene's clearcolor (the
+        // first scene shown), defaulting to black when it declares none.
+        let start = storyboard
+            .start_scene
+            .clamp(0, storyboard.scenes.len() as i32 - 1) as usize;
+        let (cr, cg, cb) = storyboard
+            .scenes
+            .get(start)
+            .and_then(|s| s.clearcolor)
+            .unwrap_or((0, 0, 0));
+        let clear = HudColor::new(renderer, cr, cg, cb);
+        Some(Self {
+            player: fp_storyboard::StoryboardPlayer::new(storyboard),
+            sff,
+            sprite_cache: HashMap::new(),
+            clear,
+        })
+    }
+
+    /// Whether the storyboard has finished playing (no more scenes).
+    fn is_done(&self) -> bool {
+        self.player.is_done()
+    }
+
+    /// Advances the storyboard one tick. A no-op once done.
+    fn tick(&mut self) {
+        self.player.tick();
+    }
+
+    /// Pre-decodes this tick's draw-list sprites into the GPU cache. Run once per
+    /// frame **before** `begin_frame` (decoding needs `&Renderer`, which a live
+    /// [`fp_render::RenderFrame`] holds borrowed). Missing/undecodable sprites are
+    /// skipped (logged once via the cache), never fatal.
+    fn cache_sprites(&mut self, renderer: &Renderer) {
+        let ids: Vec<SpriteId> = self.player.draw_list().iter().map(|d| d.sprite).collect();
+        for sprite_id in ids {
+            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+        }
+    }
+
+    /// Draws the storyboard's current frame: the pre-built opaque clear backdrop
+    /// covering the whole window, then each [`StoryboardDraw`] mapped from
+    /// storyboard-local coordinates into the window. A missing/uncached sprite is
+    /// skipped.
+    ///
+    /// Storyboard-local coordinates use the `[Info] localcoord` frame (Y-down,
+    /// origin top-left); this scales that frame to fill the window so the cutscene
+    /// fills the screen regardless of the window size. Drawn entirely over the
+    /// match (it is a full-screen cutscene), so the caller invokes it *after* the
+    /// fighters/stage and instead of (not under) the normal scene.
+    fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, win_h: f32) {
+        // Cover the whole window with the clear color so the cutscene reads as a
+        // full-screen overlay rather than compositing over the live fight.
+        let cover = HudRect { x: 0.0, y: 0.0, w: win_w, h: win_h };
+        let params = SpriteDrawParams {
+            x: cover.x,
+            y: cover.y,
+            scale_x: cover.w.max(0.0),
+            scale_y: cover.h.max(0.0),
+            ..Default::default()
+        };
+        frame.draw_sprite(&self.clear.quad, &self.clear.palette, &params);
+
+        // Map storyboard-local coords into the window. localcoord defaults to
+        // (320, 240); guard against a zero/degenerate coordinate space.
+        let (local_w, local_h) = self.player.storyboard().localcoord;
+        let sx = if local_w > 0 { win_w / local_w as f32 } else { 1.0 };
+        let sy = if local_h > 0 { win_h / local_h as f32 } else { 1.0 };
+
+        for draw in self.player.draw_list() {
+            let Some(cached) = self.sprite_cache.get(&draw.sprite) else {
+                continue;
+            };
+            // Anchor by the sprite's axis like the fighters/stage do, then scale
+            // the local-space position into the window.
+            let screen_x = draw.pos.0 * sx - cached.axis_x as f32;
+            let screen_y = draw.pos.1 * sy - cached.axis_y as f32;
+            let (render_blend, alpha) = map_blend_mode(&draw.blend);
+            let params = SpriteDrawParams {
+                x: screen_x,
+                y: screen_y,
+                flip_h: draw.flip_h,
+                flip_v: draw.flip_v,
+                blend: render_blend,
+                alpha,
+                ..Default::default()
+            };
+            frame.draw_sprite(&cached.texture, &cached.palette, &params);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Legacy SFF+AIR animation viewer (demo path)
 // ---------------------------------------------------------------------------
 
@@ -1555,6 +1806,117 @@ struct MatchRun {
     /// back to the hand-rolled quad [`Hud`] (no regression); `Some` draws the real
     /// lifebars/power/text via [`fp_ui::ScreenpackHud`] instead of the quads.
     screenpack: Option<ScreenpackHud>,
+    /// P1's declared intro storyboard, played as a full-screen overlay during the
+    /// first round's [`RoundState::Intro`] (audit #32). `None` when P1 declares no
+    /// `intro.storyboard` or it/its SFF cannot load — then the normal intro plays
+    /// with no overlay (no regression).
+    intro_storyboard: Option<StoryboardOverlay>,
+    /// P1's declared ending storyboard, played as a full-screen overlay once the
+    /// match is decided (audit #32). `None` when P1 declares no `ending.storyboard`
+    /// or it/its SFF cannot load.
+    ending_storyboard: Option<StoryboardOverlay>,
+    /// Whether the intro overlay has been played to completion this match, so it
+    /// is shown once (during round 1's intro) and not re-triggered on later rounds.
+    intro_storyboard_done: bool,
+}
+
+/// Which storyboard overlay (if any) is *active* for the current frame, given the
+/// live round state (audit #32).
+///
+/// Pure decision split out from [`MatchRun`] so the gating rule is unit-testable
+/// without an SDL2 window, a GPU, or a real `Match`:
+/// - the **intro** plays during the first round's [`RoundState::Intro`], until it
+///   has run to completion (`intro_done`), and only when one is loaded;
+/// - the **ending** plays once the whole match is decided (`match_over`), and only
+///   when one is loaded;
+/// - otherwise no overlay is active and the normal match renders unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveStoryboard {
+    /// No overlay this frame — render the normal match (no regression).
+    None,
+    /// Play the intro overlay this frame.
+    Intro,
+    /// Play the ending overlay this frame.
+    Ending,
+}
+
+/// Decides which storyboard overlay is active for a frame from the round state and
+/// per-match flags. See [`ActiveStoryboard`]. Pure (no `self`) so it is testable.
+fn active_storyboard(
+    round_state: RoundState,
+    round_number: i32,
+    match_over: bool,
+    intro_done: bool,
+    has_intro: bool,
+    has_ending: bool,
+) -> ActiveStoryboard {
+    // The ending takes precedence once the match is decided.
+    if match_over && has_ending {
+        return ActiveStoryboard::Ending;
+    }
+    // The intro plays only during round 1's intro phase, before it has finished.
+    if has_intro
+        && !intro_done
+        && round_number == 1
+        && round_state == RoundState::Intro
+    {
+        return ActiveStoryboard::Intro;
+    }
+    ActiveStoryboard::None
+}
+
+impl MatchRun {
+    /// Which overlay is active this frame (the gating decision), reading the live
+    /// [`Match`] state and this run's loaded-overlay / done flags.
+    fn active_storyboard(&self) -> ActiveStoryboard {
+        active_storyboard(
+            self.m.round_state(),
+            self.m.round_number(),
+            self.m.match_winner().is_some(),
+            self.intro_storyboard_done,
+            self.intro_storyboard.is_some(),
+            self.ending_storyboard.is_some(),
+        )
+    }
+
+    /// Advances the active overlay one tick and decodes its sprites for this frame
+    /// (both gated behind [`MatchRun::active_storyboard`]). Run once per frame
+    /// **before** `begin_frame`, because decoding needs `&Renderer`. When the intro
+    /// overlay finishes it latches `intro_storyboard_done` so it is shown once.
+    /// A no-op when no overlay is active — the normal match is untouched.
+    fn tick_storyboard(&mut self, renderer: &Renderer) {
+        match self.active_storyboard() {
+            ActiveStoryboard::Intro => {
+                if let Some(intro) = self.intro_storyboard.as_mut() {
+                    intro.cache_sprites(renderer);
+                    intro.tick();
+                    if intro.is_done() {
+                        self.intro_storyboard_done = true;
+                    }
+                }
+            }
+            ActiveStoryboard::Ending => {
+                if let Some(ending) = self.ending_storyboard.as_mut() {
+                    ending.cache_sprites(renderer);
+                    ending.tick();
+                }
+            }
+            ActiveStoryboard::None => {}
+        }
+    }
+
+    /// The overlay to draw this frame, if one is active and not finished. Returns
+    /// `None` when the normal match should render (no overlay), so the caller draws
+    /// the storyboard *instead of* nothing extra and the rest of the scene is
+    /// unchanged. A finished overlay returns `None` so play falls back to the
+    /// normal view on the frame after it ends.
+    fn storyboard_to_draw(&self) -> Option<&StoryboardOverlay> {
+        match self.active_storyboard() {
+            ActiveStoryboard::Intro => self.intro_storyboard.as_ref().filter(|s| !s.is_done()),
+            ActiveStoryboard::Ending => self.ending_storyboard.as_ref().filter(|s| !s.is_done()),
+            ActiveStoryboard::None => None,
+        }
+    }
 }
 
 /// The selected run mode after parsing CLI args and loading assets.
@@ -1664,6 +2026,12 @@ fn load_match_or_fallback(
             // bad parse, or missing `fight.sff`) falls back to the hand-rolled quad
             // HUD, so the default match looks exactly as before (no regression).
             let screenpack = load_screenpack(p1_def, renderer);
+            // Intro/ending storyboards (audit #32) are P1's own declarations,
+            // loaded best-effort: a character without them (or with an unloadable
+            // SFF) simply plays no overlay — the normal intro/match is unchanged.
+            let intro_storyboard = load_character_storyboard(p1_def, StoryboardKind::Intro, renderer);
+            let ending_storyboard =
+                load_character_storyboard(p1_def, StoryboardKind::Ending, renderer);
             Mode::Match(Box::new(MatchRun {
                 m: Box::new(m),
                 p1_render: FighterRender::default(),
@@ -1676,6 +2044,9 @@ fn load_match_or_fallback(
                 p2_audio: FighterAudio::default(),
                 stage,
                 screenpack,
+                intro_storyboard,
+                ending_storyboard,
+                intro_storyboard_done: false,
             }))
         }
         Err(e) => {
@@ -1960,6 +2331,10 @@ fn run() -> fp_core::FpResult<()> {
                 if let Some(stage) = run.stage.as_mut() {
                     stage.cache_sprites(&renderer);
                 }
+                // Advance + decode the active intro/ending storyboard overlay
+                // (audit #32). A no-op when no overlay is active, so the normal
+                // intro/match path is unchanged.
+                run.tick_storyboard(&renderer);
             }
             Mode::Viewer(ref mut v) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
@@ -2044,6 +2419,16 @@ fn run() -> fp_core::FpResult<()> {
                         screenpack.draw(&mut frame, &state);
                     }
                     None => hud.draw(&mut frame, win_wf, &run.m),
+                }
+
+                // Intro/ending storyboard overlay (audit #32), drawn LAST and only
+                // while one is active: a full-screen cutscene that paints over the
+                // fight (its own opaque clear-color cover blocks what is behind it).
+                // When no overlay is active this is a no-op, so the fighters/HUD/
+                // screenpack drawn above are exactly the normal match — no
+                // regression.
+                if let Some(overlay) = run.storyboard_to_draw() {
+                    overlay.draw(&mut frame, win_wf, win_hf);
                 }
             }
             Mode::Viewer(ref v) => {
@@ -2234,6 +2619,148 @@ mod tests {
         assert!(is_def_path("path/to/KFM.DEF"));
         assert!(!is_def_path("kfm.sff"));
         assert!(!is_def_path("kfm"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Intro / ending storyboard overlay (audit #32)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storyboard_kind_def_keys() {
+        assert_eq!(StoryboardKind::Intro.def_key(), "intro.storyboard");
+        assert_eq!(StoryboardKind::Ending.def_key(), "ending.storyboard");
+    }
+
+    /// The intro overlay is active only during round 1's [`RoundState::Intro`],
+    /// while an intro is loaded and not yet finished.
+    #[test]
+    fn intro_storyboard_active_only_in_round1_intro() {
+        // Round 1 intro, intro loaded, not done -> Intro.
+        assert_eq!(
+            active_storyboard(RoundState::Intro, 1, false, false, true, false),
+            ActiveStoryboard::Intro
+        );
+        // Past the intro phase (Fight) -> nothing.
+        assert_eq!(
+            active_storyboard(RoundState::Fight, 1, false, false, true, false),
+            ActiveStoryboard::None
+        );
+        // Later round's intro -> nothing (intro is a once-per-match cutscene).
+        assert_eq!(
+            active_storyboard(RoundState::Intro, 2, false, false, true, false),
+            ActiveStoryboard::None
+        );
+        // Intro already finished -> nothing (don't loop it).
+        assert_eq!(
+            active_storyboard(RoundState::Intro, 1, false, true, true, false),
+            ActiveStoryboard::None
+        );
+    }
+
+    /// With no intro storyboard loaded, the intro gate never fires — the normal
+    /// intro plays with no overlay (no regression).
+    #[test]
+    fn no_intro_storyboard_no_overlay() {
+        assert_eq!(
+            active_storyboard(RoundState::Intro, 1, false, false, false, false),
+            ActiveStoryboard::None
+        );
+    }
+
+    /// The ending overlay is active once the match is decided, taking precedence,
+    /// and only when an ending is loaded.
+    #[test]
+    fn ending_storyboard_active_when_match_over() {
+        // Match over, ending loaded -> Ending.
+        assert_eq!(
+            active_storyboard(RoundState::Win, 3, true, true, true, true),
+            ActiveStoryboard::Ending
+        );
+        // Match over but no ending loaded -> nothing (normal match-over view).
+        assert_eq!(
+            active_storyboard(RoundState::Win, 3, true, true, true, false),
+            ActiveStoryboard::None
+        );
+        // Match NOT over -> not the ending, even if loaded.
+        assert_eq!(
+            active_storyboard(RoundState::Fight, 1, false, false, true, true),
+            ActiveStoryboard::None
+        );
+    }
+
+    /// During an in-progress match (not over, past the intro) no overlay is ever
+    /// active even when both are loaded — the live fight is untouched.
+    #[test]
+    fn mid_fight_has_no_overlay() {
+        assert_eq!(
+            active_storyboard(RoundState::Fight, 1, false, true, true, true),
+            ActiveStoryboard::None
+        );
+        assert_eq!(
+            active_storyboard(RoundState::Ko, 1, false, true, true, true),
+            ActiveStoryboard::None
+        );
+    }
+
+    /// The overlay loader no-ops (returns `None`) for a character `.def` that
+    /// declares no `intro.storyboard`/`ending.storyboard` key — gated as required,
+    /// without needing a GPU. (We read the key via the same DEF path the loader
+    /// uses; a renderer is only needed once a storyboard is actually found.)
+    #[test]
+    fn character_without_storyboard_key_yields_none() {
+        // A minimal in-memory character def with no storyboard declarations.
+        let def_text = "[Info]\nname = \"X\"\n[Files]\nsprite = x.sff\n";
+        let def = fp_formats::def::DefFile::from_str(def_text).expect("parse def");
+        // The loader's gating predicate: the key must be present and non-empty.
+        let has_intro = def
+            .get(STORYBOARD_SECTION, StoryboardKind::Intro.def_key())
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_ending = def
+            .get(STORYBOARD_SECTION, StoryboardKind::Ending.def_key())
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        assert!(!has_intro, "no intro.storyboard declared -> no overlay");
+        assert!(!has_ending, "no ending.storyboard declared -> no overlay");
+    }
+
+    /// The real KFM character `.def` declares both an intro and an ending
+    /// storyboard, and both resolve to existing `.def` files (asset-gated; skips
+    /// cleanly when test-assets is absent). This verifies the declaration-reading
+    /// half of the overlay loader against real content without needing a GPU.
+    #[test]
+    fn kfm_declares_resolvable_storyboards() {
+        let char_def = test_asset("kfm/kfm.def");
+        let Ok(def) = fp_formats::def::DefFile::load(&char_def) else {
+            eprintln!("skipping: {} not present", char_def.display());
+            return;
+        };
+        for kind in [StoryboardKind::Intro, StoryboardKind::Ending] {
+            let rel = def
+                .get(STORYBOARD_SECTION, kind.def_key())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| panic!("KFM declares {}", kind.def_key()));
+            let sb_path = fp_formats::def::DefFile::resolve_path(&char_def, rel);
+            assert!(
+                sb_path.exists(),
+                "KFM {} resolves to an existing file: {}",
+                kind.def_key(),
+                sb_path.display()
+            );
+            // And the storyboard parses into a non-empty, playable scene model.
+            let sb = fp_storyboard::Storyboard::load(&sb_path).expect("storyboard loads");
+            assert!(
+                !sb.scenes.is_empty(),
+                "KFM {} has scenes",
+                kind.def_key()
+            );
+            assert!(
+                !sb.sprite_path.is_empty(),
+                "KFM {} declares a sprite file",
+                kind.def_key()
+            );
+        }
     }
 
     #[test]

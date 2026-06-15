@@ -106,10 +106,31 @@ pub struct Scene {
     pub bg_name: Option<String>,
     /// Optional background-music path (`bgm`).
     pub bgm: Option<String>,
-    /// Default position for all layers (`layerall.pos`). `(0.0, 0.0)` if absent.
-    pub layerall_pos: (f32, f32),
+    /// Default position for all layers (`layerall.pos`), as authored.
+    ///
+    /// `None` when the scene **omits** the key — in MUGEN an omitted
+    /// `layerall.pos` inherits the previous scene's value (carry-over), which the
+    /// [`crate::player::StoryboardPlayer`] resolves at playback time. `Some((0.0,
+    /// 0.0))` distinguishes an explicit `layerall.pos = 0,0` (which does *not*
+    /// inherit). [`Scene::effective_layerall_pos`] returns the non-inheriting
+    /// fallback for a standalone scene.
+    pub layerall_pos: Option<(f32, f32)>,
     /// Per-layer overlay definitions (`layerN.*`), ordered by layer index.
     pub layers: Vec<SceneLayer>,
+}
+
+impl Scene {
+    /// The scene's own `layerall.pos`, treating an absent value as `(0.0, 0.0)`.
+    ///
+    /// This is the *standalone* value with **no** carry-over from a previous
+    /// scene; carry-over (a scene omitting `layerall.pos` inheriting the prior
+    /// scene's value) is resolved during playback by
+    /// [`crate::player::StoryboardPlayer`]. Use this when a scene is considered in
+    /// isolation.
+    #[must_use]
+    pub fn effective_layerall_pos(&self) -> (f32, f32) {
+        self.layerall_pos.unwrap_or((0.0, 0.0))
+    }
 }
 
 /// A single overlay layer within a [`Scene`] (`layerN.*` keys).
@@ -317,7 +338,11 @@ fn parse_scene(def: &DefFile, section: &str) -> Scene {
         .get(section, "bgm")
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let layerall_pos = parse_pair_f32(def.get(section, "layerall.pos")).unwrap_or((0.0, 0.0));
+    // Stored as `Option`: `None` means the key was absent, so the value is
+    // inherited from the previous scene at playback time (MUGEN carry-over). A
+    // present-but-malformed value also yields `None` (warned in `parse_pair_f32`)
+    // and therefore inherits, matching the "degrade safely" rule.
+    let layerall_pos = parse_pair_f32(def.get(section, "layerall.pos"));
     let layers = parse_scene_layers(def, section);
 
     Scene {
@@ -767,7 +792,7 @@ trans = sub
         assert_eq!(s.fadeout_time, 30);
         assert_eq!(s.clearcolor, Some((255, 255, 255)));
         assert_eq!(s.bg_name.as_deref(), Some("BG0"));
-        assert_eq!(s.layerall_pos, (160.0, 120.0));
+        assert_eq!(s.layerall_pos, Some((160.0, 120.0)));
         assert_eq!(s.layers.len(), 1);
         assert_eq!(s.layers[0].index, 0);
         assert_eq!(s.layers[0].anim, Some(0));
@@ -845,7 +870,10 @@ end.time = 100
         assert_eq!(s.fadein_time, 0);
         assert_eq!(s.clearcolor, None);
         assert_eq!(s.bg_name, None);
-        assert_eq!(s.layerall_pos, (0.0, 0.0));
+        // Absent `layerall.pos` is `None` (inherits at playback); its standalone
+        // fallback is (0,0).
+        assert_eq!(s.layerall_pos, None);
+        assert_eq!(s.effective_layerall_pos(), (0.0, 0.0));
         assert!(s.layers.is_empty());
     }
 
@@ -967,11 +995,42 @@ end.time = 10
 layerall.pos = 5,6
 ";
         let sb = Storyboard::from_def(text);
-        assert_eq!(sb.scenes[0].layerall_pos, (5.0, 6.0));
+        assert_eq!(sb.scenes[0].layerall_pos, Some((5.0, 6.0)));
         assert!(
             sb.scenes[0].layers.is_empty(),
             "layerall.* must not create a SceneLayer"
         );
+    }
+
+    /// `layerall.pos` is parsed as `Option` so the player can implement MUGEN's
+    /// carry-over: an explicit value is `Some`, an omitted value is `None`
+    /// (inherit), and an explicit `0,0` is `Some((0,0))` (do NOT inherit).
+    #[test]
+    fn layerall_pos_absent_vs_explicit_zero() {
+        // Scene 0 sets it explicitly; scene 1 omits it; scene 2 sets it to 0,0.
+        let text = "\
+[Scene 0]
+end.time = 10
+layerall.pos = 160,0
+[Scene 1]
+end.time = 10
+[Scene 2]
+end.time = 10
+layerall.pos = 0,0
+";
+        let sb = Storyboard::from_def(text);
+        assert_eq!(sb.scenes[0].layerall_pos, Some((160.0, 0.0)));
+        assert_eq!(
+            sb.scenes[1].layerall_pos, None,
+            "an omitted layerall.pos must be None so the player inherits it"
+        );
+        assert_eq!(
+            sb.scenes[2].layerall_pos,
+            Some((0.0, 0.0)),
+            "an explicit 0,0 is Some, not None — it must NOT inherit"
+        );
+        // The standalone fallback collapses None to (0,0).
+        assert_eq!(sb.scenes[1].effective_layerall_pos(), (0.0, 0.0));
     }
 
     /// Two-digit (and higher) layer indices parse correctly. MUGEN documents
