@@ -1,0 +1,23 @@
+; Fighters Paradise — default motif character/stage select list
+; (c) 2025 Sekou Doumbouya, MIT. ORIGINAL clean-room content.
+;
+; Roster lines use the MUGEN format:
+;     displayname, deffile [, stagefile] [, key=value ...]
+; The word "randomselect" on its own line adds the random-pick icon.
+
+[Characters]
+; The shipped clean-room conformance character. Path is relative to this file's
+; data/ directory: data/ -> assets/trainingdummy/trainingdummy.def.
+Training Dummy, ../trainingdummy/trainingdummy.def
+; A second slot reuses the same character so a small grid has more than one cell.
+Training Dummy, ../trainingdummy/trainingdummy.def, order=2
+; A random-pick icon rounds out the grid.
+randomselect
+
+[ExtraStages]
+; No extra stages ship by default.
+
+[Options]
+; Up to N matches per ordering priority in arcade mode.
+arcade.maxmatches = 2, 1, 0, 0, 0, 0, 0, 0, 0, 0
+team.maxmatches   = 2, 1, 0, 0, 0, 0, 0, 0, 0, 0
