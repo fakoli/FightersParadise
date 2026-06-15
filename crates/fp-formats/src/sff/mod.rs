@@ -403,6 +403,15 @@ impl SffFile {
     ///
     /// Follows linked palettes if necessary. The returned array is 1024 bytes
     /// (256 colors * 4 bytes RGBA), with index 0 having alpha = 0 (transparent).
+    ///
+    /// The on-disk encoding is **version-dependent**:
+    /// - **SFF v1** palettes are the trailing 256-color VGA palette of an inline
+    ///   PCX image: 768 bytes of **RGB** triplets, expanded to RGBA here.
+    /// - **SFF v2** palettes are stored as `num_colors` **RGBA** quadruplets
+    ///   (4 bytes per color) in the LData block — a palette may carry fewer than
+    ///   256 colors (e.g. KFM's 32-color per-sprite palettes). Reading these
+    ///   through the v1 RGB path is the bug that rendered v2 characters as black
+    ///   silhouettes; the version split below is the fix.
     pub fn palette(&self, index: usize) -> FpResult<[u8; PALETTE_RGBA_SIZE]> {
         let pal = self.palettes.get(index).ok_or_else(|| {
             FpError::not_found("palette", format!("index {index}"))
@@ -440,7 +449,16 @@ impl SffFile {
             ));
         }
 
-        palette::rgb_to_rgba(&self.ldata[start..end])
+        let raw = &self.ldata[start..end];
+        match self.version {
+            // SFF v1: 768-byte RGB trailing PCX palette. Unchanged from before.
+            SffVersion::V1 => palette::rgb_to_rgba(raw),
+            // SFF v2: `num_colors` RGBA quadruplets. The sub-header's
+            // `data_length` already sizes the slice (e.g. 128 bytes for a
+            // 32-color palette); `rgba_to_palette` clamps internally so a short
+            // or oversized sub-header is handled safely.
+            SffVersion::V2 => Ok(palette::rgba_to_palette(raw, data_pal.num_colors)),
+        }
     }
 }
 
@@ -497,19 +515,22 @@ mod tests {
     use super::*;
 
     /// Builds a minimal synthetic SFF v2 file with one sprite and one palette.
+    ///
+    /// The palette is a full 256-color **RGBA** table (1024 bytes), matching the
+    /// real SFF v2 on-disk encoding (4 bytes/color) rather than v1's RGB.
     fn make_test_sff() -> Vec<u8> {
         // Layout:
         // [0..512)     header
         // [512..540)   1 sprite sub-header (28 bytes)
         // [540..556)   1 palette sub-header (16 bytes)
-        // [556..1324)  LData: 768 bytes of RGB palette data
-        // [1324..1335) TData: RLE8 compressed sprite data
+        // [556..1580)  LData: 1024 bytes of RGBA palette data (256 * 4)
+        // [1580..1586) TData: RLE8 compressed sprite data
 
         let sprite_offset: u32 = 512;
         let palette_offset: u32 = 540;
         let ldata_offset: u32 = 556;
-        let ldata_length: u32 = 768;
-        let tdata_offset: u32 = 556 + 768; // 1324
+        let ldata_length: u32 = 1024; // 256 colors * 4 bytes (RGBA)
+        let tdata_offset: u32 = 556 + 1024; // 1580
         // RLE8 data: size prefix (4 bytes) + 2 byte run = 6 bytes
         let tdata_length: u32 = 6;
 
@@ -562,13 +583,16 @@ mod tests {
         buf[p+4..p+6].copy_from_slice(&256u16.to_le_bytes()); // num_colors
         buf[p+6..p+8].copy_from_slice(&0u16.to_le_bytes());   // linked_index = self
         buf[p+8..p+12].copy_from_slice(&0u32.to_le_bytes());  // data_offset in LData
-        buf[p+12..p+16].copy_from_slice(&768u32.to_le_bytes()); // data_length
+        buf[p+12..p+16].copy_from_slice(&1024u32.to_le_bytes()); // data_length (RGBA)
 
-        // --- LData: palette RGB data at offset 556 ---
-        // Color 0: black (transparent). Color 1: red.
+        // --- LData: palette RGBA data at offset 556 ---
+        // SFF v2 stores 4 bytes per color. Color 0: black (forced transparent).
+        // Color 1: red. The on-disk 4th byte is reserved padding (set to 0 here
+        // on purpose) — the decoder must force non-zero indices to opaque, not
+        // honor this stored byte, or every sprite would render invisible.
         let l = ldata_offset as usize;
-        buf[l] = 0; buf[l+1] = 0; buf[l+2] = 0;     // color 0: black
-        buf[l+3] = 255; buf[l+4] = 0; buf[l+5] = 0;  // color 1: red
+        buf[l] = 0; buf[l+1] = 0; buf[l+2] = 0; buf[l+3] = 0;       // color 0: black
+        buf[l+4] = 255; buf[l+5] = 0; buf[l+6] = 0; buf[l+7] = 0;   // color 1: red, pad=0
 
         // --- TData: RLE8 data at offset 1324 ---
         // Decompressed size = 4 (2x2 pixels), run of 4 x color 1
@@ -625,6 +649,41 @@ mod tests {
         assert_eq!(rgba[4], 255); // R
         assert_eq!(rgba[5], 0);   // G
         assert_eq!(rgba[6], 0);   // B
-        assert_eq!(rgba[7], 255); // A = opaque
+        // A = opaque even though the on-disk 4th byte (padding) was 0: the v2
+        // decoder must not honor the stored alpha or every sprite goes invisible.
+        assert_eq!(rgba[7], 255);
+    }
+
+    /// Regression for the KFM "black silhouette" bug (task #32): an SFF **v2**
+    /// palette is RGBA-encoded (4 bytes/color) and must NOT be read through the
+    /// v1 RGB→RGBA path. With a single non-black, opaque color the resolved
+    /// palette must expose at least one fully-opaque, non-black, non-index-0
+    /// color — exactly the acceptance criterion for color rendering.
+    #[test]
+    fn v2_palette_rgba_is_non_degenerate() {
+        let data = make_test_sff();
+        let sff = SffFile::from_bytes(&data).unwrap();
+        assert_eq!(sff.version, SffVersion::V2);
+
+        let pal = sff.palette(0).unwrap();
+        assert_eq!(pal.len(), PALETTE_RGBA_SIZE);
+
+        // Index 0 must be transparent (alpha 0).
+        assert_eq!(pal[3], 0, "index 0 must be transparent");
+
+        // There must be at least one non-index-0 color that is non-black AND
+        // fully opaque. (The fixture's color 1 is red.)
+        let has_real_color = (1..256).any(|i| {
+            let b = i * 4;
+            let (r, g, bl, a) = (pal[b], pal[b + 1], pal[b + 2], pal[b + 3]);
+            (r != 0 || g != 0 || bl != 0) && a == 255
+        });
+        assert!(
+            has_real_color,
+            "v2 palette must have a non-black, fully-opaque color besides index 0"
+        );
+
+        // Spot-check the exact bytes for color index 1 (red, opaque).
+        assert_eq!(&pal[4..8], &[255, 0, 0, 255]);
     }
 }

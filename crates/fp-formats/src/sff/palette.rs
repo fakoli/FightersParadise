@@ -16,6 +16,9 @@ pub const PALETTE_RGBA_SIZE: usize = 1024;
 /// Size of raw RGB palette data on disk (256 colors * 3 bytes).
 const PALETTE_RGB_SIZE: usize = 768;
 
+/// Bytes per color in an SFF v2 on-disk palette entry (R, G, B, A).
+const PALETTE_RGBA_BYTES_PER_COLOR: usize = 4;
+
 /// A parsed palette sub-header from an SFF v2 file.
 #[derive(Debug, Clone)]
 pub struct SffPalette {
@@ -127,6 +130,43 @@ pub fn rgb_to_rgba(rgb_data: &[u8]) -> FpResult<[u8; PALETTE_RGBA_SIZE]> {
     Ok(rgba)
 }
 
+/// Reads an SFF v2 palette into a 1024-byte (256 * RGBA) palette.
+///
+/// SFF v2 stores palette colors as **RGBA** quadruplets in the LData block
+/// (4 bytes per color), unlike SFF v1's trailing-PCX **RGB** triplets. A palette
+/// may carry fewer than 256 colors (`num_colors`, e.g. KFM's 32-color per-sprite
+/// palettes); colors beyond `num_colors` (and beyond the supplied data) stay
+/// transparent black so the result is always a full 256-entry palette.
+///
+/// Index 0 is forced transparent (alpha = 0) per the MUGEN convention — its RGB
+/// is preserved but the GPU shader discards it. Every other in-range color is
+/// fully opaque (alpha = 255): the on-disk 4th byte of an SFF v2 palette entry
+/// is a reserved/padding byte (almost always `0`), **not** a usable per-color
+/// alpha, so honoring it would render every sprite invisible. `num_colors` is
+/// clamped to 256 and to the bytes actually available, so malformed sub-headers
+/// never read out of bounds or panic; a too-short slice simply yields fewer
+/// opaque colors (the remainder stay transparent black).
+pub fn rgba_to_palette(rgba_data: &[u8], num_colors: u16) -> [u8; PALETTE_RGBA_SIZE] {
+    let mut rgba = [0u8; PALETTE_RGBA_SIZE];
+
+    // Clamp the requested color count to a full palette and to what the slice
+    // can actually supply, so a short/garbage sub-header can't over-read.
+    let available = rgba_data.len() / PALETTE_RGBA_BYTES_PER_COLOR;
+    let count = (num_colors as usize).min(256).min(available);
+
+    for i in 0..count {
+        let src = i * PALETTE_RGBA_BYTES_PER_COLOR;
+        let dst = i * 4;
+        rgba[dst] = rgba_data[src];
+        rgba[dst + 1] = rgba_data[src + 1];
+        rgba[dst + 2] = rgba_data[src + 2];
+        // Index 0 is transparent in MUGEN palettes; every other color is opaque.
+        // The on-disk 4th byte is reserved padding, not a usable alpha value.
+        rgba[dst + 3] = if i == 0 { 0 } else { 255 };
+    }
+    rgba
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +239,76 @@ mod tests {
         let rgb = vec![0u8; 100];
         let err = rgb_to_rgba(&rgb).unwrap_err();
         assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn rgba_to_palette_full_256() {
+        // 256 RGBA colors. Color 0 black, color 1 green, with explicit padding.
+        let mut data = vec![0u8; 1024];
+        // color 0: black, on-disk alpha 5 (must be forced to 0 == transparent)
+        data[0] = 0; data[1] = 0; data[2] = 0; data[3] = 5;
+        // color 1: green, on-disk alpha 0 (must be forced to 255 == opaque)
+        data[4] = 0; data[5] = 255; data[6] = 0; data[7] = 0;
+
+        let pal = rgba_to_palette(&data, 256);
+
+        // Index 0: transparent regardless of stored alpha.
+        assert_eq!(&pal[0..4], &[0, 0, 0, 0]);
+        // Index 1: green, opaque regardless of stored padding byte.
+        assert_eq!(&pal[4..8], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn rgba_to_palette_partial_count() {
+        // A 32-color palette (KFM's per-sprite size): only 128 bytes of data.
+        let mut data = vec![0u8; 32 * 4];
+        // color 1: blue
+        data[4] = 0; data[5] = 0; data[6] = 255; data[7] = 0;
+        // color 31 (last in range): white
+        let last = 31 * 4;
+        data[last] = 255; data[last + 1] = 255; data[last + 2] = 255; data[last + 3] = 0;
+
+        let pal = rgba_to_palette(&data, 32);
+
+        // The returned palette is always a full 256 entries.
+        assert_eq!(pal.len(), PALETTE_RGBA_SIZE);
+        // In-range colors decode and are forced opaque (except index 0).
+        assert_eq!(&pal[4..8], &[0, 0, 255, 255]); // color 1: blue, opaque
+        assert_eq!(&pal[124..128], &[255, 255, 255, 255]); // color 31: white, opaque
+        // Out-of-range colors (>= 32) stay transparent black.
+        assert_eq!(&pal[128..132], &[0, 0, 0, 0]); // color 32: untouched
+        assert_eq!(&pal[1020..1024], &[0, 0, 0, 0]); // color 255: untouched
+    }
+
+    #[test]
+    fn rgba_to_palette_clamps_short_data() {
+        // num_colors claims 256 but only 2 colors of data are present: the
+        // decoder must clamp to what's available rather than reading past the
+        // slice (no panic, no garbage).
+        let mut data = vec![0u8; 8]; // 2 colors
+        data[4] = 200; data[5] = 100; data[6] = 50; data[7] = 0; // color 1
+        let pal = rgba_to_palette(&data, 256);
+
+        assert_eq!(&pal[0..4], &[0, 0, 0, 0]); // color 0: transparent
+        assert_eq!(&pal[4..8], &[200, 100, 50, 255]); // color 1: opaque
+        // Everything past the supplied data stays transparent black.
+        assert_eq!(&pal[8..12], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rgba_to_palette_clamps_oversized_count() {
+        // num_colors larger than 256 must clamp to 256 without overflow.
+        let data = vec![1u8; 4096];
+        let pal = rgba_to_palette(&data, u16::MAX);
+        assert_eq!(pal.len(), PALETTE_RGBA_SIZE);
+        // Index 0 transparent; index 255 fully populated & opaque.
+        assert_eq!(pal[3], 0);
+        assert_eq!(&pal[1020..1024], &[1, 1, 1, 255]);
+    }
+
+    #[test]
+    fn rgba_to_palette_empty_data_is_safe() {
+        let pal = rgba_to_palette(&[], 256);
+        assert_eq!(pal, [0u8; PALETTE_RGBA_SIZE]);
     }
 }
