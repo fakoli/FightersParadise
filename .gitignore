@@ -21,17 +21,20 @@
 
 # MUGEN content files (not shipped with repo)
 # The global block exists to keep third-party/Elecbyte binary assets out of the
-# repo (clean-room guard). Two ORIGINAL, clean-room asset sets — the conformance
+# repo (clean-room guard). Three ORIGINAL, clean-room asset sets — the conformance
 # character under assets/trainingdummy/ (authored from scratch, MIT — no Elecbyte
-# content) and the common hit-spark effects under assets/data/ (fightfx.sff,
-# audit #17 — also authored from scratch, MIT) — are SHIPPABLE, so their binary
-# SFF/SND are explicitly un-ignored below. Do NOT add any third-party .sff/.snd here.
+# content), the common hit-spark effects under assets/data/ (fightfx.sff,
+# audit #17 — also authored from scratch, MIT), and the HUD bitmap font under
+# assets/data/ (font.fnt, FL2b — authored from scratch, MIT; the only ASCII run is
+# the required ElecbyteFnt magic) — are SHIPPABLE, so their binary SFF/SND/FNT are
+# explicitly un-ignored below. Do NOT add any third-party .sff/.snd/.fnt here.
 *.sff
 *.snd
 *.fnt
 !/assets/trainingdummy/*.sff
 !/assets/trainingdummy/*.snd
 !/assets/data/*.sff
+!/assets/data/*.fnt
 
 # Local-only sample MUGEN content for parser/integration testing
 # (third-party assets, e.g. Elecbyte KFM CC BY-NC — never shipped)

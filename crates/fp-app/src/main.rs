@@ -62,7 +62,9 @@ use fp_core::SpriteId;
 use fp_engine::{EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
-use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
+use fp_render::{
+    BlendMode, GlyphFont, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture, TextDrawParams,
+};
 use fp_stage::{BgLayer, Stage};
 use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout};
 use fp_input::{map_controller, Button as PadButton, ControllerInput, RawController, DEADZONE_DEFAULT};
@@ -96,6 +98,13 @@ const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 const COMMON_FX_SFF: &str = "assets/data/fightfx.sff";
 /// Shipped original common-effects animation file. See [`COMMON_FX_SFF`].
 const COMMON_FX_AIR: &str = "assets/data/fightfx.air";
+
+/// Shipped original HUD bitmap font (FL2b). A clean-room FNT v1 covering `0-9`,
+/// `A-Z`, space, and colon, loaded once into a [`fp_render::GlyphFont`] to draw
+/// the round/KO/winner announcer and the round timer as real text. Resolved
+/// relative to the process working directory; a missing/bad font degrades the HUD
+/// to its solid-color quad markers (no panic, no regression).
+const HUD_FONT_FNT: &str = "assets/data/font.fnt";
 
 /// MUGEN common stand (idle) state number.
 const STATE_STAND: i32 = 0;
@@ -350,11 +359,19 @@ impl FighterRender {
     /// (the owning character's sprite file) on first use. Returns the cached
     /// entry, or `None` if the sprite is missing or fails to decode (logged,
     /// never a panic).
+    ///
+    /// `override_rgba` is an optional `.act` palette override (the runtime
+    /// costume-swap, FL2b): when `Some`, the sprite's GPU palette is built from it
+    /// via [`PaletteTexture::from_override`] instead of the SFF-embedded palette;
+    /// when `None` the embedded palette is used and the upload is byte-identical to
+    /// before. The override is fixed per fighter (a CLI `--pN-pal` selection), so
+    /// caching the resolved palette per sprite id is correct.
     fn get_or_create_sprite<'a>(
         &'a mut self,
         sff: &SffFile,
         sprite_id: SpriteId,
         renderer: &Renderer,
+        override_rgba: Option<&[u8; 1024]>,
     ) -> Option<&'a CachedSprite> {
         if self.sprite_cache.contains_key(&sprite_id) {
             return self.sprite_cache.get(&sprite_id);
@@ -399,7 +416,16 @@ impl FighterRender {
             height as u32,
             &pixels,
         );
-        let palette = PaletteTexture::new(renderer.device(), renderer.queue(), &palette_data);
+        // Build the GPU palette from the `.act` override when one is selected,
+        // otherwise the SFF-embedded palette. With no override this is
+        // byte-identical to `PaletteTexture::new(&palette_data)` (the default
+        // render path is unchanged).
+        let palette = PaletteTexture::from_override(
+            renderer.device(),
+            renderer.queue(),
+            &palette_data,
+            override_rgba,
+        );
 
         self.sprite_cache.insert(
             sprite_id,
@@ -582,9 +608,13 @@ fn player_current_frame(player: &Player) -> Option<&fp_formats::air::AnimFrame> 
 /// integration test, so the test exercises exactly the wiring the demo runs.
 /// Returns an error only if a character truly cannot be loaded; the caller
 /// degrades to the test pattern on `Err` rather than crashing.
-fn build_two_player_match(p1_def: &Path, p2_def: &Path) -> fp_core::FpResult<Match> {
-    let p1 = build_player(p1_def, P1_START_X)?;
-    let p2 = build_player(p2_def, P2_START_X)?;
+fn build_two_player_match(
+    p1_def: &Path,
+    p2_def: &Path,
+    pal: PalSelection,
+) -> fp_core::FpResult<Match> {
+    let p1 = build_player(p1_def, P1_START_X, pal.p1)?;
+    let p2 = build_player(p2_def, P2_START_X, pal.p2)?;
     // `Match::new` seeds facing toward each other from the start positions and
     // starts in the intro phase; the default 99-second round clock applies.
     Ok(Match::new(
@@ -595,14 +625,24 @@ fn build_two_player_match(p1_def: &Path, p2_def: &Path) -> fp_core::FpResult<Mat
 }
 
 /// Loads one character `.def` into a [`Player`] positioned at `start_x`,
-/// standing it in state 0 with control.
+/// standing it in state 0 with control, with an optional `.act` palette override.
 ///
 /// No app-side movement shim is applied: the loader supplies MUGEN's built-in
 /// stand<->walk<->crouch<->jump locomotion for every character (task 7.3 part B),
 /// and the [`Match`] runs each player's real [`fp_input::CommandMatcher`]
 /// (task 7.3 part A) so `holdfwd`/`holdback`/… and walk velocity all fire from
 /// the character's own data.
-fn build_player(def_path: &Path, start_x: f32) -> fp_core::FpResult<Player> {
+///
+/// `pal_selection` (FL2b) is the `--pN-pal` choice: a 0-based index into the
+/// character's loaded `.act` overrides, set as the entity's active palette so
+/// [`draw_player`] renders that costume. `None` keeps the SFF-embedded palette
+/// (unchanged). An out-of-range index is warn-logged and falls back to embedded
+/// (the loader's [`LoadedCharacter::override_palette`] returns `None` for it).
+fn build_player(
+    def_path: &Path,
+    start_x: f32,
+    pal_selection: Option<usize>,
+) -> fp_core::FpResult<Player> {
     tracing::info!("Loading match character: {}", def_path.display());
     let loaded = LoadedCharacter::load(def_path)?;
 
@@ -611,6 +651,22 @@ fn build_player(def_path: &Path, start_x: f32) -> fp_core::FpResult<Player> {
     entity.state_no = STATE_STAND;
     entity.ctrl = true;
     entity.anim = STATE_STAND; // action 0 == stand
+
+    // Apply the requested `.act` palette override (FL2b). A selection that the
+    // character cannot honor (no such override slot) is warn-logged and left as
+    // the embedded palette so the costume swap never crashes or shows blank.
+    if let Some(sel) = pal_selection {
+        if loaded.override_palette(Some(sel)).is_some() {
+            entity.set_active_palette(Some(sel));
+            tracing::info!("Applied .act palette override #{sel} to {:?}", loaded.name);
+        } else {
+            tracing::warn!(
+                "requested palette #{sel} for {:?} is out of range ({} loaded); using embedded palette",
+                loaded.name,
+                loaded.palette_count()
+            );
+        }
+    }
 
     tracing::info!(
         "Match player {:?}: {} states, {} sprites, {} animations, life {}",
@@ -861,10 +917,53 @@ struct HudRect {
     h: f32,
 }
 
+/// Loads the shipped HUD bitmap font (FL2b) into a GPU [`GlyphFont`], or returns
+/// `None` so the HUD falls back to its solid-color quad markers.
+///
+/// Resolves [`HUD_FONT_FNT`] relative to the process working directory and parses
+/// it through the real [`fp_formats::fnt::FntFont`] loader. Best-effort: a missing
+/// or unparseable font is logged and yields `None` — the HUD then draws the
+/// round/KO/winner state as a colored quad exactly as before (no panic, no
+/// regression). Split out (taking an explicit path via [`load_hud_font_from`]) so
+/// the load path is unit-testable against the shipped asset by absolute path.
+fn load_hud_font(renderer: &Renderer) -> Option<GlyphFont> {
+    load_hud_font_from(renderer, Path::new(HUD_FONT_FNT))
+}
+
+/// Loads a HUD bitmap font from an explicit `.fnt` `path` into a [`GlyphFont`].
+///
+/// See [`load_hud_font`]. A missing file, a parse failure, or an unsupported FNT
+/// version each returns `None` (logged), never a panic.
+fn load_hud_font_from(renderer: &Renderer, path: &Path) -> Option<GlyphFont> {
+    if !path.exists() {
+        tracing::debug!(path = %path.display(), "HUD font not present; HUD uses quad markers");
+        return None;
+    }
+    match fp_formats::fnt::FntFont::load(path) {
+        Ok(font) => {
+            tracing::info!(
+                "HUD font loaded: {} glyphs, {}px tall from {}",
+                font.glyph_count(),
+                font.image_height,
+                path.display()
+            );
+            Some(GlyphFont::new(renderer.device(), renderer.queue(), font))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "HUD font {} failed to load: {e}; HUD uses quad markers",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// A minimal HUD: per-fighter life bars, a smaller power (super-meter) bar under
-/// each, and a round/KO indicator, drawn as scaled solid-color quads through the
-/// existing `RenderFrame::draw_sprite` pipeline (no new renderer API). Full
-/// lifebars are a later phase.
+/// each, the round announcer / KO / winner readout and the round timer as real
+/// bitmap text, all drawn through the existing `RenderFrame` pipeline (life/power
+/// bars as solid-color quads, text via `RenderFrame::draw_text`). Full lifebars
+/// are a later phase.
 struct Hud {
     /// Neutral dark frame/background.
     dark: HudColor,
@@ -878,10 +977,14 @@ struct Hud {
     white: HudColor,
     /// Power (super-meter) fill blue.
     blue: HudColor,
+    /// The shipped HUD bitmap font (FL2b), loaded once into a GPU [`GlyphFont`].
+    /// `None` when `assets/data/font.fnt` is missing or fails to load — the HUD
+    /// then falls back to the solid-color quad markers (no panic, no regression).
+    font: Option<GlyphFont>,
 }
 
 impl Hud {
-    /// Builds all HUD color quads on the GPU.
+    /// Builds all HUD color quads on the GPU and loads the HUD font (best-effort).
     fn new(renderer: &Renderer) -> Self {
         Self {
             dark: HudColor::new(renderer, 40, 40, 48),
@@ -890,6 +993,7 @@ impl Hud {
             yellow: HudColor::new(renderer, 240, 220, 60),
             white: HudColor::new(renderer, 240, 240, 240),
             blue: HudColor::new(renderer, 70, 150, 240),
+            font: load_hud_font(renderer),
         }
     }
 
@@ -938,25 +1042,56 @@ impl Hud {
         };
         self.draw_power_bar(frame, p2_power, m.p2(), true);
 
-        // Round / KO indicator: a centered colored marker once the round is
-        // decided. Intro/Fight show nothing here (the bars carry the state).
-        let marker = match (m.round_state(), m.winner()) {
-            (RoundState::Ko, _) => Some(&self.yellow),
-            (RoundState::Win, Some(Winner::P1)) => Some(&self.green),
-            (RoundState::Win, Some(Winner::P2)) => Some(&self.red),
-            (RoundState::Win, _) => Some(&self.white), // draw
-            _ => None,
-        };
-        if let Some(color) = marker {
-            let marker_w = 80.0;
-            let marker_h = 24.0;
-            let rect = HudRect {
-                x: (win_w - marker_w) / 2.0,
-                y: MARGIN,
-                w: marker_w,
-                h: marker_h,
-            };
-            self.fill(frame, color, rect);
+        // The round timer (remaining whole seconds), centered near the top, drawn
+        // as bitmap text when the font is available. Always rendered during a live
+        // fight; harmless during intro (counts the full clock).
+        self.draw_announcer(frame, win_w, m);
+    }
+
+    /// Draws the round timer and the round/KO/winner announcer.
+    ///
+    /// When the HUD font loaded, both are drawn as real bitmap text via
+    /// [`fp_render::RenderFrame::draw_text`]: the timer (remaining whole seconds)
+    /// centered at the very top, and the announcer (`ROUND N` / `KO` / `P1 WINS` /
+    /// `P2 WINS` / `DRAW`) centered just below it, tinted per state. With no font
+    /// this falls back to the original solid-color quad marker (so a missing/bad
+    /// font is no regression).
+    fn draw_announcer(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match) {
+        const MARGIN: f32 = 12.0;
+        /// Uniform text scale: the 7px-tall font drawn at 3x ≈ 21px glyphs.
+        const TEXT_SCALE: f32 = 3.0;
+
+        let announcer = round_label(m.round_state(), m.winner(), m.round_number());
+        let timer = timer_text(m.timer());
+
+        match self.font.as_ref() {
+            Some(font) => {
+                // Timer at the very top-center.
+                draw_centered_text(frame, font, &timer, win_w, MARGIN, TEXT_SCALE, 1.0);
+                // Announcer below the timer, only when there is something to say.
+                if !announcer.is_empty() {
+                    let line_h = font.line_height() as f32 * TEXT_SCALE;
+                    let y = MARGIN + line_h + 6.0;
+                    draw_centered_text(frame, font, &announcer, win_w, y, TEXT_SCALE, 1.0);
+                }
+            }
+            // No font: fall back to the original centered colored quad marker for
+            // the decided-round state (intro/fight show nothing — the bars carry
+            // it), exactly as before this feature.
+            None => {
+                let marker = announcer_quad_color(self, m.round_state(), m.winner());
+                if let Some(color) = marker {
+                    let marker_w = 80.0;
+                    let marker_h = 24.0;
+                    let rect = HudRect {
+                        x: (win_w - marker_w) / 2.0,
+                        y: MARGIN,
+                        w: marker_w,
+                        h: marker_h,
+                    };
+                    self.fill(frame, color, rect);
+                }
+            }
         }
     }
 
@@ -1042,6 +1177,79 @@ fn power_fraction(power: i32, power_max: i32) -> f32 {
     (power.max(0) as f32 / power_max as f32).clamp(0.0, 1.0)
 }
 
+/// The round timer as HUD text: the remaining whole seconds (frames / 60),
+/// clamped to non-negative, as a decimal string.
+///
+/// [`Match::timer`] is FRAMES remaining (60 Hz); MUGEN counts whole seconds, so
+/// this integer-divides by 60 (flooring) — matching [`timer_frames_to_seconds`]
+/// used by the screenpack HUD so both readouts agree. Pure and unit-tested.
+fn timer_text(timer_frames: i32) -> String {
+    timer_frames_to_seconds(timer_frames).to_string()
+}
+
+/// The on-screen pixel width of `text` in `font` at `scale`, summing each
+/// glyph's destination advance from the pure layout (so centering matches what
+/// `draw_text` actually draws).
+///
+/// Returns the rightmost glyph edge — the last placed glyph's `dst_x + width` —
+/// scaled, or `0.0` for an empty/blank string. Pure given the font.
+fn text_pixel_width(font: &GlyphFont, text: &str, scale: f32) -> f32 {
+    font.layout(text)
+        .iter()
+        .map(|g| g.dst_x + g.width as f32)
+        .fold(0.0f32, f32::max)
+        * scale
+}
+
+/// Draws `text` horizontally centered in a `win_w`-wide window at top `y`, at the
+/// given `scale` and `alpha`, using the normal blend mode. A no-op for empty
+/// text. The centering uses [`text_pixel_width`] so it lines up with the glyphs
+/// `draw_text` lays out.
+fn draw_centered_text(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    text: &str,
+    win_w: f32,
+    y: f32,
+    scale: f32,
+    alpha: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let w = text_pixel_width(font, text, scale);
+    let x = ((win_w - w) / 2.0).max(0.0);
+    frame.draw_text(
+        font,
+        text,
+        &TextDrawParams {
+            x,
+            y,
+            scale,
+            alpha,
+            blend: BlendMode::Normal,
+        },
+    );
+}
+
+/// The quad color for the decided-round announcer marker when no HUD font is
+/// loaded (the pre-FL2b fallback): yellow on KO, green/red on a P1/P2 win, white
+/// on a draw, and `None` during intro/fight (the bars carry that state). Kept as
+/// a small helper so the fallback mapping is one place and matches the original.
+fn announcer_quad_color(
+    hud: &Hud,
+    state: RoundState,
+    winner: Option<Winner>,
+) -> Option<&HudColor> {
+    match (state, winner) {
+        (RoundState::Ko, _) => Some(&hud.yellow),
+        (RoundState::Win, Some(Winner::P1)) => Some(&hud.green),
+        (RoundState::Win, Some(Winner::P2)) => Some(&hud.red),
+        (RoundState::Win, _) => Some(&hud.white), // draw
+        _ => None,
+    }
+}
+
 /// Maps a fighter's world X position into a screen X, centered on the window.
 fn world_to_screen_x(world_x: f32, win_w: f32) -> f32 {
     win_w / 2.0 + world_x * WORLD_TO_SCREEN
@@ -1053,7 +1261,13 @@ fn world_to_screen_x(world_x: f32, win_w: f32) -> f32 {
 /// is a no-op.
 fn cache_player_sprite(cache: &mut FighterRender, player: &Player, renderer: &Renderer) {
     if let Some(sprite_id) = player_current_frame(player).map(|f| f.sprite) {
-        cache.get_or_create_sprite(&player.loaded.sff, sprite_id, renderer);
+        // Resolve the fighter's active `.act` palette override (FL2b): the runtime
+        // selection (`Character::active_palette`) into the loaded override's RGBA,
+        // or `None` to use the SFF-embedded palette (the default, unchanged).
+        let override_rgba = player
+            .loaded
+            .override_palette(player.character.active_palette());
+        cache.get_or_create_sprite(&player.loaded.sff, sprite_id, renderer, override_rgba);
     }
 }
 
@@ -1235,21 +1449,24 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
         .map(|fx| (fx.side, fx.sprite))
         .collect();
     for (side, sprite) in effects {
+        // Hit-sparks always use their source SFF's embedded palette (no `.act`
+        // costume swap on sparks); pass `None`. Spark sprite ids never collide
+        // with a fighter's body sprites, so sharing the per-side cache is safe.
         match side {
             EffectSide::P1 => {
                 run.p1_render
-                    .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer);
+                    .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer, None);
             }
             EffectSide::P2 => {
                 run.p2_render
-                    .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer);
+                    .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer, None);
             }
             // A common spark draws from the shipped common-fx SFF into its own
             // cache. A no-op when no common-fx asset is loaded (no such effects
             // are ever spawned then).
             EffectSide::Common => {
                 if let Some(fx) = run.common_fx.as_mut() {
-                    fx.render.get_or_create_sprite(&fx.sff, sprite, renderer);
+                    fx.render.get_or_create_sprite(&fx.sff, sprite, renderer, None);
                 }
             }
         }
@@ -2078,6 +2295,68 @@ fn is_def_path(p: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("def"))
 }
 
+/// Per-player `.act` palette selection from the `--p1-pal N` / `--p2-pal N` CLI
+/// flags (FL2b). Each is a 0-based index into the character's loaded `.act`
+/// overrides; `None` (the default) renders the SFF-embedded palette, so omitting
+/// the flags is byte-identical to before this feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PalSelection {
+    /// Player 1's selected override index, or `None` for the embedded palette.
+    p1: Option<usize>,
+    /// Player 2's selected override index, or `None` for the embedded palette.
+    p2: Option<usize>,
+}
+
+/// Parses (and strips) the `--p1-pal N` / `--p2-pal N` palette flags from `args`,
+/// returning the selections plus the remaining positional args (program name +
+/// file paths) that the rest of CLI routing consumes.
+///
+/// Each flag takes the next token as a non-negative decimal index; a missing or
+/// non-numeric value drops that flag with a warning (the selection stays `None`).
+/// Unknown `--…` tokens are passed through untouched. Pure — unit-tested without a
+/// window or GPU.
+fn parse_pal_flags(args: &[String]) -> (PalSelection, Vec<String>) {
+    let mut sel = PalSelection::default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let which = if arg.eq_ignore_ascii_case("--p1-pal") {
+            Some(true)
+        } else if arg.eq_ignore_ascii_case("--p2-pal") {
+            Some(false)
+        } else {
+            None
+        };
+        match which {
+            Some(is_p1) => {
+                // Consume the value token, if present and numeric.
+                match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => {
+                        if is_p1 {
+                            sel.p1 = Some(n);
+                        } else {
+                            sel.p2 = Some(n);
+                        }
+                        i += 2;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "{arg} expects a non-negative integer palette index; ignoring"
+                        );
+                        i += 1;
+                    }
+                }
+            }
+            None => {
+                rest.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    (sel, rest)
+}
+
 /// The two-player [`Match`] run state: the match plus the per-run rendering and
 /// audio resources held alongside it (per-side texture caches, the shared audio
 /// system, and per-side decoded-sound caches).
@@ -2248,12 +2527,16 @@ enum Mode {
 ///
 /// An optional 4th `.def` argument is taken as the stage; a missing/unloadable
 /// stage degrades to the flat clear-color background, never failing the match.
-fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
+///
+/// `args` are the **positional** args with the `--p1-pal`/`--p2-pal` flags
+/// already stripped (see [`parse_pal_flags`]); `pal` carries those per-player
+/// `.act` palette selections, applied to the two fighters in the match modes.
+fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode {
     match args.len() {
         // <p1.def> <p2.def> [stage.def] → two-player match from two characters.
         n if n >= 3 && is_def_path(&args[1]) && is_def_path(&args[2]) => {
             let stage = stage_arg(args, 3);
-            load_match_or_fallback(Path::new(&args[1]), Path::new(&args[2]), stage, renderer)
+            load_match_or_fallback(Path::new(&args[1]), Path::new(&args[2]), stage, pal, renderer)
         }
         // <sff> <air> [..] → legacy viewer (first arg is NOT a .def).
         n if n >= 3 && !is_def_path(&args[1]) => {
@@ -2274,7 +2557,7 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
         n if n >= 2 && is_def_path(&args[1]) => {
             let def = Path::new(&args[1]);
             let stage = stage_arg(args, 2);
-            load_match_or_fallback(def, def, stage, renderer)
+            load_match_or_fallback(def, def, stage, pal, renderer)
         }
         // <sff> → legacy static sprite.
         2 => match load_sff_sprite(renderer, Path::new(&args[1])) {
@@ -2292,7 +2575,7 @@ fn select_mode(args: &[String], renderer: &Renderer) -> Mode {
                 tracing::info!("No files provided; loading two-KFM match from {DEFAULT_DEF}");
                 // No default stage ships (clean-room / asset-blocked), so the
                 // default match renders over the flat clear color.
-                load_match_or_fallback(&def, &def, None, renderer)
+                load_match_or_fallback(&def, &def, None, pal, renderer)
             } else {
                 tracing::info!("No files and no default character; showing test pattern");
                 tracing::info!("Usage: fp-app [p1.def [p2.def]] | <file.sff> [file.air]");
@@ -2320,9 +2603,10 @@ fn load_match_or_fallback(
     p1_def: &Path,
     p2_def: &Path,
     stage_def: Option<&Path>,
+    pal: PalSelection,
     renderer: &Renderer,
 ) -> Mode {
-    match build_two_player_match(p1_def, p2_def) {
+    match build_two_player_match(p1_def, p2_def, pal) {
         Ok(mut m) => {
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the match so
@@ -2555,8 +2839,11 @@ fn run() -> fp_core::FpResult<()> {
     ))?;
 
     // --- Load content based on CLI args ---
-    let args: Vec<String> = std::env::args().collect();
-    let mut mode = select_mode(&args, &renderer);
+    // Strip the per-player `.act` palette flags (`--p1-pal N` / `--p2-pal N`,
+    // FL2b) first; the remaining positional args drive file routing as before.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let (pal, args) = parse_pal_flags(&raw_args);
+    let mut mode = select_mode(&args, pal, &renderer);
 
     // The minimal match HUD (life bars + KO marker). Built once; only drawn in
     // the two-player match mode.
@@ -3312,7 +3599,7 @@ mod tests {
             eprintln!("skipping two-KFM match test: {} not present", def.display());
             return None;
         }
-        match build_two_player_match(&def, &def) {
+        match build_two_player_match(&def, &def, PalSelection::default()) {
             Ok(m) => Some(m),
             Err(e) => {
                 eprintln!("skipping two-KFM match test: build failed: {e}");
@@ -4615,7 +4902,7 @@ mod tests {
             eprintln!("skipping build_player seed test: {} not present", def.display());
             return;
         }
-        let player = match build_player(&def, P1_START_X) {
+        let player = match build_player(&def, P1_START_X, None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("skipping build_player seed test: {e}");
@@ -4653,7 +4940,7 @@ mod tests {
         // panic). We reach into the public `character` field exactly as the engine
         // would. (`m` is borrowed immutably above, so build a fresh solo player to
         // mutate rather than reaching into the match.)
-        let mut solo = match build_player(&test_asset("kfm/kfm.def"), P1_START_X) {
+        let mut solo = match build_player(&test_asset("kfm/kfm.def"), P1_START_X, None) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -4699,7 +4986,7 @@ mod tests {
         // phase times out immediately. This drives the engine's time-over branch
         // (not the KO-by-damage branch Forge covers), using the exact `build_player`
         // construction the demo uses.
-        let (p1, p2) = match (build_player(&def, P1_START_X), build_player(&def, P2_START_X)) {
+        let (p1, p2) = match (build_player(&def, P1_START_X, None), build_player(&def, P2_START_X, None)) {
             (Ok(a), Ok(b)) => (a, b),
             _ => {
                 eprintln!("skipping time-over test: a player failed to build");
@@ -4747,7 +5034,7 @@ mod tests {
             eprintln!("skipping ko-before-win test: {} not present", def.display());
             return;
         }
-        let (p1, p2) = match (build_player(&def, P1_START_X), build_player(&def, P2_START_X)) {
+        let (p1, p2) = match (build_player(&def, P1_START_X, None), build_player(&def, P2_START_X, None)) {
             (Ok(a), Ok(b)) => (a, b),
             _ => return,
         };
@@ -5059,6 +5346,185 @@ mod tests {
         assert_eq!(timer_frames_to_seconds(-30), 0);
     }
 
+    // ---- HUD text + .act palette selection (FL2b) ----------------------------
+
+    /// Resolves a path under the shipped (committed) `assets/data/` directory.
+    /// `CARGO_MANIFEST_DIR` points at `crates/fp-app`; go up two levels.
+    fn shipped_data_asset(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/data")
+            .join(rel)
+    }
+
+    /// The HUD timer text is the engine's frame clock converted to whole seconds
+    /// (the pure composition the announcer draws), floored and never negative.
+    #[test]
+    fn timer_text_is_whole_seconds_string() {
+        assert_eq!(timer_text(5940), "99"); // 99s round
+        assert_eq!(timer_text(60), "1");
+        assert_eq!(timer_text(0), "0");
+        assert_eq!(timer_text(59), "0"); // floors the sub-second remainder
+        assert_eq!(timer_text(-30), "0"); // never renders a negative
+    }
+
+    /// The shipped HUD font (FL2b) parses through the real loader and maps every
+    /// character the announcer/timer strings need. This is the non-gated, shipped
+    /// asset, so it must load on every machine. (GPU upload via `GlyphFont` is not
+    /// exercised here — that needs a device; the parse + glyph map is the contract
+    /// the HUD text path depends on.)
+    #[test]
+    fn shipped_hud_font_parses_and_covers_hud_strings() {
+        let font = fp_formats::fnt::FntFont::load(&shipped_data_asset("font.fnt"))
+            .expect("shipped HUD font.fnt must load");
+        // Every character used by ROUND N / KO / P1 WINS / P2 WINS / DRAW and the
+        // digit timer must be mapped.
+        for s in ["KO", "ROUND", "WINS", "DRAW", "P1", "P2", "0123456789", " ", ":"] {
+            for c in s.chars() {
+                assert!(
+                    font.glyph(c).is_some(),
+                    "HUD font is missing glyph {c:?} (needed for HUD text)"
+                );
+            }
+        }
+        assert!(font.image_height > 0, "font must have a real line height");
+    }
+
+    /// `parse_pal_flags` extracts `--p1-pal`/`--p2-pal` and leaves the positional
+    /// args (program name + paths) untouched for the rest of CLI routing.
+    #[test]
+    fn parse_pal_flags_extracts_selections_and_keeps_paths() {
+        let args: Vec<String> = ["fp-app", "kfm.def", "--p1-pal", "3", "ken.def", "--p2-pal", "7"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (sel, rest) = parse_pal_flags(&args);
+        assert_eq!(sel, PalSelection { p1: Some(3), p2: Some(7) });
+        // The flags (and their values) are stripped; the positional args survive
+        // in order so `select_mode`'s file routing is unchanged.
+        assert_eq!(rest, vec!["fp-app", "kfm.def", "ken.def"]);
+    }
+
+    /// No flags → no selection and the args pass through byte-for-byte, so the
+    /// default (no costume swap) path is unchanged.
+    #[test]
+    fn parse_pal_flags_default_is_none_and_passthrough() {
+        let args: Vec<String> = ["fp-app", "a.def", "b.def"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (sel, rest) = parse_pal_flags(&args);
+        assert_eq!(sel, PalSelection::default());
+        assert_eq!(sel.p1, None);
+        assert_eq!(sel.p2, None);
+        assert_eq!(rest, args);
+    }
+
+    /// A `--pN-pal` with a missing or non-numeric value is dropped (the selection
+    /// stays `None`) and never panics; unknown `--…` tokens pass through.
+    #[test]
+    fn parse_pal_flags_tolerates_bad_values() {
+        // Missing value at end-of-args.
+        let a: Vec<String> = ["fp-app", "--p1-pal"].iter().map(|s| s.to_string()).collect();
+        let (sel, rest) = parse_pal_flags(&a);
+        assert_eq!(sel.p1, None);
+        assert_eq!(rest, vec!["fp-app"]);
+
+        // Non-numeric value: the value token is NOT consumed as a selection; it is
+        // left as a positional arg.
+        let b: Vec<String> = ["fp-app", "--p2-pal", "x.def"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (sel, rest) = parse_pal_flags(&b);
+        assert_eq!(sel.p2, None);
+        assert_eq!(rest, vec!["fp-app", "x.def"]);
+
+        // An unrelated `--flag` is passed through untouched.
+        let c: Vec<String> = ["fp-app", "--verbose", "a.def"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_sel, rest) = parse_pal_flags(&c);
+        assert_eq!(rest, vec!["fp-app", "--verbose", "a.def"]);
+    }
+
+    /// The `.act` override binding seam (the decision `get_or_create_sprite` /
+    /// `PaletteTexture::from_override` make): a present override binds a palette
+    /// that differs from the embedded one (a visible costume swap), while an absent
+    /// override binds the embedded palette byte-for-byte (the default,
+    /// no-regression path). Pins the precedence the GPU upload depends on without
+    /// needing a device. `bind_palette` mirrors `from_override`'s pure chooser.
+    #[test]
+    fn act_override_binds_when_selected_else_embedded() {
+        /// The exact rule `PaletteTexture::from_override` applies: the override
+        /// bytes when present, otherwise the embedded palette.
+        fn bind_palette<'a>(
+            embedded: &'a [u8; 1024],
+            override_rgba: Option<&'a [u8; 1024]>,
+        ) -> &'a [u8; 1024] {
+            override_rgba.unwrap_or(embedded)
+        }
+
+        let mut embedded = [0u8; 1024];
+        // Give the embedded palette a recognizable color at index 1.
+        embedded[4] = 10;
+        embedded[5] = 20;
+        embedded[6] = 30;
+        let mut over = embedded;
+        // The override differs at index 1 (a costume swap).
+        over[4] = 200;
+        over[5] = 100;
+        over[6] = 50;
+
+        // With a selection: the bound bytes are the override and differ from
+        // embedded (the costume is visibly different).
+        let chosen_with = bind_palette(&embedded, Some(&over));
+        assert!(std::ptr::eq(chosen_with, &over));
+        assert_ne!(
+            &chosen_with[4..7],
+            &embedded[4..7],
+            "a selected .act override must bind a palette that differs from embedded"
+        );
+        assert_eq!(&chosen_with[4..7], &[200, 100, 50]);
+
+        // With no selection: the bound bytes are the embedded palette,
+        // byte-identical (the default, no-regression path).
+        let chosen_without = bind_palette(&embedded, None);
+        assert!(std::ptr::eq(chosen_without, &embedded));
+        assert_eq!(chosen_without, &embedded);
+    }
+
+    /// `build_player` applies a valid `.act` selection to the entity's active
+    /// palette and ignores an out-of-range one (falling back to embedded), never
+    /// panicking. Gated on the local KFM asset; KFM ships no `.act` overrides, so
+    /// any selection is out-of-range and must resolve to "no active palette".
+    #[test]
+    fn build_player_palette_selection_is_safe() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping palette-selection test: {} not present", def.display());
+            return;
+        }
+        // KFM has no `.act` overrides, so selecting one is out of range: the
+        // entity must keep the embedded palette (active_palette == None), with a
+        // warning, not a panic.
+        let player = match build_player(&def, P1_START_X, Some(2)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping palette-selection test: {e}");
+                return;
+            }
+        };
+        assert_eq!(
+            player.character.active_palette(),
+            None,
+            "an out-of-range .act selection must fall back to the embedded palette"
+        );
+        // And no selection leaves the embedded palette too.
+        let plain = build_player(&def, P1_START_X, None).expect("kfm loads");
+        assert_eq!(plain.character.active_palette(), None);
+    }
+
     // ---- common-effects (fightfx) load path (audit #17) ----------------------
 
     /// Resolves a path under the shipped (committed) `assets/data/` directory.
@@ -5122,7 +5588,7 @@ mod tests {
         let air = AirFile::load(&shipped_fx_asset("fightfx.air"))
             .expect("shipped fightfx.air must load");
 
-        let mut m = match build_two_player_match(&def, &def) {
+        let mut m = match build_two_player_match(&def, &def, PalSelection::default()) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("skipping: KFM failed to build: {e}");
