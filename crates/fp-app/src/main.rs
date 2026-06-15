@@ -65,8 +65,11 @@ use fp_formats::sff::SffFile;
 use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
 use fp_stage::{BgLayer, Stage};
 use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout};
+use fp_input::{map_controller, Button as PadButton, ControllerInput, RawController, DEADZONE_DEFAULT};
+use sdl2::controller::{Axis, Button as SdlPadButton, GameController};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, KeyboardState, Scancode};
+use sdl2::GameControllerSubsystem;
 
 // The single-character CNS driver (now `#[cfg(test)]`) and the legacy
 // single-character tests are the only users of the command-recognition seam, so
@@ -633,6 +636,180 @@ fn match_input_from_keyboard(keyboard: &KeyboardState<'_>) -> MatchInput {
         x: keyboard.is_scancode_pressed(Scancode::J),
         y: keyboard.is_scancode_pressed(Scancode::K),
         z: keyboard.is_scancode_pressed(Scancode::L),
+    }
+}
+
+/// Number of controller slots the app tracks. Slot 0 drives player 1 (alongside
+/// the keyboard); slot 1, if filled, drives player 2 for a two-human match.
+const CONTROLLER_SLOTS: usize = 2;
+
+/// Live SDL game-controller state: the opened controllers plus the subsystem
+/// needed to open more on hotplug.
+///
+/// The first [`CONTROLLER_SLOTS`] *attached* controllers occupy `slots`; a `None`
+/// slot means "no device here" and yields a neutral input. Opening, polling, and
+/// hotplug are all failure-tolerant — a missing or disconnected device is never a
+/// panic, only a `tracing::warn!` and a fall-back to neutral.
+struct Controllers {
+    /// The SDL game-controller subsystem; kept alive so opened controllers stay
+    /// valid and new ones can be opened when a device is plugged in.
+    subsystem: GameControllerSubsystem,
+    /// Up to [`CONTROLLER_SLOTS`] opened controllers, indexed by player slot.
+    slots: [Option<GameController>; CONTROLLER_SLOTS],
+}
+
+impl Controllers {
+    /// Wraps an opened game-controller subsystem and binds every already-connected
+    /// controller-capable joystick that fits into a free player slot.
+    ///
+    /// The caller obtains the subsystem with `Sdl::game_controller()`; if that
+    /// fails (no driver, headless), the caller simply runs keyboard-only and never
+    /// constructs a `Controllers`. Construction here cannot fail — at worst all
+    /// slots stay empty and every `input` call returns `None`.
+    fn new(subsystem: GameControllerSubsystem) -> Self {
+        let mut this = Self {
+            subsystem,
+            slots: [None, None],
+        };
+        // SDL must receive controller events through the shared event pump; this
+        // is on by default but we assert it so polling state stays fresh.
+        this.subsystem.set_event_state(true);
+        this.open_all_connected();
+        this
+    }
+
+    /// Scans every connected joystick and binds the controller-capable ones to
+    /// free slots. Used at startup and is safe to re-run (it skips filled slots).
+    fn open_all_connected(&mut self) {
+        let count = match self.subsystem.num_joysticks() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("controller: could not enumerate joysticks: {e}");
+                return;
+            }
+        };
+        for index in 0..count {
+            if self.subsystem.is_game_controller(index) {
+                self.open_into_free_slot(index);
+            }
+        }
+    }
+
+    /// Opens the joystick at `joystick_index` and parks it in the first free
+    /// slot. A failed open or a full slot table is logged and ignored.
+    fn open_into_free_slot(&mut self, joystick_index: u32) {
+        let Some(slot) = self.slots.iter().position(Option::is_none) else {
+            tracing::info!(
+                "controller: all {CONTROLLER_SLOTS} slots in use; ignoring joystick {joystick_index}"
+            );
+            return;
+        };
+        match self.subsystem.open(joystick_index) {
+            Ok(ctrl) => {
+                tracing::info!(
+                    "controller: opened '{}' (instance {}) as player {}",
+                    ctrl.name(),
+                    ctrl.instance_id(),
+                    slot + 1
+                );
+                self.slots[slot] = Some(ctrl);
+            }
+            Err(e) => {
+                tracing::warn!("controller: failed to open joystick {joystick_index}: {e}");
+            }
+        }
+    }
+
+    /// Handles a `ControllerDeviceAdded` event (`which` is a *joystick index*).
+    fn on_device_added(&mut self, joystick_index: u32) {
+        if self.subsystem.is_game_controller(joystick_index) {
+            self.open_into_free_slot(joystick_index);
+        }
+    }
+
+    /// Handles a `ControllerDeviceRemoved` event (`which` is an *instance id*),
+    /// freeing whichever slot held that controller so its slot can be reused.
+    fn on_device_removed(&mut self, instance_id: u32) {
+        for slot in &mut self.slots {
+            let matches = slot
+                .as_ref()
+                .is_some_and(|c| c.instance_id() == instance_id);
+            if matches {
+                tracing::info!("controller: instance {instance_id} disconnected");
+                *slot = None;
+            }
+        }
+    }
+
+    /// Returns the mapped [`ControllerInput`] for a player slot, or `None` when no
+    /// controller is bound (or it has silently detached). Reading a detached
+    /// controller never panics — it reports neutral, which we surface as `None`.
+    fn input(&self, slot: usize) -> Option<ControllerInput> {
+        let ctrl = self.slots.get(slot)?.as_ref()?;
+        if !ctrl.attached() {
+            return None;
+        }
+        Some(map_controller(&read_raw(ctrl), DEADZONE_DEFAULT))
+    }
+}
+
+/// Reads one SDL [`GameController`]'s current physical state into the pure,
+/// backend-agnostic [`RawController`] consumed by [`map_controller`]. This is the
+/// only place SDL controller types touch the mapping; all the direction/button
+/// logic lives in `fp-input` and is unit-tested without SDL.
+fn read_raw(ctrl: &GameController) -> RawController {
+    RawController {
+        stick_x: ctrl.axis(Axis::LeftX),
+        stick_y: ctrl.axis(Axis::LeftY),
+        dpad_up: ctrl.button(SdlPadButton::DPadUp),
+        dpad_down: ctrl.button(SdlPadButton::DPadDown),
+        dpad_left: ctrl.button(SdlPadButton::DPadLeft),
+        dpad_right: ctrl.button(SdlPadButton::DPadRight),
+        face_south: ctrl.button(SdlPadButton::A),
+        face_east: ctrl.button(SdlPadButton::B),
+        face_west: ctrl.button(SdlPadButton::X),
+        face_north: ctrl.button(SdlPadButton::Y),
+        shoulder_left: ctrl.button(SdlPadButton::LeftShoulder),
+        shoulder_right: ctrl.button(SdlPadButton::RightShoulder),
+        start: ctrl.button(SdlPadButton::Start),
+    }
+}
+
+/// Converts a mapped [`ControllerInput`] into a [`MatchInput`].
+///
+/// `MatchInput` has no `start` field (the engine's `tick` takes no pause signal),
+/// so the controller's Start maps onto the input model's `start` slot only inside
+/// `fp-input`; here it is intentionally dropped (documented no-op) until the
+/// engine grows a pause path.
+fn controller_to_match_input(c: &ControllerInput) -> MatchInput {
+    MatchInput {
+        up: c.direction.up,
+        down: c.direction.down,
+        left: c.direction.left,
+        right: c.direction.right,
+        a: c.button(PadButton::A),
+        b: c.button(PadButton::B),
+        c: c.button(PadButton::C),
+        x: c.button(PadButton::X),
+        y: c.button(PadButton::Y),
+        z: c.button(PadButton::Z),
+    }
+}
+
+/// Per-field OR of two [`MatchInput`]s, so a player can act from the keyboard
+/// **or** a controller at the same time (either source asserting a bit wins).
+fn merge_match_input(a: MatchInput, b: MatchInput) -> MatchInput {
+    MatchInput {
+        up: a.up || b.up,
+        down: a.down || b.down,
+        left: a.left || b.left,
+        right: a.right || b.right,
+        a: a.a || b.a,
+        b: a.b || b.b,
+        c: a.c || b.c,
+        x: a.x || b.x,
+        y: a.y || b.y,
+        z: a.z || b.z,
     }
 }
 
@@ -2195,6 +2372,16 @@ fn run() -> fp_core::FpResult<()> {
         .video()
         .map_err(|e| fp_core::FpError::Other(format!("SDL2 video: {e}")))?;
 
+    // Game-controller support is optional: if the subsystem can't initialize
+    // (no driver / headless), we log and run keyboard-only — never a fatal error.
+    let mut controllers = match sdl.game_controller() {
+        Ok(subsystem) => Some(Controllers::new(subsystem)),
+        Err(e) => {
+            tracing::warn!("controller: subsystem unavailable, keyboard only: {e}");
+            None
+        }
+    };
+
     let window = video
         .window("Fighters Paradise", WINDOW_WIDTH, WINDOW_HEIGHT)
         .position_centered()
@@ -2275,6 +2462,20 @@ fn run() -> fp_core::FpResult<()> {
                 } => {
                     renderer.resize(w as u32, h as u32);
                 }
+                // Controller hotplug. `which` is a joystick *index* on add and an
+                // instance *id* on remove (SDL convention). Both are handled
+                // failure-tolerantly: a missing subsystem or a failed open is a
+                // no-op, never a panic.
+                Event::ControllerDeviceAdded { which, .. } => {
+                    if let Some(c) = controllers.as_mut() {
+                        c.on_device_added(which);
+                    }
+                }
+                Event::ControllerDeviceRemoved { which, .. } => {
+                    if let Some(c) = controllers.as_mut() {
+                        c.on_device_removed(which);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2284,23 +2485,38 @@ fn run() -> fp_core::FpResult<()> {
         accumulator += current - previous;
         previous = current;
 
-        // Sample the keyboard ONCE per real frame, BEFORE the fixed-timestep
-        // catch-up loop (audit #27). On a frame that has to run multiple ticks to
-        // catch up, every sub-tick is driven by this single physical snapshot —
-        // re-reading `keyboard_state()` inside the loop would replay the same live
-        // state N times anyway, but doing it here makes the "one input per frame"
-        // semantics explicit and keeps press-vs-hold edges and command timing
-        // correct (one buffer push per frame). P2 stays an idle dummy this
-        // milestone. The snapshot is cheap, so we take it unconditionally even in
-        // non-Match modes (which ignore it).
-        let p1_input = match_input_from_keyboard(&event_pump.keyboard_state());
+        // Sample every physical input ONCE per real frame, BEFORE the
+        // fixed-timestep catch-up loop (audit #27). On a frame that has to run
+        // multiple ticks to catch up, every sub-tick is driven by this single
+        // physical snapshot — re-reading `keyboard_state()` / the controller
+        // inside the loop would replay the same live state N times anyway, but
+        // doing it here makes the "one input per frame" semantics explicit and
+        // keeps press-vs-hold edges and command timing correct (one buffer push
+        // per frame). The snapshots are cheap, so we take them unconditionally
+        // even in non-Match modes (which ignore them).
+        //
+        // P1 acts from the keyboard OR controller 0 (either source can assert any
+        // bit). If a second controller is present, it drives P2 for a real
+        // two-human match; otherwise P2 stays an idle dummy as before.
+        let kbd_input = match_input_from_keyboard(&event_pump.keyboard_state());
+        let pad0 = controllers
+            .as_ref()
+            .and_then(|c| c.input(0))
+            .map(|c| controller_to_match_input(&c))
+            .unwrap_or_else(MatchInput::none);
+        let p1_input = merge_match_input(kbd_input, pad0);
+        let p2_input = controllers
+            .as_ref()
+            .and_then(|c| c.input(1))
+            .map(|c| controller_to_match_input(&c))
+            .unwrap_or_else(MatchInput::none);
 
         while accumulator >= TICK_DURATION {
             match mode {
                 Mode::Match(ref mut run) => {
-                    // P1 from this frame's single keyboard snapshot; P2 is an idle
-                    // dummy this milestone.
-                    run.m.tick(p1_input, MatchInput::none());
+                    // P1 = keyboard OR controller 0; P2 = controller 1 if present,
+                    // else an idle dummy.
+                    run.m.tick(p1_input, p2_input);
 
                     // AFTER the tick: play this frame's surfaced sound requests,
                     // P1 then P2, each from its own decoded-sound cache. Graceful
@@ -2611,6 +2827,66 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn controller_to_match_input_carries_directions_and_buttons() {
+        // A right-down + (a, c) controller snapshot must surface those exact bits.
+        let raw = RawController {
+            dpad_right: true,
+            stick_y: 30000, // down (SDL: +Y is down)
+            face_west: true,     // a
+            shoulder_right: true, // c
+            ..RawController::default()
+        };
+        let ci = map_controller(&raw, DEADZONE_DEFAULT);
+        let mi = controller_to_match_input(&ci);
+        assert!(mi.right);
+        assert!(mi.down);
+        assert!(!mi.up);
+        assert!(!mi.left);
+        assert!(mi.a);
+        assert!(mi.c);
+        assert!(!mi.b && !mi.x && !mi.y && !mi.z);
+    }
+
+    #[test]
+    fn controller_to_match_input_neutral_is_none() {
+        let ci = map_controller(&RawController::default(), DEADZONE_DEFAULT);
+        assert_eq!(controller_to_match_input(&ci), MatchInput::none());
+    }
+
+    #[test]
+    fn merge_match_input_is_per_field_or() {
+        let kbd = MatchInput {
+            left: true,
+            a: true,
+            ..MatchInput::none()
+        };
+        let pad = MatchInput {
+            right: true,
+            a: true,
+            z: true,
+            ..MatchInput::none()
+        };
+        let merged = merge_match_input(kbd, pad);
+        assert!(merged.left, "from keyboard");
+        assert!(merged.right, "from controller");
+        assert!(merged.a, "asserted by both");
+        assert!(merged.z, "from controller");
+        assert!(!merged.up && !merged.down);
+        assert!(!merged.b && !merged.c && !merged.x && !merged.y);
+    }
+
+    #[test]
+    fn merge_with_none_is_identity() {
+        let only_kbd = MatchInput {
+            up: true,
+            x: true,
+            ..MatchInput::none()
+        };
+        assert_eq!(merge_match_input(only_kbd, MatchInput::none()), only_kbd);
+        assert_eq!(merge_match_input(MatchInput::none(), only_kbd), only_kbd);
     }
 
     #[test]
