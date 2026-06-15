@@ -731,8 +731,7 @@ impl Character {
         // tick, so this shared borrow coexists with `&mut self` below: each eval
         // site reborrows `&*self` into a short-lived `EvalCtx` that drops before
         // any mutation.
-        let opp_ctx: Option<EvalCtx> =
-            opponent.map(|o| EvalCtx::new(o, None, stage));
+        let opp_ctx: Option<EvalCtx> = opponent.map(|o| EvalCtx::new(o, None, stage));
         // This character's own loaded animation action set, for `SelfAnimExist(n)`
         // (audit P22). The opponent context above is built without an `.air` view
         // (it carries the empty default), so `enemy, SelfAnimExist` degrades to
@@ -1211,12 +1210,7 @@ impl Character {
     /// a scalar parameter is read with `i == 0`; the second value of an `x, y`
     /// pair is read with `i == 1`. A missing component returns `None` so the
     /// caller can substitute its own documented default. Never panics.
-    fn eval_param_component(
-        &self,
-        param: &CompiledParam,
-        i: usize,
-        env: EvalEnv,
-    ) -> Option<Value> {
+    fn eval_param_component(&self, param: &CompiledParam, i: usize, env: EvalEnv) -> Option<Value> {
         param.component(i).map(|expr| self.eval_value(expr, env))
     }
 
@@ -1462,7 +1456,11 @@ impl Character {
         env: EvalEnv,
         report: &mut TickReport,
     ) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: ChangeState in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1490,7 +1488,11 @@ impl Character {
         report.transitions += 1;
 
         // ChangeState's optional `ctrl` parameter overrides the statedef ctrl.
-        if let Some(ctrl_val) = ctrl.params.get("ctrl").and_then(|p| self.eval_param(p, env)) {
+        if let Some(ctrl_val) = ctrl
+            .params
+            .get("ctrl")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.ctrl = ctrl_val.as_bool();
         }
     }
@@ -1564,7 +1566,11 @@ impl Character {
 
     /// `CtrlSet`: set the player control flag from the `value` parameter.
     fn ctrl_ctrl_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.ctrl = v.as_bool();
         }
     }
@@ -1613,7 +1619,11 @@ impl Character {
     /// action's range, so an out-of-range value never panics). A missing `value`
     /// is a safe no-op.
     fn ctrl_change_anim(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: ChangeAnim in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1623,7 +1633,11 @@ impl Character {
         self.anim = value.to_int();
         // MUGEN's optional `elem` is one-based; store it zero-based. Default to
         // the first element when absent.
-        let start_elem = match ctrl.params.get("elem").and_then(|p| self.eval_param(p, env)) {
+        let start_elem = match ctrl
+            .params
+            .get("elem")
+            .and_then(|p| self.eval_param(p, env))
+        {
             Some(v) => v.to_int().saturating_sub(1).max(0),
             None => 0,
         };
@@ -1653,10 +1667,15 @@ impl Character {
             }
         }
         // `v`/`fv` + `value` form.
-        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) {
                 self.assign_var(VarBank::Int, index.to_int(), value);
-            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env)) {
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env))
+            {
                 self.assign_var(VarBank::Float, index.to_int(), value);
             } else {
                 tracing::debug!(
@@ -1679,10 +1698,15 @@ impl Character {
                 return;
             }
         }
-        if let Some(delta) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(delta) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             if let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) {
                 self.add_var(VarBank::Int, index.to_int(), delta);
-            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env)) {
+            } else if let Some(index) = ctrl.params.get("fv").and_then(|p| self.eval_param(p, env))
+            {
                 self.add_var(VarBank::Float, index.to_int(), delta);
             } else {
                 tracing::debug!(
@@ -1700,7 +1724,11 @@ impl Character {
     /// safe debug-logged no-op (adds nothing). A garbage value can never panic:
     /// the addition saturates and the result is clamped.
     fn ctrl_power_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: PowerAdd in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1717,7 +1745,11 @@ impl Character {
     /// safe debug-logged no-op (leaves power unchanged). A garbage value can
     /// never panic: the result is clamped into range.
     fn ctrl_power_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: PowerSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1731,7 +1763,11 @@ impl Character {
     /// *deals* is scaled by it in `resolve_attack`; default `1.0`). A missing
     /// `value` is a safe debug-logged no-op; never panics.
     fn ctrl_attack_mul_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: AttackMulSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1745,7 +1781,11 @@ impl Character {
     /// *receives* is scaled by it in `resolve_attack`; default `1.0`). A missing
     /// `value` is a safe debug-logged no-op; never panics.
     fn ctrl_defence_mul_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: DefenceMulSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -1769,7 +1809,11 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .map_or(0, |v| v.to_int());
         // `value` targets the int bank; `fvalue` targets the float bank.
-        if let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             let last = ctrl
                 .params
                 .get("last")
@@ -1779,7 +1823,11 @@ impl Character {
                 self.assign_var(VarBank::Int, index, value);
             }
         }
-        if let Some(value) = ctrl.params.get("fvalue").and_then(|p| self.eval_param(p, env)) {
+        if let Some(value) = ctrl
+            .params
+            .get("fvalue")
+            .and_then(|p| self.eval_param(p, env))
+        {
             let last = ctrl
                 .params
                 .get("last")
@@ -1960,9 +2008,7 @@ impl Character {
         let pos_type = ctrl
             .params
             .get("postype")
-            .map_or(HelperPosType::default(), |p| {
-                HelperPosType::parse(p.raw())
-            });
+            .map_or(HelperPosType::default(), |p| HelperPosType::parse(p.raw()));
         let pos_param = ctrl.params.get("pos");
         let pos_x = pos_param
             .and_then(|p| self.eval_param_component(p, 0, env))
@@ -2095,12 +2141,7 @@ impl Character {
     /// named by `value`. Throws use this to drive the victim through the
     /// thrown-animation states (KFM state 820). A missing `value`, or no target,
     /// pushes nothing.
-    fn ctrl_target_state(
-        &self,
-        ctrl: &CompiledController,
-        env: EvalEnv,
-        report: &mut TickReport,
-    ) {
+    fn ctrl_target_state(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
         if !self.has_target {
             tracing::debug!(
                 "tick: TargetState in state {} with no target; no-op",
@@ -2108,7 +2149,11 @@ impl Character {
             );
             return;
         }
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: TargetState in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -2170,7 +2215,11 @@ impl Character {
             );
             return;
         }
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: TargetLifeAdd in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -2194,12 +2243,7 @@ impl Character {
     /// to this character (`1` = same facing, `-1` = opposite). Throws use this to
     /// face the victim toward the thrower (KFM state 810). A missing `value`, or
     /// no target, pushes nothing.
-    fn ctrl_target_facing(
-        &self,
-        ctrl: &CompiledController,
-        env: EvalEnv,
-        report: &mut TickReport,
-    ) {
+    fn ctrl_target_facing(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
         if !self.has_target {
             tracing::debug!(
                 "tick: TargetFacing in state {} with no target; no-op",
@@ -2207,7 +2251,11 @@ impl Character {
             );
             return;
         }
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: TargetFacing in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -2287,7 +2335,11 @@ impl Character {
             );
             return;
         }
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: TargetPowerAdd in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -2696,7 +2748,10 @@ impl Character {
         };
         // Component 0 is the front half-width; component 1 the back. A scalar form
         // (only one component) sets both halves to that value.
-        let Some(front) = self.eval_param_component(param, 0, env).map(|v| v.to_float()) else {
+        let Some(front) = self
+            .eval_param_component(param, 0, env)
+            .map(|v| v.to_float())
+        else {
             tracing::debug!(
                 "tick: Width in state {} had an unparseable width; no-op",
                 ctrl.state_number
@@ -3024,11 +3079,7 @@ impl Character {
         // MUGEN `time = -1` means "persist until explicitly cleared". Represent
         // it faithfully with the PERSISTENT sentinel (it never counts down; only a
         // `time = 0` EnvColor clears it), rather than a long-but-finite window.
-        let remaining = if time < 0 {
-            EnvColor::PERSISTENT
-        } else {
-            time
-        };
+        let remaining = if time < 0 { EnvColor::PERSISTENT } else { time };
         // `value = r,g,b` on a 0..255 scale; default white. Each channel clamps.
         let rgb = self.read_rgb_triple(ctrl, "value", env, 255.0, 1.0);
         let col = [
@@ -3099,7 +3150,11 @@ impl Character {
     /// presenter to read. A missing `value` is a safe no-op (leaves the previous
     /// selection). Never panics.
     fn ctrl_victory_quote(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.victory_quote = Some(v.to_int());
         }
     }
@@ -3173,21 +3228,33 @@ impl Character {
     /// (persistent — survives the tick); a missing `value` is a safe no-op. Never
     /// panics.
     fn ctrl_angle_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.draw_angle.angle = v.to_float();
         }
     }
 
     /// `AngleAdd`: add to the sprite draw angle (T015). See [`ctrl_angle_set`](Self::ctrl_angle_set).
     fn ctrl_angle_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.draw_angle.angle += v.to_float();
         }
     }
 
     /// `AngleMul`: multiply the sprite draw angle (T015). See [`ctrl_angle_set`](Self::ctrl_angle_set).
     fn ctrl_angle_mul(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.draw_angle.angle *= v.to_float();
         }
     }
@@ -3201,7 +3268,11 @@ impl Character {
     /// frame only. (The optional `scale = x, y` is a render concern not modeled
     /// here.) Never panics.
     fn ctrl_angle_draw(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+        if let Some(v) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        {
             self.draw_angle.angle = v.to_float();
         }
         self.draw_angle.active = true;
@@ -3217,7 +3288,11 @@ impl Character {
     /// `LifeAdd` is a direct life write, distinct from hit damage. A missing
     /// `value` is a safe no-op. Never panics.
     fn ctrl_life_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: LifeAdd in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -3244,7 +3319,11 @@ impl Character {
     /// MUGEN's `LifeSet value = n` sets the player's life to `n`, clamped to
     /// `[0, life_max]`. A missing `value` is a safe no-op. Never panics.
     fn ctrl_life_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: LifeSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -3420,7 +3499,11 @@ impl Character {
     /// on [`GetHitVars::fall`](crate::GetHitVars::fall) (`GetHitVar(fall)`), which
     /// the get-hit states branch on. A missing `value` is a no-op; never panics.
     fn ctrl_hit_fall_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
-        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+        let Some(value) = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+        else {
             tracing::debug!(
                 "tick: HitFallSet in state {} has no `value`; ignored",
                 ctrl.state_number
@@ -4327,7 +4410,10 @@ fn pair_to_vec2(comps: &[Value], default: Vec2<f32>) -> Vec2<f32> {
 fn parse_velset(raw: &str) -> Option<(f32, f32)> {
     let mut parts = raw.split(',').map(str::trim);
     let x = parts.next().and_then(|p| p.parse::<f32>().ok())?;
-    let y = parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(0.0);
+    let y = parts
+        .next()
+        .and_then(|p| p.parse::<f32>().ok())
+        .unwrap_or(0.0);
     Some((x, y))
 }
 
@@ -4362,11 +4448,7 @@ fn clamp_index_usize(index: usize, len: usize) -> usize {
 /// For a looping or hold-forever action the value can be `0`/positive. This is a
 /// best-effort reconstruction sufficient for the executor and the `AnimTime`
 /// trigger: it sums the remaining durations from the current element to the end.
-fn remaining_anim_time(
-    action: &fp_formats::air::AnimAction,
-    elem: usize,
-    elem_time: i32,
-) -> i32 {
+fn remaining_anim_time(action: &fp_formats::air::AnimAction, elem: usize, elem_time: i32) -> i32 {
     let frames = &action.frames;
     let Some(current) = frames.get(elem) else {
         return 0;
@@ -4395,7 +4477,7 @@ mod tests {
         CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup, LoadedCharacter,
     };
     use crate::{
-        ActiveCommands, CharacterConstants, MovementConstants, MoveType, NoCommands, Physics,
+        ActiveCommands, CharacterConstants, MoveType, MovementConstants, NoCommands, Physics,
         StateType,
     };
     use fp_core::Vec2;
@@ -4437,7 +4519,10 @@ mod tests {
             state_number,
             label: String::new(),
             controller_type: Some(kind.to_string()),
-            triggerall: triggerall.iter().map(|s| CompiledExpr::compile(s)).collect(),
+            triggerall: triggerall
+                .iter()
+                .map(|s| CompiledExpr::compile(s))
+                .collect(),
             triggers: groups
                 .iter()
                 .map(|(n, conds)| CompiledTriggerGroup {
@@ -4562,8 +4647,27 @@ mod tests {
             None,
             &[("value", "20")],
         );
-        let st0 = state(0, Entry { st: Some("S"), mv: Some("I"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![walk]);
-        let st20 = state(20, Entry { st: Some("S"), ph: Some("S"), anim: Some("20"), ..Entry::default() }, vec![]);
+        let st0 = state(
+            0,
+            Entry {
+                st: Some("S"),
+                mv: Some("I"),
+                ph: Some("S"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![walk],
+        );
+        let st20 = state(
+            20,
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("20"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st0, st20], tiny_air(0, &[5, 5]));
 
         let mut ch = Character::new();
@@ -4609,7 +4713,10 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.transitions, 0, "trigger4 after a gap must be dead (CB6)");
+        assert_eq!(
+            report.transitions, 0,
+            "trigger4 after a gap must be dead (CB6)"
+        );
         assert_eq!(ch.state_no, 0);
 
         // Sanity: with trigger3 present (closing the gap) AND true, trigger4-style
@@ -4634,12 +4741,16 @@ mod tests {
     fn missing_trigger1_never_fires() {
         // A controller whose only group is trigger2 (no trigger1) cannot fire:
         // contiguity requires a trigger1 to start.
-        let c = ctrl(0, "ChangeState", &[], &[(2, &["1"])], None, &[("value", "20")]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(2, &["1"])],
+            None,
+            &[("value", "20")],
+        );
         let lc = loaded(
-            vec![
-                stand_n(0, vec![c]),
-                stand_n(20, vec![]),
-            ],
+            vec![stand_n(0, vec![c]), stand_n(20, vec![])],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -4652,16 +4763,48 @@ mod tests {
 
     #[test]
     fn change_state_updates_cursor_and_resets_time() {
-        let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "20")]);
-        let st0 = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![c]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "20")],
+        );
+        let st0 = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![c],
+        );
         // Destination sets anim 20 and ctrl 1 on entry.
-        let st20 = state(20, Entry { st: Some("A"), mv: Some("A"), ph: Some("A"), anim: Some("20"), ctrl: Some("1"), velset: Some("3, -5"), ..Entry::default() }, vec![]);
+        let st20 = state(
+            20,
+            Entry {
+                st: Some("A"),
+                mv: Some("A"),
+                ph: Some("A"),
+                anim: Some("20"),
+                ctrl: Some("1"),
+                velset: Some("3, -5"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st0, st20], {
             // Two actions: 0 and 20.
             let mut air = tiny_air(0, &[5]);
             air.actions.insert(
                 20,
-                AnimAction { action_number: 20, frames: tiny_air(20, &[7]).actions.remove(&20).unwrap().frames, loopstart: 0 },
+                AnimAction {
+                    action_number: 20,
+                    frames: tiny_air(20, &[7]).actions.remove(&20).unwrap().frames,
+                    loopstart: 0,
+                },
             );
             air
         });
@@ -4695,7 +4838,18 @@ mod tests {
     fn velset_then_stand_friction_applies_each_tick() {
         // State 0: stand physics, velset 10,0. First tick: enter (velset 10),
         // then friction *0.85. Next tick: friction again.
-        let st0 = state(0, Entry { st: Some("S"), mv: Some("I"), ph: Some("S"), anim: Some("0"), velset: Some("10, 0"), ..Entry::default() }, vec![]);
+        let st0 = state(
+            0,
+            Entry {
+                st: Some("S"),
+                mv: Some("I"),
+                ph: Some("S"),
+                anim: Some("0"),
+                velset: Some("10, 0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
         let mut ch = Character::new();
         // Force an entry by transitioning into 0 via the executor's enter path:
@@ -4717,12 +4871,23 @@ mod tests {
         ch2.vel = Vec2::new(8.0, 0.0);
         lc.tick(&mut ch2);
         let cf = CharacterConstants::default().movement.crouch_friction;
-        assert!((ch2.vel.x - 8.0 * cf).abs() < 1e-6, "crouch friction applied");
+        assert!(
+            (ch2.vel.x - 8.0 * cf).abs() < 1e-6,
+            "crouch friction applied"
+        );
     }
 
     #[test]
     fn air_physics_adds_gravity_and_none_does_nothing() {
-        let st = state(0, Entry { st: Some("A"), ph: Some("A"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("A"),
+                ph: Some("A"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -4766,22 +4931,43 @@ mod tests {
 
         // Tick once: pos.y = -3 + 2 = -1, still airborne, not yet clamped.
         lc.tick(&mut ch);
-        assert!((ch.pos.y - (-1.0)).abs() < 1e-6, "still airborne, got {}", ch.pos.y);
-        assert!((ch.vel.y - 2.0).abs() < 1e-6, "vel.y untouched by integration");
+        assert!(
+            (ch.pos.y - (-1.0)).abs() < 1e-6,
+            "still airborne, got {}",
+            ch.pos.y
+        );
+        assert!(
+            (ch.vel.y - 2.0).abs() < 1e-6,
+            "vel.y untouched by integration"
+        );
 
         // Tick again: pos.y would integrate to -1 + 2 = +1 (below floor); the
         // clamp must hold it AT the floor (0), and must NOT modify vel.y.
         lc.tick(&mut ch);
-        assert!((ch.pos.y - GROUND_Y).abs() < 1e-6, "clamped to floor, got {}", ch.pos.y);
+        assert!(
+            (ch.pos.y - GROUND_Y).abs() < 1e-6,
+            "clamped to floor, got {}",
+            ch.pos.y
+        );
         assert!(ch.pos.y <= GROUND_Y, "pos.y never positive (below floor)");
-        assert!((ch.vel.y - 2.0).abs() < 1e-6, "clamp must NOT touch vel.y (land-trigger timing)");
+        assert!(
+            (ch.vel.y - 2.0).abs() < 1e-6,
+            "clamp must NOT touch vel.y (land-trigger timing)"
+        );
 
         // Keep ticking with the same downward velocity: it stays pinned at 0.
         for _ in 0..10 {
             lc.tick(&mut ch);
-            assert!(ch.pos.y <= GROUND_Y, "stays at/above floor, got {}", ch.pos.y);
+            assert!(
+                ch.pos.y <= GROUND_Y,
+                "stays at/above floor, got {}",
+                ch.pos.y
+            );
         }
-        assert!((ch.pos.y - GROUND_Y).abs() < 1e-6, "settled exactly at the floor");
+        assert!(
+            (ch.pos.y - GROUND_Y).abs() < 1e-6,
+            "settled exactly at the floor"
+        );
     }
 
     /// Upward motion (negative Y, above the floor) is unaffected by the
@@ -4799,7 +4985,10 @@ mod tests {
         up.pos = Vec2::new(0.0, 0.0);
         up.vel = Vec2::new(0.0, -5.0); // upward
         lc.tick(&mut up);
-        assert!((up.pos.y - (-5.0)).abs() < 1e-6, "upward motion passes through clamp");
+        assert!(
+            (up.pos.y - (-5.0)).abs() < 1e-6,
+            "upward motion passes through clamp"
+        );
 
         // Grounded character at the floor, no vertical velocity: stays at 0.
         let mut grounded = Character::new();
@@ -4808,7 +4997,10 @@ mod tests {
         grounded.pos = Vec2::new(0.0, GROUND_Y);
         grounded.vel = Vec2::new(0.0, 0.0);
         lc.tick(&mut grounded);
-        assert!((grounded.pos.y - GROUND_Y).abs() < 1e-6, "grounded char unmoved by min(_,0)");
+        assert!(
+            (grounded.pos.y - GROUND_Y).abs() < 1e-6,
+            "grounded char unmoved by min(_,0)"
+        );
     }
 
     /// Gated real-KFM integration test (skips silently when the
@@ -4853,7 +5045,11 @@ mod tests {
         jumper.pos = Vec2::new(0.0, GROUND_Y);
         jumper.change_state(&lc.states, 50); // air jump-up (sets type/physics=A)
         jumper.vel = Vec2::new(0.0, lc.constants.velocity.jump_up);
-        assert!(jumper.vel.y < 0.0, "jump y must be upward (negative), got {}", jumper.vel.y);
+        assert!(
+            jumper.vel.y < 0.0,
+            "jump y must be upward (negative), got {}",
+            jumper.vel.y
+        );
 
         let mut peaked_airborne = false;
         let mut returned_to_ground = false;
@@ -4873,7 +5069,10 @@ mod tests {
                 break;
             }
         }
-        assert!(peaked_airborne, "the jump should lift the character off the floor");
+        assert!(
+            peaked_airborne,
+            "the jump should lift the character off the floor"
+        );
         assert!(
             returned_to_ground,
             "the falling character should settle back AT the floor (Pos Y = 0), \
@@ -4925,7 +5124,10 @@ mod tests {
     /// `min(pos.y, GROUND_Y)` keeps a player at or above this line.
     #[test]
     fn ground_y_constant_is_floor_zero() {
-        assert!((GROUND_Y - 0.0).abs() < f32::EPSILON, "floor is the world origin Y=0");
+        assert!(
+            (GROUND_Y - 0.0).abs() < f32::EPSILON,
+            "floor is the world origin Y=0"
+        );
     }
 
     // ---- A.P14: air-jump (double jump) engine built-in ---------------------
@@ -4939,12 +5141,22 @@ mod tests {
     fn air_jump_synth() -> Synth {
         let air_idle = state(
             0,
-            Entry { st: Some("A"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            Entry {
+                st: Some("A"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
             vec![],
         );
         let airjump_start = state(
             AIRJUMP_START_STATE,
-            Entry { st: Some("A"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            Entry {
+                st: Some("A"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
             vec![],
         );
         loaded(vec![air_idle, airjump_start], tiny_air(0, &[5]))
@@ -4979,9 +5191,15 @@ mod tests {
         let mut ch = airborne_ctrl_char(1, 35.0);
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let report = synth.tick(&mut ch);
-        assert_eq!(ch.state_no, AIRJUMP_START_STATE, "fresh up-press in the air → state 45");
+        assert_eq!(
+            ch.state_no, AIRJUMP_START_STATE,
+            "fresh up-press in the air → state 45"
+        );
         assert_eq!(ch.air_jump_count, 1, "the air-jump count is incremented");
-        assert!(report.transitions >= 1, "the engine air-jump counts as a transition");
+        assert!(
+            report.transitions >= 1,
+            "the engine air-jump counts as a transition"
+        );
     }
 
     /// AC2/AC3: **holding** up does not burn a second air-jump — the second tick
@@ -5003,7 +5221,10 @@ mod tests {
         ch.ctrl = true;
         ch.pos = Vec2::new(0.0, -100.0);
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 1, "held up (no rising edge) must NOT air-jump again");
+        assert_eq!(
+            ch.air_jump_count, 1,
+            "held up (no rising edge) must NOT air-jump again"
+        );
         assert_eq!(ch.state_no, 0, "stays in the airborne idle state");
     }
 
@@ -5030,8 +5251,14 @@ mod tests {
         // Fresh press again — but the allowance (num = 1) is already spent.
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 1, "count == num blocks further air-jumps");
-        assert_eq!(ch.state_no, 0, "no transition to 45 once the allowance is spent");
+        assert_eq!(
+            ch.air_jump_count, 1,
+            "count == num blocks further air-jumps"
+        );
+        assert_eq!(
+            ch.state_no, 0,
+            "no transition to 45 once the allowance is spent"
+        );
     }
 
     /// AC2/AC3: below `airjump.height` (too close to the floor) blocks the
@@ -5068,11 +5295,11 @@ mod tests {
         let synth = air_jump_synth();
         // Add a grounded stand state 11 to "land" into.
         let mut states = synth.states;
-        states.insert(
-            11,
-            stand_n(11, vec![]),
-        );
-        let synth = Synth { states, air: synth.air };
+        states.insert(11, stand_n(11, vec![]));
+        let synth = Synth {
+            states,
+            air: synth.air,
+        };
 
         let mut ch = airborne_ctrl_char(1, 35.0);
 
@@ -5086,7 +5313,10 @@ mod tests {
         ch.change_state(&synth.states, 11);
         ch.set_command_source(Box::new(NoCommands)); // release up while landing
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 0, "grounded tick resets the air-jump count");
+        assert_eq!(
+            ch.air_jump_count, 0,
+            "grounded tick resets the air-jump count"
+        );
 
         // Fresh ground jump back into the air, then a fresh up-press air-jumps
         // again (the allowance was restored by landing).
@@ -5096,8 +5326,14 @@ mod tests {
         ch.pos = Vec2::new(0.0, -100.0);
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 1, "after landing, a fresh ground jump restores the air-jump");
-        assert_eq!(ch.state_no, AIRJUMP_START_STATE, "air-jump works again after landing");
+        assert_eq!(
+            ch.air_jump_count, 1,
+            "after landing, a fresh ground jump restores the air-jump"
+        );
+        assert_eq!(
+            ch.state_no, AIRJUMP_START_STATE,
+            "air-jump works again after landing"
+        );
     }
 
     // =====================================================================
@@ -5153,7 +5389,10 @@ mod tests {
         at.pos = Vec2::new(0.0, -35.0);
         at.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut at);
-        assert_eq!(at.air_jump_count, 1, "pos.y == -airjump_height is high enough (inclusive)");
+        assert_eq!(
+            at.air_jump_count, 1,
+            "pos.y == -airjump_height is high enough (inclusive)"
+        );
         assert_eq!(at.state_no, AIRJUMP_START_STATE);
 
         // One pixel below the boundary (closer to the floor): blocked.
@@ -5161,7 +5400,10 @@ mod tests {
         below.pos = Vec2::new(0.0, -34.0);
         below.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut below);
-        assert_eq!(below.air_jump_count, 0, "one pixel below the boundary is too low");
+        assert_eq!(
+            below.air_jump_count, 0,
+            "one pixel below the boundary is too low"
+        );
         assert_eq!(below.state_no, 0);
     }
 
@@ -5176,7 +5418,10 @@ mod tests {
         ch.pos = Vec2::new(0.0, -1.0); // barely off the floor
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 1, "airjump.height = 0: any airborne height qualifies");
+        assert_eq!(
+            ch.air_jump_count, 1,
+            "airjump.height = 0: any airborne height qualifies"
+        );
         assert_eq!(ch.state_no, AIRJUMP_START_STATE);
     }
 
@@ -5190,7 +5435,10 @@ mod tests {
         let mut ch = airborne_ctrl_char(-3, 35.0);
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 0, "negative airjump.num behaves like 0 (no air jump)");
+        assert_eq!(
+            ch.air_jump_count, 0,
+            "negative airjump.num behaves like 0 (no air jump)"
+        );
         assert_eq!(ch.state_no, 0);
     }
 
@@ -5249,7 +5497,10 @@ mod tests {
         let _ = synth.tick(&mut ch);
         ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
         let _ = synth.tick(&mut ch);
-        assert_eq!(ch.air_jump_count, 2, "third press blocked: count (2) == num (2)");
+        assert_eq!(
+            ch.air_jump_count, 2,
+            "third press blocked: count (2) == num (2)"
+        );
         assert_eq!(ch.state_no, 0, "no third air-jump");
     }
 
@@ -5320,8 +5571,7 @@ mod tests {
             // air-jump height, and in control — a clean fresh up-press (the
             // rising edge) at that point, exactly as a player taps up again at
             // the apex. Holding it thereafter must NOT burn a second jump.
-            let high_enough =
-                ch.pos.y <= GROUND_Y - lc.constants.movement.airjump_height - 1.0;
+            let high_enough = ch.pos.y <= GROUND_Y - lc.constants.movement.airjump_height - 1.0;
             if !pressing_up && ch.state_type == StateType::Air && high_enough && ch.ctrl {
                 ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
                 pressing_up = true;
@@ -5360,12 +5610,20 @@ mod tests {
         // Air state so `Physics::Air` adds gravity (yaccel) to vel.y each tick.
         let air = state(
             0,
-            Entry { st: Some("A"), ph: Some("A"), anim: Some("0"), ..Entry::default() },
+            Entry {
+                st: Some("A"),
+                ph: Some("A"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(vec![air], tiny_air(0, &[5]));
         let yaccel = CharacterConstants::default().movement.yaccel;
-        assert!(yaccel > 0.0, "downward gravity must be positive (Y increases downward)");
+        assert!(
+            yaccel > 0.0,
+            "downward gravity must be positive (Y increases downward)"
+        );
 
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5393,7 +5651,10 @@ mod tests {
                 break;
             }
         }
-        assert!(peaked_airborne, "gravity test should lift the character (min_y = {min_y})");
+        assert!(
+            peaked_airborne,
+            "gravity test should lift the character (min_y = {min_y})"
+        );
         assert!(
             settled,
             "gravity should pull the falling character back to rest AT the floor, \
@@ -5447,10 +5708,7 @@ mod tests {
         // persistent=0 VelAdd: should fire on the first qualifying tick only,
         // even though its trigger is true every tick.
         let c = ctrl(0, "VelAdd", &[], &[(1, &["1"])], Some("0"), &[("x", "1")]);
-        let lc = loaded(
-            vec![stand_n(0, vec![c])],
-            tiny_air(0, &[5]),
-        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
@@ -5458,34 +5716,35 @@ mod tests {
         lc.tick(&mut ch); // fires: x += 1
         lc.tick(&mut ch); // does NOT fire (once per entry)
         lc.tick(&mut ch); // does NOT fire
-        assert!((ch.vel.x - 1.0).abs() < 1e-6, "persistent=0 fires once, got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 1.0).abs() < 1e-6,
+            "persistent=0 fires once, got {}",
+            ch.vel.x
+        );
     }
 
     #[test]
     fn persistent_default_fires_every_tick() {
         // No persistent param → default 1 → fires every qualifying tick.
         let c = ctrl(0, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "1")]);
-        let lc = loaded(
-            vec![stand_n(0, vec![c])],
-            tiny_air(0, &[5]),
-        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
         lc.tick(&mut ch);
         lc.tick(&mut ch);
         lc.tick(&mut ch);
-        assert!((ch.vel.x - 3.0).abs() < 1e-6, "default persistent fires every tick");
+        assert!(
+            (ch.vel.x - 3.0).abs() < 1e-6,
+            "default persistent fires every tick"
+        );
     }
 
     #[test]
     fn persistent_n_fires_every_nth_tick() {
         // persistent=2 → fires on the 2nd, 4th, … qualifying tick.
         let c = ctrl(0, "VelAdd", &[], &[(1, &["1"])], Some("2"), &[("x", "1")]);
-        let lc = loaded(
-            vec![stand_n(0, vec![c])],
-            tiny_air(0, &[5]),
-        );
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
@@ -5503,7 +5762,16 @@ mod tests {
     #[test]
     fn animation_advances_and_loops_from_air_durations() {
         // Action 0: two frames, each holding 2 ticks; loops at 0.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[2, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5528,7 +5796,16 @@ mod tests {
     #[test]
     fn hold_forever_frame_never_advances() {
         // A single frame with ticks = -1 holds forever.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[-1]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5543,7 +5820,14 @@ mod tests {
 
     #[test]
     fn vel_set_and_ctrl_set_dispatch() {
-        let vset = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "4"), ("y", "-2")]);
+        let vset = ctrl(
+            0,
+            "VelSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "4"), ("y", "-2")],
+        );
         let cset = ctrl(0, "CtrlSet", &[], &[(1, &["1"])], None, &[("value", "1")]);
         let st = stand_n(0, vec![vset, cset]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -5561,7 +5845,14 @@ mod tests {
     fn null_and_unknown_controllers_are_safe_noops() {
         // Null + an unrecognized controller both run without effect or panic.
         let null = ctrl(0, "Null", &[], &[(1, &["1"])], None, &[]);
-        let bogus = ctrl(0, "TotallyMadeUpController", &[], &[(1, &["1"])], None, &[("x", "9")]);
+        let bogus = ctrl(
+            0,
+            "TotallyMadeUpController",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "9")],
+        );
         let st = stand_n(0, vec![null, bogus]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -5585,10 +5876,7 @@ mod tests {
         let s_neg2 = ctrl(-2, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "10")]);
         let s_cur = ctrl(0, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "1")]);
         let lc = loaded(
-            vec![
-                stand_n(-2, vec![s_neg2]),
-                stand_n(0, vec![s_cur]),
-            ],
+            vec![stand_n(-2, vec![s_neg2]), stand_n(0, vec![s_cur])],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -5607,8 +5895,22 @@ mod tests {
         // appended after it, task 7.3 part B) must NOT also fire. MUGEN scans -1
         // top-down and stops at the first state change. Regression test for the
         // 7.3-fix priority guarantee (without it, the second would redirect 100->200).
-        let first = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "100")]);
-        let second = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "200")]);
+        let first = ctrl(
+            -1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "100")],
+        );
+        let second = ctrl(
+            -1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "200")],
+        );
         let lc = loaded(
             vec![
                 stand_n(-1, vec![first, second]),
@@ -5632,13 +5934,10 @@ mod tests {
 
     #[test]
     fn unknown_current_state_does_not_panic() {
-        let lc = loaded(
-            vec![stand_n(0, vec![])],
-            tiny_air(0, &[5]),
-        );
+        let lc = loaded(vec![stand_n(0, vec![])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 999; // not in the graph
-        // Must not panic; cursor stays, time/anim advance harmlessly.
+                           // Must not panic; cursor stays, time/anim advance harmlessly.
         let report = lc.tick(&mut ch);
         assert_eq!(report.transitions, 0);
         assert_eq!(ch.state_no, 999);
@@ -5647,13 +5946,24 @@ mod tests {
     #[test]
     fn cyclic_change_state_is_bounded() {
         // A ↔ B infinite ChangeState loop must hit the cap and stop, not hang.
-        let a = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "1")]);
-        let b = ctrl(1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        let a = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
+        let b = ctrl(
+            1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "0")],
+        );
         let lc = loaded(
-            vec![
-                stand_n(0, vec![a]),
-                stand_n(1, vec![b]),
-            ],
+            vec![stand_n(0, vec![a]), stand_n(1, vec![b])],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -5728,7 +6038,14 @@ mod tests {
         let s100 = CompiledState::from_parsed(&cns.statedefs[1]);
         let lc = loaded(vec![s0, s100], {
             let mut air = tiny_air(0, &[5]);
-            air.actions.insert(100, AnimAction { action_number: 100, frames: tiny_air(100, &[5]).actions.remove(&100).unwrap().frames, loopstart: 0 });
+            air.actions.insert(
+                100,
+                AnimAction {
+                    action_number: 100,
+                    frames: tiny_air(100, &[5]).actions.remove(&100).unwrap().frames,
+                    loopstart: 0,
+                },
+            );
             air
         });
         let mut ch = Character::new();
@@ -5759,12 +6076,38 @@ mod tests {
         );
         let lc = loaded(
             vec![
-                state(0, Entry { st: Some("S"), mv: Some("I"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![walk]),
-                state(20, Entry { st: Some("S"), ph: Some("S"), anim: Some("20"), ..Entry::default() }, vec![]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        mv: Some("I"),
+                        ph: Some("S"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![walk],
+                ),
+                state(
+                    20,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("S"),
+                        anim: Some("20"),
+                        ..Entry::default()
+                    },
+                    vec![],
+                ),
             ],
             {
                 let mut air = tiny_air(0, &[5]);
-                air.actions.insert(20, AnimAction { action_number: 20, frames: tiny_air(20, &[5]).actions.remove(&20).unwrap().frames, loopstart: 0 });
+                air.actions.insert(
+                    20,
+                    AnimAction {
+                        action_number: 20,
+                        frames: tiny_air(20, &[5]).actions.remove(&20).unwrap().frames,
+                        loopstart: 0,
+                    },
+                );
                 air
             },
         );
@@ -5837,10 +6180,25 @@ mod tests {
     fn poweradd_on_entry_adds_once_per_entry() {
         // State 0: no poweradd. State 1: poweradd=10. Each entry into state 1
         // bumps power by 10; entering state 0 adds nothing.
-        let st0 = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st0 = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let st1 = state(
             1,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("10"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("10"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(vec![st0, st1], tiny_air(0, &[5]));
@@ -5862,14 +6220,39 @@ mod tests {
     /// even with a huge authored value.
     #[test]
     fn poweradd_on_entry_clamps_at_power_max() {
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
         let dest = state(
             5,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("999999"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("999999"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![go],
+                ),
+                dest,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -5884,10 +6267,38 @@ mod tests {
     /// AC1: a state with NO `poweradd` adds nothing on entry.
     #[test]
     fn entry_without_poweradd_leaves_power_unchanged() {
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
-        let dest = state(5, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
+        let dest = state(
+            5,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![go],
+                ),
+                dest,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -5901,8 +6312,24 @@ mod tests {
     /// AC2/AC3: `PowerAdd` controller adds `value` and clamps at `power_max`.
     #[test]
     fn power_add_controller_adds_and_clamps_high() {
-        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "300")]);
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let add = ctrl(
+            0,
+            "PowerAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "300")],
+        );
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![add],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5916,8 +6343,24 @@ mod tests {
     /// below the floor).
     #[test]
     fn power_add_controller_clamps_low() {
-        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "-500")]);
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let add = ctrl(
+            0,
+            "PowerAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "-500")],
+        );
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![add],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5930,8 +6373,24 @@ mod tests {
     #[test]
     fn power_set_controller_sets_and_clamps() {
         // Set above power_max -> clamps high.
-        let set_hi = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "5000")]);
-        let st_hi = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set_hi]);
+        let set_hi = ctrl(
+            0,
+            "PowerSet",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "5000")],
+        );
+        let st_hi = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![set_hi],
+        );
         let lc_hi = loaded(vec![st_hi], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -5941,8 +6400,24 @@ mod tests {
         assert_eq!(ch.power, 3000, "PowerSet 5000 clamped to power_max 3000");
 
         // Set below 0 -> clamps low.
-        let set_lo = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "-7")]);
-        let st_lo = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set_lo]);
+        let set_lo = ctrl(
+            0,
+            "PowerSet",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "-7")],
+        );
+        let st_lo = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![set_lo],
+        );
         let lc_lo = loaded(vec![st_lo], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
@@ -5959,7 +6434,12 @@ mod tests {
             let c = ctrl(0, kind, &[], &[(1, &["1"])], Some("0"), params);
             let st = state(
                 0,
-                Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+                Entry {
+                    st: Some("S"),
+                    ph: Some("N"),
+                    anim: Some("0"),
+                    ..Entry::default()
+                },
                 vec![c],
             );
             loaded(vec![st], tiny_air(0, &[5]))
@@ -5968,18 +6448,27 @@ mod tests {
         let mut ch = Character::new();
         ch.state_no = 0;
         mk("AttackMulSet", &[("value", "2.5")]).tick(&mut ch);
-        assert!((ch.attack_mul - 2.5).abs() < 1e-6, "AttackMulSet sets attack_mul");
+        assert!(
+            (ch.attack_mul - 2.5).abs() < 1e-6,
+            "AttackMulSet sets attack_mul"
+        );
 
         let mut ch2 = Character::new();
         ch2.state_no = 0;
         mk("DefenceMulSet", &[("value", "0.5")]).tick(&mut ch2);
-        assert!((ch2.defence_mul - 0.5).abs() < 1e-6, "DefenceMulSet sets defence_mul");
+        assert!(
+            (ch2.defence_mul - 0.5).abs() < 1e-6,
+            "DefenceMulSet sets defence_mul"
+        );
 
         // No `value` -> no-op, multiplier stays the default 1.0.
         let mut ch3 = Character::new();
         ch3.state_no = 0;
         mk("AttackMulSet", &[]).tick(&mut ch3);
-        assert!((ch3.attack_mul - 1.0).abs() < 1e-6, "no value -> attack_mul unchanged");
+        assert!(
+            (ch3.attack_mul - 1.0).abs() < 1e-6,
+            "no value -> attack_mul unchanged"
+        );
     }
 
     /// AC2/AC3: `PowerAdd`/`PowerSet` with a missing `value` is a safe no-op
@@ -5987,7 +6476,16 @@ mod tests {
     #[test]
     fn power_controllers_missing_value_is_noop() {
         let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[]);
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![add],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6005,11 +6503,29 @@ mod tests {
     fn poweradd_on_entry_negative_clamps_at_floor() {
         let drain = state(
             7,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("-1000"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("-1000"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), drain],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![],
+                ),
+                drain,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -6025,11 +6541,29 @@ mod tests {
     fn poweradd_on_entry_evaluates_expression() {
         let st = state(
             3,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("30 + 20"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("30 + 20"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![],
+                ),
+                st,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -6047,11 +6581,29 @@ mod tests {
         // const-0 fallback, so entry adds 0.
         let st = state(
             4,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("1 +"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("1 +"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![],
+                ),
+                st,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -6069,11 +6621,29 @@ mod tests {
         // poweradd-on-entry with power_max = 0.
         let st = state(
             2,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), poweradd: Some("500"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                poweradd: Some("500"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]), st],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![],
+                ),
+                st,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -6084,9 +6654,25 @@ mod tests {
         assert_eq!(ch.power, 0, "power_max=0 -> power pinned to 0 on entry");
 
         // PowerSet with a negative power_max also pins to 0 (never panics).
-        let set = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "900")]);
+        let set = ctrl(
+            0,
+            "PowerSet",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "900")],
+        );
         let lc2 = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![set])],
+            vec![state(
+                0,
+                Entry {
+                    st: Some("S"),
+                    ph: Some("N"),
+                    anim: Some("0"),
+                    ..Entry::default()
+                },
+                vec![set],
+            )],
             tiny_air(0, &[5]),
         );
         let mut ch2 = Character::new();
@@ -6102,7 +6688,14 @@ mod tests {
     /// add starting from a positive power clamps at power_max, no panic.
     #[test]
     fn power_add_controller_saturates_huge_value() {
-        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "2147483647")]);
+        let add = ctrl(
+            0,
+            "PowerAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "2147483647")],
+        );
         let st = stand_n(0, vec![add]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -6110,7 +6703,10 @@ mod tests {
         ch.power_max = 1000;
         ch.power = 2000; // already above max (e.g. stale data) — clamp brings it down
         lc.tick(&mut ch);
-        assert_eq!(ch.power, 1000, "huge add saturates then clamps to power_max");
+        assert_eq!(
+            ch.power, 1000,
+            "huge add saturates then clamps to power_max"
+        );
     }
 
     /// AC2: `PowerAdd`/`PowerSet` with a malformed `value` (const-0 fallback) is a
@@ -6119,7 +6715,14 @@ mod tests {
     #[test]
     fn power_controllers_malformed_value_are_safe() {
         // PowerAdd with garbage value -> fallback evals to 0 -> adds nothing.
-        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "1 +")]);
+        let add = ctrl(
+            0,
+            "PowerAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "1 +")],
+        );
         let lc_add = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6128,20 +6731,37 @@ mod tests {
         assert_eq!(ch.power, 444, "PowerAdd garbage value adds 0");
 
         // PowerSet with garbage value -> fallback evals to 0 -> sets power to 0.
-        let set = ctrl(0, "PowerSet", &[], &[(1, &["1"])], Some("0"), &[("value", "*/")]);
+        let set = ctrl(
+            0,
+            "PowerSet",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "*/")],
+        );
         let lc_set = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
         ch2.power = 444;
         lc_set.tick(&mut ch2);
-        assert_eq!(ch2.power, 0, "PowerSet garbage value sets the const-0 fallback");
+        assert_eq!(
+            ch2.power, 0,
+            "PowerSet garbage value sets the const-0 fallback"
+        );
     }
 
     /// AC2: the controller dispatch matches `PowerAdd`/`PowerSet` case-INsensitively
     /// (MUGEN type names are not case-sensitive). `poweradd`/`POWERSET` both fire.
     #[test]
     fn power_controllers_dispatch_case_insensitively() {
-        let add = ctrl(0, "poweradd", &[], &[(1, &["1"])], Some("0"), &[("value", "40")]);
+        let add = ctrl(
+            0,
+            "poweradd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "40")],
+        );
         let lc_add = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6149,7 +6769,14 @@ mod tests {
         lc_add.tick(&mut ch);
         assert_eq!(ch.power, 40, "lowercase `poweradd` controller fires");
 
-        let set = ctrl(0, "POWERSET", &[], &[(1, &["1"])], Some("0"), &[("value", "77")]);
+        let set = ctrl(
+            0,
+            "POWERSET",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "77")],
+        );
         let lc_set = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
@@ -6163,7 +6790,14 @@ mod tests {
     /// current power. Confirms the controller routes through `eval_param`.
     #[test]
     fn power_add_controller_value_is_an_expression() {
-        let add = ctrl(0, "PowerAdd", &[], &[(1, &["1"])], Some("0"), &[("value", "10 * 5")]);
+        let add = ctrl(
+            0,
+            "PowerAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("value", "10 * 5")],
+        );
         let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6204,7 +6838,10 @@ mod tests {
         let mut last = ch.power;
         for _ in 0..200 {
             ch.enter_state(&lc.states, 200, EvalEnv::self_only());
-            assert!(ch.power >= last, "power never decreases across attack entries");
+            assert!(
+                ch.power >= last,
+                "power never decreases across attack entries"
+            );
             assert!(
                 (0..=ch.power_max).contains(&ch.power),
                 "power stays within [0, power_max] (got {}, max {})",
@@ -6260,7 +6897,10 @@ mod tests {
             "entering KFM attack state 200 should fill the power meter (got {})",
             ch.power
         );
-        assert!(ch.power <= ch.power_max, "power stays within [0, power_max]");
+        assert!(
+            ch.power <= ch.power_max,
+            "power stays within [0, power_max]"
+        );
     }
 
     // =====================================================================
@@ -6333,7 +6973,14 @@ mod tests {
         // A ChangeState fired from [Statedef -1] (the .cmd command bridge) must
         // change which numbered state is treated as "current" this tick: -1 sends
         // us from 0 to 50, and state 50's controller runs in the SAME tick.
-        let cmd = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "50")]);
+        let cmd = ctrl(
+            -1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "50")],
+        );
         let in50 = ctrl(50, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "5")]);
         // State 0's controller would add 999 if it ran — it must NOT, since -1 sent
         // us to 50 before the current-state pass.
@@ -6341,8 +6988,26 @@ mod tests {
         let lc = loaded(
             vec![
                 stand_n(-1, vec![cmd]),
-                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![in0]),
-                state(50, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![in50]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![in0],
+                ),
+                state(
+                    50,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![in50],
+                ),
             ],
             tiny_air(0, &[5]),
         );
@@ -6351,10 +7016,17 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::<f32>::ZERO;
         let report = lc.tick(&mut ch);
-        assert_eq!(ch.state_no, 50, "[-1] ChangeState redirected the current state");
+        assert_eq!(
+            ch.state_no, 50,
+            "[-1] ChangeState redirected the current state"
+        );
         assert!(report.transitions >= 1);
         // Only state 50's VelAdd ran on the current pass (not state 0's).
-        assert!((ch.vel.x - 5.0).abs() < 1e-6, "state 0 must not run after redirect; got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 5.0).abs() < 1e-6,
+            "state 0 must not run after redirect; got {}",
+            ch.vel.x
+        );
     }
 
     // ---- AC1: triggerall AND semantics (multi-condition) ----
@@ -6363,7 +7035,14 @@ mod tests {
     fn triggerall_all_conditions_must_be_true() {
         // Two triggerall conditions: the controller fires only when BOTH hold.
         let mk = |life_ok: &'static str| {
-            ctrl(0, "VelAdd", &["ctrl", life_ok], &[(1, &["1"])], None, &[("x", "1")])
+            ctrl(
+                0,
+                "VelAdd",
+                &["ctrl", life_ok],
+                &[(1, &["1"])],
+                None,
+                &[("x", "1")],
+            )
         };
         // ctrl=true and Life>50 → fires.
         let lc_pass = loaded(vec![stand_n(0, vec![mk("Life > 50")])], tiny_air(0, &[5]));
@@ -6374,7 +7053,10 @@ mod tests {
         ch.life = 100;
         ch.vel = Vec2::<f32>::ZERO;
         lc_pass.tick(&mut ch);
-        assert!((ch.vel.x - 1.0).abs() < 1e-6, "both triggerall true → fires");
+        assert!(
+            (ch.vel.x - 1.0).abs() < 1e-6,
+            "both triggerall true → fires"
+        );
 
         // Second triggerall false (Life > 5000) → does not fire despite ctrl true.
         let lc_fail = loaded(vec![stand_n(0, vec![mk("Life > 5000")])], tiny_air(0, &[5]));
@@ -6385,7 +7067,10 @@ mod tests {
         ch2.life = 100;
         ch2.vel = Vec2::<f32>::ZERO;
         lc_fail.tick(&mut ch2);
-        assert!((ch2.vel.x - 0.0).abs() < 1e-6, "one false triggerall → skipped");
+        assert!(
+            (ch2.vel.x - 0.0).abs() < 1e-6,
+            "one false triggerall → skipped"
+        );
     }
 
     // ---- AC1: within-group AND across multiple conditions ----
@@ -6393,24 +7078,44 @@ mod tests {
     #[test]
     fn group_requires_all_conditions_and() {
         // trigger1 has two AND'd conditions; the group is true only when both are.
-        let c_true = ctrl(0, "VelAdd", &[], &[(1, &["Time >= 0", "StateNo = 0"])], None, &[("x", "1")]);
+        let c_true = ctrl(
+            0,
+            "VelAdd",
+            &[],
+            &[(1, &["Time >= 0", "StateNo = 0"])],
+            None,
+            &[("x", "1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c_true])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
         ch.vel = Vec2::<f32>::ZERO;
         lc.tick(&mut ch);
-        assert!((ch.vel.x - 1.0).abs() < 1e-6, "both group conds true → fires");
+        assert!(
+            (ch.vel.x - 1.0).abs() < 1e-6,
+            "both group conds true → fires"
+        );
 
         // One condition false (StateNo = 7) → the whole AND-group is false.
-        let c_false = ctrl(0, "VelAdd", &[], &[(1, &["Time >= 0", "StateNo = 7"])], None, &[("x", "1")]);
+        let c_false = ctrl(
+            0,
+            "VelAdd",
+            &[],
+            &[(1, &["Time >= 0", "StateNo = 7"])],
+            None,
+            &[("x", "1")],
+        );
         let lc2 = loaded(vec![stand_n(0, vec![c_false])], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
         ch2.physics = Physics::None;
         ch2.vel = Vec2::<f32>::ZERO;
         lc2.tick(&mut ch2);
-        assert!((ch2.vel.x - 0.0).abs() < 1e-6, "one false group cond → skipped");
+        assert!(
+            (ch2.vel.x - 0.0).abs() < 1e-6,
+            "one false group cond → skipped"
+        );
     }
 
     // ---- AC1: OR across multiple contiguous groups ----
@@ -6426,7 +7131,10 @@ mod tests {
             None,
             &[("value", "9")],
         );
-        let lc = loaded(vec![stand_n(0, vec![c]), stand_n(9, vec![])], tiny_air(0, &[5]));
+        let lc = loaded(
+            vec![stand_n(0, vec![c]), stand_n(9, vec![])],
+            tiny_air(0, &[5]),
+        );
         let mut ch = Character::new();
         ch.state_no = 0;
         assert_eq!(lc.tick(&mut ch).transitions, 1);
@@ -6491,7 +7199,10 @@ mod tests {
         // which is always false → the controller can never fire. Use a malformed
         // expression ("1 +") that compiles to the fallback.
         let bad = CompiledExpr::compile("1 +");
-        assert!(bad.is_fallback, "precondition: malformed expr is a fallback");
+        assert!(
+            bad.is_fallback,
+            "precondition: malformed expr is a fallback"
+        );
         let c = CompiledController {
             state_number: 0,
             label: String::new(),
@@ -6533,7 +7244,14 @@ mod tests {
     #[test]
     fn change_state_ctrl_param_overrides_ctrl_flag() {
         // ChangeState's optional `ctrl` param sets the control flag on transition.
-        let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "1"), ("ctrl", "1")]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1"), ("ctrl", "1")],
+        );
         // Destination state 1 has NO ctrl entry param, so the ChangeState ctrl wins.
         let lc = loaded(
             vec![stand_n(0, vec![c]), stand_n(1, vec![])],
@@ -6552,7 +7270,14 @@ mod tests {
         // Transition to a state not in the graph: the cursor moves (so triggers
         // reading StateNo see the requested number) but no entry params apply, and
         // nothing panics.
-        let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "12345")]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "12345")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6572,7 +7297,14 @@ mod tests {
         // state_time resets to 0 (then +1 from advance_time), prev = self.
         // Gate it so it fires only once (persistent semantics not the point here):
         // use Time = 0 so after the reset+advance it no longer qualifies.
-        let c = ctrl(0, "ChangeState", &[], &[(1, &["Time = 5"])], None, &[("value", "0")]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["Time = 5"])],
+            None,
+            &[("value", "0")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -6592,12 +7324,24 @@ mod tests {
         // `type=SelfState value=N` must change state_no to N through the normal
         // enter_state path: prev_state_no = old, state_time reset, and the
         // destination statedef's entry header (here, anim) applied.
-        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[("value", "5210")]);
+        let c = ctrl(
+            0,
+            "SelfState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5210")],
+        );
         // Destination state 5210 carries an entry anim so we can prove the
         // statedef header ran (mirrors a get-hit recovery state's `anim`).
         let dest = state(
             5210,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("5210"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("5210"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(vec![stand_n(0, vec![c]), dest], tiny_air(5210, &[5]));
@@ -6606,10 +7350,16 @@ mod tests {
         ch.prev_state_no = -1;
         ch.anim = 0;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.transitions, 1, "SelfState transitions via enter_state");
+        assert_eq!(
+            report.transitions, 1,
+            "SelfState transitions via enter_state"
+        );
         assert_eq!(ch.state_no, 5210);
         assert_eq!(ch.prev_state_no, 0, "prev set to the departed state");
-        assert_eq!(ch.state_time, 1, "time reset on entry then advanced one tick");
+        assert_eq!(
+            ch.state_time, 1,
+            "time reset on entry then advanced one tick"
+        );
         assert_eq!(ch.anim, 5210, "destination statedef entry anim applied");
     }
 
@@ -6657,7 +7407,11 @@ mod tests {
         // Physics::None so apply_physics does not perturb the velocity we assert.
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6667,16 +7421,30 @@ mod tests {
         ch.vel = Vec2::new(4.0, 3.0);
         lc.tick(&mut ch);
         assert!((ch.vel.x - 2.0).abs() < 1e-6, "x halved, got {}", ch.vel.x);
-        assert!((ch.vel.y - 3.0).abs() < 1e-6, "absent y axis unchanged (×1.0)");
+        assert!(
+            (ch.vel.y - 3.0).abs() < 1e-6,
+            "absent y axis unchanged (×1.0)"
+        );
     }
 
     #[test]
     fn vel_mul_zero_on_both_axes_zeroes_velocity() {
         // VelMul x=0 y=0 zeroes both components.
-        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "0"), ("y", "0")]);
+        let c = ctrl(
+            0,
+            "VelMul",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "0"), ("y", "0")],
+        );
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6731,7 +7499,12 @@ mod tests {
         );
         let dest = state(
             9,
-            Entry { st: Some("S"), ph: Some("N"), ctrl: Some("0"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ctrl: Some("0"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(vec![stand_n(0, vec![c]), dest], tiny_air(0, &[5]));
@@ -6740,7 +7513,10 @@ mod tests {
         ch.ctrl = false;
         lc.tick(&mut ch);
         assert_eq!(ch.state_no, 9);
-        assert!(ch.ctrl, "controller ctrl=1 override beats destination ctrl=0 header");
+        assert!(
+            ch.ctrl,
+            "controller ctrl=1 override beats destination ctrl=0 header"
+        );
     }
 
     #[test]
@@ -6748,16 +7524,32 @@ mod tests {
         // SelfState to a state that does not exist in the map must not panic:
         // enter_state moves the cursor (transitions counted) but applies no entry
         // header. This mirrors ChangeState's "unknown state; cursor updated only".
-        let c = ctrl(0, "SelfState", &[], &[(1, &["1"])], None, &[("value", "424242")]);
+        let c = ctrl(
+            0,
+            "SelfState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "424242")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.anim = 7;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.transitions, 1, "transition counted even for unknown target");
-        assert_eq!(ch.state_no, 424_242, "cursor moved to the requested (missing) state");
+        assert_eq!(
+            report.transitions, 1,
+            "transition counted even for unknown target"
+        );
+        assert_eq!(
+            ch.state_no, 424_242,
+            "cursor moved to the requested (missing) state"
+        );
         assert_eq!(ch.prev_state_no, 0, "prev recorded");
-        assert_eq!(ch.anim, 7, "no entry header applied for a missing state → anim unchanged");
+        assert_eq!(
+            ch.anim, 7,
+            "no entry header applied for a missing state → anim unchanged"
+        );
     }
 
     #[test]
@@ -6788,10 +7580,16 @@ mod tests {
         ch.state_no = 0;
         ch.state_time = 50;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.transitions, 1, "self-transition counts as a re-entry");
+        assert_eq!(
+            report.transitions, 1,
+            "self-transition counts as a re-entry"
+        );
         assert_eq!(ch.state_no, 0);
         // enter_state set state_time = 0, then advance_time ticked it to 1.
-        assert_eq!(ch.state_time, 1, "state_time reset on re-entry then advanced");
+        assert_eq!(
+            ch.state_time, 1,
+            "state_time reset on re-entry then advanced"
+        );
     }
 
     // ---- Proctor: extra VelMul coverage (edge + MUGEN semantics) -----------
@@ -6802,7 +7600,11 @@ mod tests {
         let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("y", "2.0")]);
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6811,8 +7613,15 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::new(5.0, -1.5);
         lc.tick(&mut ch);
-        assert!((ch.vel.x - 5.0).abs() < 1e-6, "absent x axis unchanged (×1.0)");
-        assert!((ch.vel.y - (-3.0)).abs() < 1e-6, "y doubled, got {}", ch.vel.y);
+        assert!(
+            (ch.vel.x - 5.0).abs() < 1e-6,
+            "absent x axis unchanged (×1.0)"
+        );
+        assert!(
+            (ch.vel.y - (-3.0)).abs() < 1e-6,
+            "y doubled, got {}",
+            ch.vel.y
+        );
     }
 
     #[test]
@@ -6822,7 +7631,11 @@ mod tests {
         let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[]);
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6831,7 +7644,10 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::new(3.25, -6.5);
         let report = lc.tick(&mut ch);
-        assert_eq!(report.controllers_fired, 1, "VelMul fired even with no params");
+        assert_eq!(
+            report.controllers_fired, 1,
+            "VelMul fired even with no params"
+        );
         assert!((ch.vel.x - 3.25).abs() < 1e-6, "x unchanged");
         assert!((ch.vel.y - (-6.5)).abs() < 1e-6, "y unchanged");
     }
@@ -6839,10 +7655,21 @@ mod tests {
     #[test]
     fn vel_mul_negative_factor_reverses_direction() {
         // A negative multiplier flips the sign and scales magnitude.
-        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "-2"), ("y", "-0.5")]);
+        let c = ctrl(
+            0,
+            "VelMul",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "-2"), ("y", "-0.5")],
+        );
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6851,18 +7678,37 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::new(3.0, -8.0);
         lc.tick(&mut ch);
-        assert!((ch.vel.x - (-6.0)).abs() < 1e-6, "x = 3 × -2, got {}", ch.vel.x);
-        assert!((ch.vel.y - 4.0).abs() < 1e-6, "y = -8 × -0.5, got {}", ch.vel.y);
+        assert!(
+            (ch.vel.x - (-6.0)).abs() < 1e-6,
+            "x = 3 × -2, got {}",
+            ch.vel.x
+        );
+        assert!(
+            (ch.vel.y - 4.0).abs() < 1e-6,
+            "y = -8 × -0.5, got {}",
+            ch.vel.y
+        );
     }
 
     #[test]
     fn vel_mul_evaluates_an_expression_factor() {
         // The factor is an expr, like KFM's `x = .85 * ifelse(...)`. Use a pure
         // arithmetic expr so the result is deterministic: x ×= (0.5 * 0.5) = 0.25.
-        let c = ctrl(0, "VelMul", &[], &[(1, &["1"])], None, &[("x", "0.5 * 0.5")]);
+        let c = ctrl(
+            0,
+            "VelMul",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "0.5 * 0.5")],
+        );
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6871,7 +7717,11 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::new(8.0, 1.0);
         lc.tick(&mut ch);
-        assert!((ch.vel.x - 2.0).abs() < 1e-6, "x = 8 × 0.25, got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 2.0).abs() < 1e-6,
+            "x = 8 × 0.25, got {}",
+            ch.vel.x
+        );
         assert!((ch.vel.y - 1.0).abs() < 1e-6, "absent y unchanged");
     }
 
@@ -6892,7 +7742,11 @@ mod tests {
         );
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
             vec![c],
         );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6903,9 +7757,17 @@ mod tests {
         // Must not panic.
         lc.tick(&mut ch);
         // Garbage x → const-0 fallback → 4 × 0 = 0 (defined, non-panicking).
-        assert!((ch.vel.x).abs() < 1e-6, "garbage x factor → 0 fallback, got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x).abs() < 1e-6,
+            "garbage x factor → 0 fallback, got {}",
+            ch.vel.x
+        );
         // Valid y still applied: 2 × 3 = 6.
-        assert!((ch.vel.y - 6.0).abs() < 1e-6, "valid y still scaled, got {}", ch.vel.y);
+        assert!(
+            (ch.vel.y - 6.0).abs() < 1e-6,
+            "valid y still scaled, got {}",
+            ch.vel.y
+        );
     }
 
     #[test]
@@ -6915,7 +7777,11 @@ mod tests {
             let c = ctrl(0, spelling, &[], &[(1, &["1"])], None, &[("x", "0.5")]);
             let st = state(
                 0,
-                Entry { st: Some("S"), ph: Some("N"), ..Entry::default() },
+                Entry {
+                    st: Some("S"),
+                    ph: Some("N"),
+                    ..Entry::default()
+                },
                 vec![c],
             );
             let lc = loaded(vec![st], tiny_air(0, &[5]));
@@ -6924,7 +7790,11 @@ mod tests {
             ch.physics = Physics::None;
             ch.vel = Vec2::new(10.0, 0.0);
             lc.tick(&mut ch);
-            assert!((ch.vel.x - 5.0).abs() < 1e-6, "{spelling}: x halved, got {}", ch.vel.x);
+            assert!(
+                (ch.vel.x - 5.0).abs() < 1e-6,
+                "{spelling}: x halved, got {}",
+                ch.vel.x
+            );
         }
     }
 
@@ -6953,12 +7823,19 @@ mod tests {
         ch.vel = Vec2::new(6.0, 2.0);
         let report = lc.tick(&mut ch);
         // VelMul x=.5 applied before the SelfState moved us out of 200.
-        assert!((ch.vel.x - 3.0).abs() < 1e-6, "VelMul halved x, got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 3.0).abs() < 1e-6,
+            "VelMul halved x, got {}",
+            ch.vel.x
+        );
         assert!((ch.vel.y - 2.0).abs() < 1e-6, "absent y unchanged");
         // SelfState carried us back to state 0 with control enabled.
         assert_eq!(ch.state_no, 0, "SelfState returned to own state 0");
         assert!(ch.ctrl, "SelfState ctrl=1 enabled control");
-        assert!(report.transitions >= 1, "the SelfState transition is counted");
+        assert!(
+            report.transitions >= 1,
+            "the SelfState transition is counted"
+        );
     }
 
     // ---- Proctor: gated real-KFM fixtures for SelfState + VelMul -----------
@@ -6988,8 +7865,14 @@ mod tests {
                 })
             })
         };
-        assert!(has("SelfState"), "KFM authors at least one SelfState (e.g. state 821)");
-        assert!(has("VelMul"), "KFM authors at least one VelMul (e.g. state 1020)");
+        assert!(
+            has("SelfState"),
+            "KFM authors at least one SelfState (e.g. state 821)"
+        );
+        assert!(
+            has("VelMul"),
+            "KFM authors at least one VelMul (e.g. state 1020)"
+        );
     }
 
     #[test]
@@ -7038,7 +7921,11 @@ mod tests {
             (x - 8.5).abs() < 1e-4 || (x - 6.8).abs() < 1e-4,
             "VelMul scaled x by .85×{{1,.8}}; expected 8.5 or 6.8, got {x}"
         );
-        assert!((ch.vel.y - 4.0).abs() < 1e-6, "absent y axis unchanged, got {}", ch.vel.y);
+        assert!(
+            (ch.vel.y - 4.0).abs() < 1e-6,
+            "absent y axis unchanged, got {}",
+            ch.vel.y
+        );
     }
 
     // ---- AC1: persistent re-arms on state re-entry (fire_counts cleared) ----
@@ -7050,12 +7937,44 @@ mod tests {
         // State 0: a persistent=0 VelAdd, plus a ChangeState->1 gated on Time=1.
         // State 1: a ChangeState->0 gated on Time=1, sending us back.
         let add = ctrl(0, "VelAdd", &[], &[(1, &["1"])], Some("0"), &[("x", "1")]);
-        let go1 = ctrl(0, "ChangeState", &[], &[(1, &["Time = 1"])], None, &[("value", "1")]);
-        let go0 = ctrl(1, "ChangeState", &[], &[(1, &["Time = 1"])], None, &[("value", "0")]);
+        let go1 = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["Time = 1"])],
+            None,
+            &[("value", "1")],
+        );
+        let go0 = ctrl(
+            1,
+            "ChangeState",
+            &[],
+            &[(1, &["Time = 1"])],
+            None,
+            &[("value", "0")],
+        );
         let lc = loaded(
             vec![
-                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![add, go1]),
-                state(1, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go0]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![add, go1],
+                ),
+                state(
+                    1,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![go0],
+                ),
             ],
             tiny_air(0, &[5]),
         );
@@ -7071,14 +7990,21 @@ mod tests {
         //         go1 fires → enter state 1 (clears fire_counts).
         lc.tick(&mut ch);
         assert_eq!(ch.state_no, 1, "moved to state 1");
-        assert!((ch.vel.x - 1.0).abs() < 1e-6, "add did not refire same entry");
+        assert!(
+            (ch.vel.x - 1.0).abs() < 1e-6,
+            "add did not refire same entry"
+        );
         // Tick 3: in state 1, Time=1 (entered last tick, advanced). go0 fires →
         //         back to state 0 (fresh entry, fire_counts cleared again).
         lc.tick(&mut ch);
         assert_eq!(ch.state_no, 0, "back to state 0");
         // Tick 4: new entry into 0, Time=1 → add fires AGAIN (re-armed).
         lc.tick(&mut ch);
-        assert!((ch.vel.x - 2.0).abs() < 1e-6, "add re-armed on re-entry, got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 2.0).abs() < 1e-6,
+            "add re-armed on re-entry, got {}",
+            ch.vel.x
+        );
     }
 
     #[test]
@@ -7109,7 +8035,16 @@ mod tests {
         // VelSet x=10 in a stand-physics state, then friction *0.85 applies the
         // SAME tick → final x = 10 * 0.85, proving controllers run before physics.
         let vset = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "10")]);
-        let st = state(0, Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![vset]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![vset],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7117,7 +8052,11 @@ mod tests {
         ch.vel = Vec2::<f32>::ZERO;
         lc.tick(&mut ch);
         let f = CharacterConstants::default().movement.stand_friction;
-        assert!((ch.vel.x - 10.0 * f).abs() < 1e-6, "friction applied after VelSet; got {}", ch.vel.x);
+        assert!(
+            (ch.vel.x - 10.0 * f).abs() < 1e-6,
+            "friction applied after VelSet; got {}",
+            ch.vel.x
+        );
     }
 
     #[test]
@@ -7148,7 +8087,10 @@ mod tests {
         ch2.physics = Physics::Crouch;
         ch2.vel = Vec2::new(8.0, 0.0);
         lc.tick(&mut ch2);
-        assert!((ch2.vel.x - 2.0).abs() < 1e-6, "custom crouch friction 0.25");
+        assert!(
+            (ch2.vel.x - 2.0).abs() < 1e-6,
+            "custom crouch friction 0.25"
+        );
 
         // Air gravity 1.5.
         let mut ch3 = Character::with_constants(consts);
@@ -7156,7 +8098,10 @@ mod tests {
         ch3.physics = Physics::Air;
         ch3.vel = Vec2::new(0.0, -3.0);
         lc.tick(&mut ch3);
-        assert!((ch3.vel.y - (-1.5)).abs() < 1e-6, "custom gravity 1.5 added");
+        assert!(
+            (ch3.vel.y - (-1.5)).abs() < 1e-6,
+            "custom gravity 1.5 added"
+        );
     }
 
     #[test]
@@ -7179,10 +8124,39 @@ mod tests {
     fn entry_unchanged_tokens_keep_prior_category() {
         // A statedef with type=U / movetype=U / physics=U must NOT clobber the
         // character's existing category on entry (MUGEN "unchanged" semantics).
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
-        let dest = state(5, Entry { st: Some("U"), mv: Some("U"), ph: Some("U"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
+        let dest = state(
+            5,
+            Entry {
+                st: Some("U"),
+                mv: Some("U"),
+                ph: Some("U"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![go],
+                ),
+                dest,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -7202,10 +8176,38 @@ mod tests {
     fn entry_invalid_token_keeps_prior_category() {
         // An unrecognized type token (e.g. "Z") yields None from from_token, so the
         // category is left unchanged rather than reset or panicking.
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
-        let dest = state(5, Entry { st: Some("Z"), ph: Some("?"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
+        let dest = state(
+            5,
+            Entry {
+                st: Some("Z"),
+                ph: Some("?"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(
-            vec![state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![go]), dest],
+            vec![
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("0"),
+                        ..Entry::default()
+                    },
+                    vec![go],
+                ),
+                dest,
+            ],
             tiny_air(0, &[5]),
         );
         let mut ch = Character::new();
@@ -7214,16 +8216,40 @@ mod tests {
         ch.physics = Physics::Air;
         lc.tick(&mut ch);
         assert_eq!(ch.state_no, 5);
-        assert_eq!(ch.state_type, StateType::Air, "invalid type token left unchanged");
-        assert_eq!(ch.physics, Physics::Air, "invalid physics token left unchanged");
+        assert_eq!(
+            ch.state_type,
+            StateType::Air,
+            "invalid type token left unchanged"
+        );
+        assert_eq!(
+            ch.physics,
+            Physics::Air,
+            "invalid physics token left unchanged"
+        );
     }
 
     #[test]
     fn entry_anim_resets_element_and_time() {
         // Entering a state with an `anim` header resets the element cursor and the
         // element time to 0, even if they were mid-animation before.
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
-        let dest = state(5, Entry { st: Some("S"), ph: Some("N"), anim: Some("5"), ..Entry::default() }, vec![]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
+        let dest = state(
+            5,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("5"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![stand_n(0, vec![go]), dest], {
             let mut air = tiny_air(0, &[5]);
             add_action(&mut air, 5, &[10, 10]);
@@ -7244,8 +8270,25 @@ mod tests {
     #[test]
     fn entry_velset_pair_and_scalar() {
         // velset with both components, and velset with a single (x-only) value.
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "5")]);
-        let pair = state(5, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), velset: Some("6, -4"), ..Entry::default() }, vec![]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
+        let pair = state(
+            5,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                velset: Some("6, -4"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![stand_n(0, vec![go]), pair], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7255,8 +8298,25 @@ mod tests {
         assert!((ch.vel.y - (-4.0)).abs() < 1e-6);
 
         // Scalar velset (x only) → y component becomes 0.
-        let go2 = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "6")]);
-        let scalar = state(6, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), velset: Some("9"), ..Entry::default() }, vec![]);
+        let go2 = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "6")],
+        );
+        let scalar = state(
+            6,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                velset: Some("9"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc2 = loaded(vec![stand_n(0, vec![go2]), scalar], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
@@ -7284,7 +8344,14 @@ mod tests {
 
     #[test]
     fn vel_add_accumulates_both_axes() {
-        let add = ctrl(0, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "2"), ("y", "-1")]);
+        let add = ctrl(
+            0,
+            "VelAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "2"), ("y", "-1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7301,7 +8368,16 @@ mod tests {
     fn animation_advances_to_nonzero_loopstart() {
         // Two frames, loopstart = 1: after the last frame, loop back to element 1,
         // never returning to element 0.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], air_with_loopstart(0, &[1, 1], 1));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7320,7 +8396,15 @@ mod tests {
     fn animation_unknown_action_is_safe_noop() {
         // The current anim id has no action in the AIR file: advancing must be a
         // no-op (cursor untouched), not a panic.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         // State entry sets no anim, so ch.anim stays whatever we set (777, absent).
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -7338,7 +8422,16 @@ mod tests {
         // For a finite 2-frame action (durations 3 and 2 → total 5), AnimTime is
         // maintained as the negative ticks-until-end. After one tick in element 0,
         // 4 ticks remain → AnimTime = -4.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7346,14 +8439,26 @@ mod tests {
         ch.anim_elem = 0;
         ch.anim_elem_time = 0;
         lc.tick(&mut ch); // elem 0, elem_time 1 → remaining (3-1)+2 = 4
-        assert_eq!(ch.anim_time, -4, "AnimTime counts down negatively; got {}", ch.anim_time);
+        assert_eq!(
+            ch.anim_time, -4,
+            "AnimTime counts down negatively; got {}",
+            ch.anim_time
+        );
     }
 
     #[test]
     fn out_of_range_anim_element_is_clamped_not_panicking() {
         // An externally-corrupted anim_elem (beyond the action length) must be
         // clamped into range by advance_animation rather than panicking.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[2, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -7361,7 +8466,11 @@ mod tests {
         ch.anim_elem = 99; // out of range for a 2-frame action
         ch.anim_elem_time = 0;
         lc.tick(&mut ch); // must not panic
-        assert!(ch.anim_elem >= 0 && ch.anim_elem < 2, "clamped into range; got {}", ch.anim_elem);
+        assert!(
+            ch.anim_elem >= 0 && ch.anim_elem < 2,
+            "clamped into range; got {}",
+            ch.anim_elem
+        );
     }
 
     // ---- AC4: TickReport counters are accurate ----
@@ -7371,7 +8480,14 @@ mod tests {
         // Two firing controllers and one transition in a single tick.
         let add = ctrl(0, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "1")]);
         let set = ctrl(0, "CtrlSet", &[], &[(1, &["1"])], None, &[("value", "1")]);
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "1")]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
         let lc = loaded(
             vec![stand_n(0, vec![add, set, go]), stand_n(1, vec![])],
             tiny_air(0, &[5]),
@@ -7391,7 +8507,14 @@ mod tests {
     fn controllers_after_transition_in_same_state_are_skipped() {
         // Once a ChangeState fires, the remaining controllers of the OLD state are
         // not run this tick (MUGEN stops processing the old state's list).
-        let go = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "1")]);
+        let go = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
         let after = ctrl(0, "VelAdd", &[], &[(1, &["1"])], None, &[("x", "999")]);
         let lc = loaded(
             vec![stand_n(0, vec![go, after]), stand_n(1, vec![])],
@@ -7403,7 +8526,10 @@ mod tests {
         ch.vel = Vec2::<f32>::ZERO;
         lc.tick(&mut ch);
         assert_eq!(ch.state_no, 1);
-        assert!((ch.vel.x - 0.0).abs() < 1e-6, "post-ChangeState controller in old state must not run");
+        assert!(
+            (ch.vel.x - 0.0).abs() < 1e-6,
+            "post-ChangeState controller in old state must not run"
+        );
     }
 
     // ---- AC4: no-state special slots are skipped without error ----
@@ -7459,7 +8585,14 @@ mod tests {
     fn controller_type_match_is_case_insensitive() {
         // MUGEN controller names are case-insensitive: "velset"/"VELSET" dispatch.
         let lower = ctrl(0, "velset", &[], &[(1, &["1"])], None, &[("x", "3")]);
-        let upper = ctrl(0, "CHANGESTATE", &[], &[(1, &["Time = 0"])], None, &[("value", "1")]);
+        let upper = ctrl(
+            0,
+            "CHANGESTATE",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("value", "1")],
+        );
         let lc = loaded(
             vec![stand_n(0, vec![lower, upper]), stand_n(1, vec![])],
             tiny_air(0, &[5]),
@@ -7521,10 +8654,7 @@ mod tests {
         // the character via integration). Anim 0 has two 1-tick frames so a
         // running tick advances the element each tick.
         let mover = ctrl(0, "VelSet", &[], &[(1, &["1"])], None, &[("x", "1")]);
-        let lc = loaded(
-            vec![stand_n(0, vec![mover])],
-            tiny_air(0, &[1, 1]),
-        );
+        let lc = loaded(vec![stand_n(0, vec![mover])], tiny_air(0, &[1, 1]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.anim = 0;
@@ -7543,7 +8673,10 @@ mod tests {
         assert_eq!(ch.anim_elem, anim_elem0, "anim frozen");
         assert_eq!(ch.state_time, time0, "state Time frozen");
         assert_eq!(ch.pos, pos0, "position frozen (no physics integration)");
-        assert_eq!(ch.vel.x, 0.0, "VelSet did not fire (controller is gated off)");
+        assert_eq!(
+            ch.vel.x, 0.0,
+            "VelSet did not fire (controller is gated off)"
+        );
         assert_eq!(r1.controllers_fired, 0, "no controllers fire while frozen");
 
         // Tick 2: still frozen. hitpause counts 1 -> 0.
@@ -7558,8 +8691,14 @@ mod tests {
         let r3 = lc.tick(&mut ch);
         assert!(!r3.hitpaused, "freeze is over; tick runs normally");
         assert_eq!(ch.vel.x, 1.0, "VelSet fired on the resumed tick");
-        assert!(ch.pos.x > pos0.x, "position integrated once the freeze ended");
-        assert!(ch.state_time > time0, "state Time advances after the freeze");
+        assert!(
+            ch.pos.x > pos0.x,
+            "position integrated once the freeze ended"
+        );
+        assert!(
+            ch.state_time > time0,
+            "state Time advances after the freeze"
+        );
     }
 
     /// AC2/AC4: during a freeze, an `ignorehitpause`-flagged controller still
@@ -7569,9 +8708,21 @@ mod tests {
         // State 0 has two VarSet controllers, both unconditionally triggered:
         //  - idx 0: writes var(0) = 1, NO ignorehitpause -> skipped while frozen.
         //  - idx 1: writes var(1) = 1, ignorehitpause = 1 -> runs while frozen.
-        let normal = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "0"), ("value", "1")]);
-        let flagged =
-            ctrl_ihp(0, "VarSet", &[(1, &["1"])], "1", &[("v", "1"), ("value", "1")]);
+        let normal = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("v", "0"), ("value", "1")],
+        );
+        let flagged = ctrl_ihp(
+            0,
+            "VarSet",
+            &[(1, &["1"])],
+            "1",
+            &[("v", "1"), ("value", "1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![normal, flagged])], tiny_air(0, &[1]));
 
         let mut ch = Character::new();
@@ -7580,23 +8731,37 @@ mod tests {
 
         let report = lc.tick(&mut ch);
         assert!(report.hitpaused, "the tick is hit-paused");
-        assert_eq!(ch.vars[0], 0, "normal controller is SKIPPED during the pause");
-        assert_eq!(ch.vars[1], 1, "ignorehitpause controller STILL fires during pause");
+        assert_eq!(
+            ch.vars[0], 0,
+            "normal controller is SKIPPED during the pause"
+        );
+        assert_eq!(
+            ch.vars[1], 1,
+            "ignorehitpause controller STILL fires during pause"
+        );
         assert_eq!(report.controllers_fired, 1, "exactly the flagged one fired");
         assert_eq!(ch.hitpause_time(), 0, "pause counted down to zero");
 
         // After the pause ends, the normal controller fires too.
         let report2 = lc.tick(&mut ch);
         assert!(!report2.hitpaused);
-        assert_eq!(ch.vars[0], 1, "normal controller fires once the freeze ends");
+        assert_eq!(
+            ch.vars[0], 1,
+            "normal controller fires once the freeze ends"
+        );
     }
 
     /// AC2: an `ignorehitpause` whose expression evaluates to `0` is treated as
     /// absent — the controller is skipped during a freeze, like any normal one.
     #[test]
     fn ignorehitpause_evaluating_to_zero_is_skipped_during_pause() {
-        let flagged_off =
-            ctrl_ihp(0, "VarSet", &[(1, &["1"])], "0", &[("v", "2"), ("value", "9")]);
+        let flagged_off = ctrl_ihp(
+            0,
+            "VarSet",
+            &[(1, &["1"])],
+            "0",
+            &[("v", "2"), ("value", "9")],
+        );
         let lc = loaded(vec![stand_n(0, vec![flagged_off])], tiny_air(0, &[1]));
 
         let mut ch = Character::new();
@@ -7605,7 +8770,10 @@ mod tests {
 
         let report = lc.tick(&mut ch);
         assert!(report.hitpaused);
-        assert_eq!(ch.vars[2], 0, "ignorehitpause=0 controller is skipped while frozen");
+        assert_eq!(
+            ch.vars[2], 0,
+            "ignorehitpause=0 controller is skipped while frozen"
+        );
         assert_eq!(report.controllers_fired, 0);
     }
 
@@ -7645,7 +8813,11 @@ mod tests {
         assert_eq!(ch.vel.x, 1.0, "VelSet ran on the unpaused tick");
         assert!(ch.pos.x > pos0.x, "physics integrated normally");
         assert!(ch.state_time > 0, "state Time advanced normally");
-        assert_eq!(ch.hitpause_time(), 0, "still zero — nothing decremented below 0");
+        assert_eq!(
+            ch.hitpause_time(),
+            0,
+            "still zero — nothing decremented below 0"
+        );
     }
 
     /// AC2: `hitpause == 1` is a single-tick freeze: one frozen tick (counter
@@ -7678,9 +8850,22 @@ mod tests {
     #[test]
     fn ignorehitpause_controller_in_special_state_runs_during_pause() {
         // [Statedef -2]: writes var(3) = 1, ignorehitpause = 1 -> runs while frozen.
-        let special = ctrl_ihp(-2, "VarSet", &[(1, &["1"])], "1", &[("v", "3"), ("value", "1")]);
+        let special = ctrl_ihp(
+            -2,
+            "VarSet",
+            &[(1, &["1"])],
+            "1",
+            &[("v", "3"), ("value", "1")],
+        );
         // Current state has a NON-flagged controller that must stay skipped.
-        let normal = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "4"), ("value", "1")]);
+        let normal = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("v", "4"), ("value", "1")],
+        );
         let lc = loaded(
             vec![stand_n(-2, vec![special]), stand_n(0, vec![normal])],
             tiny_air(0, &[1]),
@@ -7692,9 +8877,18 @@ mod tests {
 
         let report = lc.tick(&mut ch);
         assert!(report.hitpaused);
-        assert_eq!(ch.vars[3], 1, "special-state ignorehitpause controller fires");
-        assert_eq!(ch.vars[4], 0, "current-state normal controller stays skipped");
-        assert_eq!(report.controllers_fired, 1, "only the flagged special one fired");
+        assert_eq!(
+            ch.vars[3], 1,
+            "special-state ignorehitpause controller fires"
+        );
+        assert_eq!(
+            ch.vars[4], 0,
+            "current-state normal controller stays skipped"
+        );
+        assert_eq!(
+            report.controllers_fired, 1,
+            "only the flagged special one fired"
+        );
     }
 
     /// AC2/MUGEN-semantics: a `ChangeState` carried by an `ignorehitpause`
@@ -7721,8 +8915,14 @@ mod tests {
 
         let report = lc.tick(&mut ch);
         assert!(report.hitpaused);
-        assert_eq!(ch.state_no, 7, "the ChangeState dispatched and moved the cursor");
-        assert_eq!(ch.vel.x, 0.0, "destination state was NOT re-processed this frozen tick");
+        assert_eq!(
+            ch.state_no, 7,
+            "the ChangeState dispatched and moved the cursor"
+        );
+        assert_eq!(
+            ch.vel.x, 0.0,
+            "destination state was NOT re-processed this frozen tick"
+        );
         assert_eq!(ch.hitpause_time(), 0, "freeze still counted down");
     }
 
@@ -7753,7 +8953,10 @@ mod tests {
         // the normal path (3 -> 2 -> 1). The mover now fires.
         let r2 = lc.tick(&mut ch);
         assert!(!r2.hitpaused, "freeze over once hitpause hit 0");
-        assert_eq!(ch.shaketime, 1, "remaining shake counts down on a normal tick");
+        assert_eq!(
+            ch.shaketime, 1,
+            "remaining shake counts down on a normal tick"
+        );
         assert_eq!(ch.vel.x, 1.0, "mover fires once the freeze ended");
 
         // Tick 3: shaketime 1 -> 0.
@@ -7766,7 +8969,14 @@ mod tests {
     /// transition is gated off with every other non-`ignorehitpause` controller.
     #[test]
     fn normal_changestate_is_suppressed_during_freeze() {
-        let jump = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "42")]);
+        let jump = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "42")],
+        );
         let lc = loaded(
             vec![stand_n(0, vec![jump]), stand_n(42, vec![])],
             tiny_air(0, &[1]),
@@ -7779,7 +8989,10 @@ mod tests {
         assert!(r.hitpaused);
         assert_eq!(ch.state_no, 0, "no transition while frozen");
         assert_eq!(r.transitions, 0, "no transitions counted during a freeze");
-        assert_eq!(r.controllers_fired, 0, "the normal ChangeState did not fire");
+        assert_eq!(
+            r.controllers_fired, 0,
+            "the normal ChangeState did not fire"
+        );
     }
 
     // ---- AC5: full multi-tick walk-cycle integration through the executor ----
@@ -7791,13 +9004,47 @@ mod tests {
         //  - State 20 (walk): VelSet x = walk speed each tick; on Time>=2 with no
         //    command → ChangeState back to 0.
         // Drives several ticks and checks the cursor + velocity evolve correctly.
-        let to_walk = ctrl(0, "ChangeState", &["ctrl"], &[(1, &["command = \"holdfwd\""])], None, &[("value", "20")]);
+        let to_walk = ctrl(
+            0,
+            "ChangeState",
+            &["ctrl"],
+            &[(1, &["command = \"holdfwd\""])],
+            None,
+            &[("value", "20")],
+        );
         let walk_vel = ctrl(20, "VelSet", &[], &[(1, &["1"])], None, &[("x", "2.4")]);
-        let to_stand = ctrl(20, "ChangeState", &[], &[(1, &["Time >= 2"])], None, &[("value", "0")]);
+        let to_stand = ctrl(
+            20,
+            "ChangeState",
+            &[],
+            &[(1, &["Time >= 2"])],
+            None,
+            &[("value", "0")],
+        );
         let lc = loaded(
             vec![
-                state(0, Entry { st: Some("S"), mv: Some("I"), ph: Some("S"), anim: Some("0"), ctrl: Some("1"), ..Entry::default() }, vec![to_walk]),
-                state(20, Entry { st: Some("S"), ph: Some("N"), anim: Some("20"), ..Entry::default() }, vec![walk_vel, to_stand]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        mv: Some("I"),
+                        ph: Some("S"),
+                        anim: Some("0"),
+                        ctrl: Some("1"),
+                        ..Entry::default()
+                    },
+                    vec![to_walk],
+                ),
+                state(
+                    20,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("20"),
+                        ..Entry::default()
+                    },
+                    vec![walk_vel, to_stand],
+                ),
             ],
             {
                 let mut air = tiny_air(0, &[4]);
@@ -7839,7 +9086,10 @@ mod tests {
                 break;
             }
         }
-        assert!(returned, "walk should return to stand once Time >= 2 and command released");
+        assert!(
+            returned,
+            "walk should return to stand once Time >= 2 and command released"
+        );
     }
 
     // ---- AC1: persistent counts collide across special and current states ----
@@ -7870,7 +9120,11 @@ mod tests {
         lc.tick(&mut ch);
         lc.tick(&mut ch);
         // Each tick: +100 (from -2) and +1 (current) → 2 ticks = 202.
-        assert!((ch.vel.y - 202.0).abs() < 1e-6, "both fire every tick; got {}", ch.vel.y);
+        assert!(
+            (ch.vel.y - 202.0).abs() < 1e-6,
+            "both fire every tick; got {}",
+            ch.vel.y
+        );
     }
 
     // ---- AC1/AC4: in-tick re-entry chains follow ChangeState in the same tick --
@@ -7880,8 +9134,22 @@ mod tests {
         // A ChangeState lands in a state whose own controller immediately fires
         // another ChangeState: MUGEN follows the chain within the same tick. Here
         // 0 → 1 → 2 all resolve in one tick, ending in state 2.
-        let go1 = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "1")]);
-        let go2 = ctrl(1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "2")]);
+        let go1 = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
+        let go2 = ctrl(
+            1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "2")],
+        );
         let lc = loaded(
             vec![
                 stand_n(0, vec![go1]),
@@ -7912,7 +9180,14 @@ mod tests {
     fn change_anim_sets_anim_and_resets_cursor() {
         // ChangeAnim value=5 must switch the anim and reset elem/elem_time to the
         // start of the new action (then the per-tick advance moves elem_time to 1).
-        let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let c = ctrl(
+            0,
+            "ChangeAnim",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], {
             let mut air = tiny_air(0, &[5]);
             add_action(&mut air, 5, &[10, 10]);
@@ -7926,13 +9201,23 @@ mod tests {
         lc.tick(&mut ch);
         assert_eq!(ch.anim, 5, "anim switched");
         assert_eq!(ch.anim_elem, 0, "element reset");
-        assert_eq!(ch.anim_elem_time, 1, "elem time reset to 0 then advanced one tick");
+        assert_eq!(
+            ch.anim_elem_time, 1,
+            "elem time reset to 0 then advanced one tick"
+        );
     }
 
     #[test]
     fn change_anim_with_elem_starts_at_one_based_element() {
         // ChangeAnim with elem=2 starts at one-based element 2 → zero-based 1.
-        let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5"), ("elem", "2")]);
+        let c = ctrl(
+            0,
+            "ChangeAnim",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5"), ("elem", "2")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], {
             let mut air = tiny_air(0, &[5]);
             add_action(&mut air, 5, &[10, 10, 10]);
@@ -7949,7 +9234,14 @@ mod tests {
     #[test]
     fn change_anim2_aliases_change_anim() {
         // ChangeAnim2 behaves as ChangeAnim for a single entity.
-        let c = ctrl(0, "ChangeAnim2", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let c = ctrl(
+            0,
+            "ChangeAnim2",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], {
             let mut air = tiny_air(0, &[5]);
             add_action(&mut air, 5, &[10]);
@@ -7990,7 +9282,14 @@ mod tests {
         assert!((ch.pos.x - 50.0).abs() < 1e-6, "x set");
         assert!((ch.pos.y - (-2.0)).abs() < 1e-6, "y left unchanged");
 
-        let both = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "3"), ("y", "-4")]);
+        let both = ctrl(
+            0,
+            "PosSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "3"), ("y", "-4")],
+        );
         let lc2 = loaded(vec![stand_n(0, vec![both])], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
@@ -8004,7 +9303,14 @@ mod tests {
     #[test]
     fn pos_add_accumulates_both_axes() {
         // Default facing is Right (sign +1), so PosAdd x adds as written.
-        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "2"), ("y", "-1")]);
+        let add = ctrl(
+            0,
+            "PosAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "2"), ("y", "-1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8033,9 +9339,16 @@ mod tests {
         ch.pos = Vec2::<f32>::ZERO;
         ch.vel = Vec2::new(3.0, 0.0);
         lc.tick(&mut ch);
-        assert!((ch.pos.x - 3.0).abs() < 1e-6, "facing right + vel.x=+3 -> +x; got {}", ch.pos.x);
+        assert!(
+            (ch.pos.x - 3.0).abs() < 1e-6,
+            "facing right + vel.x=+3 -> +x; got {}",
+            ch.pos.x
+        );
         // The stored velocity is unchanged (facing-relative, not mirrored).
-        assert!((ch.vel.x - 3.0).abs() < 1e-6, "stored vel.x stays facing-relative (+3)");
+        assert!(
+            (ch.vel.x - 3.0).abs() < 1e-6,
+            "stored vel.x stays facing-relative (+3)"
+        );
     }
 
     #[test]
@@ -8051,9 +9364,16 @@ mod tests {
         ch.pos = Vec2::<f32>::ZERO;
         ch.vel = Vec2::new(3.0, 0.0);
         lc.tick(&mut ch);
-        assert!((ch.pos.x - (-3.0)).abs() < 1e-6, "facing left + vel.x=+3 -> -x; got {}", ch.pos.x);
+        assert!(
+            (ch.pos.x - (-3.0)).abs() < 1e-6,
+            "facing left + vel.x=+3 -> -x; got {}",
+            ch.pos.x
+        );
         // Stored velocity is still +3 (facing-relative), NOT mirrored to -3.
-        assert!((ch.vel.x - 3.0).abs() < 1e-6, "stored vel.x stays facing-relative (+3) when facing left");
+        assert!(
+            (ch.vel.x - 3.0).abs() < 1e-6,
+            "stored vel.x stays facing-relative (+3) when facing left"
+        );
     }
 
     #[test]
@@ -8067,8 +9387,14 @@ mod tests {
         ch.pos = Vec2::<f32>::ZERO;
         ch.vel = Vec2::new(0.0, -4.0);
         lc.tick(&mut ch);
-        assert!((ch.pos.y - (-4.0)).abs() < 1e-6, "y integrated unmirrored even facing left");
-        assert!((ch.pos.x - 0.0).abs() < 1e-6, "no x velocity -> no x motion");
+        assert!(
+            (ch.pos.y - (-4.0)).abs() < 1e-6,
+            "y integrated unmirrored even facing left"
+        );
+        assert!(
+            (ch.pos.x - 0.0).abs() < 1e-6,
+            "no x velocity -> no x motion"
+        );
     }
 
     #[test]
@@ -8100,7 +9426,10 @@ mod tests {
         left.facing = Facing::Left;
         left.pos = Vec2::new(50.0, 0.0);
         let px = EvalContext::trigger(&left, "Pos", &[Value::Int(0)]).to_float();
-        assert!((px - 50.0).abs() < 1e-6, "Pos X is absolute stage position; got {px}");
+        assert!(
+            (px - 50.0).abs() < 1e-6,
+            "Pos X is absolute stage position; got {px}"
+        );
     }
 
     #[test]
@@ -8110,7 +9439,14 @@ mod tests {
         // the integration adds nothing and we observe PosAdd in isolation.
         // PosAdd y is negative (upward / above the floor) so the per-tick ground
         // clamp leaves it untouched; this test is about facing-relative x.
-        let add = ctrl(0, "PosAdd", &[], &[(1, &["1"])], None, &[("x", "5"), ("y", "-2")]);
+        let add = ctrl(
+            0,
+            "PosAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "5"), ("y", "-2")],
+        );
         let lc = loaded(vec![stand_n(0, vec![add.clone()])], tiny_air(0, &[5]));
         let mut right = Character::new();
         right.state_no = 0;
@@ -8118,8 +9454,14 @@ mod tests {
         right.facing = Facing::Right;
         right.pos = Vec2::<f32>::ZERO;
         lc.tick(&mut right);
-        assert!((right.pos.x - 5.0).abs() < 1e-6, "facing right PosAdd x=+5 -> +5");
-        assert!((right.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y is never mirrored");
+        assert!(
+            (right.pos.x - 5.0).abs() < 1e-6,
+            "facing right PosAdd x=+5 -> +5"
+        );
+        assert!(
+            (right.pos.y - (-2.0)).abs() < 1e-6,
+            "PosAdd y is never mirrored"
+        );
 
         let lc2 = loaded(vec![stand_n(0, vec![add])], tiny_air(0, &[5]));
         let mut left = Character::new();
@@ -8128,8 +9470,14 @@ mod tests {
         left.facing = Facing::Left;
         left.pos = Vec2::<f32>::ZERO;
         lc2.tick(&mut left);
-        assert!((left.pos.x - (-5.0)).abs() < 1e-6, "facing left PosAdd x=+5 -> -5 (forward)");
-        assert!((left.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y unmirrored facing left");
+        assert!(
+            (left.pos.x - (-5.0)).abs() < 1e-6,
+            "facing left PosAdd x=+5 -> -5 (forward)"
+        );
+        assert!(
+            (left.pos.y - (-2.0)).abs() < 1e-6,
+            "PosAdd y unmirrored facing left"
+        );
     }
 
     #[test]
@@ -8137,7 +9485,14 @@ mod tests {
         // PosSet writes the absolute stage x regardless of facing.
         // Y is set above the floor (negative) so the ground clamp is a no-op here;
         // this test verifies PosSet writes the absolute x irrespective of facing.
-        let set = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "7"), ("y", "-1")]);
+        let set = ctrl(
+            0,
+            "PosSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "7"), ("y", "-1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![set])], tiny_air(0, &[5]));
         let mut left = Character::new();
         left.state_no = 0;
@@ -8145,7 +9500,11 @@ mod tests {
         left.facing = Facing::Left;
         left.pos = Vec2::new(100.0, -100.0);
         lc.tick(&mut left);
-        assert!((left.pos.x - 7.0).abs() < 1e-6, "PosSet x is absolute (7), not mirrored; got {}", left.pos.x);
+        assert!(
+            (left.pos.x - 7.0).abs() < 1e-6,
+            "PosSet x is absolute (7), not mirrored; got {}",
+            left.pos.x
+        );
         assert!((left.pos.y - (-1.0)).abs() < 1e-6);
     }
 
@@ -8155,9 +9514,30 @@ mod tests {
     fn var_set_indexed_keys_target_correct_bank() {
         // var(1), fvar(2), sysvar(3), sysfvar(4) each set their own bank.
         let set_int = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("var(1)", "7")]);
-        let set_float = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("fvar(2)", "1.5")]);
-        let set_sys = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("sysvar(3)", "9")]);
-        let set_sysf = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("sysfvar(4)", "2.5")]);
+        let set_float = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("fvar(2)", "1.5")],
+        );
+        let set_sys = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("sysvar(3)", "9")],
+        );
+        let set_sysf = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("sysfvar(4)", "2.5")],
+        );
         let lc = loaded(
             vec![stand_n(0, vec![set_int, set_float, set_sys, set_sysf])],
             tiny_air(0, &[5]),
@@ -8167,15 +9547,28 @@ mod tests {
         ch.physics = Physics::None;
         lc.tick(&mut ch);
         assert_eq!(ch.vars[1], 7, "var(1) set in int bank");
-        assert!((ch.fvars[2] - 1.5).abs() < 1e-6, "fvar(2) set in float bank");
+        assert!(
+            (ch.fvars[2] - 1.5).abs() < 1e-6,
+            "fvar(2) set in float bank"
+        );
         assert_eq!(ch.sysvars[3], 9, "sysvar(3) set in sys int bank");
-        assert!((ch.sysfvars[4] - 2.5).abs() < 1e-6, "sysfvar(4) set in sys float bank");
+        assert!(
+            (ch.sysfvars[4] - 2.5).abs() < 1e-6,
+            "sysfvar(4) set in sys float bank"
+        );
     }
 
     #[test]
     fn var_set_v_value_form_targets_int_bank() {
         // The `v = i` + `value = expr` form sets the integer bank at index i.
-        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "5"), ("value", "42")]);
+        let c = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("v", "5"), ("value", "42")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8186,7 +9579,14 @@ mod tests {
 
     #[test]
     fn var_set_fv_value_form_targets_float_bank() {
-        let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("fv", "3"), ("value", "0.25")]);
+        let c = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("fv", "3"), ("value", "0.25")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8198,8 +9598,18 @@ mod tests {
     #[test]
     fn var_add_accumulates_in_int_and_float_banks() {
         let add_int = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("var(0)", "3")]);
-        let add_float = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("fvar(0)", "1.5")]);
-        let lc = loaded(vec![stand_n(0, vec![add_int, add_float])], tiny_air(0, &[5]));
+        let add_float = ctrl(
+            0,
+            "VarAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("fvar(0)", "1.5")],
+        );
+        let lc = loaded(
+            vec![stand_n(0, vec![add_int, add_float])],
+            tiny_air(0, &[5]),
+        );
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
@@ -8214,7 +9624,14 @@ mod tests {
     fn var_set_out_of_range_index_is_safe_noop() {
         // An index beyond the bank size must not panic and must change nothing.
         let c = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("var(999)", "1")]);
-        let neg = ctrl(0, "VarSet", &[], &[(1, &["1"])], None, &[("v", "-1"), ("value", "1")]);
+        let neg = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("v", "-1"), ("value", "1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c, neg])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8273,7 +9690,14 @@ mod tests {
     fn var_range_set_default_range_covers_whole_bank_without_panic() {
         // No first/last → whole int bank set; the upper bound equals the bank max
         // so the inclusive loop never indexes out of range.
-        let c = ctrl(0, "VarRangeSet", &[], &[(1, &["1"])], None, &[("value", "8")]);
+        let c = ctrl(
+            0,
+            "VarRangeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "8")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8326,7 +9750,11 @@ mod tests {
         ch.move_type = MoveType::Idle;
         lc.tick(&mut ch);
         assert_eq!(ch.move_type, MoveType::BeingHit, "movetype updated");
-        assert_eq!(ch.state_type, StateType::Crouching, "U token left statetype unchanged");
+        assert_eq!(
+            ch.state_type,
+            StateType::Crouching,
+            "U token left statetype unchanged"
+        );
     }
 
     // ---- 5.4 AC: Turn flips facing ----
@@ -8356,7 +9784,14 @@ mod tests {
     #[test]
     fn play_snd_does_not_mutate_character_state() {
         // PlaySnd emits a request but must not panic or mutate the character.
-        let c = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "1, 0")]);
+        let c = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1, 0")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8455,7 +9890,14 @@ mod tests {
     fn pause_does_not_mutate_character_state() {
         // The freeze is a deferred request: the controller must not move/pause the
         // character itself (that is the coordinator's job).
-        let c = ctrl(0, "SuperPause", &[], &[(1, &["1"])], None, &[("time", "30")]);
+        let c = ctrl(
+            0,
+            "SuperPause",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("time", "30")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8544,12 +9986,18 @@ mod tests {
     fn play_snd_garbage_value_emits_no_request() {
         // Non-numeric group, non-numeric sample, and a value missing the sample
         // each push NO request and must not panic.
-        assert!(play_snd_tick(&[("value", "abc, 0")]).sound_requests.is_empty());
-        assert!(play_snd_tick(&[("value", "1, xyz")]).sound_requests.is_empty());
+        assert!(play_snd_tick(&[("value", "abc, 0")])
+            .sound_requests
+            .is_empty());
+        assert!(play_snd_tick(&[("value", "1, xyz")])
+            .sound_requests
+            .is_empty());
         assert!(play_snd_tick(&[("value", "1")]).sound_requests.is_empty());
         assert!(play_snd_tick(&[("value", "")]).sound_requests.is_empty());
         // A bare `F` flag with no digits is unparseable → no request.
-        assert!(play_snd_tick(&[("value", "F, 5")]).sound_requests.is_empty());
+        assert!(play_snd_tick(&[("value", "F, 5")])
+            .sound_requests
+            .is_empty());
     }
 
     #[test]
@@ -8626,11 +10074,7 @@ mod tests {
 
     #[test]
     fn target_life_add_emits_value_and_kill() {
-        let ops = target_tick(
-            "TargetLifeAdd",
-            &[("value", "-40"), ("kill", "1")],
-            true,
-        );
+        let ops = target_tick("TargetLifeAdd", &[("value", "-40"), ("kill", "1")], true);
         assert_eq!(
             ops,
             vec![TargetOp::LifeAdd {
@@ -8772,7 +10216,14 @@ mod tests {
     /// proving the existing `eval_param` helper is actually wired in.
     #[test]
     fn target_state_value_reads_character_var() {
-        let c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "var(0)")]);
+        let c = ctrl(
+            0,
+            "TargetState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "var(0)")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8844,10 +10295,38 @@ mod tests {
     /// throw (state 810) shape: Bind, then State, LifeAdd, Facing each tick.
     #[test]
     fn multiple_target_controllers_emit_in_fire_order() {
-        let bind = ctrl(0, "TargetBind", &[], &[(1, &["1"])], None, &[("time", "1"), ("pos", "10, 0")]);
-        let state_c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "820")]);
-        let life = ctrl(0, "TargetLifeAdd", &[], &[(1, &["1"])], None, &[("value", "-13"), ("kill", "0")]);
-        let face = ctrl(0, "TargetFacing", &[], &[(1, &["1"])], None, &[("value", "-1")]);
+        let bind = ctrl(
+            0,
+            "TargetBind",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("time", "1"), ("pos", "10, 0")],
+        );
+        let state_c = ctrl(
+            0,
+            "TargetState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "820")],
+        );
+        let life = ctrl(
+            0,
+            "TargetLifeAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "-13"), ("kill", "0")],
+        );
+        let face = ctrl(
+            0,
+            "TargetFacing",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "-1")],
+        );
         let lc = loaded(
             vec![stand_n(0, vec![bind, state_c, life, face])],
             tiny_air(0, &[5]),
@@ -8860,9 +10339,15 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                TargetOp::Bind { time: 1, pos: (10.0, 0.0) },
+                TargetOp::Bind {
+                    time: 1,
+                    pos: (10.0, 0.0)
+                },
                 TargetOp::State(820),
-                TargetOp::LifeAdd { value: -13, kill: false },
+                TargetOp::LifeAdd {
+                    value: -13,
+                    kill: false
+                },
                 TargetOp::Facing(-1),
             ],
             "ops preserve controller fire order"
@@ -8874,7 +10359,14 @@ mod tests {
     /// AND exactly one (not two) on tick 2.
     #[test]
     fn target_ops_do_not_accumulate_across_ticks() {
-        let c = ctrl(0, "TargetState", &[], &[(1, &["1"])], None, &[("value", "820")]);
+        let c = ctrl(
+            0,
+            "TargetState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "820")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8883,7 +10375,11 @@ mod tests {
         let t1 = lc.tick(&mut ch).target_ops;
         assert_eq!(t1, vec![TargetOp::State(820)], "tick 1 emits one op");
         let t2 = lc.tick(&mut ch).target_ops;
-        assert_eq!(t2, vec![TargetOp::State(820)], "tick 2 emits one op, not two");
+        assert_eq!(
+            t2,
+            vec![TargetOp::State(820)],
+            "tick 2 emits one op, not two"
+        );
     }
 
     /// A `Target*` controller gated off by its trigger never runs, so emits
@@ -8891,7 +10387,14 @@ mod tests {
     /// controller actually qualifies.
     #[test]
     fn gated_off_target_controller_emits_nothing() {
-        let c = ctrl(0, "TargetState", &[], &[(1, &["0"])], None, &[("value", "820")]);
+        let c = ctrl(
+            0,
+            "TargetState",
+            &[],
+            &[(1, &["0"])],
+            None,
+            &[("value", "820")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -8914,11 +10417,17 @@ mod tests {
         assert_eq!(parse_var_bank_key("var(0)"), Some((VarBank::Int, 0)));
         assert_eq!(parse_var_bank_key("fvar(12)"), Some((VarBank::Float, 12)));
         assert_eq!(parse_var_bank_key("sysvar(3)"), Some((VarBank::SysInt, 3)));
-        assert_eq!(parse_var_bank_key("sysfvar(4)"), Some((VarBank::SysFloat, 4)));
+        assert_eq!(
+            parse_var_bank_key("sysfvar(4)"),
+            Some((VarBank::SysFloat, 4))
+        );
         // Whitespace inside the parens is tolerated.
         assert_eq!(parse_var_bank_key("var( 7 )"), Some((VarBank::Int, 7)));
         // sysvar must not be mis-parsed as the `var` bank.
-        assert_ne!(parse_var_bank_key("sysvar(1)").map(|(b, _)| b), Some(VarBank::Int));
+        assert_ne!(
+            parse_var_bank_key("sysvar(1)").map(|(b, _)| b),
+            Some(VarBank::Int)
+        );
         // Non-var keys and malformed forms → None.
         assert_eq!(parse_var_bank_key("value"), None);
         assert_eq!(parse_var_bank_key("var"), None);
@@ -8933,7 +10442,14 @@ mod tests {
         // A ChangeState fired from [Statedef -1] (the command bridge) sends us from
         // state 7 to state 50. prev_state_no must record 7 (the state we left),
         // not -1 (the special state that issued the ChangeState).
-        let cmd = ctrl(-1, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "50")]);
+        let cmd = ctrl(
+            -1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "50")],
+        );
         let lc = loaded(
             vec![
                 stand_n(-1, vec![cmd]),
@@ -8947,8 +10463,14 @@ mod tests {
         ch.prev_state_no = -999;
         let report = lc.tick(&mut ch);
         assert!(report.transitions >= 1);
-        assert_eq!(ch.state_no, 50, "-1 ChangeState redirected the current state");
-        assert_eq!(ch.prev_state_no, 7, "prev_state_no is the state we left, not -1");
+        assert_eq!(
+            ch.state_no, 50,
+            "-1 ChangeState redirected the current state"
+        );
+        assert_eq!(
+            ch.prev_state_no, 7,
+            "prev_state_no is the state we left, not -1"
+        );
     }
 
     // ---- 5.3 review fix (3): fire_counts keyed by ctrl.state_number ----
@@ -8961,8 +10483,22 @@ mod tests {
         // once-per-entry counts independent, so BOTH fire on the first tick.
         // (If they shared a key, the second to qualify would see count==2 and be
         // suppressed by persistent=0.)
-        let in_neg2 = ctrl(-2, "VarAdd", &[], &[(1, &["1"])], Some("0"), &[("var(0)", "10")]);
-        let in_cur = ctrl(0, "VarAdd", &[], &[(1, &["1"])], Some("0"), &[("var(1)", "1")]);
+        let in_neg2 = ctrl(
+            -2,
+            "VarAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("var(0)", "10")],
+        );
+        let in_cur = ctrl(
+            0,
+            "VarAdd",
+            &[],
+            &[(1, &["1"])],
+            Some("0"),
+            &[("var(1)", "1")],
+        );
         let lc = loaded(
             vec![stand_n(-2, vec![in_neg2]), stand_n(0, vec![in_cur])],
             tiny_air(0, &[5]),
@@ -8971,12 +10507,18 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.controllers_fired, 2, "both once-per-entry controllers fired");
+        assert_eq!(
+            report.controllers_fired, 2,
+            "both once-per-entry controllers fired"
+        );
         assert_eq!(ch.vars[0], 10, "special -2 idx0 fired");
         assert_eq!(ch.vars[1], 1, "current 0 idx0 fired despite same index");
         // A second tick: each is once-per-entry, neither refires.
         let report2 = lc.tick(&mut ch);
-        assert_eq!(report2.controllers_fired, 0, "both already fired this entry");
+        assert_eq!(
+            report2.controllers_fired, 0,
+            "both already fired this entry"
+        );
         assert_eq!(ch.vars[0], 10);
         assert_eq!(ch.vars[1], 1);
     }
@@ -9017,7 +10559,14 @@ mod tests {
         // BEFORE the debug_assert (which only guards the "moved to a different
         // state" fall-through). This pins that a self-transition does not loop and
         // does not trip the invariant in a debug build.
-        let c = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        let c = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "0")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -9042,7 +10591,10 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         lc.tick(&mut ch);
-        assert!((ch.fvars[0] - 3.0).abs() < 1e-6, "int expr widened into float bank");
+        assert!(
+            (ch.fvars[0] - 3.0).abs() < 1e-6,
+            "int expr widened into float bank"
+        );
         assert_eq!(ch.vars[0], 1, "float expr truncated into int bank");
     }
 
@@ -9068,13 +10620,24 @@ mod tests {
         lc.tick(&mut ch);
         let set0 = ch.vars[0] == 11 && ch.vars[1] == 0;
         let set1 = ch.vars[1] == 22 && ch.vars[0] == 0;
-        assert!(set0 ^ set1, "exactly one indexed key wins; got vars={:?}", &ch.vars[0..2]);
+        assert!(
+            set0 ^ set1,
+            "exactly one indexed key wins; got vars={:?}",
+            &ch.vars[0..2]
+        );
     }
 
     #[test]
     fn var_add_v_value_form_targets_int_bank() {
         // VarAdd via the `v = i` + `value = expr` form accumulates in the int bank.
-        let c = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("v", "2"), ("value", "5")]);
+        let c = ctrl(
+            0,
+            "VarAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("v", "2"), ("value", "5")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -9086,14 +10649,24 @@ mod tests {
 
     #[test]
     fn var_add_fv_value_form_targets_float_bank() {
-        let c = ctrl(0, "VarAdd", &[], &[(1, &["1"])], None, &[("fv", "1"), ("value", "0.5")]);
+        let c = ctrl(
+            0,
+            "VarAdd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("fv", "1"), ("value", "0.5")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
         ch.fvars[1] = 2.0;
         lc.tick(&mut ch);
-        assert!((ch.fvars[1] - 2.5).abs() < 1e-6, "fv/value VarAdd accumulates in float bank");
+        assert!(
+            (ch.fvars[1] - 2.5).abs() < 1e-6,
+            "fv/value VarAdd accumulates in float bank"
+        );
     }
 
     #[test]
@@ -9144,7 +10717,10 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         lc.tick(&mut ch);
-        assert!(ch.vars.iter().all(|&v| v == 0), "inverted range writes nothing");
+        assert!(
+            ch.vars.iter().all(|&v| v == 0),
+            "inverted range writes nothing"
+        );
     }
 
     #[test]
@@ -9178,7 +10754,12 @@ mod tests {
             &[],
             &[(1, &["1"])],
             None,
-            &[("value", "7"), ("fvalue", "1.5"), ("first", "0"), ("last", "1")],
+            &[
+                ("value", "7"),
+                ("fvalue", "1.5"),
+                ("first", "0"),
+                ("last", "1"),
+            ],
         );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -9190,7 +10771,10 @@ mod tests {
         assert!((ch.fvars[0] - 1.5).abs() < 1e-6);
         assert!((ch.fvars[1] - 1.5).abs() < 1e-6);
         assert_eq!(ch.vars[2], 0, "above range untouched (int)");
-        assert!((ch.fvars[2] - 0.0).abs() < 1e-6, "above range untouched (float)");
+        assert!(
+            (ch.fvars[2] - 0.0).abs() < 1e-6,
+            "above range untouched (float)"
+        );
     }
 
     // ---- AC1: StateTypeSet ignores a fully invalid token ----
@@ -9213,22 +10797,41 @@ mod tests {
         ch.state_type = StateType::Air;
         ch.physics = Physics::Air;
         lc.tick(&mut ch);
-        assert_eq!(ch.state_type, StateType::Air, "invalid statetype token left unchanged");
-        assert_eq!(ch.physics, Physics::Air, "invalid physics token left unchanged");
+        assert_eq!(
+            ch.state_type,
+            StateType::Air,
+            "invalid statetype token left unchanged"
+        );
+        assert_eq!(
+            ch.physics,
+            Physics::Air,
+            "invalid physics token left unchanged"
+        );
     }
 
     #[test]
     fn state_type_set_lowercase_token_is_accepted() {
         // Letter tokens are matched case-insensitively (from_token trims + ignores
         // case): a lowercase `c` sets crouching.
-        let c = ctrl(0, "StateTypeSet", &[], &[(1, &["1"])], None, &[("statetype", "c")]);
+        let c = ctrl(
+            0,
+            "StateTypeSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("statetype", "c")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
         ch.state_type = StateType::Standing;
         lc.tick(&mut ch);
-        assert_eq!(ch.state_type, StateType::Crouching, "lowercase token accepted");
+        assert_eq!(
+            ch.state_type,
+            StateType::Crouching,
+            "lowercase token accepted"
+        );
     }
 
     // ---- AC1: ChangeAnim elem param edge cases (zero / negative clamp) ----
@@ -9238,7 +10841,14 @@ mod tests {
         // elem is one-based; saturating_sub(1).max(0) clamps `0` and negatives to
         // the first element (zero-based 0) rather than producing a negative index.
         for elem_src in ["0", "-5"] {
-            let c = ctrl(0, "ChangeAnim", &[], &[(1, &["1"])], None, &[("value", "5"), ("elem", elem_src)]);
+            let c = ctrl(
+                0,
+                "ChangeAnim",
+                &[],
+                &[(1, &["1"])],
+                None,
+                &[("value", "5"), ("elem", elem_src)],
+            );
             let lc = loaded(vec![stand_n(0, vec![c])], {
                 let mut air = tiny_air(0, &[5]);
                 add_action(&mut air, 5, &[10, 10]);
@@ -9281,8 +10891,24 @@ mod tests {
         // (post-friction, facing-relative) velocity. Facing right, the integrated
         // x delta is the friction-scaled velocity (no mirror), so:
         //   pos.x = 100 (PosSet) + 10 * stand_friction * (+1)
-        let pset = ctrl(0, "PosSet", &[], &[(1, &["1"])], None, &[("x", "100"), ("y", "-20")]);
-        let st = state(0, Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), ..Entry::default() }, vec![pset]);
+        let pset = ctrl(
+            0,
+            "PosSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "100"), ("y", "-20")],
+        );
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![pset],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -9353,7 +10979,10 @@ mod tests {
         ch.facing = Facing::Right;
         ch.pos = Vec2::<f32>::ZERO;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.controllers_fired, 5, "all five 5.4 controllers fired");
+        assert_eq!(
+            report.controllers_fired, 5,
+            "all five 5.4 controllers fired"
+        );
         assert_eq!(ch.anim, 5, "ChangeAnim");
         assert!((ch.pos.x - 3.0).abs() < 1e-6, "PosAdd x");
         assert!((ch.pos.y - (-2.0)).abs() < 1e-6, "PosAdd y");
@@ -9437,7 +11066,9 @@ mod tests {
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 1, "HitDef dispatched");
 
-        let hd = ch.active_hitdef.expect("HitDef must populate active_hitdef");
+        let hd = ch
+            .active_hitdef
+            .expect("HitDef must populate active_hitdef");
         // String param (attr) parsed from the raw source.
         assert_eq!(hd.attr, fp_combat::AttackAttr::parse("S, NA"));
         assert_eq!(hd.attr.class, fp_combat::StateClass::Standing);
@@ -9464,26 +11095,27 @@ mod tests {
         // `hitsound = 5, 0` (no prefix) → the common/fight sound file, group 5.
         assert_eq!(
             hd.resources.hitsound,
-            Some(fp_combat::SoundId { group: 5, sample: 0, common: true })
+            Some(fp_combat::SoundId {
+                group: 5,
+                sample: 0,
+                common: true
+            })
         );
         // `guardsound = S6, 1` → `S` prefix selects the character's own .snd.
         assert_eq!(
             hd.resources.guardsound,
-            Some(fp_combat::SoundId { group: 6, sample: 1, common: false })
+            Some(fp_combat::SoundId {
+                group: 6,
+                sample: 1,
+                common: false
+            })
         );
     }
 
     /// Unspecified params fall back to `HitDef::default()`'s MUGEN sentinels.
     #[test]
     fn hit_def_unspecified_params_use_defaults() {
-        let hitdef = ctrl(
-            0,
-            "HitDef",
-            &[],
-            &[(1, &["1"])],
-            None,
-            &[("attr", "C, HP")],
-        );
+        let hitdef = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "C, HP")]);
         let st = stand_n(0, vec![hitdef]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -9531,7 +11163,10 @@ mod tests {
         let hd = ch.active_hitdef.expect("active_hitdef populated");
         assert_eq!(hd.damage.hit, 60, "var(1)*2 evaluated against attacker");
         assert_eq!(hd.damage.guard, 30, "var(1) evaluated against attacker");
-        assert_eq!(hd.hittimes.ground, 35, "var(1)+5 evaluated against attacker");
+        assert_eq!(
+            hd.hittimes.ground, 35,
+            "var(1)+5 evaluated against attacker"
+        );
     }
 
     /// The full CNS authoring path: a `HitDef` block parsed by the real CNS
@@ -9586,8 +11221,14 @@ mod tests {
         ch.physics = Physics::None;
 
         let _ = lc.tick(&mut ch);
-        let hd = ch.active_hitdef.expect("active_hitdef populated even on bad input");
-        assert_eq!(hd.attr, fp_combat::AttackAttr::default(), "bad attr -> default");
+        let hd = ch
+            .active_hitdef
+            .expect("active_hitdef populated even on bad input");
+        assert_eq!(
+            hd.attr,
+            fp_combat::AttackAttr::default(),
+            "bad attr -> default"
+        );
         assert_eq!(hd.damage.hit, 0, "empty damage component -> 0");
         // Unrecognized priority type keeps the default kind.
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Hit);
@@ -9678,7 +11319,10 @@ mod tests {
             .expect("one projectile spawned");
         assert_eq!(spawn.id, 0, "default projid");
         assert_eq!(spawn.anim, 0, "default projanim");
-        assert!(spawn.pos.0.abs() < 1e-4 && spawn.pos.1.abs() < 1e-4, "zero offset");
+        assert!(
+            spawn.pos.0.abs() < 1e-4 && spawn.pos.1.abs() < 1e-4,
+            "zero offset"
+        );
         assert!(
             spawn.velocity.0.abs() < 1e-4 && spawn.velocity.1.abs() < 1e-4,
             "zero velocity"
@@ -9719,8 +11363,15 @@ mod tests {
             .projectile_spawns
             .first()
             .expect("spawn emitted even on bad input");
-        assert_eq!(spawn.hitdef.attr, fp_combat::AttackAttr::default(), "bad attr -> default");
-        assert!(spawn.velocity.0.abs() < 1e-4, "empty velocity component -> 0");
+        assert_eq!(
+            spawn.hitdef.attr,
+            fp_combat::AttackAttr::default(),
+            "bad attr -> default"
+        );
+        assert!(
+            spawn.velocity.0.abs() < 1e-4,
+            "empty velocity component -> 0"
+        );
         assert_eq!(spawn.anim, 0, "non-numeric projanim -> 0");
     }
 
@@ -9807,7 +11458,8 @@ mod tests {
         ch.physics = Physics::None;
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 1, "HitDef must dispatch");
-        ch.active_hitdef.expect("HitDef must populate active_hitdef")
+        ch.active_hitdef
+            .expect("HitDef must populate active_hitdef")
     }
 
     // ---- AC1: every numeric param is evaluated and mapped --------------------
@@ -9888,8 +11540,16 @@ mod tests {
             ("animtype", "Light"),
             ("air.animtype", "Up"),
         ]);
-        assert_eq!(hd.animtype, fp_combat::AnimType::Light, "ground stays Light");
-        assert_eq!(hd.air_animtype, fp_combat::AnimType::Up, "air overridden to Up");
+        assert_eq!(
+            hd.animtype,
+            fp_combat::AnimType::Light,
+            "ground stays Light"
+        );
+        assert_eq!(
+            hd.air_animtype,
+            fp_combat::AnimType::Up,
+            "air overridden to Up"
+        );
     }
 
     #[test]
@@ -9942,8 +11602,22 @@ mod tests {
     fn hit_def_later_controller_overwrites_earlier() {
         // Two HitDef controllers fire in one tick; MUGEN keeps a single active
         // HitDef, so the SECOND one must win (overwrite the first).
-        let first = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "S, NA"), ("damage", "10, 0")]);
-        let second = ctrl(0, "HitDef", &[], &[(1, &["1"])], None, &[("attr", "C, HP"), ("damage", "99, 1")]);
+        let first = ctrl(
+            0,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", "S, NA"), ("damage", "10, 0")],
+        );
+        let second = ctrl(
+            0,
+            "HitDef",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", "C, HP"), ("damage", "99, 1")],
+        );
         let lc = loaded(vec![stand_n(0, vec![first, second])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -9951,7 +11625,11 @@ mod tests {
         let report = lc.tick(&mut ch);
         assert_eq!(report.controllers_fired, 2, "both HitDefs dispatch");
         let hd = ch.active_hitdef.expect("active_hitdef populated");
-        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("C, HP"), "second HitDef wins");
+        assert_eq!(
+            hd.attr,
+            fp_combat::AttackAttr::parse("C, HP"),
+            "second HitDef wins"
+        );
         assert_eq!(hd.damage.hit, 99, "second HitDef's damage wins");
     }
 
@@ -9967,8 +11645,14 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.controllers_fired, 0, "gated-off HitDef does not fire");
-        assert!(ch.active_hitdef.is_none(), "no fire → active_hitdef stays None");
+        assert_eq!(
+            report.controllers_fired, 0,
+            "gated-off HitDef does not fire"
+        );
+        assert!(
+            ch.active_hitdef.is_none(),
+            "no fire → active_hitdef stays None"
+        );
     }
 
     // ---- AC1: a HitDef with NO params still builds a default-valued HitDef ----
@@ -10016,8 +11700,16 @@ mod tests {
         ch.physics = Physics::None;
         let _ = lc.tick(&mut ch);
         let hd = ch.active_hitdef.expect("active_hitdef populated");
-        assert_eq!(hd.attr, fp_combat::AttackAttr::parse("C, HP"), "mixed-case attr key found");
-        assert_eq!(hd.ground_type, fp_combat::HitType::Low, "mixed-case ground.type key found");
+        assert_eq!(
+            hd.attr,
+            fp_combat::AttackAttr::parse("C, HP"),
+            "mixed-case attr key found"
+        );
+        assert_eq!(
+            hd.ground_type,
+            fp_combat::HitType::Low,
+            "mixed-case ground.type key found"
+        );
     }
 
     // ---- helper-fn unit coverage: parse_sparkno ------------------------------
@@ -10111,9 +11803,18 @@ mod tests {
     #[test]
     fn parse_priority_type_reads_second_token() {
         // The type is the SECOND comma-separated token of the priority value.
-        assert_eq!(parse_priority_type("5, Hit"), Some(fp_combat::PriorityType::Hit));
-        assert_eq!(parse_priority_type("5, Miss"), Some(fp_combat::PriorityType::Miss));
-        assert_eq!(parse_priority_type("5, dodge"), Some(fp_combat::PriorityType::Dodge));
+        assert_eq!(
+            parse_priority_type("5, Hit"),
+            Some(fp_combat::PriorityType::Hit)
+        );
+        assert_eq!(
+            parse_priority_type("5, Miss"),
+            Some(fp_combat::PriorityType::Miss)
+        );
+        assert_eq!(
+            parse_priority_type("5, dodge"),
+            Some(fp_combat::PriorityType::Dodge)
+        );
         // No second token → None (keep the default kind).
         assert_eq!(parse_priority_type("5"), None);
         // Empty second token → None.
@@ -10128,9 +11829,15 @@ mod tests {
     fn pair_to_vec2_uses_default_per_missing_axis() {
         let dflt = Vec2::new(1.0, 2.0);
         // Both present → both used.
-        assert_eq!(pair_to_vec2(&[Value::Float(3.0), Value::Float(4.0)], dflt), Vec2::new(3.0, 4.0));
+        assert_eq!(
+            pair_to_vec2(&[Value::Float(3.0), Value::Float(4.0)], dflt),
+            Vec2::new(3.0, 4.0)
+        );
         // Only x present → y falls back to default.y.
-        assert_eq!(pair_to_vec2(&[Value::Float(3.0)], dflt), Vec2::new(3.0, 2.0));
+        assert_eq!(
+            pair_to_vec2(&[Value::Float(3.0)], dflt),
+            Vec2::new(3.0, 2.0)
+        );
         // Empty → both default.
         assert_eq!(pair_to_vec2(&[], dflt), dflt);
     }
@@ -10219,8 +11926,14 @@ mod tests {
         ch.physics = Physics::None;
         lc.tick(&mut ch);
         let hd = ch.active_hitdef.expect("active_hitdef");
-        assert!((hd.ground_velocity.x - (-4.0)).abs() < 1e-6, "x ← component 0");
-        assert!((hd.ground_velocity.y - (-3.0)).abs() < 1e-6, "y ← component 1");
+        assert!(
+            (hd.ground_velocity.x - (-4.0)).abs() < 1e-6,
+            "x ← component 0"
+        );
+        assert!(
+            (hd.ground_velocity.y - (-3.0)).abs() < 1e-6,
+            "y ← component 1"
+        );
     }
 
     #[test]
@@ -10278,7 +11991,11 @@ mod tests {
         let hd = ch.active_hitdef.expect("active_hitdef");
         assert_eq!(hd.priority.value, 5, "priority value ← component 0");
         // `Miss` is NOT the default (`Hit`), so this proves the raw-token read.
-        assert_eq!(hd.priority.kind, fp_combat::PriorityType::Miss, "type ← raw token");
+        assert_eq!(
+            hd.priority.kind,
+            fp_combat::PriorityType::Miss,
+            "type ← raw token"
+        );
     }
 
     // ---- Audit P9: NotHitBy / HitBy controller dispatch -------------------
@@ -10301,7 +12018,10 @@ mod tests {
         assert_eq!(ch.invuln.slot1.time_remaining, 5, "time -> slot1 remaining");
         assert!(ch.invuln.slot1.is_active());
         // Slot 2 was untouched (no `value2`).
-        assert!(!ch.invuln.slot2.is_active(), "value2 absent -> slot2 inactive");
+        assert!(
+            !ch.invuln.slot2.is_active(),
+            "value2 absent -> slot2 inactive"
+        );
         // The SCA set covers a standing normal attack.
         let attr = fp_combat::AttackAttr::parse("S, NA");
         assert!(ch.invuln.slot1.blocks(&attr), "SCA NotHitBy blocks S,NA");
@@ -10340,7 +12060,10 @@ mod tests {
         ch.state_no = 0;
         ch.physics = Physics::None;
         lc.tick(&mut ch);
-        assert_eq!(ch.invuln.slot1.time_remaining, 1, "absent time defaults to 1");
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 1,
+            "absent time defaults to 1"
+        );
     }
 
     #[test]
@@ -10357,8 +12080,14 @@ mod tests {
         // HitBy admitting only throws blocks a normal attack.
         let punch = fp_combat::AttackAttr::parse("S, NA");
         let throw = fp_combat::AttackAttr::parse("S, NT");
-        assert!(ch.invuln.slot1.blocks(&punch), "HitBy(throws) blocks a punch");
-        assert!(!ch.invuln.slot1.blocks(&throw), "HitBy(throws) admits a throw");
+        assert!(
+            ch.invuln.slot1.blocks(&punch),
+            "HitBy(throws) blocks a punch"
+        );
+        assert!(
+            !ch.invuln.slot1.blocks(&throw),
+            "HitBy(throws) admits a throw"
+        );
     }
 
     #[test]
@@ -10409,15 +12138,27 @@ mod tests {
         lc.tick(&mut ch);
         assert_eq!(ch.invuln.slot1.time_remaining, 9);
         assert_eq!(ch.invuln.slot2.time_remaining, 9);
-        assert!(!ch.invuln.slot1.ignore_hitpause, "slot1 has no ignorehitpause");
-        assert!(ch.invuln.slot2.ignore_hitpause, "slot2 carries ignorehitpause");
+        assert!(
+            !ch.invuln.slot1.ignore_hitpause,
+            "slot1 has no ignorehitpause"
+        );
+        assert!(
+            ch.invuln.slot2.ignore_hitpause,
+            "slot2 carries ignorehitpause"
+        );
 
         // Enter a hit-pause and tick: slot1 frozen, slot2 (ignorehitpause) counts.
         ch.hitpause = 4;
         let report = lc.tick(&mut ch);
         assert!(report.hitpaused, "this tick was a hit-pause freeze");
-        assert_eq!(ch.invuln.slot1.time_remaining, 9, "frozen slot held during pause");
-        assert_eq!(ch.invuln.slot2.time_remaining, 8, "ignorehitpause slot counted");
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 9,
+            "frozen slot held during pause"
+        );
+        assert_eq!(
+            ch.invuln.slot2.time_remaining, 8,
+            "ignorehitpause slot counted"
+        );
     }
 
     // ---- Proctor (Audit P9): controller-dispatch edge cases ---------------
@@ -10445,7 +12186,10 @@ mod tests {
         assert_eq!(ch.invuln.slot1.time_remaining, 0);
         assert!(!ch.invuln.slot1.is_active(), "time=0 slot is inactive");
         let attr = fp_combat::AttackAttr::parse("S, NA");
-        assert!(!ch.invuln.slot1.blocks(&attr), "an inactive slot blocks nothing");
+        assert!(
+            !ch.invuln.slot1.blocks(&attr),
+            "an inactive slot blocks nothing"
+        );
     }
 
     /// P9 (Proctor): a NEGATIVE `time` also yields an inactive slot (the
@@ -10479,13 +12223,22 @@ mod tests {
         ch.physics = Physics::None;
 
         lc.tick(&mut ch);
-        assert_eq!(ch.invuln.slot1.time_remaining, 3, "armed to 3 on the first fire");
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 3,
+            "armed to 3 on the first fire"
+        );
         // Next tick: top-of-tick decrement to 2, then the controller re-fires and
         // resets it back to 3 — so a continuously-firing NotHitBy stays at `time`.
         lc.tick(&mut ch);
-        assert_eq!(ch.invuln.slot1.time_remaining, 3, "re-armed back to 3, not decayed");
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 3,
+            "re-armed back to 3, not decayed"
+        );
         lc.tick(&mut ch);
-        assert_eq!(ch.invuln.slot1.time_remaining, 3, "still re-armed while firing");
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 3,
+            "still re-armed while firing"
+        );
         assert!(ch.invuln.slot1.is_active());
     }
 
@@ -10516,8 +12269,15 @@ mod tests {
         lc.tick(&mut ch);
         // Slot 1 untouched by the value2-only controller (only the per-tick
         // decrement applied: 7 -> 6); mode/attrs intact.
-        assert_eq!(ch.invuln.slot1.mode, crate::invuln::InvulnMode::HitBy, "slot1 mode preserved");
-        assert_eq!(ch.invuln.slot1.time_remaining, 6, "slot1 only decremented, not re-armed");
+        assert_eq!(
+            ch.invuln.slot1.mode,
+            crate::invuln::InvulnMode::HitBy,
+            "slot1 mode preserved"
+        );
+        assert_eq!(
+            ch.invuln.slot1.time_remaining, 6,
+            "slot1 only decremented, not re-armed"
+        );
         // Slot 2 was the one the controller armed.
         assert_eq!(ch.invuln.slot2.mode, crate::invuln::InvulnMode::NotHitBy);
         assert_eq!(ch.invuln.slot2.time_remaining, 4, "value2 armed slot2");
@@ -10538,7 +12298,10 @@ mod tests {
         assert!(ch.invuln.slot1.attrs.any, "`*` parsed as the wildcard set");
         for s in ["S, NA", "C, HP", "A, ST", "S, SP"] {
             let attr = fp_combat::AttackAttr::parse(s);
-            assert!(ch.invuln.slot1.blocks(&attr), "wildcard NotHitBy blocks {s:?}");
+            assert!(
+                ch.invuln.slot1.blocks(&attr),
+                "wildcard NotHitBy blocks {s:?}"
+            );
         }
     }
 
@@ -10578,7 +12341,11 @@ mod tests {
         ch.physics = Physics::None;
         ch.state_type = StateType::Standing;
         lc.tick(&mut ch);
-        assert_eq!(ch.state_type, StateType::Crouching, "statetype overridden to C");
+        assert_eq!(
+            ch.state_type,
+            StateType::Crouching,
+            "statetype overridden to C"
+        );
         assert_eq!(ch.physics, Physics::Crouch, "physics overridden to C");
     }
 
@@ -10613,9 +12380,18 @@ mod tests {
         let ch = Character::new();
         let p = CompiledParam::compile("-4, 0");
         let env = EvalEnv::self_only();
-        assert_eq!(ch.eval_param_component(&p, 0, env).map(|v| v.to_int()), Some(-4));
-        assert_eq!(ch.eval_param_component(&p, 1, env).map(|v| v.to_int()), Some(0));
-        assert!(ch.eval_param_component(&p, 2, env).is_none(), "no third component");
+        assert_eq!(
+            ch.eval_param_component(&p, 0, env).map(|v| v.to_int()),
+            Some(-4)
+        );
+        assert_eq!(
+            ch.eval_param_component(&p, 1, env).map(|v| v.to_int()),
+            Some(0)
+        );
+        assert!(
+            ch.eval_param_component(&p, 2, env).is_none(),
+            "no third component"
+        );
         // eval_param is shorthand for component 0.
         assert_eq!(ch.eval_param(&p, env).map(|v| v.to_int()), Some(-4));
     }
@@ -10655,8 +12431,15 @@ mod tests {
         let mut hit = Character::new();
         hit.state_no = 5000;
         hit.physics = Physics::None;
-        hit.get_hit_vars = crate::GetHitVars { fall: 1, ..crate::GetHitVars::default() };
-        assert_eq!(lc.tick(&mut hit).transitions, 1, "fall=1 → get-hit state advances");
+        hit.get_hit_vars = crate::GetHitVars {
+            fall: 1,
+            ..crate::GetHitVars::default()
+        };
+        assert_eq!(
+            lc.tick(&mut hit).transitions,
+            1,
+            "fall=1 → get-hit state advances"
+        );
         assert_eq!(hit.state_no, 5001);
     }
 
@@ -10683,8 +12466,14 @@ mod tests {
             ..crate::GetHitVars::default()
         };
         lc.tick(&mut ch);
-        assert!((ch.vel.x - (-5.5)).abs() < 1e-4, "VelSet x from GetHitVar(xvel)");
-        assert!((ch.vel.y - (-3.0)).abs() < 1e-4, "VelSet y from GetHitVar(yvel)");
+        assert!(
+            (ch.vel.x - (-5.5)).abs() < 1e-4,
+            "VelSet x from GetHitVar(xvel)"
+        );
+        assert!(
+            (ch.vel.y - (-3.0)).abs() < 1e-4,
+            "VelSet y from GetHitVar(yvel)"
+        );
     }
 
     // ---- AC1: HitDef does NOT require ctrl / works in any move type ----------
@@ -10702,7 +12491,9 @@ mod tests {
         ch.physics = Physics::None;
         ch.move_type = MoveType::Attack;
         let _ = lc.tick(&mut ch);
-        let hd = ch.active_hitdef.expect("active_hitdef populated mid-attack");
+        let hd = ch
+            .active_hitdef
+            .expect("active_hitdef populated mid-attack");
         assert_eq!(hd.attr.class, fp_combat::StateClass::Air);
         assert_eq!(hd.attr.power, fp_combat::AttackPower::Special);
         assert_eq!(hd.attr.kind, fp_combat::AttackKind::Projectile);
@@ -10738,15 +12529,20 @@ mod tests {
         // Debug renders every field (used in tracing / test failure messages).
         let dbg = format!("{req:?}");
         for needle in [
-            "group", "sample", "channel", "volume_scale", "looping", "common",
+            "group",
+            "sample",
+            "channel",
+            "volume_scale",
+            "looping",
+            "common",
         ] {
-            assert!(dbg.contains(needle), "Debug output missing field {needle:?}");
+            assert!(
+                dbg.contains(needle),
+                "Debug output missing field {needle:?}"
+            );
         }
         // Distinct field values compare unequal (PartialEq is structural).
-        let other = SoundRequest {
-            group: 6,
-            ..req
-        };
+        let other = SoundRequest { group: 6, ..req };
         assert_ne!(req, other);
     }
 
@@ -10792,8 +12588,22 @@ mod tests {
     /// as the doc comment on the field promises.
     #[test]
     fn multiple_play_snd_emit_in_fire_order() {
-        let first = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "1, 0")]);
-        let second = ctrl(0, "PlaySnd", &[], &[(1, &["1"])], None, &[("value", "F2, 3")]);
+        let first = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1, 0")],
+        );
+        let second = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "F2, 3")],
+        );
         let lc = loaded(vec![stand_n(0, vec![first, second])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -10811,13 +12621,23 @@ mod tests {
     /// request — gating must precede emission.
     #[test]
     fn play_snd_not_fired_when_trigger_false_emits_no_request() {
-        let c = ctrl(0, "PlaySnd", &[], &[(1, &["0"])], None, &[("value", "1, 0")]);
+        let c = ctrl(
+            0,
+            "PlaySnd",
+            &[],
+            &[(1, &["0"])],
+            None,
+            &[("value", "1, 0")],
+        );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.physics = Physics::None;
         let report = lc.tick(&mut ch);
-        assert_eq!(report.controllers_fired, 0, "gating failed → not dispatched");
+        assert_eq!(
+            report.controllers_fired, 0,
+            "gating failed → not dispatched"
+        );
         assert!(report.sound_requests.is_empty(), "no fire → no request");
     }
 
@@ -10913,7 +12733,11 @@ mod tests {
             &[],
             &[(1, &["1"])],
             None,
-            &[("value", "1, 0"), ("channel", "var(3)"), ("volumescale", "50 + 25")],
+            &[
+                ("value", "1, 0"),
+                ("channel", "var(3)"),
+                ("volumescale", "50 + 25"),
+            ],
         );
         let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -10947,16 +12771,16 @@ mod tests {
     #[test]
     fn play_snd_more_garbage_values_emit_no_request() {
         for bad in [
-            "   ",      // whitespace only
-            ",",        // lone comma, both tokens empty
-            ", 5",      // empty group
-            "5, ",      // empty sample
-            "1.5, 0",   // float group (parse::<i32> fails)
-            "1, 2.5",   // float sample
-            "1 2, 0",   // space-separated junk in group
-            "0x1, 0",   // hex literal (not a plain i32)
-            "S, 0",     // S prefix with no digits
-            "FF, 0",    // F prefix then a non-digit letter
+            "   ",    // whitespace only
+            ",",      // lone comma, both tokens empty
+            ", 5",    // empty group
+            "5, ",    // empty sample
+            "1.5, 0", // float group (parse::<i32> fails)
+            "1, 2.5", // float sample
+            "1 2, 0", // space-separated junk in group
+            "0x1, 0", // hex literal (not a plain i32)
+            "S, 0",   // S prefix with no digits
+            "FF, 0",  // F prefix then a non-digit letter
         ] {
             let report = play_snd_tick(&[("value", bad)]);
             assert!(
@@ -10986,7 +12810,10 @@ mod tests {
         assert_eq!(req.group, 1);
         // Fallback expressions evaluate to 0.
         assert_eq!(req.channel, 0, "garbage channel expr → const-0 fallback");
-        assert_eq!(req.volume_scale, 0, "garbage volumescale expr → const-0 fallback");
+        assert_eq!(
+            req.volume_scale, 0,
+            "garbage volumescale expr → const-0 fallback"
+        );
         assert!(!req.looping, "non-bool-ish loop token → false");
     }
 
@@ -11174,7 +13001,16 @@ mod tests {
     #[test]
     fn anim_elem_time_resolves_for_all_elements() {
         // Element start offsets for ticks [3,5,2]: [0, 3, 8]; total = 10.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11186,7 +13022,11 @@ mod tests {
         lc.tick(&mut ch); // elem 0, time 1
         assert_eq!(ch.anim_elem, 0);
         assert_eq!(ch.anim_elem_time, 1);
-        assert_eq!(anim_elem_time(&ch, 1), 1, "current element == anim_elem_time");
+        assert_eq!(
+            anim_elem_time(&ch, 1),
+            1,
+            "current element == anim_elem_time"
+        );
         assert!(anim_elem_time(&ch, 2) < 0, "element 2 not yet reached");
         assert!(anim_elem_time(&ch, 3) < 0, "element 3 not yet reached");
 
@@ -11198,7 +13038,11 @@ mod tests {
         assert_eq!(ch.anim_elem, 1);
         assert_eq!(ch.anim_elem_time, 0);
         // Element 1 just began: time-since == anim_elem_time == 0.
-        assert_eq!(anim_elem_time(&ch, 2), 0, "current element == anim_elem_time");
+        assert_eq!(
+            anim_elem_time(&ch, 2),
+            0,
+            "current element == anim_elem_time"
+        );
         // Element 1 starts at offset 3; elapsed is 3 → time-since-element-1 = 3.
         assert_eq!(anim_elem_time(&ch, 1), 3, "past element positive & growing");
         assert!(anim_elem_time(&ch, 3) < 0, "element 3 still not reached");
@@ -11215,7 +13059,11 @@ mod tests {
         // After 5 ticks in elem 1 we land on elem 2, time 0.
         assert_eq!(ch.anim_elem, 2);
         assert_eq!(ch.anim_elem_time, 0);
-        assert_eq!(anim_elem_time(&ch, 3), 0, "current element == anim_elem_time");
+        assert_eq!(
+            anim_elem_time(&ch, 3),
+            0,
+            "current element == anim_elem_time"
+        );
         // Element 2 starts at offset 8; element 1 at 3, element 0 at 0.
         assert_eq!(anim_elem_time(&ch, 1), 8);
         assert_eq!(anim_elem_time(&ch, 2), 5);
@@ -11227,7 +13075,16 @@ mod tests {
     #[test]
     fn anim_elem_time_reflects_current_loop_iteration() {
         // Two elements, ticks [2, 2], loopstart 0. Total iteration length 4.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[2, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11240,7 +13097,11 @@ mod tests {
         assert_eq!(ch.anim_elem, 0, "wrapped back to loopstart element 0");
         assert_eq!(ch.anim_elem_time, 0);
         // Fresh iteration: element 0 just (re)started, element 1 not yet reached.
-        assert_eq!(anim_elem_time(&ch, 1), 0, "loop iteration restarts the clock");
+        assert_eq!(
+            anim_elem_time(&ch, 1),
+            0,
+            "loop iteration restarts the clock"
+        );
         assert!(
             anim_elem_time(&ch, 2) < 0,
             "element 2 negative again in the new loop iteration"
@@ -11258,7 +13119,16 @@ mod tests {
     fn anim_elem_time_with_nonzero_loopstart() {
         // Three elements, ticks [1, 1, 1], loopstart 1: after the last element
         // the cursor returns to element 1 (offsets [0, 1, 2]).
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], air_with_loopstart(0, &[1, 1, 1], 1));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11272,16 +13142,32 @@ mod tests {
         assert_eq!(ch.anim_elem_time, 0);
         // In this iteration element 1 just began (offset 1). Element 0 (offset 0)
         // reads as the current iteration's element-1 elapsed minus its offset.
-        assert_eq!(anim_elem_time(&ch, 2), 0, "current element == anim_elem_time");
+        assert_eq!(
+            anim_elem_time(&ch, 2),
+            0,
+            "current element == anim_elem_time"
+        );
         assert_eq!(anim_elem_time(&ch, 1), 1, "offset gap to element 1 start");
-        assert!(anim_elem_time(&ch, 3) < 0, "element 3 not yet reached again");
+        assert!(
+            anim_elem_time(&ch, 3) < 0,
+            "element 3 not yet reached again"
+        );
     }
 
     /// AC2: out-of-range `n` (n < 1 and n > num_elements) is clamped to a valid
     /// element and never panics; the result is a finite, sane time.
     #[test]
     fn anim_elem_time_out_of_range_is_safe() {
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11291,8 +13177,16 @@ mod tests {
         // n = 0 clamps to element 1; n = 99 clamps to the last element (3).
         let clamped_low = anim_elem_time(&ch, 0);
         let clamped_high = anim_elem_time(&ch, 99);
-        assert_eq!(clamped_low, anim_elem_time(&ch, 1), "n<1 clamps to element 1");
-        assert_eq!(clamped_high, anim_elem_time(&ch, 3), "n>len clamps to last element");
+        assert_eq!(
+            clamped_low,
+            anim_elem_time(&ch, 1),
+            "n<1 clamps to element 1"
+        );
+        assert_eq!(
+            clamped_high,
+            anim_elem_time(&ch, 3),
+            "n>len clamps to last element"
+        );
         // Strongly negative n must also be safe (no overflow, no panic).
         let _ = anim_elem_time(&ch, i32::MIN);
         let _ = anim_elem_time(&ch, i32::MAX);
@@ -11310,11 +13204,27 @@ mod tests {
         ch.anim_elem = 1; // one-based element 2 is current
         ch.anim_elem_time = 7;
         assert!(ch.anim_elem_start_offsets.is_empty(), "no table built yet");
-        assert_eq!(anim_elem_time(&ch, 2), 7, "legacy: current == anim_elem_time");
-        assert!(anim_elem_time(&ch, 5) < 0, "legacy: future element negative");
+        assert_eq!(
+            anim_elem_time(&ch, 2),
+            7,
+            "legacy: current == anim_elem_time"
+        );
+        assert!(
+            anim_elem_time(&ch, 5) < 0,
+            "legacy: future element negative"
+        );
 
         // With a table built by ticking, the current element still matches.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[4, 4, 4]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11337,7 +13247,16 @@ mod tests {
     fn offset_table_rebuilds_on_action_change() {
         let mut air = tiny_air(0, &[2, 2]);
         add_action(&mut air, 1, &[5, 1, 1]); // different action, different offsets
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], air);
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11351,7 +13270,11 @@ mod tests {
         ch.anim_elem = 0;
         ch.anim_elem_time = 0;
         lc.tick(&mut ch);
-        assert_eq!(ch.anim_elem_start_offsets, vec![0, 5, 6], "action 1 offsets");
+        assert_eq!(
+            ch.anim_elem_start_offsets,
+            vec![0, 5, 6],
+            "action 1 offsets"
+        );
         assert_eq!(ch.anim_table_action, Some(1));
     }
 
@@ -11404,7 +13327,10 @@ mod tests {
             "earlier element ({past}) must report a larger time-since than the \
              current element ({cur}): {t_past} vs {t_cur}"
         );
-        assert!(t_past >= 0 && t_cur >= 0, "reached elements are non-negative");
+        assert!(
+            t_past >= 0 && t_cur >= 0,
+            "reached elements are non-negative"
+        );
     }
 
     // =====================================================================
@@ -11423,7 +13349,16 @@ mod tests {
     #[test]
     fn anim_elem_time_hold_forever_element_is_safe() {
         // ticks [2, -1, 4]: offsets [0, 2, 2] (the -1 contributes 0 onward).
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[2, -1, 4]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11433,7 +13368,11 @@ mod tests {
         lc.tick(&mut ch);
         lc.tick(&mut ch);
         assert_eq!(ch.anim_elem, 1, "parked on the hold-forever element");
-        assert_eq!(ch.anim_elem_start_offsets, vec![0, 2, 2], "hold-forever → 0 onward");
+        assert_eq!(
+            ch.anim_elem_start_offsets,
+            vec![0, 2, 2],
+            "hold-forever → 0 onward"
+        );
         assert_eq!(ch.anim_elem_time, 0);
         // Current element (2, one-based) just began.
         assert_eq!(anim_elem_time(&ch, 2), 0, "current == anim_elem_time");
@@ -11456,7 +13395,11 @@ mod tests {
                 ch.anim_elem_time,
                 "hold-forever current element tracks the legacy scalar"
             );
-            assert_eq!(anim_elem_time(&ch, 1), 2 + expected, "earlier element grows too");
+            assert_eq!(
+                anim_elem_time(&ch, 1),
+                2 + expected,
+                "earlier element grows too"
+            );
         }
     }
 
@@ -11467,7 +13410,16 @@ mod tests {
     #[test]
     fn anim_elem_time_matches_offset_elapsed_invariant() {
         // ticks [3, 5, 2, 4]: offsets [0, 3, 8, 10].
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2, 4]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11498,7 +13450,11 @@ mod tests {
         // Spot-check signs: elements 1,2,3 reached (>=0), element 4 future (<0).
         assert!(anim_elem_time(&ch, 1) > 0);
         assert!(anim_elem_time(&ch, 2) > 0);
-        assert_eq!(anim_elem_time(&ch, 3), ch.anim_elem_time, "current == scalar");
+        assert_eq!(
+            anim_elem_time(&ch, 3),
+            ch.anim_elem_time,
+            "current == scalar"
+        );
         assert!(anim_elem_time(&ch, 4) < 0, "last element not yet reached");
     }
 
@@ -11507,13 +13463,26 @@ mod tests {
     /// indexing the previous action's geometry). Never panics.
     #[test]
     fn unknown_action_clears_stale_offset_table() {
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
         ch.anim = 0;
         lc.tick(&mut ch);
-        assert_eq!(ch.anim_elem_start_offsets, vec![0, 3, 8], "table built for action 0");
+        assert_eq!(
+            ch.anim_elem_start_offsets,
+            vec![0, 3, 8],
+            "table built for action 0"
+        );
 
         // Point anim at an action the AIR does not define.
         ch.anim = 9999;
@@ -11526,15 +13495,31 @@ mod tests {
         );
         assert_eq!(ch.anim_table_action, Some(9999));
         // Legacy fallback: current element (1) == scalar, others negative.
-        assert_eq!(anim_elem_time(&ch, 1), ch.anim_elem_time, "fallback current == scalar");
-        assert!(anim_elem_time(&ch, 2) < 0, "fallback future element negative");
+        assert_eq!(
+            anim_elem_time(&ch, 1),
+            ch.anim_elem_time,
+            "fallback current == scalar"
+        );
+        assert!(
+            anim_elem_time(&ch, 2) < 0,
+            "fallback future element negative"
+        );
     }
 
     /// AC2: an action with zero frames also yields the empty-table legacy
     /// fallback and never panics.
     #[test]
     fn empty_frame_action_uses_legacy_fallback() {
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         // tiny_air with an empty slice → action 0 exists but has no frames.
         let lc = loaded(vec![st], tiny_air(0, &[]));
         let mut ch = Character::new();
@@ -11543,8 +13528,15 @@ mod tests {
         ch.anim_elem = 0;
         ch.anim_elem_time = 2;
         lc.tick(&mut ch);
-        assert!(ch.anim_elem_start_offsets.is_empty(), "no frames → empty table");
-        assert_eq!(anim_elem_time(&ch, 1), ch.anim_elem_time, "current via legacy fallback");
+        assert!(
+            ch.anim_elem_start_offsets.is_empty(),
+            "no frames → empty table"
+        );
+        assert_eq!(
+            anim_elem_time(&ch, 1),
+            ch.anim_elem_time,
+            "current via legacy fallback"
+        );
         assert!(anim_elem_time(&ch, 2) < 0);
         // Strong out-of-range n on the legacy path must also be safe.
         let _ = anim_elem_time(&ch, i32::MIN);
@@ -11556,7 +13548,16 @@ mod tests {
     /// other (clamped) n collapses to element 1; never negative-by-accident.
     #[test]
     fn anim_elem_time_single_element_action() {
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         // Single hold-forever element so the cursor parks and time accrues.
         let lc = loaded(vec![st], tiny_air(0, &[-1]));
         let mut ch = Character::new();
@@ -11579,7 +13580,16 @@ mod tests {
     /// with the cursor at every tick of a multi-element action.
     #[test]
     fn bare_anim_triggers_unchanged_alongside_elem_time() {
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], tiny_air(0, &[3, 5, 2]));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11605,7 +13615,16 @@ mod tests {
     #[test]
     fn looping_future_element_re_arms_each_iteration() {
         // ticks [2, 2, 2], loopstart 0: offsets [0, 2, 4], iteration length 6.
-        let st = state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() }, vec![]);
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
         let lc = loaded(vec![st], air_with_loopstart(0, &[2, 2, 2], 0));
         let mut ch = Character::new();
         ch.state_no = 0;
@@ -11623,8 +13642,14 @@ mod tests {
         assert_eq!(ch.anim_elem, 0, "wrapped to loopstart");
         assert_eq!(ch.anim_elem_time, 0);
         // Fresh iteration: elements 2 AND 3 are future again (negative).
-        assert!(anim_elem_time(&ch, 2) < 0, "element 2 future again after wrap");
-        assert!(anim_elem_time(&ch, 3) < 0, "element 3 future again after wrap");
+        assert!(
+            anim_elem_time(&ch, 2) < 0,
+            "element 2 future again after wrap"
+        );
+        assert!(
+            anim_elem_time(&ch, 3) < 0,
+            "element 3 future again after wrap"
+        );
         // Element 1 (current, offset 0) just restarted.
         assert_eq!(anim_elem_time(&ch, 1), 0, "current element restarted at 0");
     }
@@ -11643,7 +13668,11 @@ mod tests {
     fn with_action(mut air: AirFile, n: i32) -> AirFile {
         air.actions.insert(
             n,
-            AnimAction { action_number: n, frames: Vec::new(), loopstart: 0 },
+            AnimAction {
+                action_number: n,
+                frames: Vec::new(),
+                loopstart: 0,
+            },
         );
         air
     }
@@ -11654,7 +13683,14 @@ mod tests {
         // exists in the AIR the trigger is true and we transition to 20; when it
         // is absent the controller never fires. This proves the AnimSet built
         // from the `air` param inside tick_with reaches the controller eval.
-        let gated = ctrl(0, "ChangeState", &[], &[(1, &["SelfAnimExist(44)"])], None, &[("value", "20")]);
+        let gated = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["SelfAnimExist(44)"])],
+            None,
+            &[("value", "20")],
+        );
 
         // Case A: action 44 present → ChangeState fires.
         let lc_present = loaded(
@@ -11675,7 +13711,10 @@ mod tests {
         let mut ch2 = Character::new();
         ch2.state_no = 0;
         let report2 = lc_absent.tick(&mut ch2);
-        assert_eq!(report2.transitions, 0, "SelfAnimExist(44) false → no transition");
+        assert_eq!(
+            report2.transitions, 0,
+            "SelfAnimExist(44) false → no transition"
+        );
         assert_eq!(ch2.state_no, 0, "stayed put because action 44 is absent");
     }
 
@@ -11697,7 +13736,16 @@ mod tests {
         // Present: 41 + 3 == 44 exists → transition.
         let lc = loaded(
             vec![
-                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("41"), ..Entry::default() }, vec![fallback.clone()]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("41"),
+                        ..Entry::default()
+                    },
+                    vec![fallback.clone()],
+                ),
                 stand_n(20, vec![]),
             ],
             with_action(with_action(tiny_air(0, &[5]), 41), 44),
@@ -11711,7 +13759,16 @@ mod tests {
         // Absent: remove action 44 → 41 + 3 has no target → stays in state 0.
         let lc2 = loaded(
             vec![
-                state(0, Entry { st: Some("S"), ph: Some("N"), anim: Some("41"), ..Entry::default() }, vec![fallback]),
+                state(
+                    0,
+                    Entry {
+                        st: Some("S"),
+                        ph: Some("N"),
+                        anim: Some("41"),
+                        ..Entry::default()
+                    },
+                    vec![fallback],
+                ),
                 stand_n(20, vec![]),
             ],
             with_action(tiny_air(0, &[5]), 41), // 41 present, 44 absent
@@ -11737,7 +13794,12 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let st9 = state(
             9,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("SelfAnimExist(44) + 7"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("SelfAnimExist(44) + 7"),
+                ..Entry::default()
+            },
             vec![],
         );
         let lc = loaded(vec![st0, st9], with_action(tiny_air(0, &[5]), 44));
@@ -11776,7 +13838,14 @@ mod tests {
     #[test]
     fn assert_special_sets_and_clears_per_tick() {
         // State 0 asserts NoWalk every tick (persistent default).
-        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
+        let assert = ctrl(
+            0,
+            "AssertSpecial",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("flag", "NoWalk")],
+        );
         let st0 = stand_n(0, vec![assert]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -11801,7 +13870,11 @@ mod tests {
             &[],
             &[(1, &["1"])],
             None,
-            &[("flag", "NoAutoTurn"), ("flag2", "Intro"), ("flag3", "NoBarDisplay")],
+            &[
+                ("flag", "NoAutoTurn"),
+                ("flag2", "Intro"),
+                ("flag3", "NoBarDisplay"),
+            ],
         );
         let st0 = stand_n(0, vec![assert]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
@@ -11809,8 +13882,14 @@ mod tests {
         lc.tick(&mut ch);
         assert!(ch.asserted.no_auto_turn);
         assert!(ch.asserted.intro);
-        assert!(ch.asserted.is_asserted("NoBarDisplay"), "unknown flag stored verbatim");
-        assert!(!ch.asserted.is_asserted("NoWalk"), "an un-asserted flag reads false");
+        assert!(
+            ch.asserted.is_asserted("NoBarDisplay"),
+            "unknown flag stored verbatim"
+        );
+        assert!(
+            !ch.asserted.is_asserted("NoWalk"),
+            "an un-asserted flag reads false"
+        );
     }
 
     /// NoWalk suppresses ONLY the engine-built-in stand->walk / walk->stand
@@ -11819,9 +13898,21 @@ mod tests {
     fn nowalk_suppresses_engine_walk_transition() {
         // A character-OWN walk ChangeState (empty label) is NOT suppressed; the
         // engine-built-in one (labeled `engine: stand->walk`) IS.
-        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
-        let engine_walk =
-            ctrl_labeled(0, "engine: stand->walk", "ChangeState", &[(1, &["1"])], &[("value", "20")]);
+        let assert = ctrl(
+            0,
+            "AssertSpecial",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("flag", "NoWalk")],
+        );
+        let engine_walk = ctrl_labeled(
+            0,
+            "engine: stand->walk",
+            "ChangeState",
+            &[(1, &["1"])],
+            &[("value", "20")],
+        );
         let st0 = stand_n(0, vec![assert, engine_walk]);
         let st20 = stand_n(20, vec![]);
         let lc = loaded(vec![st0, st20], tiny_air(0, &[5]));
@@ -11831,30 +13922,55 @@ mod tests {
         assert_eq!(ch.state_no, 0, "NoWalk blocked the engine walk transition");
 
         // Without NoWalk, the same engine transition fires.
-        let engine_walk2 =
-            ctrl_labeled(0, "engine: stand->walk", "ChangeState", &[(1, &["1"])], &[("value", "20")]);
+        let engine_walk2 = ctrl_labeled(
+            0,
+            "engine: stand->walk",
+            "ChangeState",
+            &[(1, &["1"])],
+            &[("value", "20")],
+        );
         let st0b = stand_n(0, vec![engine_walk2]);
         let st20b = stand_n(20, vec![]);
         let lc2 = loaded(vec![st0b, st20b], tiny_air(0, &[5]));
         let mut ch2 = Character::new();
         ch2.state_no = 0;
         lc2.tick(&mut ch2);
-        assert_eq!(ch2.state_no, 20, "walk transition fires when NoWalk is not asserted");
+        assert_eq!(
+            ch2.state_no, 20,
+            "walk transition fires when NoWalk is not asserted"
+        );
     }
 
     /// NoWalk does NOT suppress a character's OWN (non-engine-labeled)
     /// ChangeState to the walk state.
     #[test]
     fn nowalk_does_not_suppress_own_changestate() {
-        let assert = ctrl(0, "AssertSpecial", &[], &[(1, &["1"])], None, &[("flag", "NoWalk")]);
-        let own_walk = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "20")]);
+        let assert = ctrl(
+            0,
+            "AssertSpecial",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("flag", "NoWalk")],
+        );
+        let own_walk = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "20")],
+        );
         let st0 = stand_n(0, vec![assert, own_walk]);
         let st20 = stand_n(20, vec![]);
         let lc = loaded(vec![st0, st20], tiny_air(0, &[5]));
         let mut ch = Character::new();
         ch.state_no = 0;
         lc.tick(&mut ch);
-        assert_eq!(ch.state_no, 20, "NoWalk only gates engine-labeled walk built-ins");
+        assert_eq!(
+            ch.state_no, 20,
+            "NoWalk only gates engine-labeled walk built-ins"
+        );
     }
 
     // ---- #10 Width ---------------------------------------------------------
@@ -11863,7 +13979,14 @@ mod tests {
     /// next tick.
     #[test]
     fn width_sets_override_per_tick() {
-        let width = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("value", "16, 12")]);
+        let width = ctrl(
+            0,
+            "Width",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "16, 12")],
+        );
         let st0 = stand_n(0, vec![width]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -11876,7 +13999,10 @@ mod tests {
         let st0_empty = stand_n(0, vec![]);
         let lc2 = loaded(vec![st0_empty], tiny_air(0, &[5]));
         lc2.tick(&mut ch);
-        assert!(!ch.cur_width.active, "Width override cleared when not re-asserted");
+        assert!(
+            !ch.cur_width.active,
+            "Width override cleared when not re-asserted"
+        );
     }
 
     /// A scalar `Width value = 16` sets both halves; `edge`/`player` forms parse.
@@ -11891,7 +14017,14 @@ mod tests {
         assert_eq!((ch.cur_width.front, ch.cur_width.back), (16.0, 16.0));
 
         // `player = a, b` alias.
-        let wp = ctrl(0, "Width", &[], &[(1, &["1"])], None, &[("player", "20, 8")]);
+        let wp = ctrl(
+            0,
+            "Width",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("player", "20, 8")],
+        );
         let st0p = stand_n(0, vec![wp]);
         let lcp = loaded(vec![st0p], tiny_air(0, &[5]));
         let mut chp = Character::new();
@@ -11914,7 +14047,14 @@ mod tests {
     /// an unset axis flag leaves that axis unchanged.
     #[test]
     fn hit_vel_set_applies_selected_axes() {
-        let hvs = ctrl(5000, "HitVelSet", &[], &[(1, &["1"])], None, &[("x", "1"), ("y", "1")]);
+        let hvs = ctrl(
+            5000,
+            "HitVelSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("x", "1"), ("y", "1")],
+        );
         let st = stand_n(5000, vec![hvs]);
         let lc = loaded(vec![st], tiny_air(0, &[5]));
         let mut ch = Character::new();
@@ -11943,7 +14083,14 @@ mod tests {
     #[test]
     fn hit_fall_set_sets_clears_and_holds() {
         // value=1 -> fall set.
-        let set1 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "1")]);
+        let set1 = ctrl(
+            5000,
+            "HitFallSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
         let mut ch = Character::new();
         ch.state_no = 5000;
         ch.get_hit_vars.fall = 0;
@@ -11951,13 +14098,27 @@ mod tests {
         assert_eq!(ch.get_hit_vars.fall, 1);
 
         // value=0 -> fall cleared.
-        let set0 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "0")]);
+        let set0 = ctrl(
+            5000,
+            "HitFallSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "0")],
+        );
         ch.get_hit_vars.fall = 1;
         loaded(vec![stand_n(5000, vec![set0])], tiny_air(0, &[5])).tick(&mut ch);
         assert_eq!(ch.get_hit_vars.fall, 0);
 
         // value=-1 -> unchanged ("no change" sentinel).
-        let setm1 = ctrl(5000, "HitFallSet", &[], &[(1, &["1"])], None, &[("value", "-1")]);
+        let setm1 = ctrl(
+            5000,
+            "HitFallSet",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "-1")],
+        );
         ch.get_hit_vars.fall = 1;
         loaded(vec![stand_n(5000, vec![setm1])], tiny_air(0, &[5])).tick(&mut ch);
         assert_eq!(ch.get_hit_vars.fall, 1, "-1 leaves the fall flag unchanged");
@@ -12015,7 +14176,12 @@ mod tests {
             &[],
             &[(1, &["1"])],
             None,
-            &[("attr", ", NT,ST,HT"), ("stateno", "700"), ("slot", "2"), ("time", "30")],
+            &[
+                ("attr", ", NT,ST,HT"),
+                ("stateno", "700"),
+                ("slot", "2"),
+                ("time", "30"),
+            ],
         );
         let st0 = stand_n(0, vec![ho]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
@@ -12026,13 +14192,22 @@ mod tests {
         // The per-tick countdown runs BEFORE the controllers (so it does not eat
         // into the tick that arms the slot): a slot armed with `time = 30` reads a
         // full 30 on the arming tick and is active for 30 ticks.
-        assert_eq!(slot.time_remaining, 30, "armed this tick, not yet decremented");
+        assert_eq!(
+            slot.time_remaining, 30,
+            "armed this tick, not yet decremented"
+        );
         assert!(slot.is_active());
 
         // A throw attr matches; a normal strike does not.
         use fp_combat::AttackAttr;
-        assert!(ch.hit_overrides.matching(&AttackAttr::parse("S, NT")).is_some());
-        assert!(ch.hit_overrides.matching(&AttackAttr::parse("S, NA")).is_none());
+        assert!(ch
+            .hit_overrides
+            .matching(&AttackAttr::parse("S, NT"))
+            .is_some());
+        assert!(ch
+            .hit_overrides
+            .matching(&AttackAttr::parse("S, NA"))
+            .is_none());
     }
 
     /// An armed `HitOverride` slot counts down and expires.
@@ -12045,7 +14220,12 @@ mod tests {
             &[],
             &[(1, &["1"])],
             Some("0"), // once per entry
-            &[("attr", "SCA"), ("stateno", "700"), ("slot", "0"), ("time", "2")],
+            &[
+                ("attr", "SCA"),
+                ("stateno", "700"),
+                ("slot", "0"),
+                ("time", "2"),
+            ],
         );
         let st0 = stand_n(0, vec![ho]);
         let lc = loaded(vec![st0], tiny_air(0, &[5, 5, 5]));
@@ -12072,7 +14252,12 @@ mod tests {
             &[],
             &[(1, &["1"])],
             Some("0"),
-            &[("attr", "SCA"), ("stateno", "700"), ("slot", "1"), ("time", "-1")],
+            &[
+                ("attr", "SCA"),
+                ("stateno", "700"),
+                ("slot", "1"),
+                ("time", "-1"),
+            ],
         );
         let st0 = stand_n(0, vec![ho]);
         let lc = loaded(vec![st0], tiny_air(0, &[5, 5, 5]));
@@ -12080,7 +14265,10 @@ mod tests {
         lc.tick(&mut ch);
         lc.tick(&mut ch);
         lc.tick(&mut ch);
-        assert_eq!(ch.hit_overrides.slots[1].time_remaining, -1, "forever sentinel preserved");
+        assert_eq!(
+            ch.hit_overrides.slots[1].time_remaining, -1,
+            "forever sentinel preserved"
+        );
         assert!(ch.hit_overrides.slots[1].is_active());
     }
 
@@ -12093,7 +14281,12 @@ mod tests {
             &[],
             &[(1, &["1"])],
             None,
-            &[("attr", "SCA"), ("stateno", "700"), ("slot", "99"), ("time", "10")],
+            &[
+                ("attr", "SCA"),
+                ("stateno", "700"),
+                ("slot", "99"),
+                ("time", "10"),
+            ],
         );
         let st0 = stand_n(0, vec![ho]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
@@ -12114,7 +14307,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let st9 = state(
             9,
-            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), sprpriority: Some("3"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                sprpriority: Some("3"),
+                ..Entry::default()
+            },
             vec![],
         );
         let states = {
@@ -12132,13 +14331,23 @@ mod tests {
     /// The `SprPriority` controller sets `cur_sprpriority` mid-state.
     #[test]
     fn spr_priority_controller_sets_priority_mid_state() {
-        let spr = ctrl(0, "SprPriority", &[], &[(1, &["1"])], None, &[("value", "5")]);
+        let spr = ctrl(
+            0,
+            "SprPriority",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "5")],
+        );
         let st0 = stand_n(0, vec![spr]);
         let lc = loaded(vec![st0], tiny_air(0, &[5]));
         let mut ch = Character::new();
         assert_eq!(ch.cur_sprpriority, 0);
         lc.tick(&mut ch);
-        assert_eq!(ch.cur_sprpriority, 5, "SprPriority controller set the priority");
+        assert_eq!(
+            ch.cur_sprpriority, 5,
+            "SprPriority controller set the priority"
+        );
     }
 
     /// `SprPriority` with no `value` is a safe no-op (priority unchanged).
@@ -12150,7 +14359,10 @@ mod tests {
         let mut ch = Character::new();
         ch.cur_sprpriority = 2;
         lc.tick(&mut ch);
-        assert_eq!(ch.cur_sprpriority, 2, "missing value leaves the priority unchanged");
+        assert_eq!(
+            ch.cur_sprpriority, 2,
+            "missing value leaves the priority unchanged"
+        );
     }
 
     // ---- #33: PalFX / AfterImage color effects -----------------------------
@@ -12215,12 +14427,18 @@ mod tests {
         lc.tick(&mut ch);
         let fx = ch.palfx();
         assert!(fx.is_active(), "PalFX armed");
-        assert_eq!(fx.mul, [1.0; 3], "missing mul must be the ×1 identity, not 256");
+        assert_eq!(
+            fx.mul, [1.0; 3],
+            "missing mul must be the ×1 identity, not 256"
+        );
         // add = 32,16,0 over the 0–255 scale → ~0.1255, ~0.0627, 0.0.
         assert!((fx.add[0] - 32.0 / 255.0).abs() < 1e-4);
         assert!((fx.add[1] - 16.0 / 255.0).abs() < 1e-4);
         assert!((fx.add[2] - 0.0).abs() < 1e-4);
-        assert!((fx.color - 1.0).abs() < 1e-4, "color = 256 → full color (1.0)");
+        assert!(
+            (fx.color - 1.0).abs() < 1e-4,
+            "color = 256 → full color (1.0)"
+        );
     }
 
     /// A **partial** `PalFX mul` (a single bare component) must normalize the
@@ -12242,7 +14460,10 @@ mod tests {
         lc.tick(&mut ch);
         let fx = ch.palfx();
         assert!(fx.is_active(), "PalFX armed");
-        assert!((fx.mul[0] - 0.5).abs() < 1e-4, "specified channel scaled by 256");
+        assert!(
+            (fx.mul[0] - 0.5).abs() < 1e-4,
+            "specified channel scaled by 256"
+        );
         assert_eq!(fx.mul[1], 1.0, "unspecified G channel is the ×1 identity");
         assert_eq!(fx.mul[2], 1.0, "unspecified B channel is the ×1 identity");
     }
@@ -12273,7 +14494,11 @@ mod tests {
         assert_eq!(ch.cur_palfx.remaining, 1);
         lc.tick(&mut ch); // 1 → 0, expires
         assert!(!ch.palfx().is_active(), "tint expired");
-        assert_eq!(ch.palfx(), crate::CurPalFx::IDENTITY, "palfx() returns identity when none");
+        assert_eq!(
+            ch.palfx(),
+            crate::CurPalFx::IDENTITY,
+            "palfx() returns identity when none"
+        );
     }
 
     /// `PalFX time = 0` (non-positive) arms nothing and clears any active tint.
@@ -12284,7 +14509,13 @@ mod tests {
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
         // Pre-seed an active tint; the zero-time PalFX must clear it.
-        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5, ..crate::CurPalFx::IDENTITY };
+        ch.cur_palfx = crate::CurPalFx {
+            add: [1.0, 0.0, 0.0],
+            mul: [1.0; 3],
+            color: 1.0,
+            remaining: 5,
+            ..crate::CurPalFx::IDENTITY
+        };
         lc.tick(&mut ch);
         assert!(!ch.palfx().is_active(), "zero-time PalFX cleared the tint");
     }
@@ -12308,12 +14539,22 @@ mod tests {
         assert!(ch.palfx().invertall, "invertall = 1 sets the flag");
 
         // A PalFX with no invertall leaves it false.
-        let pal2 = ctrl(0, "PalFX", &[], &[(1, &["Time = 0"])], None, &[("time", "10")]);
+        let pal2 = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "10")],
+        );
         let st0b = stand_n(0, vec![pal2]);
         let lcb = loaded(vec![st0b], tiny_air(0, &[30]));
         let mut chb = Character::new();
         lcb.tick(&mut chb);
-        assert!(!chb.palfx().invertall, "missing invertall defaults to false");
+        assert!(
+            !chb.palfx().invertall,
+            "missing invertall defaults to false"
+        );
     }
 
     /// `PalFX sinadd = r,g,b,period` records the oscillation amplitude (0–255
@@ -12333,9 +14574,15 @@ mod tests {
         let mut ch = Character::new();
         lc.tick(&mut ch);
         // The stored (unresolved) effect carries the amplitude + period.
-        assert!((ch.cur_palfx.sinadd[0] - 1.0).abs() < 1e-4, "R amplitude 255 → 1.0");
+        assert!(
+            (ch.cur_palfx.sinadd[0] - 1.0).abs() < 1e-4,
+            "R amplitude 255 → 1.0"
+        );
         assert!((ch.cur_palfx.sinadd[1] - 0.0).abs() < 1e-4);
-        assert!((ch.cur_palfx.sinadd[2] + 1.0).abs() < 1e-4, "B amplitude -255 → -1.0");
+        assert!(
+            (ch.cur_palfx.sinadd[2] + 1.0).abs() < 1e-4,
+            "B amplitude -255 → -1.0"
+        );
         assert_eq!(ch.cur_palfx.sinadd_period, 8, "4th component is the period");
         assert_eq!(ch.cur_palfx.elapsed, 0, "phase starts at tick 0");
     }
@@ -12364,7 +14611,10 @@ mod tests {
         // Tick 1 fires the controller (elapsed = 0): sin(0) = 0 → add = 0.
         lc.tick(&mut ch);
         assert_eq!(ch.cur_palfx.elapsed, 0);
-        assert!(ch.palfx().add[0].abs() < 1e-4, "tick 0: sin(0)=0 → static add 0");
+        assert!(
+            ch.palfx().add[0].abs() < 1e-4,
+            "tick 0: sin(0)=0 → static add 0"
+        );
 
         // Period 8 → quarter-period at elapsed = 2: sin(π/2) = 1 → add = 1.0.
         // The countdown/phase advances one per tick BEFORE the (already-spent)
@@ -12372,24 +14622,37 @@ mod tests {
         lc.tick(&mut ch); // elapsed 1
         lc.tick(&mut ch); // elapsed 2
         assert_eq!(ch.cur_palfx.elapsed, 2);
-        assert!((ch.palfx().add[0] - 1.0).abs() < 1e-4, "quarter-period: sin(π/2)=1 → 1.0");
+        assert!(
+            (ch.palfx().add[0] - 1.0).abs() < 1e-4,
+            "quarter-period: sin(π/2)=1 → 1.0"
+        );
 
         // Half-period at elapsed = 4: sin(π) ≈ 0 → back to the static add.
         lc.tick(&mut ch); // elapsed 3
         lc.tick(&mut ch); // elapsed 4
         assert_eq!(ch.cur_palfx.elapsed, 4);
-        assert!(ch.palfx().add[0].abs() < 1e-4, "half-period: sin(π)≈0 → static add 0");
+        assert!(
+            ch.palfx().add[0].abs() < 1e-4,
+            "half-period: sin(π)≈0 → static add 0"
+        );
 
         // Three-quarter-period at elapsed = 6: sin(3π/2) = -1 → add = -1.0.
         lc.tick(&mut ch); // elapsed 5
         lc.tick(&mut ch); // elapsed 6
         assert_eq!(ch.cur_palfx.elapsed, 6);
-        assert!((ch.palfx().add[0] + 1.0).abs() < 1e-4, "3/4-period: sin(3π/2)=-1 → -1.0");
+        assert!(
+            (ch.palfx().add[0] + 1.0).abs() < 1e-4,
+            "3/4-period: sin(3π/2)=-1 → -1.0"
+        );
 
         // The G/B channels (amplitude 0) never move, and `mul`/`color` are static.
         assert!(ch.palfx().add[1].abs() < 1e-4, "G amplitude 0 stays put");
         assert!(ch.palfx().add[2].abs() < 1e-4, "B amplitude 0 stays put");
-        assert_eq!(ch.palfx().mul, [1.0; 3], "mul is constant over the lifetime");
+        assert_eq!(
+            ch.palfx().mul,
+            [1.0; 3],
+            "mul is constant over the lifetime"
+        );
         assert!((ch.palfx().color - 1.0).abs() < 1e-4, "color is constant");
     }
 
@@ -12405,21 +14668,31 @@ mod tests {
             &[],
             &[(1, &["Time = 0"])],
             None,
-            &[("time", "40"), ("add", "51, 0, 0"), ("sinadd", "51, 0, 0, 8")],
+            &[
+                ("time", "40"),
+                ("add", "51, 0, 0"),
+                ("sinadd", "51, 0, 0, 8"),
+            ],
         );
         let st0 = stand_n(0, vec![pal]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
         lc.tick(&mut ch); // elapsed 0: sin(0)=0 → effective add = static 0.2
         let fx0 = ch.palfx();
-        assert!((fx0.add[0] - 0.2).abs() < 1e-4, "elapsed 0: static add only");
+        assert!(
+            (fx0.add[0] - 0.2).abs() < 1e-4,
+            "elapsed 0: static add only"
+        );
         // The resolved effect handed out has the oscillation folded away.
         assert_eq!(fx0.sinadd, [0.0; 3], "palfx() clears sinadd amplitude");
         assert_eq!(fx0.sinadd_period, 0, "palfx() clears sinadd period");
 
         lc.tick(&mut ch); // elapsed 1
         lc.tick(&mut ch); // elapsed 2: sin(π/2)=1 → 0.2 + 0.2 = 0.4
-        assert!((ch.palfx().add[0] - 0.4).abs() < 1e-4, "static 0.2 + amplitude 0.2");
+        assert!(
+            (ch.palfx().add[0] - 0.4).abs() < 1e-4,
+            "static 0.2 + amplitude 0.2"
+        );
     }
 
     /// `effective_add` with a zero `sinadd_period` is a no-op: it returns the
@@ -12433,7 +14706,11 @@ mod tests {
             remaining: 5,
             ..crate::CurPalFx::IDENTITY
         };
-        assert_eq!(fx.effective_add(), [0.3, -0.2, 0.5], "period 0 → static add");
+        assert_eq!(
+            fx.effective_add(),
+            [0.3, -0.2, 0.5],
+            "period 0 → static add"
+        );
     }
 
     /// `AfterImage` arms the trail with a duration, length, and ghost tint.
@@ -12473,7 +14750,14 @@ mod tests {
     /// cannot drive an unbounded ghost count.
     #[test]
     fn afterimage_length_is_clamped() {
-        let ai = ctrl(0, "AfterImage", &[], &[(1, &["1"])], None, &[("time", "5"), ("length", "100000")]);
+        let ai = ctrl(
+            0,
+            "AfterImage",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("time", "5"), ("length", "100000")],
+        );
         let st0 = stand_n(0, vec![ai]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
@@ -12539,7 +14823,10 @@ mod tests {
         // is inactive when capture runs this tick — no frame yet).
         lc.tick(&mut ch);
         assert!(ch.afterimage().is_active(), "trail armed");
-        assert!(ch.afterimage().frames.is_empty(), "no capture on the arming tick");
+        assert!(
+            ch.afterimage().frames.is_empty(),
+            "no capture on the arming tick"
+        );
 
         // Drive several more ticks; with timegap = 2 a frame is captured every 2nd
         // active tick, and the ring is bounded to length = 3.
@@ -12621,12 +14908,22 @@ mod tests {
     #[test]
     fn afterimage_time_re_arms_and_noops_without_trail() {
         // No trail active: AfterImageTime time = 5 must NOT start a trail.
-        let ait = ctrl(0, "AfterImageTime", &[], &[(1, &["1"])], None, &[("time", "5")]);
+        let ait = ctrl(
+            0,
+            "AfterImageTime",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("time", "5")],
+        );
         let st0 = stand_n(0, vec![ait]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
         lc.tick(&mut ch);
-        assert!(!ch.afterimage().is_active(), "AfterImageTime does not start a trail");
+        assert!(
+            !ch.afterimage().is_active(),
+            "AfterImageTime does not start a trail"
+        );
 
         // With a trail active, AfterImageTime resets its remaining time. Seed a
         // trail with enough time to survive the pre-controller countdown (3 → 2),
@@ -12638,13 +14935,24 @@ mod tests {
             ..crate::AfterImageState::inactive()
         };
         lc.tick(&mut ch2);
-        assert_eq!(ch2.afterimage().time, 5, "AfterImageTime re-armed the duration");
+        assert_eq!(
+            ch2.afterimage().time,
+            5,
+            "AfterImageTime re-armed the duration"
+        );
     }
 
     /// `AfterImageTime time <= 0` cancels an active trail.
     #[test]
     fn afterimage_time_zero_cancels() {
-        let ait = ctrl(0, "AfterImageTime", &[], &[(1, &["1"])], None, &[("time", "0")]);
+        let ait = ctrl(
+            0,
+            "AfterImageTime",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("time", "0")],
+        );
         let st0 = stand_n(0, vec![ait]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
@@ -12654,7 +14962,10 @@ mod tests {
             ..crate::AfterImageState::inactive()
         };
         lc.tick(&mut ch);
-        assert!(!ch.afterimage().is_active(), "AfterImageTime 0 cancelled the trail");
+        assert!(
+            !ch.afterimage().is_active(),
+            "AfterImageTime 0 cancelled the trail"
+        );
     }
 
     /// A frozen (hit-paused) character holds its PalFX tint and AfterImage trail —
@@ -12664,7 +14975,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
-        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5, ..crate::CurPalFx::IDENTITY };
+        ch.cur_palfx = crate::CurPalFx {
+            add: [1.0, 0.0, 0.0],
+            mul: [1.0; 3],
+            color: 1.0,
+            remaining: 5,
+            ..crate::CurPalFx::IDENTITY
+        };
         ch.afterimage = crate::AfterImageState {
             time: 8,
             length: 4,
@@ -12698,7 +15015,12 @@ mod tests {
     fn envshake_arms_and_counts_down() {
         let lc = one_ctrl_synth(
             "EnvShake",
-            &[("time", "2"), ("freq", "90"), ("ampl", "8"), ("phase", "45")],
+            &[
+                ("time", "2"),
+                ("freq", "90"),
+                ("ampl", "8"),
+                ("phase", "45"),
+            ],
         );
         let mut ch = Character::new();
         assert!(!ch.env_shake.is_active(), "no shake initially");
@@ -12720,7 +15042,12 @@ mod tests {
     fn envshake_zero_time_disarms_and_defaults() {
         let lc = one_ctrl_synth("EnvShake", &[("time", "0")]);
         let mut ch = Character::new();
-        ch.env_shake = crate::EnvShake { time: 9, freq: 1.0, ampl: 1.0, phase: 1.0 };
+        ch.env_shake = crate::EnvShake {
+            time: 9,
+            freq: 1.0,
+            ampl: 1.0,
+            phase: 1.0,
+        };
         lc.tick(&mut ch);
         assert!(!ch.env_shake.is_active(), "zero-time EnvShake disarmed");
 
@@ -12792,7 +15119,11 @@ mod tests {
 
         let lc_clear = one_ctrl_synth("EnvColor", &[("time", "0")]);
         let mut ch3 = Character::new();
-        ch3.env_color = crate::EnvColor { time: 5, col: [1, 2, 3], under: true };
+        ch3.env_color = crate::EnvColor {
+            time: 5,
+            col: [1, 2, 3],
+            under: true,
+        };
         lc_clear.tick(&mut ch3);
         assert!(!ch3.env_color.is_active(), "time=0 cleared the fill");
 
@@ -12825,7 +15156,10 @@ mod tests {
 
         let lc_restore = one_ctrl_synth("RemapPal", &[("source", "1,0"), ("dest", "-1,-1")]);
         let mut ch2 = Character::new();
-        ch2.remap_pal = crate::RemapPal { source: Some((1, 0)), dest: Some((1, 3)) };
+        ch2.remap_pal = crate::RemapPal {
+            source: Some((1, 0)),
+            dest: Some((1, 3)),
+        };
         lc_restore.tick(&mut ch2);
         assert_eq!(ch2.remap_pal.dest, None, "(-1,-1) restores the default");
         assert!(!ch2.remap_pal.is_active());
@@ -12838,7 +15172,10 @@ mod tests {
         let lc = one_ctrl_synth("DisplayToClipboard", &[("text", "\"hello\"")]);
         let mut ch = Character::new();
         lc.tick(&mut ch);
-        assert_eq!(ch.clipboard, "hello", "Display set the clipboard, quotes stripped");
+        assert_eq!(
+            ch.clipboard, "hello",
+            "Display set the clipboard, quotes stripped"
+        );
 
         let lc_app = one_ctrl_synth("AppendToClipboard", &[("text", "\" world\"")]);
         // Reuse `ch`'s clipboard by seeding a fresh character.
@@ -12886,7 +15223,10 @@ mod tests {
         assert_eq!(ch.pos.x, x0, "PosFreeze held the position this tick");
         assert!(ch.pos_frozen, "pos_frozen set by the firing tick");
         lc.tick(&mut ch); // top-of-tick clears the flag; Time != 0 → no re-fire
-        assert!(!ch.pos_frozen, "pos_frozen cleared at the top of the next tick");
+        assert!(
+            !ch.pos_frozen,
+            "pos_frozen cleared at the top of the next tick"
+        );
         assert!(ch.pos.x > x0, "position advanced once unfrozen");
     }
 
@@ -12898,15 +15238,25 @@ mod tests {
         let mut ch = Character::new();
         assert_eq!(ch.cur_trans, None, "no blend override initially");
         lc.tick(&mut ch);
-        assert_eq!(ch.cur_trans, Some(crate::TransMode::Add), "set by the firing tick");
+        assert_eq!(
+            ch.cur_trans,
+            Some(crate::TransMode::Add),
+            "set by the firing tick"
+        );
         lc.tick(&mut ch); // top-of-tick clears it; Time != 0 → no re-fire
-        assert_eq!(ch.cur_trans, None, "Trans override cleared at the top of the next tick");
+        assert_eq!(
+            ch.cur_trans, None,
+            "Trans override cleared at the top of the next tick"
+        );
 
         // `addalpha` reads the `alpha = src, dst` pair.
         let lc_alpha = one_ctrl_synth("Trans", &[("trans", "addalpha"), ("alpha", "200,56")]);
         let mut ch2 = Character::new();
         lc_alpha.tick(&mut ch2);
-        assert_eq!(ch2.cur_trans, Some(crate::TransMode::AddAlpha { src: 200, dst: 56 }));
+        assert_eq!(
+            ch2.cur_trans,
+            Some(crate::TransMode::AddAlpha { src: 200, dst: 56 })
+        );
     }
 
     /// `AngleSet` / `AngleAdd` / `AngleMul` mutate the persistent draw angle;
@@ -12937,9 +15287,15 @@ mod tests {
         let mut ch4 = Character::new();
         lc_draw.tick(&mut ch4);
         assert_eq!(ch4.draw_angle.angle, 90.0);
-        assert!(ch4.draw_angle.active, "AngleDraw armed a rotated draw this tick");
+        assert!(
+            ch4.draw_angle.active,
+            "AngleDraw armed a rotated draw this tick"
+        );
         lc_draw.tick(&mut ch4); // top-of-tick clears the arm; Time != 0 → no re-fire
-        assert!(!ch4.draw_angle.active, "AngleDraw arm cleared at the top of the next tick");
+        assert!(
+            !ch4.draw_angle.active,
+            "AngleDraw arm cleared at the top of the next tick"
+        );
         assert_eq!(ch4.draw_angle.angle, 90.0, "the angle itself persists");
     }
 
@@ -13026,7 +15382,10 @@ mod tests {
         let mut ch = Character::new();
         ch.move_connect.hit = true;
         ch.move_connect.guarded = true;
-        assert!(ch.move_connect.contact(), "precondition: move had connected");
+        assert!(
+            ch.move_connect.contact(),
+            "precondition: move had connected"
+        );
         lc.tick(&mut ch);
         assert!(!ch.move_connect.hit, "MoveHit cleared");
         assert!(!ch.move_connect.guarded, "MoveGuarded cleared");
@@ -13045,7 +15404,10 @@ mod tests {
         ch.vars[0] = 7; // an untouched neighbour
         lc.tick(&mut ch);
         let v = ch.vars[3];
-        assert!((10..=20).contains(&v), "VarRandom result {v} out of [10,20]");
+        assert!(
+            (10..=20).contains(&v),
+            "VarRandom result {v} out of [10,20]"
+        );
         assert_eq!(ch.vars[0], 7, "VarRandom only touched the requested index");
 
         // Deterministic for a fixed seed (replay safety).
@@ -13062,7 +15424,10 @@ mod tests {
         let mut ch2 = Character::new();
         ch2.seed_rng(42);
         lc_single.tick(&mut ch2);
-        assert!((0..=5).contains(&ch2.vars[1]), "single-range VarRandom in [0,5]");
+        assert!(
+            (0..=5).contains(&ch2.vars[1]),
+            "single-range VarRandom in [0,5]"
+        );
 
         // No `v` index → safe no-op (no var changes, no panic).
         let lc_noidx = one_ctrl_synth("VarRandom", &[("range", "0,10")]);
@@ -13182,8 +15547,22 @@ mod tests {
     #[test]
     fn tick_with_graph_resolves_parent_and_root_redirects() {
         // var(0) = 1 iff `root, Life == 555`; var(1) = 1 iff `parent, Life == 321`.
-        let set_root_flag = ctrl(0, "VarSet", &[], &[(1, &["root, Life = 555"])], None, &[("v", "0"), ("value", "1")]);
-        let set_parent_flag = ctrl(0, "VarSet", &[], &[(1, &["parent, Life = 321"])], None, &[("v", "1"), ("value", "1")]);
+        let set_root_flag = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["root, Life = 555"])],
+            None,
+            &[("v", "0"), ("value", "1")],
+        );
+        let set_parent_flag = ctrl(
+            0,
+            "VarSet",
+            &[],
+            &[(1, &["parent, Life = 321"])],
+            None,
+            &[("v", "1"), ("value", "1")],
+        );
         let st0 = stand_n(0, vec![set_root_flag, set_parent_flag]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
 
@@ -13203,14 +15582,23 @@ mod tests {
             graph,
         );
 
-        assert_eq!(helper.vars[0], 1, "`root, Life` redirect resolved to the root");
-        assert_eq!(helper.vars[1], 1, "`parent, Life` redirect resolved to the parent");
+        assert_eq!(
+            helper.vars[0], 1,
+            "`root, Life` redirect resolved to the root"
+        );
+        assert_eq!(
+            helper.vars[1], 1,
+            "`parent, Life` redirect resolved to the parent"
+        );
 
         // Without the graph (a plain tick), the same redirects bottom out: the
         // gating conditions are false, so neither flag is set.
         let mut lone = Character::new();
         lone.tick_with(&lc.states, &lc.air, Some(&root), StageView::default());
-        assert_eq!(lone.vars[0], 0, "no graph: `root, Life` (a helper's root) does not match 555");
+        assert_eq!(
+            lone.vars[0], 0,
+            "no graph: `root, Life` (a helper's root) does not match 555"
+        );
         assert_eq!(lone.vars[1], 0, "no graph: `parent` resolves to None → 0");
     }
 
@@ -13221,15 +15609,27 @@ mod tests {
     #[test]
     fn deferred_controllers_are_tracked() {
         for kind in [
-            "Explod", "ModifyExplod", "RemoveExplod",
-            "BGPalFX", "AllPalFX", "BindToParent", "BindToRoot", "BindToTarget",
-            "DestroySelf", "MakeDust", "ForceFeedback",
+            "Explod",
+            "ModifyExplod",
+            "RemoveExplod",
+            "BGPalFX",
+            "AllPalFX",
+            "BindToParent",
+            "BindToRoot",
+            "BindToTarget",
+            "DestroySelf",
+            "MakeDust",
+            "ForceFeedback",
             // T015 follow-up review: documented controllers that depend on an
             // unbuilt subsystem must be tracked, not silently no-op'd.
-            "ReversalDef", "ScreenBound", "FallEnvShake",
+            "ReversalDef",
+            "ScreenBound",
+            "FallEnvShake",
             // Target / active-HitDef controllers — blocked on the bind/hit-count
             // entity lifecycle; must be tracked, not silent no-ops.
-            "HitAdd", "AttackDist", "TargetDrop",
+            "HitAdd",
+            "AttackDist",
+            "TargetDrop",
         ] {
             assert!(
                 is_tracked_deferred_controller(kind),
@@ -13243,8 +15643,17 @@ mod tests {
         // `Helper` spawn-request emitter added in T012, and the `Projectile`
         // spawn-request emitter added in T013).
         for handled in [
-            "EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw",
-            "Gravity", "VarRandom", "MoveHitReset", "Helper", "Projectile",
+            "EnvShake",
+            "EnvColor",
+            "RemapPal",
+            "LifeAdd",
+            "Trans",
+            "AngleDraw",
+            "Gravity",
+            "VarRandom",
+            "MoveHitReset",
+            "Helper",
+            "Projectile",
         ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
@@ -13277,7 +15686,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let throw = state(
             810,
-            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), facep2: Some("1"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                facep2: Some("1"),
+                ..Entry::default()
+            },
             vec![
                 // A ChangeState back to 0 must NOT fire this tick; gate it off.
             ],
@@ -13303,7 +15718,14 @@ mod tests {
         // change_state under an opponent-aware tick instead: re-enter from tick.
         // Simplest: enter via the cross-entity path inside tick_with by having
         // state 0 ChangeState to 810. Build that:
-        let to_throw = ctrl(0, "ChangeState", &[], &[(1, &["1"])], None, &[("value", "810")]);
+        let to_throw = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "810")],
+        );
         let st0b = stand_n(0, vec![to_throw]);
         let mut states2 = states;
         states2.insert(0, st0b);
@@ -13312,7 +15734,11 @@ mod tests {
 
         me.tick_with(&states2, &air, Some(&opp), StageView::default());
         assert_eq!(me.state_no, 810, "entered the throw state");
-        assert_eq!(me.facing, Facing::Right, "facep2 turned me to face the opponent on my right");
+        assert_eq!(
+            me.facing,
+            Facing::Right,
+            "facep2 turned me to face the opponent on my right"
+        );
     }
 
     /// A facep2 entry with NO opponent in view leaves the facing unchanged.
@@ -13321,7 +15747,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let throw = state(
             810,
-            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), facep2: Some("1"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                facep2: Some("1"),
+                ..Entry::default()
+            },
             vec![],
         );
         let states = {
@@ -13334,7 +15766,11 @@ mod tests {
         ch.facing = Facing::Left;
         // change_state uses the self-only env (no opponent) — facing must not flip.
         ch.change_state(&states, 810);
-        assert_eq!(ch.facing, Facing::Left, "no opponent -> facep2 leaves facing unchanged");
+        assert_eq!(
+            ch.facing,
+            Facing::Left,
+            "no opponent -> facep2 leaves facing unchanged"
+        );
     }
 
     /// On a plain state entry (no `hitdefpersist`) the active HitDef is cleared.
@@ -13353,7 +15789,10 @@ mod tests {
         // change_state happens outside a tick, so `hitdef_set_this_tick` is false:
         // a carried-over HitDef is cleared.
         ch.change_state(&states, 5);
-        assert!(ch.active_hitdef.is_none(), "default entry clears a stale HitDef");
+        assert!(
+            ch.active_hitdef.is_none(),
+            "default entry clears a stale HitDef"
+        );
     }
 
     /// `hitdefpersist = 1` keeps the active HitDef across a state change.
@@ -13362,7 +15801,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let persist = state(
             5,
-            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), hitdefpersist: Some("1"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                hitdefpersist: Some("1"),
+                ..Entry::default()
+            },
             vec![],
         );
         let states = {
@@ -13374,7 +15819,10 @@ mod tests {
         let mut ch = Character::new();
         ch.active_hitdef = Some(fp_combat::HitDef::default());
         ch.change_state(&states, 5);
-        assert!(ch.active_hitdef.is_some(), "hitdefpersist=1 keeps the active HitDef");
+        assert!(
+            ch.active_hitdef.is_some(),
+            "hitdefpersist=1 keeps the active HitDef"
+        );
     }
 
     /// On a plain state entry (no `movehitpersist`) the move-hit flags reset.
@@ -13391,7 +15839,10 @@ mod tests {
         let mut ch = Character::new();
         ch.move_connect.hit = true;
         ch.change_state(&states, 5);
-        assert!(!ch.move_connect.contact(), "default entry resets move-hit flags");
+        assert!(
+            !ch.move_connect.contact(),
+            "default entry resets move-hit flags"
+        );
     }
 
     /// `movehitpersist = 1` keeps the move-hit flags across a state change.
@@ -13400,7 +15851,13 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let persist = state(
             5,
-            Entry { st: Some("S"), ph: Some("S"), anim: Some("0"), movehitpersist: Some("1"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("S"),
+                anim: Some("0"),
+                movehitpersist: Some("1"),
+                ..Entry::default()
+            },
             vec![],
         );
         let states = {
@@ -13412,7 +15869,10 @@ mod tests {
         let mut ch = Character::new();
         ch.move_connect.hit = true;
         ch.change_state(&states, 5);
-        assert!(ch.move_connect.hit, "movehitpersist=1 keeps the move-hit flag");
+        assert!(
+            ch.move_connect.hit,
+            "movehitpersist=1 keeps the move-hit flag"
+        );
     }
 
     /// The `juggle` header sets `cur_juggle_cost` on entry; absent leaves it 0.
@@ -13465,7 +15925,10 @@ mod tests {
         ch.juggle_points = 2; // simulate a spent pool
         ch.state_type = StateType::Standing; // grounded
         lc.tick(&mut ch);
-        assert_eq!(ch.juggle_points, 15, "grounded tick refills the juggle pool");
+        assert_eq!(
+            ch.juggle_points, 15,
+            "grounded tick refills the juggle pool"
+        );
     }
 
     // ---- T009: per-frame scale/angle + Interpolate at render time ----------
@@ -13482,17 +15945,19 @@ mod tests {
     fn scale_angle_air(frames: &[FrameSpec]) -> AirFile {
         let frames: Vec<AnimFrame> = frames
             .iter()
-            .map(|&(ticks, scale, angle, interp_scale, interp_angle)| AnimFrame {
-                ticks,
-                scale: Some(Vec2::new(scale.0, scale.1)),
-                angle: Some(angle),
-                interpolate: Interpolate {
-                    scale: interp_scale,
-                    angle: interp_angle,
+            .map(
+                |&(ticks, scale, angle, interp_scale, interp_angle)| AnimFrame {
+                    ticks,
+                    scale: Some(Vec2::new(scale.0, scale.1)),
+                    angle: Some(angle),
+                    interpolate: Interpolate {
+                        scale: interp_scale,
+                        angle: interp_angle,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            })
+            )
             .collect();
         let mut actions = HashMap::new();
         actions.insert(
@@ -13565,7 +16030,12 @@ mod tests {
         // anim_elem_time the executor maintains feeds the render-time transform.
         let st = state(
             0,
-            Entry { st: Some("S"), ph: Some("N"), anim: Some("0"), ..Entry::default() },
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
             vec![],
         );
         let air = scale_angle_air(&[

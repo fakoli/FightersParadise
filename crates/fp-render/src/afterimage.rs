@@ -233,7 +233,10 @@ mod tests {
         assert_eq!(TrailTrans::Add1.blend_mode(), BlendMode::Additive);
         assert_eq!(TrailTrans::Sub.blend_mode(), BlendMode::Subtractive);
         assert!(approx(TrailTrans::Add.base_alpha(), 1.0));
-        assert!(approx(TrailTrans::Add1.base_alpha(), 0.5), "add1 is half-strength");
+        assert!(
+            approx(TrailTrans::Add1.base_alpha(), 0.5),
+            "add1 is half-strength"
+        );
     }
 
     #[test]
@@ -252,6 +255,9 @@ mod tests {
     fn add1_halves_the_ghost_alpha() {
         let normal = ghost_alpha(1, 4, TrailTrans::Add);
         let half = ghost_alpha(1, 4, TrailTrans::Add1);
-        assert!(approx(half, normal * 0.5), "add1 halves the per-ghost alpha");
+        assert!(
+            approx(half, normal * 0.5),
+            "add1 halves the per-ghost alpha"
+        );
     }
 }

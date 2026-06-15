@@ -198,9 +198,7 @@ impl CmdFile {
                             if let Ok(v) = value.parse::<u32>() {
                                 defaults.command_buffer_time = v;
                             } else {
-                                tracing::warn!(
-                                    "CMD: invalid command.buffer.time value: {value}"
-                                );
+                                tracing::warn!("CMD: invalid command.buffer.time value: {value}");
                             }
                         }
                     }

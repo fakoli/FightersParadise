@@ -265,7 +265,12 @@ fn parse_pos(def: &DefFile, section: &str, key: &str) -> Option<Pos> {
     match parse_int_pair(raw) {
         Some((x, y)) => Some(Pos::new(x, y)),
         None => {
-            tracing::warn!(section, key, raw, "screenpack: malformed position; ignoring");
+            tracing::warn!(
+                section,
+                key,
+                raw,
+                "screenpack: malformed position; ignoring"
+            );
             None
         }
     }
@@ -282,7 +287,12 @@ fn parse_sprite(def: &DefFile, section: &str, key: &str) -> Option<SpriteRef> {
             offset: Pos::default(),
         }),
         None => {
-            tracing::warn!(section, key, raw, "screenpack: malformed sprite ref; ignoring");
+            tracing::warn!(
+                section,
+                key,
+                raw,
+                "screenpack: malformed sprite ref; ignoring"
+            );
             None
         }
     }
@@ -293,9 +303,7 @@ fn parse_sprite(def: &DefFile, section: &str, key: &str) -> Option<SpriteRef> {
 /// take the first integer as the slot.
 fn parse_font_slot(def: &DefFile, section: &str, key: &str) -> usize {
     match def.get(section, key) {
-        Some(raw) => first_int(raw)
-            .map(|n| n.max(0) as usize)
-            .unwrap_or(0),
+        Some(raw) => first_int(raw).map(|n| n.max(0) as usize).unwrap_or(0),
         None => 0,
     }
 }
@@ -362,7 +370,12 @@ fn parse_bar_layer(def: &DefFile, section: &str, side: &str, layer: &str) -> Opt
 fn parse_range(def: &DefFile, section: &str, key: &str) -> (i32, i32) {
     match def.get(section, key) {
         Some(raw) => parse_int_pair(raw).unwrap_or_else(|| {
-            tracing::warn!(section, key, raw, "screenpack: malformed range; defaulting to (0,0)");
+            tracing::warn!(
+                section,
+                key,
+                raw,
+                "screenpack: malformed range; defaulting to (0,0)"
+            );
             (0, 0)
         }),
         None => (0, 0),
@@ -380,7 +393,12 @@ fn parse_level_sounds(def: &DefFile, section: &str, side: &str) -> Vec<(i32, i32
                 if let Some(pair) = parse_int_pair(raw) {
                     out.push(pair);
                 } else {
-                    tracing::warn!(section, key, raw, "screenpack: malformed level sound; skipping");
+                    tracing::warn!(
+                        section,
+                        key,
+                        raw,
+                        "screenpack: malformed level sound; skipping"
+                    );
                 }
                 level += 1;
             }
@@ -401,9 +419,10 @@ fn parse_name_side(def: &DefFile, section: &str, side: &str) -> NameSide {
 /// Parses one side (`p1`/`p2`) of `[Face]`.
 fn parse_face_side(def: &DefFile, section: &str, side: &str) -> FaceSide {
     let mut spr = parse_sprite(def, section, &format!("{side}.spr"));
-    if let (Some(s), Some(off)) =
-        (spr.as_mut(), parse_pos(def, section, &format!("{side}.offset")))
-    {
+    if let (Some(s), Some(off)) = (
+        spr.as_mut(),
+        parse_pos(def, section, &format!("{side}.offset")),
+    ) {
         s.offset = off;
     }
     FaceSide {
@@ -537,14 +556,33 @@ mystery.key = should be ignored
         assert_eq!(
             lb.bg_layers,
             vec![
-                SpriteRef { group: 0, image: 0, offset: Pos::new(0, 0) },
-                SpriteRef { group: 0, image: 2, offset: Pos::new(3, 3) },
+                SpriteRef {
+                    group: 0,
+                    image: 0,
+                    offset: Pos::new(0, 0)
+                },
+                SpriteRef {
+                    group: 0,
+                    image: 2,
+                    offset: Pos::new(3, 3)
+                },
             ]
         );
-        assert_eq!(lb.mid, Some(SpriteRef { group: 1, image: 0, offset: Pos::default() }));
+        assert_eq!(
+            lb.mid,
+            Some(SpriteRef {
+                group: 1,
+                image: 0,
+                offset: Pos::default()
+            })
+        );
         assert_eq!(
             lb.front,
-            Some(SpriteRef { group: 2, image: 0, offset: Pos::new(4, 4) })
+            Some(SpriteRef {
+                group: 2,
+                image: 0,
+                offset: Pos::new(4, 4)
+            })
         );
         assert_eq!(lb.range, (0, 256));
     }
@@ -556,11 +594,22 @@ mystery.key = should be ignored
         assert_eq!(lb.pos, Pos::new(240, 33));
         assert_eq!(
             lb.bg_layers,
-            vec![SpriteRef { group: 0, image: 1, offset: Pos::default() }],
+            vec![SpriteRef {
+                group: 0,
+                image: 1,
+                offset: Pos::default()
+            }],
             "p2 has a single bg0 layer authored"
         );
         assert_eq!(lb.mid, None, "p2 has no mid layer authored");
-        assert_eq!(lb.front, Some(SpriteRef { group: 2, image: 1, offset: Pos::default() }));
+        assert_eq!(
+            lb.front,
+            Some(SpriteRef {
+                group: 2,
+                image: 1,
+                offset: Pos::default()
+            })
+        );
         assert_eq!(lb.range, (0, -256), "p2 fill range mirrors to the left");
     }
 
@@ -578,8 +627,16 @@ mystery.key = should be ignored
         assert_eq!(
             l.p1_lifebar.bg_layers,
             vec![
-                SpriteRef { group: 0, image: 0, offset: Pos::default() },
-                SpriteRef { group: 0, image: 1, offset: Pos::default() },
+                SpriteRef {
+                    group: 0,
+                    image: 0,
+                    offset: Pos::default()
+                },
+                SpriteRef {
+                    group: 0,
+                    image: 1,
+                    offset: Pos::default()
+                },
             ],
             "collection stops at the first missing bgN (the non-contiguous bg3 is ignored)"
         );
@@ -599,9 +656,20 @@ mystery.key = should be ignored
         assert_eq!(pb.pos, Pos::new(80, 200));
         assert_eq!(
             pb.bg_layers,
-            vec![SpriteRef { group: 10, image: 0, offset: Pos::default() }]
+            vec![SpriteRef {
+                group: 10,
+                image: 0,
+                offset: Pos::default()
+            }]
         );
-        assert_eq!(pb.front, Some(SpriteRef { group: 12, image: 0, offset: Pos::default() }));
+        assert_eq!(
+            pb.front,
+            Some(SpriteRef {
+                group: 12,
+                image: 0,
+                offset: Pos::default()
+            })
+        );
         assert_eq!(pb.range, (0, 144));
         assert_eq!(pb.level_sounds, vec![(60, 0), (60, 1), (60, 2)]);
         // P2 has no level sounds authored.
@@ -612,7 +680,10 @@ mystery.key = should be ignored
     fn parses_round_time_combo_with_font_slots() {
         let l = sample();
         assert_eq!(l.round.pos, Pos::new(160, 20));
-        assert_eq!(l.round.font, 2, "font slot is the first int of 'font = 2,0,0'");
+        assert_eq!(
+            l.round.font, 2,
+            "font slot is the first int of 'font = 2,0,0'"
+        );
         assert_eq!(l.time.pos, Pos::new(160, 16));
         assert_eq!(l.time.font, 1);
         assert_eq!(l.combo.pos, Pos::new(30, 80));
@@ -626,13 +697,21 @@ mystery.key = should be ignored
         assert_eq!(l.p2_name.pos, Pos::new(300, 12));
         assert_eq!(
             l.p1_face.spr,
-            Some(SpriteRef { group: 9000, image: 0, offset: Pos::new(1, 1) })
+            Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::new(1, 1)
+            })
         );
         assert_eq!(l.p1_face.pos, Pos::new(12, 12));
         // P2 face has a sprite but no offset key -> offset stays default.
         assert_eq!(
             l.p2_face.spr,
-            Some(SpriteRef { group: 9000, image: 0, offset: Pos::default() })
+            Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::default()
+            })
         );
     }
 
@@ -655,10 +734,8 @@ mystery.key = should be ignored
 
     #[test]
     fn malformed_position_falls_back_to_default() {
-        let def = DefFile::from_str(
-            "[Lifebar]\np1.pos = not-a-number\np1.range.x = 0, 200\n",
-        )
-        .unwrap();
+        let def =
+            DefFile::from_str("[Lifebar]\np1.pos = not-a-number\np1.range.x = 0, 200\n").unwrap();
         let l = ScreenpackLayout::parse(&def);
         // Bad pos -> default (0,0); the valid range still parses.
         assert_eq!(l.p1_lifebar.pos, Pos::default());
@@ -668,10 +745,8 @@ mystery.key = should be ignored
     #[test]
     fn fonts_stop_at_first_gap() {
         // font0, font1 present, font2 absent, font3 present -> only 0,1 collected.
-        let def = DefFile::from_str(
-            "[Files]\nfont0 = a.fnt\nfont1 = b.fnt\nfont3 = d.fnt\n",
-        )
-        .unwrap();
+        let def =
+            DefFile::from_str("[Files]\nfont0 = a.fnt\nfont1 = b.fnt\nfont3 = d.fnt\n").unwrap();
         let l = ScreenpackLayout::parse(&def);
         assert_eq!(l.fonts, vec!["a.fnt".to_string(), "b.fnt".to_string()]);
     }

@@ -404,7 +404,10 @@ unknown.option = whatever
         let s = sample();
         assert_eq!(
             s.extra_stages,
-            vec!["stages/bonus.def".to_string(), "stages/another.def".to_string()]
+            vec![
+                "stages/bonus.def".to_string(),
+                "stages/another.def".to_string()
+            ]
         );
         assert_eq!(s.arcade_maxmatches, vec![6, 1, 1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(s.team_maxmatches, vec![4, 1, 1]);

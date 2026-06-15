@@ -53,7 +53,10 @@ fn fightfx_sff_loads_as_v2_and_decodes_every_sprite() {
     // Every sprite must decode to RGBA without error (proves the synthesized
     // RLE8 blobs + palette round-trip through the real parser).
     for (i, s) in sff.sprites.iter().enumerate() {
-        assert!(s.width > 0 && s.height > 0, "sprite {i} has zero dimensions");
+        assert!(
+            s.width > 0 && s.height > 0,
+            "sprite {i} has zero dimensions"
+        );
         let rgba = sff
             .decode_sprite_rgba(i)
             .unwrap_or_else(|e| panic!("fightfx sprite {i} failed to decode: {e}"));

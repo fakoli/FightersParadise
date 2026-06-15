@@ -731,12 +731,14 @@ pub fn validate_path(def_path: &Path) -> fp_core::FpResult<AnyReport> {
     match kind {
         ContentKind::Character => Ok(AnyReport::Character(validate(def_path)?)),
         ContentKind::Stage => Ok(AnyReport::Stage(validate_stage(def_path)?)),
-        ContentKind::Storyboard => {
-            Ok(AnyReport::Scene(validate_scene(def_path, ContentKind::Storyboard)?))
-        }
-        ContentKind::Screenpack => {
-            Ok(AnyReport::Scene(validate_scene(def_path, ContentKind::Screenpack)?))
-        }
+        ContentKind::Storyboard => Ok(AnyReport::Scene(validate_scene(
+            def_path,
+            ContentKind::Storyboard,
+        )?)),
+        ContentKind::Screenpack => Ok(AnyReport::Scene(validate_scene(
+            def_path,
+            ContentKind::Screenpack,
+        )?)),
     }
 }
 
@@ -857,10 +859,7 @@ pub fn analyze_stage(stage: &Stage) -> StageReport {
             // in-memory parse is left unchecked.
             if path.is_absolute() || path.exists() {
                 if !path.exists() {
-                    report.push(
-                        "BGdef",
-                        format!("`spr` file not found: {}", path.display()),
-                    );
+                    report.push("BGdef", format!("`spr` file not found: {}", path.display()));
                 } else if let Err(e) = fp_formats::sff::SffFile::load(path) {
                     report.push(
                         "BGdef",
@@ -1236,9 +1235,9 @@ mod tests {
 
     use fp_character::loader::{CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup};
     use fp_character::CharacterConstants;
+    use fp_core::SpriteId;
     use fp_formats::air::{AirFile, AnimAction, AnimFrame};
     use fp_formats::sff::SffFile;
-    use fp_core::SpriteId;
 
     // ---- builders for an in-memory broken/clean character ----------------
 
@@ -1324,7 +1323,10 @@ mod tests {
     /// A `ChangeState value = N` controller (N a literal int).
     fn change_state(state: i32, label: &str, target: i32) -> CompiledController {
         let mut params = HashMap::new();
-        params.insert("value".to_string(), CompiledParam::compile(&target.to_string()));
+        params.insert(
+            "value".to_string(),
+            CompiledParam::compile(&target.to_string()),
+        );
         CompiledController {
             state_number: state,
             label: label.to_string(),
@@ -1342,7 +1344,10 @@ mod tests {
 
     fn change_anim(state: i32, label: &str, target: i32) -> CompiledController {
         let mut params = HashMap::new();
-        params.insert("value".to_string(), CompiledParam::compile(&target.to_string()));
+        params.insert(
+            "value".to_string(),
+            CompiledParam::compile(&target.to_string()),
+        );
         CompiledController {
             state_number: state,
             label: label.to_string(),
@@ -1429,8 +1434,14 @@ mod tests {
             action(20, vec![frame(20, 0)]),
         ]);
         let states = vec![
-            state(0, vec![change_anim(0, "anim", 0), change_state(0, "go", 20)]),
-            state(20, vec![change_anim(20, "anim", 20), change_state(20, "back", 0)]),
+            state(
+                0,
+                vec![change_anim(0, "anim", 0), change_state(0, "go", 20)],
+            ),
+            state(
+                20,
+                vec![change_anim(20, "anim", 20), change_state(20, "back", 0)],
+            ),
         ];
         let c = loaded(sff, air, states, true);
         let report = analyze(&c);
@@ -1614,8 +1625,8 @@ mod tests {
         // loader and report it clean (no missing sprites / dead refs / failed
         // compiles). This is the conformance guard for the shipped fixture.
         let def = dummy_asset("trainingdummy.def");
-        let report = validate(&def)
-            .unwrap_or_else(|e| panic!("shipped Training Dummy failed to load: {e}"));
+        let report =
+            validate(&def).unwrap_or_else(|e| panic!("shipped Training Dummy failed to load: {e}"));
         assert!(
             report.is_clean(),
             "Training Dummy not clean: {} problem(s):\n{}",
@@ -1799,7 +1810,10 @@ spriteno = -1, 0
         // an empty stage with no BGs reports the no-spr issue.
         assert!(!report.is_clean());
         // A truly minimal but valid stage: give it a spr (bare path, unchecked).
-        let stage2 = Stage::parse("[StageInfo]\nlocalcoord=320,240\n[BGdef]\nspr=s.sff\n", None);
+        let stage2 = Stage::parse(
+            "[StageInfo]\nlocalcoord=320,240\n[BGdef]\nspr=s.sff\n",
+            None,
+        );
         let report2 = analyze_stage(&stage2);
         let text = render_stage_report(&report2);
         assert!(text.contains("PASS"), "{text}");
@@ -1853,10 +1867,13 @@ layer0.offset = 10, 10
 ";
         let sb = Storyboard::from_def(text);
         let report = analyze_storyboard(&sb);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.detail.contains("draws nothing")), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.detail.contains("draws nothing")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -1871,10 +1888,13 @@ layer0.spriteno = 0, 0
 ";
         let sb = Storyboard::from_def(text);
         let report = analyze_storyboard(&sb);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.detail.contains("no matching background group")), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.detail.contains("no matching background group")),
+            "{report:?}"
+        );
     }
 
     // ===================================================================
@@ -1930,10 +1950,13 @@ font = 3
         let d = def(text);
         let layout = ScreenpackLayout::parse(&d);
         let report = analyze_screenpack(&layout);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.location == "Round" && i.detail.contains("out of range")), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.location == "Round" && i.detail.contains("out of range")),
+            "{report:?}"
+        );
     }
 
     // ===================================================================
@@ -2047,7 +2070,10 @@ font = 3
     fn validate_path_errors_on_unclassifiable_def() {
         let path = write_temp_def("junk", "[Whatever]\nkey=value\n");
         let result = validate_path(&path);
-        assert!(result.is_err(), "an unclassifiable .def must error, not guess");
+        assert!(
+            result.is_err(),
+            "an unclassifiable .def must error, not guess"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

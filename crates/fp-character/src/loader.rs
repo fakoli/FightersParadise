@@ -57,8 +57,8 @@ use fp_formats::air::AirFile;
 use fp_formats::cmd::CmdFile;
 use fp_formats::cns::{CnsFile, StateController, Statedef};
 use fp_formats::def::DefFile;
-use fp_formats::snd::SndFile;
 use fp_formats::sff::SffFile;
+use fp_formats::snd::SndFile;
 use fp_vm::Expr;
 
 use fp_core::Vec2;
@@ -98,9 +98,7 @@ impl CompiledExpr {
                 is_fallback: false,
             },
             Err(err) => {
-                tracing::warn!(
-                    "character load: bad expression {source:?} -> const 0 ({err})"
-                );
+                tracing::warn!("character load: bad expression {source:?} -> const 0 ({err})");
                 Self {
                     expr: Expr::Int(0),
                     source: source.to_string(),
@@ -301,7 +299,11 @@ impl CompiledController {
             .iter()
             .map(|g| CompiledTriggerGroup {
                 number: g.number,
-                conditions: g.conditions.iter().map(|s| CompiledExpr::compile(s)).collect(),
+                conditions: g
+                    .conditions
+                    .iter()
+                    .map(|s| CompiledExpr::compile(s))
+                    .collect(),
             })
             .collect();
 
@@ -407,7 +409,11 @@ impl CompiledState {
             facep2: def.facep2.as_deref().map(CompiledExpr::compile),
             hitdefpersist: def.hitdefpersist.as_deref().map(CompiledExpr::compile),
             movehitpersist: def.movehitpersist.as_deref().map(CompiledExpr::compile),
-            controllers: def.controllers.iter().map(CompiledController::from_parsed).collect(),
+            controllers: def
+                .controllers
+                .iter()
+                .map(CompiledController::from_parsed)
+                .collect(),
         }
     }
 }
@@ -513,12 +519,18 @@ impl LoadedCharacter {
 
         // ---- [Files]: required assets ----
         let sprite_ref = def.get("Files", "sprite").ok_or_else(|| {
-            FpError::not_found("sprite", format!("{} has no [Files] sprite", def_path.display()))
+            FpError::not_found(
+                "sprite",
+                format!("{} has no [Files] sprite", def_path.display()),
+            )
         })?;
         let sff = SffFile::load(&DefFile::resolve_path(def_path, sprite_ref))?;
 
         let anim_ref = def.get("Files", "anim").ok_or_else(|| {
-            FpError::not_found("animation", format!("{} has no [Files] anim", def_path.display()))
+            FpError::not_found(
+                "animation",
+                format!("{} has no [Files] anim", def_path.display()),
+            )
         })?;
         let air = AirFile::load(&DefFile::resolve_path(def_path, anim_ref))?;
 
@@ -997,7 +1009,10 @@ fn merge_cmd_statedefs(states: &mut HashMap<i32, CompiledState>, path: &Path, re
     let cns = match CnsFile::load(path) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("CMD statedef merge for {rel} ({}) skipped: {e}", path.display());
+            tracing::warn!(
+                "CMD statedef merge for {rel} ({}) skipped: {e}",
+                path.display()
+            );
             return;
         }
     };
@@ -1140,10 +1155,11 @@ fn append_builtin_ground_locomotion(states: &mut HashMap<i32, CompiledState>) {
     // `load` of the same graph), do nothing — appending twice would create
     // duplicate command-states that can flicker (a stale `walk->stand` firing in
     // the same `-1` pass). No real character labels its controllers `engine: `.
-    if states
-        .get(&-1)
-        .is_some_and(|s| s.controllers.iter().any(|c| c.label.starts_with("engine: ")))
-    {
+    if states.get(&-1).is_some_and(|s| {
+        s.controllers
+            .iter()
+            .any(|c| c.label.starts_with("engine: "))
+    }) {
         return;
     }
     let cns = match CnsFile::from_str(BUILTIN_GROUND_LOCOMOTION_CNS) {
@@ -1392,7 +1408,10 @@ fn read_movement_group(ini: &DefFile, mv: &mut MovementConstants) {
 fn parse_vec2(raw: &str) -> Option<Vec2<f32>> {
     let mut parts = raw.split(',').map(str::trim);
     let x = parts.next().and_then(|p| p.parse::<f32>().ok())?;
-    let y = parts.next().and_then(|p| p.parse::<f32>().ok()).unwrap_or(0.0);
+    let y = parts
+        .next()
+        .and_then(|p| p.parse::<f32>().ok())
+        .unwrap_or(0.0);
     Some(Vec2::new(x, y))
 }
 
@@ -1485,7 +1504,9 @@ mod tests {
         }
         // Emulate the fill-missing merge for the second file.
         for d in &second.statedefs {
-            states.entry(d.number).or_insert_with(|| CompiledState::from_parsed(d));
+            states
+                .entry(d.number)
+                .or_insert_with(|| CompiledState::from_parsed(d));
         }
         // The first file's state 0 (type S) wins.
         assert_eq!(states.get(&0).unwrap().state_type.as_deref(), Some("S"));
@@ -1547,7 +1568,10 @@ mod tests {
         )
         .unwrap();
         let state = CompiledState::from_parsed(&cns.statedefs[0]);
-        let pa = state.poweradd.as_ref().expect("poweradd compiled into CompiledState");
+        let pa = state
+            .poweradd
+            .as_ref()
+            .expect("poweradd compiled into CompiledState");
         assert!(!pa.is_fallback, "literal `10` compiles cleanly");
         assert_eq!(pa.source, "10", "raw source preserved verbatim");
         assert_eq!(pa.expr, Expr::Int(10));
@@ -1567,10 +1591,8 @@ mod tests {
         // AC1: `poweradd` is an EXPRESSION (compiled at load), not a fixed int.
         // A trigger-bearing value compiles to a non-fallback expr; evaluation is
         // the executor's job. (Tests the compile step keeps non-literal source.)
-        let cns = CnsFile::from_str(
-            "[Statedef 200]\ntype = S\nanim = 200\npoweradd = 5 + 5\n",
-        )
-        .unwrap();
+        let cns =
+            CnsFile::from_str("[Statedef 200]\ntype = S\nanim = 200\npoweradd = 5 + 5\n").unwrap();
         let state = CompiledState::from_parsed(&cns.statedefs[0]);
         let pa = state.poweradd.as_ref().expect("poweradd present");
         assert!(!pa.is_fallback, "`5 + 5` is a valid expression");
@@ -1581,12 +1603,13 @@ mod tests {
     fn from_parsed_poweradd_malformed_is_const_zero_fallback() {
         // AC3: a garbage `poweradd` value compiles to the const-0 fallback (never
         // panics, never an Err) — on entry the executor adds 0.
-        let cns = CnsFile::from_str(
-            "[Statedef 200]\ntype = S\nanim = 200\npoweradd = 1 +\n",
-        )
-        .unwrap();
+        let cns =
+            CnsFile::from_str("[Statedef 200]\ntype = S\nanim = 200\npoweradd = 1 +\n").unwrap();
         let state = CompiledState::from_parsed(&cns.statedefs[0]);
-        let pa = state.poweradd.as_ref().expect("poweradd present even when malformed");
+        let pa = state
+            .poweradd
+            .as_ref()
+            .expect("poweradd present even when malformed");
         assert!(pa.is_fallback, "malformed `1 +` -> const-0 fallback");
         assert_eq!(pa.expr, Expr::Int(0));
     }
@@ -1613,17 +1636,35 @@ mod tests {
         .unwrap();
         let state = CompiledState::from_parsed(&cns.statedefs[0]);
         assert_eq!(
-            state.sprpriority.as_ref().expect("sprpriority carried").expr,
+            state
+                .sprpriority
+                .as_ref()
+                .expect("sprpriority carried")
+                .expr,
             Expr::Int(3)
         );
-        assert_eq!(state.juggle.as_ref().expect("juggle carried").expr, Expr::Int(4));
-        assert_eq!(state.facep2.as_ref().expect("facep2 carried").expr, Expr::Int(1));
         assert_eq!(
-            state.hitdefpersist.as_ref().expect("hitdefpersist carried").expr,
+            state.juggle.as_ref().expect("juggle carried").expr,
+            Expr::Int(4)
+        );
+        assert_eq!(
+            state.facep2.as_ref().expect("facep2 carried").expr,
             Expr::Int(1)
         );
         assert_eq!(
-            state.movehitpersist.as_ref().expect("movehitpersist carried").expr,
+            state
+                .hitdefpersist
+                .as_ref()
+                .expect("hitdefpersist carried")
+                .expr,
+            Expr::Int(1)
+        );
+        assert_eq!(
+            state
+                .movehitpersist
+                .as_ref()
+                .expect("movehitpersist carried")
+                .expr,
             Expr::Int(1)
         );
     }
@@ -1817,9 +1858,9 @@ mod tests {
         // expression, failed on the top-level comma, and warned once per param.
         let logs = capture_warnings(|| {
             for raw in [
-                "20, 5",        // damage = hit, guard
-                "-4, 0",        // ground.velocity = x, y
-                "12, 12",       // pausetime = p1, p2
+                "20, 5",                 // damage = hit, guard
+                "-4, 0",                 // ground.velocity = x, y
+                "12, 12",                // pausetime = p1, p2
                 "ceil(var(1) * 1.5), 0", // expression component + scalar
                 "var(2) * 2, var(2)",    // both components are expressions
             ] {
@@ -1870,7 +1911,10 @@ mod tests {
         // Multi-byte UTF-8 around / inside delimiters must not panic and must not
         // be mis-sliced (the scanner uses char_indices + len_utf8). A quoted
         // multi-byte token and a unicode-laden bare token are each one component.
-        assert_eq!(split_top_level_commas("\"café, x\", y"), vec!["\"café, x\"", " y"]);
+        assert_eq!(
+            split_top_level_commas("\"café, x\", y"),
+            vec!["\"café, x\"", " y"]
+        );
         assert_eq!(split_top_level_commas("naïve"), vec!["naïve"]);
         // Deeply nested parens/brackets: every comma is interior → one component.
         assert_eq!(
@@ -1889,7 +1933,14 @@ mod tests {
         // Malformed MUGEN content can have unbalanced parens/brackets/quotes. The
         // scanner must never panic and must still return at least one component.
         // (`saturating_sub` on depth and the in_string toggle guarantee this.)
-        for raw in ["(((", ")))", "[a, b", "a, b]", "\"unterminated, comma", "((1, 2)"] {
+        for raw in [
+            "(((",
+            ")))",
+            "[a, b",
+            "a, b]",
+            "\"unterminated, comma",
+            "((1, 2)",
+        ] {
             let parts = split_top_level_commas(raw);
             assert!(!parts.is_empty(), "{raw:?} yielded zero components");
             // The re-joined parts (with the commas the scanner consumed) preserve
@@ -1903,7 +1954,16 @@ mod tests {
     fn split_round_trips_for_balanced_inputs() {
         // For any input, joining the components on ',' reconstructs the source,
         // because the scanner only ever consumes single-byte top-level commas.
-        for raw in ["", "1", "1, 2, 3", "a,,b", ", leading", "trailing, ", "  ", "x , y"] {
+        for raw in [
+            "",
+            "1",
+            "1, 2, 3",
+            "a,,b",
+            ", leading",
+            "trailing, ",
+            "  ",
+            "x , y",
+        ] {
             assert_eq!(split_top_level_commas(raw).join(","), raw, "{raw:?}");
         }
     }
@@ -1917,7 +1977,10 @@ mod tests {
             let p = CompiledParam::compile(raw);
             assert_eq!(p.len(), 1, "{raw:?} → one component");
             assert!(!p.is_empty(), "{raw:?} is never component-empty");
-            assert!(p.component(0).is_some_and(|c| c.is_fallback), "{raw:?} → fallback");
+            assert!(
+                p.component(0).is_some_and(|c| c.is_fallback),
+                "{raw:?} → fallback"
+            );
             assert_eq!(p.component(0).map(|c| c.expr.clone()), Some(Expr::Int(0)));
             assert_eq!(p.raw(), raw, "{raw:?} raw preserved verbatim");
         }
@@ -1930,15 +1993,30 @@ mod tests {
         // so the positional read (component 0 vs 1) stays correct.
         let lead = CompiledParam::compile(", 5");
         assert_eq!(lead.len(), 2);
-        assert!(lead.component(0).is_some_and(|c| c.is_fallback), "empty x → 0");
-        assert_eq!(lead.component(0).map(|c| c.expr.clone()), Some(Expr::Int(0)));
+        assert!(
+            lead.component(0).is_some_and(|c| c.is_fallback),
+            "empty x → 0"
+        );
+        assert_eq!(
+            lead.component(0).map(|c| c.expr.clone()),
+            Some(Expr::Int(0))
+        );
         assert!(lead.component(1).is_some_and(|c| !c.is_fallback));
-        assert_eq!(lead.component(1).map(|c| c.expr.clone()), Some(Expr::Int(5)));
+        assert_eq!(
+            lead.component(1).map(|c| c.expr.clone()),
+            Some(Expr::Int(5))
+        );
 
         let trail = CompiledParam::compile("12, ");
         assert_eq!(trail.len(), 2);
-        assert_eq!(trail.component(0).map(|c| c.expr.clone()), Some(Expr::Int(12)));
-        assert!(trail.component(1).is_some_and(|c| c.is_fallback), "empty y → 0 fallback");
+        assert_eq!(
+            trail.component(0).map(|c| c.expr.clone()),
+            Some(Expr::Int(12))
+        );
+        assert!(
+            trail.component(1).is_some_and(|c| c.is_fallback),
+            "empty y → 0 fallback"
+        );
     }
 
     #[test]
@@ -1960,7 +2038,10 @@ mod tests {
         // does not corrupt multi-arg calls. `ceil(var(1), 0)` parses cleanly.
         let p = CompiledParam::compile("ceil(var(1), 0), 7");
         assert_eq!(p.len(), 2, "the call-comma is NOT a top-level separator");
-        assert!(p.component(0).is_some_and(|c| !c.is_fallback), "call component compiles");
+        assert!(
+            p.component(0).is_some_and(|c| !c.is_fallback),
+            "call component compiles"
+        );
         assert!(
             matches!(p.component(0).map(|c| &c.expr), Some(Expr::Call { .. })),
             "component 0 is the multi-arg call"
@@ -2023,15 +2104,27 @@ mod tests {
         assert_eq!(loaded.constants.defence, 100);
 
         // Sprites and animations loaded.
-        assert!(!loaded.sff.sprites.is_empty(), "kfm.sff should have sprites");
-        assert!(!loaded.air.actions.is_empty(), "kfm.air should have actions");
+        assert!(
+            !loaded.sff.sprites.is_empty(),
+            "kfm.sff should have sprites"
+        );
+        assert!(
+            !loaded.air.actions.is_empty(),
+            "kfm.air should have actions"
+        );
 
         // >0 compiled states; the merge folded in common1.cns common states.
         assert!(loaded.state_count() > 0, "should have compiled states");
         // KFM defines [Statedef -3] (its own) and common1.cns defines the common
         // states like [Statedef 0] (stand). Both must be present after the merge.
-        assert!(loaded.state(-3).is_some(), "kfm's [Statedef -3] should load");
-        assert!(loaded.state(0).is_some(), "common Stand [Statedef 0] should load");
+        assert!(
+            loaded.state(-3).is_some(),
+            "kfm's [Statedef -3] should load"
+        );
+        assert!(
+            loaded.state(0).is_some(),
+            "common Stand [Statedef 0] should load"
+        );
 
         // The optional cmd and snd files exist in the fixture and should parse.
         assert!(loaded.cmd.is_some(), "kfm.cmd should load");
@@ -2169,7 +2262,11 @@ mod tests {
         // so a `[Statedef -1]` split across the .cns and .cmd keeps both rules.
         let dir = scratch_dir("cmd_merge_append");
         // Pretend a state -1 already exists from a cns (one controller)…
-        let pre = write_file(&dir, "pre.cns", "[Statedef -1]\n[State -1, a]\ntype = Null\ntrigger1 = 1\n");
+        let pre = write_file(
+            &dir,
+            "pre.cns",
+            "[Statedef -1]\n[State -1, a]\ntype = Null\ntrigger1 = 1\n",
+        );
         // …and the .cmd adds another (a command-gated ChangeState).
         let cmd = write_file(
             &dir,
@@ -2184,7 +2281,11 @@ mod tests {
 
         let s = states.get(&-1).expect("state -1 present");
         // Both controllers survive: the original Null and the appended ChangeState.
-        assert_eq!(s.controllers.len(), 2, "CMD controllers append, not replace");
+        assert_eq!(
+            s.controllers.len(),
+            2,
+            "CMD controllers append, not replace"
+        );
         assert!(s
             .controllers
             .iter()
@@ -2445,7 +2546,11 @@ mod tests {
         let dir = scratch_dir("pal_bad");
         // pal1 points at a present-but-too-short .act; the parser pads with black
         // and still yields a palette (never a panic). pal2 is missing entirely.
-        let def = write_file(&dir, "c.def", "[Files]\npal1 = short.act\npal2 = gone.act\n");
+        let def = write_file(
+            &dir,
+            "c.def",
+            "[Files]\npal1 = short.act\npal2 = gone.act\n",
+        );
         write_bytes(&dir, "short.act", &[1, 2, 3]);
         let parsed = DefFile::load(&def).unwrap();
         let pals = load_act_palettes(&parsed, &def);
@@ -2542,8 +2647,15 @@ mod tests {
         );
         // The active color at index 1 came from the .act (50,51,52), not the
         // embedded ramp (whose green is 200) — the costume actually replaced it.
-        assert_eq!(&over[4..7], &[50, 51, 52], "index 1 RGB must come from the .act");
-        assert_ne!(over[5], embedded[5], ".act green must replace the embedded green");
+        assert_eq!(
+            &over[4..7],
+            &[50, 51, 52],
+            "index 1 RGB must come from the .act"
+        );
+        assert_ne!(
+            over[5], embedded[5],
+            ".act green must replace the embedded green"
+        );
 
         // Index-0 transparency is preserved through the override (alpha == 0),
         // and a color index stays opaque (alpha == 255) — the MUGEN convention
@@ -2965,7 +3077,10 @@ mod tests {
         // Constants read from [Data]; unspecified fields default.
         assert_eq!(loaded.constants.life_max, 1234);
         assert_eq!(loaded.constants.attack, 105);
-        assert_eq!(loaded.constants.defence, CharacterConstants::default().defence);
+        assert_eq!(
+            loaded.constants.defence,
+            CharacterConstants::default().defence
+        );
         // Required assets loaded.
         assert!(!loaded.sff.sprites.is_empty());
         assert!(!loaded.air.actions.is_empty());
@@ -3086,7 +3201,11 @@ mod tests {
         // Only ground.front is authored; the other [Size] fields keep defaults.
         let dir = scratch_dir("consts_size_partial");
         let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
-        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Size]\nground.front = 30\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Size]\nground.front = 30\n",
+        );
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
         let d = SizeConstants::default();
@@ -3119,7 +3238,10 @@ mod tests {
         assert!((v.run_fwd.x - 4.6).abs() < 1e-6);
         // jump.neu pair, and jump.up DERIVED from jump.neu.y when no explicit one.
         assert!((v.jump_neu.y - (-8.4)).abs() < 1e-6);
-        assert!((v.jump_up - (-8.4)).abs() < 1e-6, "jump.up derived from jump.neu.y");
+        assert!(
+            (v.jump_up - (-8.4)).abs() < 1e-6,
+            "jump.up derived from jump.neu.y"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3138,7 +3260,10 @@ mod tests {
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
         // jump.neu.y is still -8.4, but jump.up is the explicit -9.5.
         assert!((consts.velocity.jump_neu.y - (-8.4)).abs() < 1e-6);
-        assert!((consts.velocity.jump_up - (-9.5)).abs() < 1e-6, "explicit jump.up wins");
+        assert!(
+            (consts.velocity.jump_up - (-9.5)).abs() < 1e-6,
+            "explicit jump.up wins"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3180,7 +3305,10 @@ mod tests {
         assert!((v.airjump_neu.x - 0.0).abs() < 1e-6);
         assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
         assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6);
-        assert!((v.airjump_y - (-8.1)).abs() < 1e-6, "airjump.y derived from airjump.neu.y");
+        assert!(
+            (v.airjump_y - (-8.1)).abs() < 1e-6,
+            "airjump.y derived from airjump.neu.y"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3211,7 +3339,11 @@ mod tests {
         // their MUGEN-sane defaults — never an error, never silently 0.
         let dir = scratch_dir("consts_velocity_absent");
         let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
-        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Velocity]\nwalk.fwd = 2.4\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Velocity]\nwalk.fwd = 2.4\n",
+        );
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
         let d = VelocityConstants::default();
@@ -3247,7 +3379,10 @@ mod tests {
         assert!((v.runjump_fwd.x - 4.0).abs() < 1e-6, "runjump.fwd.x");
         assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6, "airjump.fwd.x");
         assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6, "airjump.back.x");
-        assert!((v.airjump_y - (-8.1)).abs() < 1e-6, "airjump.y derived from airjump.neu.y");
+        assert!(
+            (v.airjump_y - (-8.1)).abs() < 1e-6,
+            "airjump.y derived from airjump.neu.y"
+        );
         // The load-bearing assertion: these must be nonzero (the bug fixed here).
         assert!(v.jump_fwd.x.abs() > 1e-6, "jump.fwd.x must not be 0");
         assert!(v.airjump_fwd.x.abs() > 1e-6, "airjump.fwd.x must not be 0");
@@ -3297,7 +3432,11 @@ mod tests {
         // (old and new) stays at its KFM-baseline default; load never errors.
         let dir = scratch_dir("consts_no_velocity_section");
         let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
-        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n",
+        );
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
         assert_eq!(consts.velocity, VelocityConstants::default());
@@ -3322,7 +3461,10 @@ mod tests {
         let parsed = DefFile::load(&def).unwrap();
         let v = load_constants(&parsed, &def, &["chr.cns".to_string()]).velocity;
         assert!((v.jump_fwd.x - 2.5).abs() < 1e-6);
-        assert!(v.jump_fwd.y.abs() < 1e-6, "bare jump.fwd y must be 0, not the pair sibling's y");
+        assert!(
+            v.jump_fwd.y.abs() < 1e-6,
+            "bare jump.fwd y must be 0, not the pair sibling's y"
+        );
         assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
         assert!(v.airjump_fwd.y.abs() < 1e-6, "bare airjump.fwd y must be 0");
         // The pairs keep their authored y.
@@ -3373,7 +3515,9 @@ mod tests {
         assert!((v.jump_fwd.x - 2.5).abs() < 1e-6);
         assert!((v.jump_back.x - (-2.55)).abs() < 1e-6);
         assert!((v.runjump_fwd.x - 4.0).abs() < 1e-6 && (v.runjump_fwd.y - (-8.1)).abs() < 1e-6);
-        assert!((v.runjump_back.x - (-2.55)).abs() < 1e-6 && (v.runjump_back.y - (-8.1)).abs() < 1e-6);
+        assert!(
+            (v.runjump_back.x - (-2.55)).abs() < 1e-6 && (v.runjump_back.y - (-8.1)).abs() < 1e-6
+        );
         assert!((v.airjump_neu.y - (-8.1)).abs() < 1e-6);
         assert!((v.airjump_fwd.x - 2.5).abs() < 1e-6);
         assert!((v.airjump_back.x - (-2.55)).abs() < 1e-6);
@@ -3452,8 +3596,14 @@ mod tests {
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
         let d = MovementConstants::default();
-        assert!((consts.movement.yaccel - d.yaccel).abs() < 1e-6, "bad yaccel keeps default");
-        assert!((consts.movement.stand_friction - 0.5).abs() < 1e-6, "valid sibling still read");
+        assert!(
+            (consts.movement.yaccel - d.yaccel).abs() < 1e-6,
+            "bad yaccel keeps default"
+        );
+        assert!(
+            (consts.movement.stand_friction - 0.5).abs() < 1e-6,
+            "valid sibling still read"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3516,7 +3666,10 @@ mod tests {
         assert!((m.crouch_friction - 0.82).abs() < 1e-6);
         // Air-jump defaults to MUGEN's "no air jump" baseline when absent.
         assert_eq!(m.airjump_num, 0, "airjump.num defaults to 0 (no air jump)");
-        assert!((m.airjump_height - 0.0).abs() < 1e-6, "airjump.height defaults to 0");
+        assert!(
+            (m.airjump_height - 0.0).abs() < 1e-6,
+            "airjump.height defaults to 0"
+        );
     }
 
     #[test]
@@ -3531,7 +3684,10 @@ mod tests {
         );
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
-        assert_eq!(consts.movement.airjump_num, 1, "airjump.num read from [Movement]");
+        assert_eq!(
+            consts.movement.airjump_num, 1,
+            "airjump.num read from [Movement]"
+        );
         assert!(
             (consts.movement.airjump_height - 35.0).abs() < 1e-6,
             "airjump.height read from [Movement]"
@@ -3544,10 +3700,17 @@ mod tests {
         // A character that omits the air-jump keys gets the no-air-jump default.
         let dir = scratch_dir("consts_airjump_absent");
         let def = write_file(&dir, "chr.def", "[Files]\ncns = chr.cns\n");
-        write_file(&dir, "chr.cns", "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n");
+        write_file(
+            &dir,
+            "chr.cns",
+            "[Data]\nlife = 1000\n[Movement]\nyaccel = .44\n",
+        );
         let parsed = DefFile::load(&def).unwrap();
         let consts = load_constants(&parsed, &def, &["chr.cns".to_string()]);
-        assert_eq!(consts.movement.airjump_num, 0, "absent airjump.num keeps default 0");
+        assert_eq!(
+            consts.movement.airjump_num, 0,
+            "absent airjump.num keeps default 0"
+        );
         assert!(
             (consts.movement.airjump_height - 0.0).abs() < 1e-6,
             "absent airjump.height keeps default 0"
@@ -3643,7 +3806,11 @@ mod tests {
         // 2-component jump.up must NEVER be what is returned. Use a distinctive
         // nonzero x so a regression that reads x is unambiguous.
         assert_eq!(parse_jump_up("7.5, -9.5"), Some(-9.5));
-        assert_ne!(parse_jump_up("7.5, -9.5"), Some(7.5), "must not return the x component");
+        assert_ne!(
+            parse_jump_up("7.5, -9.5"),
+            Some(7.5),
+            "must not return the x component"
+        );
     }
 
     #[test]
@@ -3683,7 +3850,10 @@ mod tests {
             "jump.up = 0, -9.5 must store -9.5, got {}",
             consts.velocity.jump_up
         );
-        assert!(consts.velocity.jump_up.abs() > 1e-6, "must not be silently 0");
+        assert!(
+            consts.velocity.jump_up.abs() > 1e-6,
+            "must not be silently 0"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3706,7 +3876,10 @@ mod tests {
         assert!((v.run_fwd.x - 4.6).abs() < 1e-6 && (v.run_fwd.y - (-0.2)).abs() < 1e-6);
         // jump.neu pair stored; jump.up derived from its y (no explicit jump.up).
         assert!((v.jump_neu.x - 0.3).abs() < 1e-6 && (v.jump_neu.y - (-8.4)).abs() < 1e-6);
-        assert!((v.jump_up - (-8.4)).abs() < 1e-6, "jump.up derived from jump.neu.y");
+        assert!(
+            (v.jump_up - (-8.4)).abs() < 1e-6,
+            "jump.up derived from jump.neu.y"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3823,7 +3996,9 @@ mod tests {
     /// engine built-in plus KFM's own `[Statedef 20]`, with NO app shim.
     #[test]
     fn builtin_locomotion_stand_to_walk_and_velocity() {
-        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else {
+            return;
+        };
 
         let mut reached_walk = false;
         for _ in 0..5 {
@@ -3835,7 +4010,10 @@ mod tests {
                 break;
             }
         }
-        assert!(reached_walk, "holding Forward from stand must reach walk (state 20)");
+        assert!(
+            reached_walk,
+            "holding Forward from stand must reach walk (state 20)"
+        );
         assert!(
             ch.vel.x.abs() > 0.0,
             "walk state must impart a nonzero walk velocity, got vel.x = {}",
@@ -3850,7 +4028,9 @@ mod tests {
     /// the built-in stand->crouch fired and common1's 10->11 took over.
     #[test]
     fn builtin_locomotion_stand_to_crouch() {
-        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else {
+            return;
+        };
 
         let mut reached_crouch = false;
         let mut visited = Vec::new();
@@ -3882,7 +4062,9 @@ mod tests {
     /// (50) — proof the built-in stand->jump fired and common1's 40->50 took over.
     #[test]
     fn builtin_locomotion_stand_to_jump() {
-        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else {
+            return;
+        };
 
         let mut reached_jump = false;
         let mut visited = Vec::new();
@@ -3906,7 +4088,9 @@ mod tests {
     /// Part B AC: releasing all directions while walking returns to stand (0).
     #[test]
     fn builtin_locomotion_walk_to_stand_on_release() {
-        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else {
+            return;
+        };
 
         // First walk.
         for _ in 0..5 {
@@ -3937,7 +4121,9 @@ mod tests {
     /// must all precede the appended `engine:`-labelled built-ins.
     #[test]
     fn builtin_locomotion_is_appended_after_authored_minus_one() {
-        let Some((loaded, _)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, _)) = kfm_standing_with_ctrl() else {
+            return;
+        };
         let minus_one = loaded.state(-1).expect("[Statedef -1] exists");
         let first_builtin = minus_one
             .controllers
@@ -3997,9 +4183,14 @@ mod tests {
             c.controller_type
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case("ChangeState"))
-                && c.params.get("value").is_some_and(|e| e.source.trim() == "20")
+                && c.params
+                    .get("value")
+                    .is_some_and(|e| e.source.trim() == "20")
         });
-        assert!(walks, "the built-in stand->walk command-state must be present");
+        assert!(
+            walks,
+            "the built-in stand->walk command-state must be present"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4134,7 +4325,10 @@ mod tests {
         assert!(
             !ctrl_gated,
             "auto-land must NOT be ctrl-gated (landing is unconditional); triggerall = {:?}",
-            land.triggerall.iter().map(|e| &e.source).collect::<Vec<_>>()
+            land.triggerall
+                .iter()
+                .map(|e| &e.source)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4162,7 +4356,11 @@ mod tests {
                 })
                 .unwrap_or(0)
         };
-        assert_eq!(count_52(&states), 1, "exactly one auto-land controller after first inject");
+        assert_eq!(
+            count_52(&states),
+            1,
+            "exactly one auto-land controller after first inject"
+        );
         // Second inject must be a no-op (idempotency guard).
         append_builtin_ground_locomotion(&mut states);
         assert_eq!(
@@ -4204,7 +4402,10 @@ mod tests {
         ch.physics = Physics::None;
         ch.vel = Vec2::new(0.0, 0.0); // exactly zero is still >= 0 → lands
         ch.tick_with(&states, &air, None, StageView::default());
-        assert_eq!(ch.state_no, 52, "basic jump state 51 at the floor must also land to 52");
+        assert_eq!(
+            ch.state_no, 52,
+            "basic jump state 51 at the floor must also land to 52"
+        );
     }
 
     /// AC2 (negative, still rising): a character in state 50 with upward velocity
@@ -4259,7 +4460,7 @@ mod tests {
         ch.pos = Vec2::new(0.0, FLOOR_Y); // at floor, the landing-frame condition
         ch.physics = Physics::None;
         ch.vel = Vec2::new(0.0, 3.0); // falling
-        // Run several ticks: the built-in must never fire for 5040.
+                                      // Run several ticks: the built-in must never fire for 5040.
         for _ in 0..5 {
             ch.tick_with(&states, &air, None, StageView::default());
             assert_eq!(
@@ -4280,11 +4481,18 @@ mod tests {
         let states = p15b_graph();
         let air = tiny_air_p15b();
         let yaccel = CharacterConstants::default().movement.yaccel;
-        assert!(yaccel > 0.0, "gravity must be downward (positive, Y increases downward)");
+        assert!(
+            yaccel > 0.0,
+            "gravity must be downward (positive, Y increases downward)"
+        );
 
         let mut ch = Character::new();
         ch.change_state(&states, 50); // sets physics = Air via the statedef header
-        assert_eq!(ch.physics, Physics::Air, "state 50 entry must set air physics");
+        assert_eq!(
+            ch.physics,
+            Physics::Air,
+            "state 50 entry must set air physics"
+        );
         ch.pos = Vec2::new(0.0, FLOOR_Y);
         ch.vel = Vec2::new(0.0, -8.4); // launch upward (negative Y)
 
@@ -4305,7 +4513,10 @@ mod tests {
                 break;
             }
         }
-        assert!(peaked_airborne, "the jump should lift the character off the floor first");
+        assert!(
+            peaked_airborne,
+            "the jump should lift the character off the floor first"
+        );
         assert!(
             landed,
             "the basic jump (50) must auto-land to Jump Land (52) once it returns to the floor; \
@@ -4321,7 +4532,9 @@ mod tests {
     /// completes on real content. Skips cleanly when test-assets/ is absent.
     #[test]
     fn p15b_real_kfm_full_jump_reaches_grounded_state() {
-        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else { return };
+        let Some((loaded, mut ch)) = kfm_standing_with_ctrl() else {
+            return;
+        };
 
         // Hold Up from stand: the built-in stand->jump (40) fires, common1
         // carries 40 -> 50 with KFM's jump velocity, then gravity + the P15a
@@ -4384,7 +4597,12 @@ mod tests {
             .triggers
             .iter()
             .flat_map(|g| g.conditions.iter())
-            .map(|c| c.source.to_ascii_lowercase().split_whitespace().collect::<String>())
+            .map(|c| {
+                c.source
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("&&");
         assert!(
@@ -4422,7 +4640,11 @@ mod tests {
             "auto-land triggerall must not reference `command` (it is condition-gated)"
         );
         assert!(
-            !land.triggers.iter().flat_map(|g| g.conditions.iter()).any(mentions_command),
+            !land
+                .triggers
+                .iter()
+                .flat_map(|g| g.conditions.iter())
+                .any(mentions_command),
             "auto-land triggers must not reference `command` (landing is unconditional on input)"
         );
     }
@@ -4473,8 +4695,7 @@ mod tests {
     /// `CARGO_MANIFEST_DIR` points at `crates/fp-character`; go up two levels to
     /// the workspace root.
     fn shipped_common1() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/data/common1.cns")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/data/common1.cns")
     }
 
     #[test]
@@ -4489,8 +4710,9 @@ mod tests {
         let numbers: std::collections::HashSet<i32> =
             cns.statedefs.iter().map(|d| d.number).collect();
         // The essential get-hit / fall / land / death / getup states must exist.
-        for n in [5000, 5010, 5020, 5030, 5040, 5050, 5070, 5100, 5110, 5120, 5150, 5160, 5170, 5200]
-        {
+        for n in [
+            5000, 5010, 5020, 5030, 5040, 5050, 5070, 5100, 5110, 5120, 5150, 5160, 5170, 5200,
+        ] {
             assert!(
                 numbers.contains(&n),
                 "shipped common1.cns must define [Statedef {n}]"

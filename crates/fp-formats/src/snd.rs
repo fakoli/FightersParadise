@@ -570,10 +570,7 @@ mod tests {
     fn duplicate_group_sample_returns_first_match() {
         // MUGEN allows (and community files contain) duplicate (group, sample)
         // keys; the documented lookup contract returns the *first* match.
-        let data = make_test_snd(
-            4,
-            &[(2, 2, b"RIFF-first"), (2, 2, b"RIFF-second")],
-        );
+        let data = make_test_snd(4, &[(2, 2, b"RIFF-first"), (2, 2, b"RIFF-second")]);
         let snd = SndFile::from_bytes(&data).unwrap();
         assert_eq!(snd.len(), 2);
         assert_eq!(snd.sound(2, 2), Some(b"RIFF-first".as_slice()));
@@ -589,7 +586,10 @@ mod tests {
         let snd = SndFile::from_bytes(&data).unwrap();
         assert_eq!(snd.sounds[0].group, big_group);
         assert_eq!(snd.sounds[0].sample, big_sample);
-        assert_eq!(snd.sound(big_group, big_sample), Some(b"RIFF-big".as_slice()));
+        assert_eq!(
+            snd.sound(big_group, big_sample),
+            Some(b"RIFF-big".as_slice())
+        );
         assert!(snd.sound(0, 0).is_none());
     }
 
@@ -689,7 +689,10 @@ mod tests {
     #[test]
     fn sniffs_wav_payload() {
         // A real RIFF/WAVE blob is the supported, decodable case.
-        assert_eq!(sniff_sound_format(b"RIFF\x24\x00\x00\x00WAVE"), SoundFormat::Wav);
+        assert_eq!(
+            sniff_sound_format(b"RIFF\x24\x00\x00\x00WAVE"),
+            SoundFormat::Wav
+        );
         // A bare RIFF magic (no WAVE form type yet) still reads as WAV.
         assert_eq!(sniff_sound_format(b"RIFF...."), SoundFormat::Wav);
     }

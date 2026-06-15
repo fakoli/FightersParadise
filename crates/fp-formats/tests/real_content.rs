@@ -434,7 +434,10 @@ fn kfm_snd_loads_and_exposes_wav_payloads() {
 
     // KFM defines sound (0, 0); a direct lookup must resolve to its bytes.
     let s0 = snd.sound(0, 0).expect("kfm.snd should define sound (0, 0)");
-    assert!(s0.starts_with(b"RIFF"), "sound (0, 0) should be a RIFF blob");
+    assert!(
+        s0.starts_with(b"RIFF"),
+        "sound (0, 0) should be a RIFF blob"
+    );
 
     // Documented observed format: the payload is a complete RIFF/WAVE container
     // (the "WAVE" form-type and a "fmt " chunk both appear), confirming we
@@ -463,7 +466,10 @@ fn kfm_snd_loads_and_exposes_wav_payloads() {
     // (0,0)..=(0,N): KFM's voice/SFX bank. Spot-check that (0, 1) also resolves
     // to a RIFF blob, exercising traversal past the first entry.
     let s1 = snd.sound(0, 1).expect("kfm.snd should define sound (0, 1)");
-    assert!(s1.starts_with(b"RIFF"), "sound (0, 1) should be a RIFF blob");
+    assert!(
+        s1.starts_with(b"RIFF"),
+        "sound (0, 1) should be a RIFF blob"
+    );
 
     // No sound should carry a zero-byte payload in the real fixture, and every
     // declared length must round-trip into the captured data slice.
@@ -576,7 +582,11 @@ fn synthetic_rle5_sff_decodes_end_to_end() {
     let _ = std::fs::remove_file(&path);
     let sff = loaded.expect("synthetic RLE5 SFF should load");
 
-    assert_eq!(sff.version, SffVersion::V2, "fixture is an SFF v2 container");
+    assert_eq!(
+        sff.version,
+        SffVersion::V2,
+        "fixture is an SFF v2 container"
+    );
     assert_eq!(sff.sprites.len(), 1, "fixture declares exactly one sprite");
 
     let sprite = &sff.sprites[0];
@@ -693,7 +703,9 @@ fn synthetic_png8_sff_decodes_end_to_end() {
     assert_eq!(sff.sprites[0].format, SpriteFormat::Png8);
 
     // Indexed pixels flow through the standard index path.
-    let indices = sff.decode_sprite(0).expect("PNG8 sprite should decode to indices");
+    let indices = sff
+        .decode_sprite(0)
+        .expect("PNG8 sprite should decode to indices");
     assert_eq!(indices, vec![1, 2, 3, 1]);
 
     // RGBA uses the PNG's embedded palette: red, green, blue, red.
@@ -844,5 +856,9 @@ fn synthetic_png32_sff_decodes_to_rgba_end_to_end() {
     // 1x2 sprite at 4 bytes/pixel (RGBA) = 8 bytes.
     assert_eq!(rgba.len(), 8);
     assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "pixel 0 -> opaque red");
-    assert_eq!(&rgba[4..8], &[0, 0, 255, 128], "pixel 1 -> semi-transparent blue");
+    assert_eq!(
+        &rgba[4..8],
+        &[0, 0, 255, 128],
+        "pixel 1 -> semi-transparent blue"
+    );
 }

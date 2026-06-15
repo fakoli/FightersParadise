@@ -1177,7 +1177,10 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         let at0 = parallax_screen_x(100.0, 0.5, 0.0);
         let at100 = parallax_screen_x(100.0, 0.5, 100.0);
         assert_eq!(at0, 100.0, "at camera 0 the element sits at its start");
-        assert_eq!(at100, 50.0, "camera +100 moves a delta=0.5 element only -50");
+        assert_eq!(
+            at100, 50.0,
+            "camera +100 moves a delta=0.5 element only -50"
+        );
         assert_eq!(at0 - at100, 50.0, "half the camera travel");
     }
 
@@ -1262,9 +1265,15 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         xs.dedup();
         assert_eq!(*xs.first().unwrap(), 0.0);
-        assert!(xs.last().unwrap() + 100.0 >= 250.0, "X must cover the viewport");
+        assert!(
+            xs.last().unwrap() + 100.0 >= 250.0,
+            "X must cover the viewport"
+        );
         for pair in xs.windows(2) {
-            assert!((pair[1] - pair[0] - 100.0).abs() < 1e-4, "X gap at {pair:?}");
+            assert!(
+                (pair[1] - pair[0] - 100.0).abs() < 1e-4,
+                "X gap at {pair:?}"
+            );
         }
         // Every rect is sprite-sized.
         assert!(rects.iter().all(|r| r.w == 100.0 && r.h == 1000.0));
@@ -1315,10 +1324,7 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
             Vec2::new(0, 1),
             Vec2::new(200.0, 50.0),
         );
-        let min_x = rects
-            .iter()
-            .map(|r| r.x)
-            .fold(f32::INFINITY, f32::min);
+        let min_x = rects.iter().map(|r| r.x).fold(f32::INFINITY, f32::min);
         // The left-most tile starts at -30 (its right edge = 20 > 0, so it's drawn).
         assert_eq!(min_x, -30.0);
     }
@@ -1461,7 +1467,11 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
             .iter()
             .find(|b| b.name == "Floor")
             .expect("Floor BG present");
-        assert!((floor.scroll.x - 2.0).abs() < 1e-4, "got {}", floor.scroll.x);
+        assert!(
+            (floor.scroll.x - 2.0).abs() < 1e-4,
+            "got {}",
+            floor.scroll.x
+        );
         assert!((0.0..3.0).contains(&floor.scroll.x));
     }
 
@@ -1510,7 +1520,11 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         let action = anim_action(10, 0, &[(0, 0, 5), (0, 1, -1), (0, 2, 5)]);
         assert_eq!(anim_elem_at_tick(&action, 0), 0);
         assert_eq!(anim_elem_at_tick(&action, 5), 1);
-        assert_eq!(anim_elem_at_tick(&action, 999), 1, "hold-forever parks here");
+        assert_eq!(
+            anim_elem_at_tick(&action, 999),
+            1,
+            "hold-forever parks here"
+        );
     }
 
     #[test]
@@ -1562,7 +1576,11 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
             bg.advance_anim(&action);
         }
         let total = action_total_ticks(&action);
-        assert!(bg.anim_tick < total, "clock stayed bounded: {}", bg.anim_tick);
+        assert!(
+            bg.anim_tick < total,
+            "clock stayed bounded: {}",
+            bg.anim_tick
+        );
         // The selected element is always a valid frame index.
         assert!(bg.current_anim_elem(&action) < action.frames.len());
     }
@@ -1581,7 +1599,10 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
             bg.advance_anim(&action);
         }
         let total = action_total_ticks(&action);
-        assert_eq!(bg.anim_tick, total, "non-looping clock pins at total duration");
+        assert_eq!(
+            bg.anim_tick, total,
+            "non-looping clock pins at total duration"
+        );
         assert_eq!(bg.current_anim_elem(&action), 1, "last frame held");
     }
 
@@ -1671,7 +1692,10 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         stage.camera.bound_bottom = -100.0; // inverted (top > bottom)
         stage.camera.vertical_follow = 0.5;
         let y = stage.camera_follow_y(-40.0, -40.0);
-        assert!((-100.0..=0.0).contains(&y), "clamped into normalized range: {y}");
+        assert!(
+            (-100.0..=0.0).contains(&y),
+            "clamped into normalized range: {y}"
+        );
 
         // A non-finite verticalfollow disables follow (offset 0) rather than NaN.
         stage.camera.vertical_follow = f32::NAN;

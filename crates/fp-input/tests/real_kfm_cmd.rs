@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 
 use fp_input::command::{compile_command, CommandElement};
 use fp_input::{
-    Button, CommandDef, CommandMatcher, Direction, DirToken, InputBuffer, InputModifier,
-    InputState,
+    Button, CommandDef, CommandMatcher, DirToken, Direction, InputBuffer, InputModifier, InputState,
 };
 
 /// Resolves a path inside the workspace `test-assets/kfm/` directory.
@@ -289,8 +288,7 @@ fn real_kfm_blocking_uses_direction_detect() {
             value.contains('$'),
             "blocking command `{value}` should use `$` direction-detect"
         );
-        let elements =
-            compile_command(value).unwrap_or_else(|e| panic!("`{value}` failed: {e:?}"));
+        let elements = compile_command(value).unwrap_or_else(|e| panic!("`{value}` failed: {e:?}"));
         // One direction-detect element (the F) and one button (x).
         assert_eq!(elements.len(), 2, "blocking `{value}` => F + x");
         let has_detect_fwd = elements.iter().any(|e| {
@@ -303,9 +301,15 @@ fn real_kfm_blocking_uses_direction_detect() {
                 }
             )
         });
-        let has_x = elements
-            .iter()
-            .any(|e| matches!(e, CommandElement::Button { button: Button::X, .. }));
+        let has_x = elements.iter().any(|e| {
+            matches!(
+                e,
+                CommandElement::Button {
+                    button: Button::X,
+                    ..
+                }
+            )
+        });
         assert!(has_detect_fwd, "blocking `{value}` lacks `$F`");
         assert!(has_x, "blocking `{value}` lacks the x button");
     }
@@ -555,8 +559,7 @@ fn real_kfm_down_a_hold_detect_then_button() {
         return;
     };
     let text = std::fs::read_to_string(&path).expect("read kfm.cmd");
-    let value =
-        command_value_by_name(&text, "down_a").expect("KFM must define a `down_a` command");
+    let value = command_value_by_name(&text, "down_a").expect("KFM must define a `down_a` command");
     assert_eq!(
         value.replace(' ', ""),
         "/$D,a",

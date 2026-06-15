@@ -212,9 +212,7 @@ impl TitleMenu {
 /// [`TitleMenu::from_system`] for the mapping rationale.
 fn title_action_for(kind: MenuItemKind) -> TitleAction {
     match kind {
-        MenuItemKind::Versus | MenuItemKind::TeamVersus => {
-            TitleAction::Select(SelectMode::Versus)
-        }
+        MenuItemKind::Versus | MenuItemKind::TeamVersus => TitleAction::Select(SelectMode::Versus),
         MenuItemKind::Training => TitleAction::Select(SelectMode::Training),
         MenuItemKind::Exit => TitleAction::Quit,
         // Recognised but not yet implemented: keep them visible but inert.
@@ -594,7 +592,10 @@ mod tests {
         };
         let menu = TitleMenu::from_system(&system);
         assert_eq!(menu.entries.len(), 4);
-        assert_eq!(menu.entries[0].action, TitleAction::Select(SelectMode::Versus));
+        assert_eq!(
+            menu.entries[0].action,
+            TitleAction::Select(SelectMode::Versus)
+        );
         assert_eq!(
             menu.entries[1].action,
             TitleAction::Select(SelectMode::Training)
@@ -657,9 +658,7 @@ mod tests {
         // Two distinct characters then a random icon. The display names carry a
         // space so the parser uses the explicit-def form (name, deffile), making
         // the resolved def_path exactly the second field.
-        SelectDef::parse(
-            "[Characters]\nChar Alpha, a/a.def\nChar Beta, b/b.def\nrandomselect\n",
-        )
+        SelectDef::parse("[Characters]\nChar Alpha, a/a.def\nChar Beta, b/b.def\nrandomselect\n")
     }
 
     fn info_grid(cols: u32) -> SelectInfo {
@@ -830,11 +829,21 @@ mod tests {
             Path::new("data/select.def"),
         );
         // Every direction keeps the cursor on the single cell.
-        for dir in [up(), down(), MenuInput { left: true, ..MenuInput::default() }] {
+        for dir in [
+            up(),
+            down(),
+            MenuInput {
+                left: true,
+                ..MenuInput::default()
+            },
+        ] {
             screen.update(dir, 0);
             assert_eq!(screen.p1_cursor, 0, "single-cell cursor never leaves 0");
         }
-        assert!(matches!(screen.update(confirm(), 0), SelectOutcome::Done(_)));
+        assert!(matches!(
+            screen.update(confirm(), 0),
+            SelectOutcome::Done(_)
+        ));
     }
 
     // ---- grid cursor ----------------------------------------------------
@@ -867,8 +876,16 @@ mod tests {
             ..MenuInput::default()
         };
         assert_eq!(move_cursor(0, down, 3, 6), 3);
-        assert_eq!(move_cursor(3, down, 3, 6), 0, "down from last row wraps to first");
-        assert_eq!(move_cursor(0, up, 3, 6), 3, "up from first row wraps to last");
+        assert_eq!(
+            move_cursor(3, down, 3, 6),
+            0,
+            "down from last row wraps to first"
+        );
+        assert_eq!(
+            move_cursor(0, up, 3, 6),
+            3,
+            "up from first row wraps to last"
+        );
         assert_eq!(move_cursor(4, up, 3, 6), 1);
     }
 
@@ -888,10 +905,22 @@ mod tests {
     #[test]
     fn move_cursor_single_cell_is_fixed() {
         for dir in [
-            MenuInput { up: true, ..MenuInput::default() },
-            MenuInput { down: true, ..MenuInput::default() },
-            MenuInput { left: true, ..MenuInput::default() },
-            MenuInput { right: true, ..MenuInput::default() },
+            MenuInput {
+                up: true,
+                ..MenuInput::default()
+            },
+            MenuInput {
+                down: true,
+                ..MenuInput::default()
+            },
+            MenuInput {
+                left: true,
+                ..MenuInput::default()
+            },
+            MenuInput {
+                right: true,
+                ..MenuInput::default()
+            },
         ] {
             assert_eq!(move_cursor(0, dir, 1, 1), 0);
         }

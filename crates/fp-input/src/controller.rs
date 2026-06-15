@@ -366,7 +366,14 @@ mod tests {
             DEADZONE_DEFAULT,
         );
         assert!(out.button(Button::A));
-        for b in [Button::B, Button::C, Button::X, Button::Y, Button::Z, Button::Start] {
+        for b in [
+            Button::B,
+            Button::C,
+            Button::X,
+            Button::Y,
+            Button::Z,
+            Button::Start,
+        ] {
             assert!(!out.button(b), "{b:?} should be unpressed");
         }
     }

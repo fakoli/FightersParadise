@@ -264,11 +264,7 @@ impl TeamMatch {
     /// teammate hit while off the active stage) no longer counts.
     #[must_use]
     pub fn fighters_remaining(&self, side: Side) -> usize {
-        let living_reserves = self
-            .reserves(side)
-            .iter()
-            .filter(|p| p.life() > 0)
-            .count();
+        let living_reserves = self.reserves(side).iter().filter(|p| p.life() > 0).count();
         let active_alive = self.active_player(side).life() > 0;
         living_reserves + usize::from(active_alive)
     }
@@ -537,7 +533,11 @@ mod tests {
 
     #[test]
     fn single_mode_ticks_without_panic() {
-        let mut m = TeamMatch::new(make_player(-50.0), make_player(50.0), StageBounds::default());
+        let mut m = TeamMatch::new(
+            make_player(-50.0),
+            make_player(50.0),
+            StageBounds::default(),
+        );
         for _ in 0..120 {
             m.tick(MatchInput::none(), MatchInput::none());
         }
@@ -559,7 +559,9 @@ mod tests {
 
     #[test]
     fn roster_is_clamped_to_cap() {
-        let big: Vec<Player> = (0..(MAX_TEAM_SIZE + 4)).map(|_| make_player(-50.0)).collect();
+        let big: Vec<Player> = (0..(MAX_TEAM_SIZE + 4))
+            .map(|_| make_player(-50.0))
+            .collect();
         let m = TeamMatch::with_mode(
             big,
             vec![make_player(50.0)],

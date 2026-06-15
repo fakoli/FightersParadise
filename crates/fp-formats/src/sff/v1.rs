@@ -67,10 +67,8 @@ pub fn parse_v1_header(data: &[u8]) -> FpResult<SffV1Header> {
     // The signature (12 bytes) and 4 version bytes precede the counts.
     let after_version = &data[16..];
 
-    let (rest, num_groups) =
-        le_u32::<_, nom::error::Error<&[u8]>>(after_version).map_err(|_| {
-            FpError::parse("SFF", "failed to read SFF v1 num_groups")
-        })?;
+    let (rest, num_groups) = le_u32::<_, nom::error::Error<&[u8]>>(after_version)
+        .map_err(|_| FpError::parse("SFF", "failed to read SFF v1 num_groups"))?;
     let (rest, num_images) = le_u32::<_, nom::error::Error<&[u8]>>(rest)
         .map_err(|_| FpError::parse("SFF", "failed to read SFF v1 num_images"))?;
     let (rest, first_subheader_offset) = le_u32::<_, nom::error::Error<&[u8]>>(rest)
@@ -474,7 +472,7 @@ mod tests {
         let s = 512usize;
         let mut sub = vec![0u8; 32];
         sub[0..4].copy_from_slice(&0u32.to_le_bytes()); // next offset = 0 (last)
-        // PCX data length filled in after we build the PCX.
+                                                        // PCX data length filled in after we build the PCX.
         sub[8..10].copy_from_slice(&3i16.to_le_bytes()); // axis_x
         sub[10..12].copy_from_slice(&4i16.to_le_bytes()); // axis_y
         sub[12..14].copy_from_slice(&7u16.to_le_bytes()); // group
@@ -693,7 +691,10 @@ mod tests {
         let idx = reuse_or_default(&mut palettes, &mut last_real);
         assert_eq!(idx, 0);
         assert_eq!(palettes.len(), 1);
-        assert_eq!(palettes[0].data_length, 0, "default palette carries no data");
+        assert_eq!(
+            palettes[0].data_length, 0,
+            "default palette carries no data"
+        );
         assert_eq!(last_real, Some(0));
     }
 

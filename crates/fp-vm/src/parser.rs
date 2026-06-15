@@ -895,8 +895,8 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.advance(); // consume the operator
-                // Left-associative: parse the RHS with a higher threshold so equal
-                // precedence binds to the left.
+                                // Left-associative: parse the RHS with a higher threshold so equal
+                                // precedence binds to the left.
                 let rhs = self.parse_expr(bp + 1)?;
                 lhs = Expr::Binary {
                     op,
@@ -1290,9 +1290,9 @@ impl<'a> Parser<'a> {
         if let Some(tok) = self.peek() {
             if tok.kind == TokenKind::StarStar {
                 self.advance(); // consume `**`
-                // Right-associative: the exponent itself may carry a prefix
-                // (e.g. `2 ** -3`), so recurse through `parse_prefix`, which in
-                // turn handles the next `**` at the same level.
+                                // Right-associative: the exponent itself may carry a prefix
+                                // (e.g. `2 ** -3`), so recurse through `parse_prefix`, which in
+                                // turn handles the next `**` at the same level.
                 let exponent = self.parse_prefix()?;
                 return Ok(Expr::Binary {
                     op: BinaryOp::Pow,
@@ -1625,7 +1625,10 @@ mod tests {
     fn unary_operators() {
         assert_eq!(parse_str("-5").unwrap(), un(UnaryOp::Neg, int(5)));
         assert_eq!(parse_str("!a").unwrap(), un(UnaryOp::Not, ident("a")));
-        assert_eq!(parse_str("~bits").unwrap(), un(UnaryOp::BitNot, ident("bits")));
+        assert_eq!(
+            parse_str("~bits").unwrap(),
+            un(UnaryOp::BitNot, ident("bits"))
+        );
         // Chained prefixes.
         assert_eq!(
             parse_str("!!a").unwrap(),
@@ -1755,19 +1758,35 @@ mod tests {
         };
         assert_eq!(
             parse_str("x = [1,2]").unwrap(),
-            bin(BinaryOp::Eq, ident("x"), mk(Bound::Inclusive, Bound::Inclusive))
+            bin(
+                BinaryOp::Eq,
+                ident("x"),
+                mk(Bound::Inclusive, Bound::Inclusive)
+            )
         );
         assert_eq!(
             parse_str("x = (1,2]").unwrap(),
-            bin(BinaryOp::Eq, ident("x"), mk(Bound::Exclusive, Bound::Inclusive))
+            bin(
+                BinaryOp::Eq,
+                ident("x"),
+                mk(Bound::Exclusive, Bound::Inclusive)
+            )
         );
         assert_eq!(
             parse_str("x = [1,2)").unwrap(),
-            bin(BinaryOp::Eq, ident("x"), mk(Bound::Inclusive, Bound::Exclusive))
+            bin(
+                BinaryOp::Eq,
+                ident("x"),
+                mk(Bound::Inclusive, Bound::Exclusive)
+            )
         );
         assert_eq!(
             parse_str("x = (1,2)").unwrap(),
-            bin(BinaryOp::Eq, ident("x"), mk(Bound::Exclusive, Bound::Exclusive))
+            bin(
+                BinaryOp::Eq,
+                ident("x"),
+                mk(Bound::Exclusive, Bound::Exclusive)
+            )
         );
     }
 
@@ -1833,7 +1852,10 @@ mod tests {
     #[test]
     fn empty_input_is_error() {
         assert_eq!(parse_str("").unwrap_err(), ParseError::Empty);
-        assert_eq!(parse_str("   ; comment only").unwrap_err(), ParseError::Empty);
+        assert_eq!(
+            parse_str("   ; comment only").unwrap_err(),
+            ParseError::Empty
+        );
     }
 
     #[test]
@@ -1940,7 +1962,13 @@ mod tests {
         );
         assert_eq!(
             parse_str("root, var(0)").unwrap(),
-            redirected(Redirect::Root, Expr::Call { name: "var".into(), args: vec![int(0)] })
+            redirected(
+                Redirect::Root,
+                Expr::Call {
+                    name: "var".into(),
+                    args: vec![int(0)]
+                }
+            )
         );
         assert_eq!(
             parse_str("partner, life").unwrap(),
@@ -2037,10 +2065,7 @@ mod tests {
         // `enemy, helper(1), x` → Redirected(Enemy, Redirected(Helper(1), x)).
         assert_eq!(
             parse_str("enemy, helper(1), x").unwrap(),
-            redirected(
-                Redirect::Enemy,
-                redirected(Redirect::Helper(1), ident("x")),
-            )
+            redirected(Redirect::Enemy, redirected(Redirect::Helper(1), ident("x")),)
         );
     }
 
@@ -2069,11 +2094,7 @@ mod tests {
             parse_str("cond(enemy, life, 1, 0)").unwrap(),
             call(
                 "cond",
-                vec![
-                    redirected(Redirect::Enemy, ident("life")),
-                    int(1),
-                    int(0),
-                ],
+                vec![redirected(Redirect::Enemy, ident("life")), int(1), int(0),],
             )
         );
     }
@@ -2219,7 +2240,10 @@ mod tests {
     fn malformed_redirect_missing_expr_is_recoverable_error() {
         // `enemy,` — comma with no following sub-expression.
         let err = parse_str("enemy,").unwrap_err();
-        assert!(matches!(err, ParseError::MalformedRedirect { .. }), "{err:?}");
+        assert!(
+            matches!(err, ParseError::MalformedRedirect { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2249,10 +2273,34 @@ mod tests {
         // A spread of malformed inputs must all return Err, never panic.
         for src in [
             // Redirection garbage variants must not panic either.
-            "enemy,", "helper(,", "playerid,", "parent(1),", "enemy(),",
-            "root,,x", "helper(1)(2),x", ",enemy", "enemy(", "enemynear(-",
-            "", "(", ")", "[", "]", ",", "+", "**", "1 +", "a b c", "((1)",
-            "[1,2", "cond(", "= = =", "1 ** ** 2", "var(", "@#$", "1,2,3",
+            "enemy,",
+            "helper(,",
+            "playerid,",
+            "parent(1),",
+            "enemy(),",
+            "root,,x",
+            "helper(1)(2),x",
+            ",enemy",
+            "enemy(",
+            "enemynear(-",
+            "",
+            "(",
+            ")",
+            "[",
+            "]",
+            ",",
+            "+",
+            "**",
+            "1 +",
+            "a b c",
+            "((1)",
+            "[1,2",
+            "cond(",
+            "= = =",
+            "1 ** ** 2",
+            "var(",
+            "@#$",
+            "1,2,3",
         ] {
             let _ = parse_str(src); // Result; panicking here fails the test.
         }
@@ -2357,7 +2405,10 @@ mod tests {
                 ),
             ),
         );
-        assert_eq!(parse_str("a || b && c | d = e + f * g ** h").unwrap(), expected);
+        assert_eq!(
+            parse_str("a || b && c | d = e + f * g ** h").unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -2422,7 +2473,11 @@ mod tests {
         // Relational ops share level 4 and fold left: a < b > c == (a < b) > c.
         assert_eq!(
             parse_str("a < b > c").unwrap(),
-            bin(BinaryOp::Gt, bin(BinaryOp::Lt, ident("a"), ident("b")), ident("c"))
+            bin(
+                BinaryOp::Gt,
+                bin(BinaryOp::Lt, ident("a"), ident("b")),
+                ident("c")
+            )
         );
         // Each relational token maps to its own BinaryOp.
         assert_eq!(
@@ -2486,7 +2541,10 @@ mod tests {
         // ~-!a : three distinct prefixes nest right-to-left.
         assert_eq!(
             parse_str("~-!a").unwrap(),
-            un(UnaryOp::BitNot, un(UnaryOp::Neg, un(UnaryOp::Not, ident("a"))))
+            un(
+                UnaryOp::BitNot,
+                un(UnaryOp::Neg, un(UnaryOp::Not, ident("a")))
+            )
         );
     }
 
@@ -2540,7 +2598,10 @@ mod tests {
     fn parameterized_triggers_fvar_and_sysvar() {
         // fvar(1), sysvar(0) — float/system variable accessors parse as calls.
         assert_eq!(parse_str("fvar(1)").unwrap(), call("fvar", vec![int(1)]));
-        assert_eq!(parse_str("sysvar(0)").unwrap(), call("sysvar", vec![int(0)]));
+        assert_eq!(
+            parse_str("sysvar(0)").unwrap(),
+            call("sysvar", vec![int(0)])
+        );
     }
 
     #[test]
@@ -2549,7 +2610,10 @@ mod tests {
         // with precedence (each arg is its own parse_expr(0)).
         assert_eq!(
             parse_str("min(life + 1, 100)").unwrap(),
-            call("min", vec![bin(BinaryOp::Add, ident("life"), int(1)), int(100)])
+            call(
+                "min",
+                vec![bin(BinaryOp::Add, ident("life"), int(1)), int(100)]
+            )
         );
     }
 
@@ -2841,11 +2905,23 @@ mod tests {
     fn axis_suffixed_component_triggers_parse_as_calls() {
         // Task 4.10 gap 1: `Vel Y`, `Pos X`, … fold to a one-arg call with the
         // axis as an upper-cased string literal argument.
-        assert_eq!(parse_str("Vel Y").unwrap(), call("Vel", vec![Expr::Str("Y".into())]));
-        assert_eq!(parse_str("Pos X").unwrap(), call("Pos", vec![Expr::Str("X".into())]));
+        assert_eq!(
+            parse_str("Vel Y").unwrap(),
+            call("Vel", vec![Expr::Str("Y".into())])
+        );
+        assert_eq!(
+            parse_str("Pos X").unwrap(),
+            call("Pos", vec![Expr::Str("X".into())])
+        );
         // Case-insensitive axis word, normalized to upper-case.
-        assert_eq!(parse_str("Pos y").unwrap(), call("Pos", vec![Expr::Str("Y".into())]));
-        assert_eq!(parse_str("Vel x").unwrap(), call("Vel", vec![Expr::Str("X".into())]));
+        assert_eq!(
+            parse_str("Pos y").unwrap(),
+            call("Pos", vec![Expr::Str("Y".into())])
+        );
+        assert_eq!(
+            parse_str("Vel x").unwrap(),
+            call("Vel", vec![Expr::Str("X".into())])
+        );
         // Multi-word trigger names (P2Dist, P2BodyDist, ScreenPos).
         assert_eq!(
             parse_str("P2BodyDist X").unwrap(),
@@ -2856,7 +2932,10 @@ mod tests {
             call("ScreenPos", vec![Expr::Str("Y".into())])
         );
         // The Z axis is accepted too.
-        assert_eq!(parse_str("Pos Z").unwrap(), call("Pos", vec![Expr::Str("Z".into())]));
+        assert_eq!(
+            parse_str("Pos Z").unwrap(),
+            call("Pos", vec![Expr::Str("Z".into())])
+        );
     }
 
     #[test]
@@ -2864,20 +2943,35 @@ mod tests {
         // The folded call is an ordinary atom, so it composes with operators...
         assert_eq!(
             parse_str("Vel Y > 0").unwrap(),
-            bin(BinaryOp::Gt, call("Vel", vec![Expr::Str("Y".into())]), int(0))
+            bin(
+                BinaryOp::Gt,
+                call("Vel", vec![Expr::Str("Y".into())]),
+                int(0)
+            )
         );
         assert_eq!(
             parse_str("(Vel y > 0) && (Pos y >= 0)").unwrap(),
             bin(
                 BinaryOp::And,
-                bin(BinaryOp::Gt, call("Vel", vec![Expr::Str("Y".into())]), int(0)),
-                bin(BinaryOp::Ge, call("Pos", vec![Expr::Str("Y".into())]), int(0)),
+                bin(
+                    BinaryOp::Gt,
+                    call("Vel", vec![Expr::Str("Y".into())]),
+                    int(0)
+                ),
+                bin(
+                    BinaryOp::Ge,
+                    call("Pos", vec![Expr::Str("Y".into())]),
+                    int(0)
+                ),
             )
         );
         // ...and through a redirect: `enemy, P2BodyDist X` (a real KFM shape).
         assert_eq!(
             parse_str("enemy, P2BodyDist X").unwrap(),
-            redirected(Redirect::Enemy, call("P2BodyDist", vec![Expr::Str("X".into())]))
+            redirected(
+                Redirect::Enemy,
+                call("P2BodyDist", vec![Expr::Str("X".into())])
+            )
         );
     }
 
@@ -2909,7 +3003,11 @@ mod tests {
         // It composes in a comparison: `GetHitVar(fall.yvel) = 0` (common1.cns).
         assert_eq!(
             parse_str("GetHitVar(fall.yvel) = 0").unwrap(),
-            bin(BinaryOp::Eq, call("GetHitVar", vec![ident("fall.yvel")]), int(0))
+            bin(
+                BinaryOp::Eq,
+                call("GetHitVar", vec![ident("fall.yvel")]),
+                int(0)
+            )
         );
     }
 
@@ -2956,7 +3054,13 @@ mod tests {
         let src = (0..n).map(|_| "1").collect::<Vec<_>>().join(" + ");
         let parsed = parse_str(&src).expect("long chain parses");
         // Leftmost-deepest: count that the top node is an Add.
-        assert!(matches!(parsed, Expr::Binary { op: BinaryOp::Add, .. }));
+        assert!(matches!(
+            parsed,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2964,10 +3068,36 @@ mod tests {
         // Broader adversarial set covering ranges, assign, mixed delimiters, and
         // operator soup. None may panic; results are ignored.
         for src in [
-            "[", "]", "[]", "[,]", "[1,]", "[,2]", "(,)", "(1,)", "(,2)",
-            "1 := 2", ":=", "var() ()", "cond(,)", "a,,b", "= [1,2]",
-            "[1,2] = x", "((((", "))))", "** **", "1 2 3 4", "!", "~", "- -",
-            "()", "f(", "f(,", "[1,2)(3,4]", "&|^~", "1...2", "abs()",
+            "[",
+            "]",
+            "[]",
+            "[,]",
+            "[1,]",
+            "[,2]",
+            "(,)",
+            "(1,)",
+            "(,2)",
+            "1 := 2",
+            ":=",
+            "var() ()",
+            "cond(,)",
+            "a,,b",
+            "= [1,2]",
+            "[1,2] = x",
+            "((((",
+            "))))",
+            "** **",
+            "1 2 3 4",
+            "!",
+            "~",
+            "- -",
+            "()",
+            "f(",
+            "f(,",
+            "[1,2)(3,4]",
+            "&|^~",
+            "1...2",
+            "abs()",
         ] {
             let _ = parse_str(src);
         }
@@ -3055,12 +3185,17 @@ mod tests {
             return;
         }
 
-        assert!(total > 0, "fixtures present but no trigger lines were found");
+        assert!(
+            total > 0,
+            "fixtures present but no trigger lines were found"
+        );
         assert!(
             ok_count > 0,
             "expected at least one simple real trigger to parse cleanly"
         );
-        eprintln!("real-fixture: {ok_count}/{total} trigger RHS parsed (simple single-expr subset)");
+        eprintln!(
+            "real-fixture: {ok_count}/{total} trigger RHS parsed (simple single-expr subset)"
+        );
     }
 
     /// Helper for the fixture test: true if two `Ident` tokens are adjacent with
@@ -3138,7 +3273,10 @@ mod tests {
         // distinct from `target(0)` → Target(Some(0)).
         assert_eq!(
             parse_str("target, gethitvar(yvel)").unwrap(),
-            redirected(Redirect::Target(None), call("gethitvar", vec![ident("yvel")]))
+            redirected(
+                Redirect::Target(None),
+                call("gethitvar", vec![ident("yvel")])
+            )
         );
         assert_eq!(
             parse_str("target(0), life").unwrap(),
@@ -3294,10 +3432,7 @@ mod tests {
             parse_str("root, parent, enemy, life").unwrap(),
             redirected(
                 Redirect::Root,
-                redirected(
-                    Redirect::Parent,
-                    redirected(Redirect::Enemy, ident("life")),
-                ),
+                redirected(Redirect::Parent, redirected(Redirect::Enemy, ident("life")),),
             )
         );
     }
@@ -3507,9 +3642,7 @@ mod tests {
             let src = format!("{name} = 2, >= 0");
             let ast = parse_str(&src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
             match ast {
-                Expr::AnimElemTail {
-                    name: n, op, ..
-                } => {
+                Expr::AnimElemTail { name: n, op, .. } => {
                     assert!(n.eq_ignore_ascii_case(name), "name preserved: {n}");
                     assert_eq!(op, BinaryOp::Ge);
                 }
@@ -3546,7 +3679,12 @@ mod tests {
     fn animelem_tail_omitted_operator_defaults_to_eq() {
         // `AnimElem = 2, 1` — no operator in the tail means `=`.
         match parse_str("AnimElem = 2, 1").unwrap() {
-            Expr::AnimElemTail { op, element, operand, .. } => {
+            Expr::AnimElemTail {
+                op,
+                element,
+                operand,
+                ..
+            } => {
                 assert_eq!(op, BinaryOp::Eq);
                 assert_eq!(*element, int(2));
                 assert_eq!(*operand, int(1));
@@ -3560,12 +3698,20 @@ mod tests {
         // Verbatim kfm.cns line 1703: `AnimElem = 3, -1` — operand is a negated
         // literal; the omitted op defaults to `=`.
         match parse_str("AnimElem = 3, -1").unwrap() {
-            Expr::AnimElemTail { op, element, operand, .. } => {
+            Expr::AnimElemTail {
+                op,
+                element,
+                operand,
+                ..
+            } => {
                 assert_eq!(op, BinaryOp::Eq);
                 assert_eq!(*element, int(3));
                 assert_eq!(
                     *operand,
-                    Expr::Unary { op: UnaryOp::Neg, operand: Box::new(int(1)) }
+                    Expr::Unary {
+                        op: UnaryOp::Neg,
+                        operand: Box::new(int(1))
+                    }
                 );
             }
             other => panic!("expected AnimElemTail, got {other:?}"),
@@ -3579,10 +3725,16 @@ mod tests {
         // operand. `AnimElem = 2, >= 0 && Time > 0` must parse as
         // `(AnimElem tail) && (Time > 0)` — the tail's operand is just `0`.
         match parse_str("AnimElem = 2, >= 0 && Time > 0").unwrap() {
-            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
                 // LHS is the folded tail with operand `0` (NOT `0 && …`).
                 match *lhs {
-                    Expr::AnimElemTail { op, ref operand, .. } => {
+                    Expr::AnimElemTail {
+                        op, ref operand, ..
+                    } => {
                         assert_eq!(op, BinaryOp::Ge);
                         assert_eq!(**operand, int(0), "operand must be just `0`");
                     }
@@ -3596,7 +3748,11 @@ mod tests {
 
         // The `||` variant binds the same way.
         match parse_str("AnimElem = 2, >= 0 || Time > 0").unwrap() {
-            Expr::Binary { op: BinaryOp::Or, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                lhs,
+                rhs,
+            } => {
                 assert!(matches!(*lhs, Expr::AnimElemTail { .. }));
                 assert_eq!(*rhs, bin(BinaryOp::Gt, ident("Time"), int(0)));
             }
@@ -3639,7 +3795,11 @@ mod tests {
         //     `Time > 0 && AnimElem = 2, >= 0` is `(Time > 0) && (AnimElem tail)`.
         //     This is the behavior the real evilken/KFM `&&`-chains rely on.
         match parse_str("Time > 0 && AnimElem = 2, >= 0").unwrap() {
-            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
                 assert_eq!(*lhs, bin(BinaryOp::Gt, ident("Time"), int(0)));
                 assert!(
                     matches!(*rhs, Expr::AnimElemTail { op: BinaryOp::Ge, ref operand, .. } if **operand == int(0)),
@@ -3676,7 +3836,11 @@ mod tests {
         // `GetHitVar(fall.yvel) + 1` — the dotted-arg call composes in arithmetic.
         assert_eq!(
             parse_str("GetHitVar(fall.yvel) + 1").unwrap(),
-            bin(BinaryOp::Add, call("GetHitVar", vec![ident("fall.yvel")]), int(1))
+            bin(
+                BinaryOp::Add,
+                call("GetHitVar", vec![ident("fall.yvel")]),
+                int(1)
+            )
         );
     }
 
@@ -3755,9 +3919,15 @@ mod tests {
         // operand, not be absorbed into the tail's secondary operand. So
         // `AnimElem = 2, >= 0 = 1` is `(tail{op:Ge, operand:0}) = 1`.
         match parse_str("AnimElem = 2, >= 0 = 1").unwrap() {
-            Expr::Binary { op: BinaryOp::Eq, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+            } => {
                 match *lhs {
-                    Expr::AnimElemTail { op, ref operand, .. } => {
+                    Expr::AnimElemTail {
+                        op, ref operand, ..
+                    } => {
                         assert_eq!(op, BinaryOp::Ge);
                         assert_eq!(**operand, int(0), "operand must be just `0`, not `0 = 1`");
                     }
@@ -3775,8 +3945,14 @@ mod tests {
         // BELOW relational in MUGEN precedence: `AnimElem = 2, >= 0 | 1` is
         // `(tail) | 1` — the operand is just `0`.
         match parse_str("AnimElem = 2, >= 0 | 1").unwrap() {
-            Expr::Binary { op: BinaryOp::BitOr, lhs, rhs } => {
-                assert!(matches!(*lhs, Expr::AnimElemTail { ref operand, .. } if **operand == int(0)));
+            Expr::Binary {
+                op: BinaryOp::BitOr,
+                lhs,
+                rhs,
+            } => {
+                assert!(
+                    matches!(*lhs, Expr::AnimElemTail { ref operand, .. } if **operand == int(0))
+                );
                 assert_eq!(*rhs, int(1));
             }
             other => panic!("expected `(tail) | 1`, got {other:?}"),
@@ -3789,10 +3965,20 @@ mod tests {
         // operator: `AnimElem = 2, >= 0 && a || b` is `((tail && a) || b)`, with
         // the tail's operand still just `0`.
         match parse_str("AnimElem = 2, >= 0 && a || b").unwrap() {
-            Expr::Binary { op: BinaryOp::Or, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                lhs,
+                rhs,
+            } => {
                 match *lhs {
-                    Expr::Binary { op: BinaryOp::And, lhs: inner_l, rhs: inner_r } => {
-                        assert!(matches!(*inner_l, Expr::AnimElemTail { ref operand, .. } if **operand == int(0)));
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        lhs: inner_l,
+                        rhs: inner_r,
+                    } => {
+                        assert!(
+                            matches!(*inner_l, Expr::AnimElemTail { ref operand, .. } if **operand == int(0))
+                        );
                         assert_eq!(*inner_r, ident("a"));
                     }
                     other => panic!("LHS should be `tail && a`, got {other:?}"),
@@ -3808,9 +3994,15 @@ mod tests {
         // The omitted-operator (defaults to `=`) shape binds the trailing `&&`
         // the same way: `AnimElem = 2, 1 && Time` is `(tail{op:Eq,operand:1}) && Time`.
         match parse_str("AnimElem = 2, 1 && Time").unwrap() {
-            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
                 match *lhs {
-                    Expr::AnimElemTail { op, ref operand, .. } => {
+                    Expr::AnimElemTail {
+                        op, ref operand, ..
+                    } => {
                         assert_eq!(op, BinaryOp::Eq);
                         assert_eq!(**operand, int(1));
                     }
@@ -3827,7 +4019,9 @@ mod tests {
         // The operand absorbs the full additive+multiplicative band (everything
         // ABOVE relational): `AnimElem = 2, >= 1 + 2 * 3` → operand `1 + (2*3)`.
         match parse_str("AnimElem = 2, >= 1 + 2 * 3").unwrap() {
-            Expr::AnimElemTail { ref operand, op, .. } => {
+            Expr::AnimElemTail {
+                ref operand, op, ..
+            } => {
                 assert_eq!(op, BinaryOp::Ge);
                 assert_eq!(
                     **operand,
@@ -3851,7 +4045,8 @@ mod tests {
             "1 || AnimElem = 2, >= 0",
             "AnimElem = 2 && AnimElem = 3, >= 0",
         ] {
-            let parsed = parse_str(src).unwrap_or_else(|e| panic!("{src:?} should parse, got {e:?}"));
+            let parsed =
+                parse_str(src).unwrap_or_else(|e| panic!("{src:?} should parse, got {e:?}"));
             match parsed {
                 Expr::Binary { rhs, .. } => assert!(
                     matches!(*rhs, Expr::AnimElemTail { .. }),
@@ -3903,7 +4098,11 @@ mod tests {
         // `AnimElemNo` is the function-form `AnimElemNo(t)`, not a comma-tail
         // trigger, so a comma tail still degrades to a recoverable error (never a
         // wrong tree, never a panic) — case-insensitively.
-        for src in ["AnimElemNo = 2, >= 0", "animelemno = 2, 1", "ANIMELEMNO = 5, < 3"] {
+        for src in [
+            "AnimElemNo = 2, >= 0",
+            "animelemno = 2, 1",
+            "ANIMELEMNO = 5, < 3",
+        ] {
             let err = parse_str(src).unwrap_err();
             assert!(
                 matches!(err, ParseError::UnexpectedToken { .. }),
@@ -3971,8 +4170,14 @@ mod tests {
     #[test]
     fn evilken_timemod_exact_failing_forms_parse() {
         // The EXACT strings the loader logged as "unexpected token , -> const 0".
-        assert_eq!(parse_str("timemod = 20,19").unwrap(), timemod(int(20), int(19)));
-        assert_eq!(parse_str("TimeMod = 4, 3").unwrap(), timemod(int(4), int(3)));
+        assert_eq!(
+            parse_str("timemod = 20,19").unwrap(),
+            timemod(int(20), int(19))
+        );
+        assert_eq!(
+            parse_str("TimeMod = 4, 3").unwrap(),
+            timemod(int(4), int(3))
+        );
         // A bare `TimeMod = d` (no tail) is still an ordinary equality.
         assert_eq!(
             parse_str("TimeMod = 2").unwrap(),
@@ -3990,12 +4195,28 @@ mod tests {
             .expect("compound evilken expression must parse");
         // Left-associative `&&`: top is `(((var=59) && (p2life>0)) && timemodtail) && (time>2)`.
         match parsed {
-            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
-                assert_eq!(*rhs, bin(BinaryOp::Gt, ident("time"), int(2)), "last conjunct is time > 2");
+            Expr::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(
+                    *rhs,
+                    bin(BinaryOp::Gt, ident("time"), int(2)),
+                    "last conjunct is time > 2"
+                );
                 // The third conjunct (the RHS of the inner `&&`) is the TimeModTail.
                 match *lhs {
-                    Expr::Binary { op: BinaryOp::And, rhs: inner_rhs, .. } => {
-                        assert_eq!(*inner_rhs, timemod(int(2), int(1)), "third conjunct is the TimeMod tail");
+                    Expr::Binary {
+                        op: BinaryOp::And,
+                        rhs: inner_rhs,
+                        ..
+                    } => {
+                        assert_eq!(
+                            *inner_rhs,
+                            timemod(int(2), int(1)),
+                            "third conjunct is the TimeMod tail"
+                        );
                     }
                     other => panic!("expected nested `&&` chain, got {other:?}"),
                 }
@@ -4010,7 +4231,11 @@ mod tests {
         // && movecontact`. It must parse as `(HitDefAttrTail) && (movecontact)`, so
         // the special-cancel gate survives instead of collapsing to const 0.
         match parse_str("hitdefattr = C, NA && movecontact").unwrap() {
-            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+            Expr::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => {
                 assert_eq!(
                     *lhs,
                     Expr::HitDefAttrTail {
@@ -4042,7 +4267,12 @@ mod tests {
         // The EXACT string the loader logged failing at col 19: `projcontact2000 =
         // 1, < 20`. It must parse (eval is `0` — projectiles unimplemented).
         match parse_str("projcontact2000 = 1, < 20").unwrap() {
-            Expr::ProjTail { name, value, op, time } => {
+            Expr::ProjTail {
+                name,
+                value,
+                op,
+                time,
+            } => {
                 assert_eq!(name, "projcontact2000");
                 assert_eq!(*value, int(1));
                 assert_eq!(op, BinaryOp::Lt);
@@ -4077,11 +4307,7 @@ mod tests {
             parse_str("cond(timemod = 2, 1, 0)").unwrap(),
             call(
                 "cond",
-                vec![
-                    bin(BinaryOp::Eq, ident("timemod"), int(2)),
-                    int(1),
-                    int(0),
-                ],
+                vec![bin(BinaryOp::Eq, ident("timemod"), int(2)), int(1), int(0),],
             )
         );
         // Plain three-arg call is unaffected.
@@ -4111,11 +4337,11 @@ mod tests {
         // Each family's malformed tail degrades to a recoverable error (the comma
         // was committed but the tail is bad), never a panic.
         for src in [
-            "timemod = 2,",          // TimeMod: nothing after the comma
-            "hitdefattr = X, NA",    // HitDefAttr: bad standtype (X)
-            "hitdefattr = C,",       // HitDefAttr: no code
-            "hitdefattr = C, 5",     // HitDefAttr: non-code token
-            "projcontact1 = 1,",     // Proj*: nothing after the comma
+            "timemod = 2,",       // TimeMod: nothing after the comma
+            "hitdefattr = X, NA", // HitDefAttr: bad standtype (X)
+            "hitdefattr = C,",    // HitDefAttr: no code
+            "hitdefattr = C, 5",  // HitDefAttr: non-code token
+            "projcontact1 = 1,",  // Proj*: nothing after the comma
         ] {
             assert!(
                 parse_str(src).is_err(),

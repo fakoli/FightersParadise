@@ -14,11 +14,11 @@ pub mod state;
 
 pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
-pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
 pub use command::{
     compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,
     InputModifier,
 };
+pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
 pub use state::{
     dir_matches, dir_matches_detect, logical_direction, Button, DirToken, Direction, InputState,
     LogicalDirection, BUTTON_COUNT,

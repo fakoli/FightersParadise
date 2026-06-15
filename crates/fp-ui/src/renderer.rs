@@ -112,7 +112,11 @@ impl ScreenpackHud {
             .map(|f| f.map(|font| GlyphFont::new(renderer.device(), renderer.queue(), font)))
             .collect();
 
-        Self { layout, sprites, fonts }
+        Self {
+            layout,
+            sprites,
+            fonts,
+        }
     }
 
     /// The parsed layout backing this HUD (e.g. for power-level sound routing).
@@ -219,9 +223,15 @@ impl ScreenpackHud {
     /// draws nothing.
     fn draw_face(&self, frame: &mut RenderFrame<'_>, face: &FaceSide) {
         let Some(r) = face.spr else { return };
-        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
+            return;
+        };
         let (x, y) = face_draw_pos(face);
-        let params = SpriteDrawParams { x, y, ..Default::default() };
+        let params = SpriteDrawParams {
+            x,
+            y,
+            ..Default::default()
+        };
         frame.draw_sprite(&gpu.texture, &gpu.palette, &params);
     }
 
@@ -240,7 +250,9 @@ impl ScreenpackHud {
         frac: f32,
     ) {
         let Some(r) = front else { return };
-        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
+            return;
+        };
         let frac = clamp_fraction(frac);
         if frac <= 0.0 {
             return;
@@ -263,7 +275,9 @@ impl ScreenpackHud {
         base_y: f32,
     ) {
         let Some(r) = spr else { return };
-        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
+            return;
+        };
         let params = SpriteDrawParams {
             x: base_x + r.offset.x as f32,
             y: base_y + r.offset.y as f32,
@@ -277,8 +291,14 @@ impl ScreenpackHud {
         if text.is_empty() {
             return;
         }
-        let Some(Some(font)) = self.fonts.get(slot) else { return };
-        let params = TextDrawParams { x, y, ..Default::default() };
+        let Some(Some(font)) = self.fonts.get(slot) else {
+            return;
+        };
+        let params = TextDrawParams {
+            x,
+            y,
+            ..Default::default()
+        };
         frame.draw_text(font, text, &params);
     }
 }
@@ -292,7 +312,11 @@ fn upload_sprite(renderer: &Renderer, sff: &SffFile, group: u16, image: u16) -> 
         .enumerate()
         .find(|(_, s)| s.group == group && s.image == image)?;
     if sprite.width == 0 || sprite.height == 0 {
-        tracing::warn!(group, image, "screenpack sprite has zero dimensions; skipping");
+        tracing::warn!(
+            group,
+            image,
+            "screenpack sprite has zero dimensions; skipping"
+        );
         return None;
     }
     let pixels = match sff.decode_sprite(index) {
@@ -475,7 +499,10 @@ mod tests {
         let (uv, dst_w, off) = bar_fill_uv((0, -256), 0.5, 200.0);
         assert_eq!(uv, [0.5, 0.0, 1.0, 1.0]);
         assert_eq!(dst_w, 100.0);
-        assert_eq!(off, 100.0, "shift = sprite_w - dst_w keeps the right edge fixed");
+        assert_eq!(
+            off, 100.0,
+            "shift = sprite_w - dst_w keeps the right edge fixed"
+        );
     }
 
     #[test]
@@ -492,14 +519,30 @@ mod tests {
         let layout = ScreenpackLayout {
             p1_lifebar: LifebarSide {
                 bg_layers: vec![
-                    SpriteRef { group: 0, image: 0, offset: Pos::default() },
-                    SpriteRef { group: 0, image: 3, offset: Pos::default() },
+                    SpriteRef {
+                        group: 0,
+                        image: 0,
+                        offset: Pos::default(),
+                    },
+                    SpriteRef {
+                        group: 0,
+                        image: 3,
+                        offset: Pos::default(),
+                    },
                 ],
-                front: Some(SpriteRef { group: 2, image: 0, offset: Pos::default() }),
+                front: Some(SpriteRef {
+                    group: 2,
+                    image: 0,
+                    offset: Pos::default(),
+                }),
                 ..Default::default()
             },
             p2_lifebar: LifebarSide {
-                bg_layers: vec![SpriteRef { group: 0, image: 1, offset: Pos::default() }],
+                bg_layers: vec![SpriteRef {
+                    group: 0,
+                    image: 1,
+                    offset: Pos::default(),
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -520,16 +563,32 @@ mod tests {
         let layout = ScreenpackLayout {
             p1_lifebar: LifebarSide {
                 bg_layers: vec![
-                    SpriteRef { group: 5, image: 0, offset: Pos::default() },
-                    SpriteRef { group: 5, image: 1, offset: Pos::default() },
+                    SpriteRef {
+                        group: 5,
+                        image: 0,
+                        offset: Pos::default(),
+                    },
+                    SpriteRef {
+                        group: 5,
+                        image: 1,
+                        offset: Pos::default(),
+                    },
                 ],
                 ..Default::default()
             },
             ..Default::default()
         };
         let refs = layout_sprite_refs(&layout);
-        assert_eq!((refs[0].group, refs[0].image), (5, 0), "bg0 first (drawn at the back)");
-        assert_eq!((refs[1].group, refs[1].image), (5, 1), "bg1 second (drawn on top)");
+        assert_eq!(
+            (refs[0].group, refs[0].image),
+            (5, 0),
+            "bg0 first (drawn at the back)"
+        );
+        assert_eq!(
+            (refs[1].group, refs[1].image),
+            (5, 1),
+            "bg1 second (drawn on top)"
+        );
     }
 
     #[test]
@@ -553,11 +612,19 @@ mod tests {
         // offset — the position the renderer draws the portrait at.
         use crate::screenpack::{FaceSide, Pos};
         let p1 = FaceSide {
-            spr: Some(SpriteRef { group: 9000, image: 0, offset: Pos::new(1, 2) }),
+            spr: Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::new(1, 2),
+            }),
             pos: Pos::new(12, 12),
         };
         let p2 = FaceSide {
-            spr: Some(SpriteRef { group: 9000, image: 0, offset: Pos::default() }),
+            spr: Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::default(),
+            }),
             pos: Pos::new(308, 12),
         };
         // P1: pos (12,12) + offset (1,2) = (13, 14).
@@ -575,7 +642,10 @@ mod tests {
     fn face_draw_pos_without_sprite_is_bare_pos() {
         // No sprite ref -> position is just the anchor (the renderer skips drawing).
         use crate::screenpack::{FaceSide, Pos};
-        let face = FaceSide { spr: None, pos: Pos::new(40, 50) };
+        let face = FaceSide {
+            spr: None,
+            pos: Pos::new(40, 50),
+        };
         assert_eq!(face_draw_pos(&face), (40.0, 50.0));
     }
 
@@ -599,11 +669,19 @@ mod tests {
         // Both players have a portrait sprite parsed.
         assert_eq!(
             layout.p1_face.spr,
-            Some(SpriteRef { group: 9000, image: 0, offset: Pos::new(1, 1) })
+            Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::new(1, 1)
+            })
         );
         assert_eq!(
             layout.p2_face.spr,
-            Some(SpriteRef { group: 9000, image: 0, offset: Pos::default() })
+            Some(SpriteRef {
+                group: 9000,
+                image: 0,
+                offset: Pos::default()
+            })
         );
         // And each side draws at its parsed (pos + offset) position.
         assert_eq!(face_draw_pos(&layout.p1_face), (13.0, 13.0));
@@ -616,7 +694,10 @@ mod tests {
         // font slot; this asserts the layout fields the renderer reads.
         use crate::screenpack::{ComboLayout, Pos};
         let layout = ScreenpackLayout {
-            combo: ComboLayout { pos: Pos::new(30, 80), font: 3 },
+            combo: ComboLayout {
+                pos: Pos::new(30, 80),
+                font: 3,
+            },
             ..Default::default()
         };
         assert_eq!(layout.combo.pos, Pos::new(30, 80));

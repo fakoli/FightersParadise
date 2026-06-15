@@ -264,7 +264,10 @@ fn detect_version(data: &[u8]) -> FpResult<FntVersion> {
     if data.len() < 16 {
         return Err(FpError::parse(
             "FNT",
-            format!("file too small for FNT header: {} bytes (need 16)", data.len()),
+            format!(
+                "file too small for FNT header: {} bytes (need 16)",
+                data.len()
+            ),
         ));
     }
     if &data[0..12] != FNT_SIGNATURE.as_slice() {
@@ -549,12 +552,12 @@ mod tests {
         pcx[1] = 5; // version
         pcx[2] = 1; // RLE encoding
         pcx[3] = 8; // bits per pixel
-        // xmin=0, ymin=0, xmax=width-1, ymax=height-1
+                    // xmin=0, ymin=0, xmax=width-1, ymax=height-1
         pcx[8..10].copy_from_slice(&(width - 1).to_le_bytes());
         pcx[10..12].copy_from_slice(&(height - 1).to_le_bytes());
         pcx[65] = 1; // planes
         pcx[66..68].copy_from_slice(&width.to_le_bytes()); // bytes per line
-        // Body: per scanline, emit RLE runs covering `width` pixels of `value`.
+                                                           // Body: per scanline, emit RLE runs covering `width` pixels of `value`.
         for _ in 0..height {
             let mut remaining = width;
             while remaining > 0 {

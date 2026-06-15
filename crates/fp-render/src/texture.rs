@@ -19,7 +19,13 @@ impl SpriteTexture {
     /// Uploads indexed pixel data to a new GPU texture.
     ///
     /// `data` must contain exactly `width * height` bytes, one palette index per pixel.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, data: &[u8]) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Self {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -324,8 +330,8 @@ mod tests {
         // A 768-byte .act: a constant opaque grey for every on-disk triple. The
         // ActPalette parser de-reverses it and forces index 0 transparent.
         let act_bytes = vec![90u8; 768];
-        let act = fp_formats::act::ActPalette::from_bytes(&act_bytes)
-            .expect("synthetic .act parses");
+        let act =
+            fp_formats::act::ActPalette::from_bytes(&act_bytes).expect("synthetic .act parses");
 
         let embedded = embedded_palette();
 

@@ -23,11 +23,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
-      # NOTE: no `cargo fmt --check` gate yet — the existing codebase is not
-      # rustfmt-clean and CLAUDE.md only mandates test + clippy. Adopting rustfmt
-      # is tracked as backlog item CB3 (run `cargo fmt --all` once, then add the gate).
+      # Formatting gate (backlog CB3, done): the workspace was run through
+      # `cargo fmt --all` once and is now rustfmt-clean, so CI fails fast on any
+      # drift. This runs before clippy/build/test because it needs no compile —
+      # a pure-text diff is the cheapest possible failure.
+      - name: Rustfmt (check formatting)
+        run: cargo fmt --all --check
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

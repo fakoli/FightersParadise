@@ -968,10 +968,19 @@ Interpolate Scale
         // Real content contains `Clsn2Defaultf: 1` (a stray `f` before the
         // colon). It must be recognized as a Clsn2Default header so the box is
         // applied as the frame's default hurtbox, not dropped.
-        assert_eq!(parse_clsn_default("Clsn2Defaultf: 1", "Clsn2Default"), Some(1));
-        assert_eq!(parse_clsn_default("Clsn1Defaultx: 2", "Clsn1Default"), Some(2));
+        assert_eq!(
+            parse_clsn_default("Clsn2Defaultf: 1", "Clsn2Default"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_clsn_default("Clsn1Defaultx: 2", "Clsn1Default"),
+            Some(2)
+        );
         // Well-formed headers still parse.
-        assert_eq!(parse_clsn_default("Clsn2Default: 3", "Clsn2Default"), Some(3));
+        assert_eq!(
+            parse_clsn_default("Clsn2Default: 3", "Clsn2Default"),
+            Some(3)
+        );
 
         let air_text = "\
 [Begin Action 300]
@@ -1071,7 +1080,9 @@ Clsn2Defaultf: 1
 
         // Action 2650 holds the `2..A` junk frame; it must still load with all
         // its frames intact (the junk frame is kept, not dropped).
-        let a2650 = air.action(2650).expect("evilken action 2650 must be present");
+        let a2650 = air
+            .action(2650)
+            .expect("evilken action 2650 must be present");
         assert!(
             !a2650.frames.is_empty(),
             "evilken action 2650 must retain its frames"

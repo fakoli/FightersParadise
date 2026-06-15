@@ -1327,8 +1327,12 @@ impl Match {
     /// [`tick`](Match::tick). Pass [`DEFAULT_MATCH_SEED`] for the fixed,
     /// reproducible default.
     pub fn seed_players(&mut self, match_seed: i32) {
-        self.p1.character.seed_rng(derive_player_seed(match_seed, 0));
-        self.p2.character.seed_rng(derive_player_seed(match_seed, 1));
+        self.p1
+            .character
+            .seed_rng(derive_player_seed(match_seed, 0));
+        self.p2
+            .character
+            .seed_rng(derive_player_seed(match_seed, 1));
     }
 
     /// Constructs a match (default round length / best-of-N) and immediately seeds
@@ -1678,7 +1682,9 @@ impl Match {
             partner: None,
             players: &p1_players,
         };
-        let mut p1_report = self.p1.tick_root(Some(&self.p2.character), stage, p1_relations);
+        let mut p1_report = self
+            .p1
+            .tick_root(Some(&self.p2.character), stage, p1_relations);
         // Capture any `Pause`/`SuperPause` P1 requested this tick (audit #24); the
         // freeze is armed after BOTH players tick so the later request wins.
         let p1_freeze = p1_report.freeze_request;
@@ -1716,7 +1722,9 @@ impl Match {
             partner: None,
             players: &p2_players,
         };
-        let mut p2_report = self.p2.tick_root(Some(&self.p1.character), stage, p2_relations);
+        let mut p2_report = self
+            .p2
+            .tick_root(Some(&self.p1.character), stage, p2_relations);
         let p2_freeze = p2_report.freeze_request;
         let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
         let p2_projectile_spawns = std::mem::take(&mut p2_report.projectile_spawns);
@@ -2024,9 +2032,10 @@ impl Match {
     /// cancels the other side. Pure field writes; never panics.
     fn resolve_priority_clash(&mut self) {
         // Both sides must have an active HitDef to clash at all.
-        let (Some(p1_hd), Some(p2_hd)) =
-            (self.p1.character.active_hitdef, self.p2.character.active_hitdef)
-        else {
+        let (Some(p1_hd), Some(p2_hd)) = (
+            self.p1.character.active_hitdef,
+            self.p2.character.active_hitdef,
+        ) else {
             return;
         };
 
@@ -2161,8 +2170,7 @@ impl Match {
                     self.decide_round(winner);
                 } else if self.timer == 0 {
                     // Time over: compare remaining life.
-                    let winner =
-                        compare_life(self.p1.character.life, self.p2.character.life);
+                    let winner = compare_life(self.p1.character.life, self.p2.character.life);
                     self.decide_round(winner);
                 }
             }
@@ -2382,7 +2390,14 @@ impl Match {
             elem_time: 0,
             remaining: lifetime,
         };
-        tracing::debug!(?side, anim, x = pos.x, y = pos.y, lifetime, "spawned hit spark");
+        tracing::debug!(
+            ?side,
+            anim,
+            x = pos.x,
+            y = pos.y,
+            lifetime,
+            "spawned hit spark"
+        );
         self.effects.push(effect);
     }
 
@@ -2594,7 +2609,8 @@ impl Player {
         self.input_buffer.push(raw);
 
         let facing_right = self.character.facing == Facing::Right;
-        self.matcher.check_commands(&self.input_buffer, facing_right);
+        self.matcher
+            .check_commands(&self.input_buffer, facing_right);
 
         // The defender guards while holding "back" (away from the opponent):
         // resolve the raw absolute direction to facing-relative and read `back`,
@@ -2669,7 +2685,10 @@ fn match_input_to_state(input: MatchInput) -> InputState {
 /// Thin wrapper over the shared [`CommandMatcher::active_command_names_in`]
 /// primitive (the actual filter lives in `fp-input`, in one place), which bounds
 /// the matcher's active set to this character's own command vocabulary.
-fn snapshot_active_commands(matcher: &CommandMatcher, command_defs: &[CommandDef]) -> ActiveCommands {
+fn snapshot_active_commands(
+    matcher: &CommandMatcher,
+    command_defs: &[CommandDef],
+) -> ActiveCommands {
     ActiveCommands::from_names(matcher.active_command_names_in(command_defs))
 }
 
@@ -2850,7 +2869,10 @@ fn directional_contact(attacker: &Player, defender: &Player) -> bool {
 /// and so changes its hurt boxes), and only uses it when the resolve actually
 /// reports a connection. An absent action/frame or empty box set yields `None`
 /// (no contact); never panics.
-fn directional_contact_point(attacker: &Player, defender: &Player) -> Option<fp_combat::HitContact> {
+fn directional_contact_point(
+    attacker: &Player,
+    defender: &Player,
+) -> Option<fp_combat::HitContact> {
     let clsn1 = current_frame_clsn1(
         &attacker.loaded.air,
         attacker.character.anim,
@@ -2915,7 +2937,11 @@ fn current_frame_clsn(air: &AirFile, anim: i32, elem: i32, attack: bool) -> Vec<
         return Vec::new();
     }
     let max = action.frames.len() - 1;
-    let idx = if elem < 0 { 0 } else { (elem as usize).min(max) };
+    let idx = if elem < 0 {
+        0
+    } else {
+        (elem as usize).min(max)
+    };
     let Some(frame) = action.frames.get(idx) else {
         return Vec::new();
     };
@@ -3145,7 +3171,7 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
     use fp_character::{
-        CharacterConstants, Character, CompiledController, CompiledExpr, CompiledParam,
+        Character, CharacterConstants, CompiledController, CompiledExpr, CompiledParam,
         CompiledState, CompiledTriggerGroup, Facing, LoadedCharacter, MoveType, StateType,
     };
     use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime, Priority, PriorityType};
@@ -3484,7 +3510,10 @@ time = 1
         let mut m = clash_match();
         // Equal value, both Hit (KFM's case: 3, Hit) -> Trade.
         let hd = HitDef {
-            priority: Priority { value: 3, kind: PriorityType::Hit },
+            priority: Priority {
+                value: 3,
+                kind: PriorityType::Hit,
+            },
             ..sample_hitdef()
         };
         arm_brawler(&mut m.p1, hd);
@@ -3505,14 +3534,20 @@ time = 1
         arm_brawler(
             &mut m.p1,
             HitDef {
-                priority: Priority { value: 6, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 6,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
         arm_brawler(
             &mut m.p2,
             HitDef {
-                priority: Priority { value: 3, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 3,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
@@ -3521,8 +3556,15 @@ time = 1
 
         // P1 won: P2 takes damage, P1 is untouched (its attacker HitDef cancelled
         // P2's before P2's resolve_attack pass).
-        assert!(m.p2().life() < 1000, "the higher-priority attacker (P1) lands on P2");
-        assert_eq!(m.p1().life(), 1000, "the lower-priority attacker (P2) was cancelled");
+        assert!(
+            m.p2().life() < 1000,
+            "the higher-priority attacker (P1) lands on P2"
+        );
+        assert_eq!(
+            m.p1().life(),
+            1000,
+            "the lower-priority attacker (P2) was cancelled"
+        );
     }
 
     /// The mirror case: P2 has the higher value, so P1 is cancelled and only P1
@@ -3533,22 +3575,35 @@ time = 1
         arm_brawler(
             &mut m.p1,
             HitDef {
-                priority: Priority { value: 2, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 2,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
         arm_brawler(
             &mut m.p2,
             HitDef {
-                priority: Priority { value: 7, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 7,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
 
         m.tick(MatchInput::none(), MatchInput::none());
 
-        assert!(m.p1().life() < 1000, "the higher-priority attacker (P2) lands on P1");
-        assert_eq!(m.p2().life(), 1000, "the lower-priority attacker (P1) was cancelled");
+        assert!(
+            m.p1().life() < 1000,
+            "the higher-priority attacker (P2) lands on P1"
+        );
+        assert_eq!(
+            m.p2().life(),
+            1000,
+            "the lower-priority attacker (P1) was cancelled"
+        );
     }
 
     /// Equal value with a `Dodge` on one side suppresses BOTH attacks: neither
@@ -3559,14 +3614,20 @@ time = 1
         arm_brawler(
             &mut m.p1,
             HitDef {
-                priority: Priority { value: 4, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 4,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
         arm_brawler(
             &mut m.p2,
             HitDef {
-                priority: Priority { value: 4, kind: PriorityType::Dodge },
+                priority: Priority {
+                    value: 4,
+                    kind: PriorityType::Dodge,
+                },
                 ..sample_hitdef()
             },
         );
@@ -3589,7 +3650,10 @@ time = 1
                 // A LOW priority value that, IF a clash were (wrongly) detected
                 // against P2, could cancel P1 — proving no clash logic fires when
                 // P2 has no HitDef.
-                priority: Priority { value: 1, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 1,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
@@ -3638,7 +3702,10 @@ time = 1
         arm_brawler(
             &mut m.p1,
             HitDef {
-                priority: Priority { value: 5, kind: PriorityType::Hit },
+                priority: Priority {
+                    value: 5,
+                    kind: PriorityType::Hit,
+                },
                 ..sample_hitdef()
             },
         );
@@ -3647,7 +3714,10 @@ time = 1
         m.p2.character.anim_elem = 0;
         m.p2.character.state_type = StateType::Standing;
         m.p2.character.active_hitdef = Some(HitDef {
-            priority: Priority { value: 7, kind: PriorityType::Hit },
+            priority: Priority {
+                value: 7,
+                kind: PriorityType::Hit,
+            },
             ..sample_hitdef()
         });
         m.p2.character.move_connect.reset();
@@ -3664,7 +3734,11 @@ time = 1
     #[test]
     fn connecting_attack_appends_hit_sound_to_attacker_requests() {
         use fp_character::SoundId;
-        let hitsound = SoundId { group: 5, sample: 0, common: false };
+        let hitsound = SoundId {
+            group: 5,
+            sample: 0,
+            common: false,
+        };
 
         let mut p1c = Character::with_constants(CharacterConstants::default());
         p1c.pos = Vec2::new(0.0, 0.0);
@@ -3704,7 +3778,10 @@ time = 1
         assert_eq!(req.channel, 0, "impact sound plays on the hit channel (0)");
         assert_eq!(req.volume_scale, 100, "impact sound at full volume");
         assert!(!req.looping);
-        assert!(!req.common, "the SoundId `common` flag propagates unchanged (own .snd here)");
+        assert!(
+            !req.common,
+            "the SoundId `common` flag propagates unchanged (own .snd here)"
+        );
         // The defender (P2) did not emit the attacker's hit sound.
         assert!(
             !m.p2_sound_requests()
@@ -3757,7 +3834,11 @@ time = 1
     #[test]
     fn guarded_attack_appends_guard_sound_to_attacker_requests() {
         use fp_character::SoundId;
-        let guardsound = SoundId { group: 6, sample: 1, common: true };
+        let guardsound = SoundId {
+            group: 6,
+            sample: 1,
+            common: true,
+        };
 
         let mut p1c = Character::with_constants(CharacterConstants::default());
         p1c.pos = Vec2::new(0.0, 0.0);
@@ -3803,7 +3884,10 @@ time = 1
             .expect("P1's guard sound must be present on a blocked attack");
         assert_eq!(req.channel, 0);
         assert_eq!(req.volume_scale, 100);
-        assert!(req.common, "a common guard sound (the hitsound/guardsound default) resolves against fight.snd");
+        assert!(
+            req.common,
+            "a common guard sound (the hitsound/guardsound default) resolves against fight.snd"
+        );
     }
 
     #[test]
@@ -3932,7 +4016,10 @@ time = 1
             "MatchOver is set once the match is decided"
         );
         assert!(m.p2().character.round_view.match_over);
-        assert!(m.game_time() > gt_before, "GameTime keeps advancing past match end");
+        assert!(
+            m.game_time() > gt_before,
+            "GameTime keeps advancing past match end"
+        );
     }
 
     // ---- T016: RoundNo / RoundsExisted threaded to triggers across rounds ----
@@ -3980,7 +4067,10 @@ time = 1
         m.tick(MatchInput::none(), MatchInput::none());
         let v = m.p1().character.round_view;
         assert_eq!(v.round_no, 2, "round 2: RoundNo 2");
-        assert_eq!(v.rounds_existed, 1, "one round completed -> RoundsExisted 1");
+        assert_eq!(
+            v.rounds_existed, 1,
+            "one round completed -> RoundsExisted 1"
+        );
         assert_eq!(v.rounds_existed, v.round_no - 1);
 
         // --- Round 2: split it so the match reaches round 3 (P2 wins this one) ---
@@ -3993,7 +4083,10 @@ time = 1
         m.tick(MatchInput::none(), MatchInput::none());
         let v = m.p2().character.round_view;
         assert_eq!(v.round_no, 3, "round 3: RoundNo 3");
-        assert_eq!(v.rounds_existed, 2, "two rounds completed -> RoundsExisted 2");
+        assert_eq!(
+            v.rounds_existed, 2,
+            "two rounds completed -> RoundsExisted 2"
+        );
         assert_eq!(v.rounds_existed, v.round_no - 1);
     }
 
@@ -4057,26 +4150,56 @@ time = 1
         // CommandMatcher, which resolves F/B against facing. Facing right,
         // hardware-right activates `holdfwd` (toward opponent) and clears
         // holding_back; hardware-left activates `holdback` and sets holding_back.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Right;
-        p.feed_input(MatchInput { right: true, ..MatchInput::none() });
-        assert!(p.character.commands.is_active("holdfwd"), "right while facing right is holdfwd");
+        p.feed_input(MatchInput {
+            right: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            p.character.commands.is_active("holdfwd"),
+            "right while facing right is holdfwd"
+        );
         assert!(!p.character.commands.is_active("holdback"));
         assert!(!p.character.holding_back, "toward opponent is not back");
 
         // Hardware-left while facing right is Back.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Right;
-        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
-        assert!(p.character.commands.is_active("holdback"), "left while facing right is holdback");
+        p.feed_input(MatchInput {
+            left: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            p.character.commands.is_active("holdback"),
+            "left while facing right is holdback"
+        );
         assert!(!p.character.commands.is_active("holdfwd"));
-        assert!(p.character.holding_back, "holding away from the opponent sets holding_back");
+        assert!(
+            p.character.holding_back,
+            "holding away from the opponent sets holding_back"
+        );
 
         // Facing LEFT mirrors it: hardware-left is now Forward.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Left;
-        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
-        assert!(p.character.commands.is_active("holdfwd"), "left while facing left is holdfwd");
+        p.feed_input(MatchInput {
+            left: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            p.character.commands.is_active("holdfwd"),
+            "left while facing left is holdfwd"
+        );
         assert!(!p.character.holding_back);
     }
 
@@ -4084,13 +4207,31 @@ time = 1
     fn feed_input_recognizes_button_commands() {
         // A button command in the `.cmd` (`punch = x`) fires when the matching
         // button is pressed, and not otherwise.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
-        p.feed_input(MatchInput { x: true, ..MatchInput::none() });
-        assert!(p.character.commands.is_active("punch"), "pressing x fires the `punch` command");
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
+        p.feed_input(MatchInput {
+            x: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            p.character.commands.is_active("punch"),
+            "pressing x fires the `punch` command"
+        );
 
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
-        p.feed_input(MatchInput { a: true, ..MatchInput::none() });
-        assert!(!p.character.commands.is_active("punch"), "pressing a does not fire `punch`");
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
+        p.feed_input(MatchInput {
+            a: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            !p.character.commands.is_active("punch"),
+            "pressing a does not fire `punch`"
+        );
     }
 
     #[test]
@@ -4115,11 +4256,7 @@ time = 1
             }
         }
         assert_ne!(m.round_state(), RoundState::Fight, "timer ran out");
-        assert_eq!(
-            m.winner(),
-            Some(Winner::P1),
-            "more life wins on time over"
-        );
+        assert_eq!(m.winner(), Some(Winner::P1), "more life wins on time over");
     }
 
     #[test]
@@ -4227,7 +4364,11 @@ time = 1
         assert_eq!(m.round_state(), RoundState::Fight);
         let before = m.timer();
         m.tick(MatchInput::none(), MatchInput::none());
-        assert_eq!(m.timer(), before - 1, "one fight tick burns one timer frame");
+        assert_eq!(
+            m.timer(),
+            before - 1,
+            "one fight tick burns one timer frame"
+        );
         m.tick(MatchInput::none(), MatchInput::none());
         assert_eq!(m.timer(), before - 2);
     }
@@ -4300,10 +4441,18 @@ time = 1
 
         // The next tick runs the Win-arm transition: below threshold -> next round.
         m.tick(MatchInput::none(), MatchInput::none());
-        assert_eq!(m.round_state(), RoundState::Intro, "Win advances to next round");
+        assert_eq!(
+            m.round_state(),
+            RoundState::Intro,
+            "Win advances to next round"
+        );
         assert_eq!(m.round_number(), 2, "round_number incremented out of Win");
         assert_eq!(m.p1_round_wins(), 1, "the round win was credited");
-        assert_eq!(m.winner(), None, "current-round winner cleared for the new round");
+        assert_eq!(
+            m.winner(),
+            None,
+            "current-round winner cleared for the new round"
+        );
     }
 
     /// AC2: winner() is None until the round is actually decided.
@@ -4371,7 +4520,11 @@ time = 1
             }
         }
         assert_ne!(m.round_state(), RoundState::Fight);
-        assert_eq!(m.winner(), Some(Winner::Draw), "equal life at time over draws");
+        assert_eq!(
+            m.winner(),
+            Some(Winner::Draw),
+            "equal life at time over draws"
+        );
     }
 
     /// AC2: time over with P2 ahead makes P2 win (mirror of the existing P1 case).
@@ -4772,8 +4925,16 @@ time = 1
         assert_eq!(p.anim_elem(), 3);
         assert_eq!(p.life(), 777);
         assert_eq!(p.life_max(), 1000);
-        assert_eq!(p.power(), 1500, "power accessor reflects the live character");
-        assert_eq!(p.power_max(), 3000, "power_max accessor reflects the live character");
+        assert_eq!(
+            p.power(),
+            1500,
+            "power accessor reflects the live character"
+        );
+        assert_eq!(
+            p.power_max(),
+            3000,
+            "power_max accessor reflects the live character"
+        );
     }
 
     /// PR-C (audit #26): the power accessor surfaces the meter the simulation
@@ -4815,15 +4976,28 @@ time = 1
     /// axis, so both-held activates neither holdfwd nor holdback.
     #[test]
     fn opposing_horizontal_inputs_cancel() {
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Right;
-        p.feed_input(MatchInput { left: true, right: true, ..MatchInput::none() });
+        p.feed_input(MatchInput {
+            left: true,
+            right: true,
+            ..MatchInput::none()
+        });
         assert!(!p.character.commands.is_active("holdfwd"));
         assert!(!p.character.commands.is_active("holdback"));
-        assert!(!p.character.holding_back, "ambiguous horizontal is not blocking");
+        assert!(
+            !p.character.holding_back,
+            "ambiguous horizontal is not blocking"
+        );
 
         // Neither held: no horizontal command, not blocking.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Left;
         p.feed_input(MatchInput::none());
         assert!(!p.character.commands.is_active("holdfwd"));
@@ -4836,15 +5010,33 @@ time = 1
     #[test]
     fn vertical_inputs_map_unchanged() {
         for facing in [Facing::Left, Facing::Right] {
-            let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+            let mut p = Player::new(
+                Character::new(),
+                loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+            );
             p.character.facing = facing;
-            p.feed_input(MatchInput { up: true, ..MatchInput::none() });
-            assert!(p.character.commands.is_active("holdup"), "up fires holdup ({facing:?})");
+            p.feed_input(MatchInput {
+                up: true,
+                ..MatchInput::none()
+            });
+            assert!(
+                p.character.commands.is_active("holdup"),
+                "up fires holdup ({facing:?})"
+            );
 
-            let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+            let mut p = Player::new(
+                Character::new(),
+                loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+            );
             p.character.facing = facing;
-            p.feed_input(MatchInput { down: true, ..MatchInput::none() });
-            assert!(p.character.commands.is_active("holddown"), "down fires holddown ({facing:?})");
+            p.feed_input(MatchInput {
+                down: true,
+                ..MatchInput::none()
+            });
+            assert!(
+                p.character.commands.is_active("holddown"),
+                "down fires holddown ({facing:?})"
+            );
         }
     }
 
@@ -4868,10 +5060,16 @@ time = 1
             z: true,
             ..MatchInput::none()
         };
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), cmd));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), cmd),
+        );
         p.feed_input(input);
         for name in ["a", "b", "c", "x", "y", "z"] {
-            assert!(p.character.commands.is_active(name), "missing button command {name}");
+            assert!(
+                p.character.commands.is_active(name),
+                "missing button command {name}"
+            );
         }
     }
 
@@ -4879,17 +5077,35 @@ time = 1
     /// character through the full feed path, enabling the guard path in combat.
     #[test]
     fn feed_input_sets_holding_back_on_character() {
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Right;
         // Facing right, pressing left = away from opponent = back.
-        p.feed_input(MatchInput { left: true, ..MatchInput::none() });
-        assert!(p.character.holding_back, "holding away from opponent sets holding_back");
+        p.feed_input(MatchInput {
+            left: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            p.character.holding_back,
+            "holding away from opponent sets holding_back"
+        );
 
         // Pressing toward the opponent clears it.
-        let mut p = Player::new(Character::new(), loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD));
+        let mut p = Player::new(
+            Character::new(),
+            loaded_with_cmd(air_with(0, vec![], vec![]), HOLD_CMD),
+        );
         p.character.facing = Facing::Right;
-        p.feed_input(MatchInput { right: true, ..MatchInput::none() });
-        assert!(!p.character.holding_back, "holding toward opponent is not back");
+        p.feed_input(MatchInput {
+            right: true,
+            ..MatchInput::none()
+        });
+        assert!(
+            !p.character.holding_back,
+            "holding toward opponent is not back"
+        );
     }
 
     /// AC1: `MatchInput::none()` and the derived `Default` agree (nothing held).
@@ -4941,7 +5157,11 @@ time = 1
         m.p1.character.state_type = StateType::Standing;
         m.p1.character.move_type = MoveType::BeingHit;
         m.tick(MatchInput::none(), MatchInput::none());
-        assert_eq!(m.p1().facing(), Facing::Right, "get-hit reaction keeps facing");
+        assert_eq!(
+            m.p1().facing(),
+            Facing::Right,
+            "get-hit reaction keeps facing"
+        );
     }
 
     /// `is_neutral_facing_state` directly: only Standing/Unchanged + Idle qualify.
@@ -5269,7 +5489,10 @@ time = 1
             eprintln!("skipping: {} not present", def.display());
             return None;
         }
-        Some((LoadedCharacter::load(&def).ok()?, LoadedCharacter::load(&def).ok()?))
+        Some((
+            LoadedCharacter::load(&def).ok()?,
+            LoadedCharacter::load(&def).ok()?,
+        ))
     }
 
     fn two_kfm_match() -> Option<Match> {
@@ -5311,7 +5534,10 @@ time = 1
     #[test]
     fn p1_walks_toward_opponent_via_real_commands() {
         let Some(mut m) = two_kfm_match() else { return };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
         assert_eq!(m.p1().facing(), Facing::Right, "P1 faces P2 (to its right)");
 
         let x_before = m.p1().pos().x;
@@ -5319,7 +5545,13 @@ time = 1
 
         let mut entered_walk = false;
         for _ in 0..60 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             if m.p1().character.state_no == 20 {
                 entered_walk = true;
             }
@@ -5346,12 +5578,21 @@ time = 1
     #[test]
     fn p2_walks_toward_opponent_facing_left() {
         let Some(mut m) = two_kfm_match() else { return };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
         assert_eq!(m.p2().facing(), Facing::Left, "P2 faces P1 (to its left)");
 
         let x_before = m.p2().pos().x;
         for _ in 0..60 {
-            m.tick(MatchInput::none(), MatchInput { left: true, ..MatchInput::none() });
+            m.tick(
+                MatchInput::none(),
+                MatchInput {
+                    left: true,
+                    ..MatchInput::none()
+                },
+            );
         }
         assert!(
             m.p2().pos().x < x_before,
@@ -5367,12 +5608,21 @@ time = 1
     #[test]
     fn real_command_attack_connects_and_drops_life() {
         let Some(mut m) = two_kfm_match() else { return };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
         let p2_life_before = m.p2().life();
 
         // Walk into range.
         for _ in 0..240 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
                 break;
             }
@@ -5382,7 +5632,10 @@ time = 1
         let mut hit = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -5448,7 +5701,11 @@ time = 1
     /// A [`LoadedCharacter`] in state 0 whose state graph fires a `PlaySnd`
     /// (group/sample `7, 3`) every tick it runs.
     fn play_snd_loaded() -> LoadedCharacter {
-        let mut loaded = loaded_with(air_with(0, Vec::new(), vec![Rect::new(-18.0, -70.0, 36.0, 70.0)]));
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
         loaded
             .states
             .insert(0, state0_with(play_snd_controller("7, 3")));
@@ -5482,7 +5739,10 @@ time = 1
         assert_eq!(reqs[0].group, 7, "authored group is surfaced");
         assert_eq!(reqs[0].sample, 3, "authored sample is surfaced");
         // P2 fired no PlaySnd, so its requests stay empty.
-        assert!(m.p2_sound_requests().is_empty(), "silent P2 surfaces nothing");
+        assert!(
+            m.p2_sound_requests().is_empty(),
+            "silent P2 surfaces nothing"
+        );
     }
 
     /// AC: the per-player request slice is REPLACED each tick, not accumulated —
@@ -5491,7 +5751,11 @@ time = 1
     fn sound_requests_are_replaced_each_tick() {
         let mut m = play_snd_match();
         m.tick(MatchInput::none(), MatchInput::none());
-        assert_eq!(m.p1_sound_requests().len(), 1, "first tick surfaces the request");
+        assert_eq!(
+            m.p1_sound_requests().len(),
+            1,
+            "first tick surfaces the request"
+        );
 
         // Swap P1 into an empty (no-PlaySnd) state, then tick again: the prior
         // request must NOT persist — the slice reflects only the latest tick.
@@ -5562,7 +5826,9 @@ time = 1
     /// not an internal helper.
     #[test]
     fn match_tick_wires_opponent_into_cross_entity_triggers() {
-        let Some((mut lc1, lc2)) = two_kfm_loaded() else { return };
+        let Some((mut lc1, lc2)) = two_kfm_loaded() else {
+            return;
+        };
         // Replace P1's state 0 with the cross-entity probe.
         lc1.states.insert(0, cross_entity_probe_state());
 
@@ -5593,7 +5859,10 @@ time = 1
 
         let p1 = &m.p1().character;
         // p2dist X: P2 is 120px ahead of a right-facing P1 → +120 (positive = front).
-        assert_eq!(p1.vars[0], 120, "p1 must see p2dist X = 120 (opponent in front)");
+        assert_eq!(
+            p1.vars[0], 120,
+            "p1 must see p2dist X = 120 (opponent in front)"
+        );
         // p2bodydist X: 120 minus both front half-widths.
         assert_eq!(
             p1.vars[1],
@@ -5611,7 +5880,9 @@ time = 1
     /// reads P2's life, exercising `EvalCtx::redirect` end-to-end.
     #[test]
     fn match_tick_resolves_redirect_through_a_trigger() {
-        let Some((mut lc1, lc2)) = two_kfm_loaded() else { return };
+        let Some((mut lc1, lc2)) = two_kfm_loaded() else {
+            return;
+        };
         let gated = CompiledController {
             state_number: 0,
             label: String::new(),
@@ -5689,7 +5960,11 @@ time = 1
     #[test]
     fn match_starts_best_of_three_round_one() {
         let m = basic_match();
-        assert_eq!(m.rounds_to_win(), DEFAULT_ROUNDS_TO_WIN, "default best of three");
+        assert_eq!(
+            m.rounds_to_win(),
+            DEFAULT_ROUNDS_TO_WIN,
+            "default best of three"
+        );
         assert_eq!(m.rounds_to_win(), 2);
         assert_eq!(m.round_number(), 1, "first round is round 1");
         assert_eq!(m.p1_round_wins(), 0);
@@ -5747,7 +6022,11 @@ time = 1
 
         assert_eq!(m.p1_round_wins(), 1, "P1 credited the round-1 KO");
         assert_eq!(m.p2_round_wins(), 0);
-        assert_eq!(m.match_state(), MatchState::InProgress, "match not over after 1");
+        assert_eq!(
+            m.match_state(),
+            MatchState::InProgress,
+            "match not over after 1"
+        );
         assert_eq!(m.match_winner(), None);
         assert_eq!(m.round_number(), 2, "round_number incremented to 2");
         assert_eq!(m.round_state(), RoundState::Intro, "reset re-enters Intro");
@@ -5829,7 +6108,11 @@ time = 1
         }
         assert_eq!(m.p1_round_wins(), 1, "time-over winner credited the round");
         assert_eq!(m.p2_round_wins(), 0);
-        assert_eq!(m.round_number(), 2, "time-over round still resets for the next");
+        assert_eq!(
+            m.round_number(),
+            2,
+            "time-over round still resets for the next"
+        );
         assert_eq!(m.round_state(), RoundState::Intro);
     }
 
@@ -5849,9 +6132,17 @@ time = 1
         }
         assert_eq!(m.p1_round_wins(), 0, "a draw credits neither player");
         assert_eq!(m.p2_round_wins(), 0);
-        assert_eq!(m.match_state(), MatchState::InProgress, "draw keeps the match live");
+        assert_eq!(
+            m.match_state(),
+            MatchState::InProgress,
+            "draw keeps the match live"
+        );
         assert_eq!(m.match_winner(), None);
-        assert_eq!(m.round_number(), 2, "a drawn round still advances to the next");
+        assert_eq!(
+            m.round_number(),
+            2,
+            "a drawn round still advances to the next"
+        );
         assert_eq!(m.round_state(), RoundState::Intro);
     }
 
@@ -5866,9 +6157,17 @@ time = 1
         into_fight(&mut m);
         ko_p2_and_settle(&mut m);
 
-        assert_eq!(m.match_state(), MatchState::Over, "best-of-one ends in one KO");
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "best-of-one ends in one KO"
+        );
         assert_eq!(m.match_winner(), Some(Winner::P1));
-        assert_eq!(m.round_number(), 1, "no reset when the match is already won");
+        assert_eq!(
+            m.round_number(),
+            1,
+            "no reset when the match is already won"
+        );
         let (state, winner, round) = (m.match_state(), m.match_winner(), m.round_number());
         for _ in 0..120 {
             m.tick(MatchInput::none(), MatchInput::none());
@@ -5889,8 +6188,16 @@ time = 1
         m.p2.character.power = 567;
         ko_p2_and_settle(&mut m);
         assert_eq!(m.round_number(), 2, "advanced to round 2");
-        assert_eq!(m.p1().character.power, 1234, "P1 power carries across rounds");
-        assert_eq!(m.p2().character.power, 567, "P2 power carries across rounds");
+        assert_eq!(
+            m.p1().character.power,
+            1234,
+            "P1 power carries across rounds"
+        );
+        assert_eq!(
+            m.p2().character.power,
+            567,
+            "P2 power carries across rounds"
+        );
     }
 
     /// AC3 (reset coverage): a round reset clears transient combat state —
@@ -5911,9 +6218,16 @@ time = 1
         let p2 = m.p2();
         assert_eq!(p2.character.hitpause, 0, "hit-pause cleared on reset");
         assert_eq!(p2.character.shaketime, 0, "hit-shake cleared on reset");
-        assert!(p2.character.active_hitdef.is_none(), "active HitDef cleared");
+        assert!(
+            p2.character.active_hitdef.is_none(),
+            "active HitDef cleared"
+        );
         assert_eq!(p2.character.move_type, MoveType::Idle, "back to idle");
-        assert_eq!(p2.character.state_type, StateType::Standing, "back to standing");
+        assert_eq!(
+            p2.character.state_type,
+            StateType::Standing,
+            "back to standing"
+        );
         assert_eq!(p2.character.vel, Vec2::new(0.0, 0.0), "velocity zeroed");
         assert_eq!(p2.character.state_no, 0, "state machine back to state 0");
     }
@@ -5946,8 +6260,16 @@ time = 1
         let p2 = Player::new(Character::new(), defender_loaded());
         // Non-positive seconds AND non-positive target: both clamp.
         let m = Match::with_config(p1, p2, StageBounds::default(), -3, -7);
-        assert_eq!(m.timer(), 0, "negative round_seconds clamps to a 0-frame timer");
-        assert_eq!(m.rounds_to_win(), 1, "non-positive rounds_to_win clamps to 1");
+        assert_eq!(
+            m.timer(),
+            0,
+            "negative round_seconds clamps to a 0-frame timer"
+        );
+        assert_eq!(
+            m.rounds_to_win(),
+            1,
+            "non-positive rounds_to_win clamps to 1"
+        );
 
         // Valid values pass straight through.
         let p1 = Player::new(Character::new(), defender_loaded());
@@ -5983,7 +6305,11 @@ time = 1
         // Round 3: P1's third win ends the match.
         into_fight(&mut m);
         ko_p2_and_settle(&mut m);
-        assert_eq!(m.p1_round_wins(), 3, "P1 reached the best-of-five threshold");
+        assert_eq!(
+            m.p1_round_wins(),
+            3,
+            "P1 reached the best-of-five threshold"
+        );
         assert_eq!(m.match_state(), MatchState::Over);
         assert_eq!(m.match_winner(), Some(Winner::P1));
         assert_eq!(m.round_number(), 3, "no reset once the match is decided");
@@ -6008,7 +6334,11 @@ time = 1
             }
             assert_eq!(m.p1_round_wins(), 0, "draws never credit P1");
             assert_eq!(m.p2_round_wins(), 0, "draws never credit P2");
-            assert_eq!(m.match_state(), MatchState::InProgress, "a draw never ends it");
+            assert_eq!(
+                m.match_state(),
+                MatchState::InProgress,
+                "a draw never ends it"
+            );
             assert_eq!(m.match_winner(), None, "match winner is never Draw");
         }
         assert_eq!(m.round_number(), 5, "four draws advanced to round 5");
@@ -6025,7 +6355,11 @@ time = 1
         into_fight(&mut m);
         ko_p2_and_settle(&mut m);
         assert_eq!(m.p1_round_wins(), 1);
-        assert_eq!(m.match_state(), MatchState::InProgress, "1 < 2, still going");
+        assert_eq!(
+            m.match_state(),
+            MatchState::InProgress,
+            "1 < 2, still going"
+        );
 
         // Lower the target to 1. The match is NOT ended here (no round is being
         // decided at this instant) — the decision happens at the next Win arm.
@@ -6040,7 +6374,11 @@ time = 1
         // The next decided round observes tally(1) >= target(1) and ends it.
         into_fight(&mut m);
         ko_p2_and_settle(&mut m);
-        assert_eq!(m.match_state(), MatchState::Over, "next decision ends the match");
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "next decision ends the match"
+        );
         assert_eq!(m.match_winner(), Some(Winner::P1));
         assert_eq!(m.p1_round_wins(), 2);
     }
@@ -6068,11 +6406,18 @@ time = 1
             captured_max,
             "life_max restored from the captured reset template"
         );
-        assert_eq!(m.p2().life(), captured_max, "life restored to the captured max");
+        assert_eq!(
+            m.p2().life(),
+            captured_max,
+            "life restored to the captured max"
+        );
         // Intro means no control and no stale guard latch.
         assert!(!m.p1().character.ctrl, "control off during the reset intro");
         assert!(!m.p2().character.ctrl);
-        assert!(!m.p1().character.holding_back, "guard latch cleared on reset");
+        assert!(
+            !m.p1().character.holding_back,
+            "guard latch cleared on reset"
+        );
         assert!(!m.p2().character.holding_back);
     }
 
@@ -6152,7 +6497,11 @@ time = 1
                 break;
             }
         }
-        assert_eq!(m.winner(), Some(Winner::P1), "P1 ahead at the second time-over");
+        assert_eq!(
+            m.winner(),
+            Some(Winner::P1),
+            "P1 ahead at the second time-over"
+        );
         for _ in 0..(KO_FRAMES + 1) {
             m.tick(MatchInput::none(), MatchInput::none());
         }
@@ -6180,7 +6529,11 @@ time = 1
         m.p1.character.life = 0; // would be a KO if the machine were live
         for _ in 0..30 {
             m.tick(MatchInput::none(), MatchInput::none());
-            assert_eq!(m.round_state(), phase, "round phase frozen after match over");
+            assert_eq!(
+                m.round_state(),
+                phase,
+                "round phase frozen after match over"
+            );
         }
         assert_eq!(m.match_winner(), Some(Winner::P1), "winner unchanged");
     }
@@ -6327,7 +6680,11 @@ time = 1
         m.tick(MatchInput::none(), MatchInput::none());
 
         // TargetState -> P2 entered 820 via its own state graph.
-        assert_eq!(m.p2().character.state_no, 820, "TargetState moved P2 to 820");
+        assert_eq!(
+            m.p2().character.state_no,
+            820,
+            "TargetState moved P2 to 820"
+        );
         // TargetBind -> P2 pinned to binder.pos + (60 * +1, -5).
         assert!(
             (m.p2().pos().x - 60.0).abs() < 1e-3,
@@ -6523,7 +6880,8 @@ time = 1
             m.p2().character.vel
         );
         assert_eq!(
-            m.p2().character.power, 250,
+            m.p2().character.power,
+            250,
             "TargetPowerAdd grants meter to the target"
         );
     }
@@ -6547,7 +6905,10 @@ time = 1
         m.p2.character.vel = Vec2::new(10.0, -4.0);
         m.p2.character.power = 0;
         let power_max = m.p2().character.power_max;
-        assert!(power_max > 0, "default power_max must be positive for this test");
+        assert!(
+            power_max > 0,
+            "default power_max must be positive for this test"
+        );
 
         m.tick(MatchInput::none(), MatchInput::none());
 
@@ -6558,7 +6919,8 @@ time = 1
             m.p2().character.vel
         );
         assert_eq!(
-            m.p2().character.power, power_max,
+            m.p2().character.power,
+            power_max,
             "a huge TargetPowerAdd saturates at power_max, never beyond"
         );
     }
@@ -6631,7 +6993,8 @@ time = 1
         m.tick(MatchInput::none(), MatchInput::none());
 
         assert_eq!(
-            m.p2().character.state_no, 820,
+            m.p2().character.state_no,
+            820,
             "the victim entered its being-hit state"
         );
         assert_eq!(
@@ -6851,11 +7214,17 @@ time = 1
             &states,
             &[
                 TargetOp::State(820),
-                TargetOp::Bind { time: 1, pos: (30.0, -4.0) },
+                TargetOp::Bind {
+                    time: 1,
+                    pos: (30.0, -4.0),
+                },
                 TargetOp::Facing(1),
                 TargetOp::VelSet((1.5, -2.5)),
                 TargetOp::VelAdd((0.5, 0.5)),
-                TargetOp::LifeAdd { value: -250, kill: false },
+                TargetOp::LifeAdd {
+                    value: -250,
+                    kill: false,
+                },
                 TargetOp::PowerAdd(120),
             ],
         );
@@ -6887,7 +7256,10 @@ time = 1
     fn facing_opposite_is_an_involution() {
         assert_eq!(facing_opposite(Facing::Right), Facing::Left);
         assert_eq!(facing_opposite(Facing::Left), Facing::Right);
-        assert_eq!(facing_opposite(facing_opposite(Facing::Right)), Facing::Right);
+        assert_eq!(
+            facing_opposite(facing_opposite(Facing::Right)),
+            Facing::Right
+        );
         assert_eq!(facing_opposite(facing_opposite(Facing::Left)), Facing::Left);
     }
 
@@ -6954,13 +7326,29 @@ time = 1
 
         // Activate a Width override (front 40, back 8). Now the push consults it.
         p.character.cur_width.set(40.0, 8.0);
-        assert_eq!(p.push_body_right_half(), 40.0, "right half = override front (facing right)");
-        assert_eq!(p.push_body_left_half(), 8.0, "left half = override back (facing right)");
+        assert_eq!(
+            p.push_body_right_half(),
+            40.0,
+            "right half = override front (facing right)"
+        );
+        assert_eq!(
+            p.push_body_left_half(),
+            8.0,
+            "left half = override back (facing right)"
+        );
 
         // Facing left swaps which half each maps to.
         p.character.facing = Facing::Left;
-        assert_eq!(p.push_body_right_half(), 8.0, "right half = override back (facing left)");
-        assert_eq!(p.push_body_left_half(), 40.0, "left half = override front (facing left)");
+        assert_eq!(
+            p.push_body_right_half(),
+            8.0,
+            "right half = override back (facing left)"
+        );
+        assert_eq!(
+            p.push_body_left_half(),
+            40.0,
+            "left half = override front (facing left)"
+        );
     }
 
     /// #10: a `Width` override actually changes how far two coincident bodies are
@@ -7024,7 +7412,11 @@ time = 1
         b.asserted.no_auto_turn = true;
         face_each_other_when_neutral(&mut a, &mut b);
         assert_eq!(b.facing, Facing::Right, "NoAutoTurn keeps B's facing");
-        assert_eq!(a.facing, Facing::Right, "A (no assertion) is unaffected / already correct");
+        assert_eq!(
+            a.facing,
+            Facing::Right,
+            "A (no assertion) is unaffected / already correct"
+        );
     }
 
     // ---- audit #24: Pause / SuperPause whole-match freeze --------------------
@@ -7064,8 +7456,11 @@ time = 1
     /// pause controller and then clears `var(0)` — so the freeze arms once when the
     /// test sets the flag. Otherwise state 0 is inert (no physics, no movement).
     fn pause_loaded(kind: &str, time: &str) -> LoadedCharacter {
-        let mut loaded =
-            loaded_with(air_with(0, Vec::new(), vec![Rect::new(-18.0, -70.0, 36.0, 70.0)]));
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
         let st = CompiledState {
             number: 0,
             state_type: Some("S".to_string()),
@@ -7120,7 +7515,10 @@ time = 1
         let p1_time_at_freeze_start = m.p1().character.state_time;
         let timer_at_freeze_start = m.timer();
         let game_time_at_freeze_start = m.game_time();
-        assert!(p2_time_frozen > p2_time_before, "P2 advanced on the fire tick");
+        assert!(
+            p2_time_frozen > p2_time_before,
+            "P2 advanced on the fire tick"
+        );
 
         // (B) Run the full freeze: P2 + timer + GameTime are held; P1 keeps ticking.
         for i in 0..5 {
@@ -7133,11 +7531,7 @@ time = 1
             );
             // Round timer + GameTime held still.
             assert_eq!(m.timer(), timer_at_freeze_start, "timer frozen");
-            assert_eq!(
-                m.game_time(),
-                game_time_at_freeze_start,
-                "GameTime frozen"
-            );
+            assert_eq!(m.game_time(), game_time_at_freeze_start, "GameTime frozen");
             // P1 (the trigger) keeps animating: its state Time advances each frame.
             assert_eq!(
                 m.p1().character.state_time,
@@ -7189,7 +7583,10 @@ time = 1
         // The Pause expires and the world resumes.
         assert_eq!(m.freeze_time(), 0, "Pause expired");
         m.tick(MatchInput::none(), MatchInput::none());
-        assert!(m.game_time() > game_time, "GameTime resumes after the Pause");
+        assert!(
+            m.game_time() > game_time,
+            "GameTime resumes after the Pause"
+        );
     }
 
     #[test]
@@ -7206,7 +7603,11 @@ time = 1
             assert_eq!(m.game_time(), gt, "GameTime does not advance while frozen");
         }
         m.tick(MatchInput::none(), MatchInput::none());
-        assert_eq!(m.game_time(), gt + 1, "GameTime advances again once unfrozen");
+        assert_eq!(
+            m.game_time(),
+            gt + 1,
+            "GameTime advances again once unfrozen"
+        );
     }
 
     #[test]
@@ -7291,7 +7692,11 @@ time = 1
         assert!(m.p2().life() < 1000, "the attack must connect");
         assert_eq!(m.effects().len(), 1, "exactly one spark spawned on the hit");
         let fx = &m.effects()[0];
-        assert_eq!(fx.side, EffectSide::P1, "the spark is sourced from the attacker (P1)");
+        assert_eq!(
+            fx.side,
+            EffectSide::P1,
+            "the spark is sourced from the attacker (P1)"
+        );
         assert_eq!(fx.anim, 5, "the own-spark plays action 5 (magnitude of -5)");
         // The spark's sprite is the spark action's CURRENT frame (group 10). After
         // spawning, `tick_effects` advanced one frame-tick (still on elem 0 of a
@@ -7318,7 +7723,10 @@ time = 1
         m.p1.character.anim = 200;
         m.p1.character.anim_elem = 0;
         m.p1.character.active_hitdef = Some(HitDef {
-            resources: fp_combat::HitResources { sparkno: -5, ..Default::default() },
+            resources: fp_combat::HitResources {
+                sparkno: -5,
+                ..Default::default()
+            },
             ..sample_hitdef()
         });
         m.p1.character.move_connect.reset();
@@ -7356,7 +7764,10 @@ time = 1
             ticked += 1;
         }
         assert!(m.effects().is_empty(), "the spark eventually expires");
-        assert!(ticked <= 6, "expiry is bounded by the action lifetime, took {ticked}");
+        assert!(
+            ticked <= 6,
+            "expiry is bounded by the action lifetime, took {ticked}"
+        );
     }
 
     /// A common (`fightfx`) spark — a non-negative `sparkno` — spawns nothing when
@@ -7370,7 +7781,10 @@ time = 1
 
         m.tick(MatchInput::none(), MatchInput::none());
 
-        assert!(m.p2().life() < 1000, "a common-spark hit still connects + damages");
+        assert!(
+            m.p2().life() < 1000,
+            "a common-spark hit still connects + damages"
+        );
         assert!(
             m.effects().is_empty(),
             "no common-fx asset loaded → common spark is a best-effort skip"
@@ -7407,14 +7821,17 @@ time = 1
     fn common_spark_spawns_from_loaded_common_fx() {
         let mut hd = sample_hitdef();
         hd.resources.sparkno = 2; // bare non-negative → common fightfx action 2
-        // The attacker's OWN AIR carries spark action 5 (which must NOT be used).
+                                  // The attacker's OWN AIR carries spark action 5 (which must NOT be used).
         let mut m = spark_match(hd, 5);
         // Install a common set whose action 2 is the spark to draw.
         m.set_common_fx(common_fx_air(2));
 
         m.tick(MatchInput::none(), MatchInput::none());
 
-        assert!(m.p2().life() < 1000, "the common-spark hit connects + damages");
+        assert!(
+            m.p2().life() < 1000,
+            "the common-spark hit connects + damages"
+        );
         assert_eq!(m.effects().len(), 1, "exactly one common spark spawned");
         let fx = &m.effects()[0];
         assert_eq!(
@@ -7439,8 +7856,14 @@ time = 1
 
         m.tick(MatchInput::none(), MatchInput::none());
 
-        assert!(m.p2().life() < 1000, "the hit lands even when the common action is missing");
-        assert!(m.effects().is_empty(), "a missing common action spawns nothing");
+        assert!(
+            m.p2().life() < 1000,
+            "the hit lands even when the common action is missing"
+        );
+        assert!(
+            m.effects().is_empty(),
+            "a missing common action spawns nothing"
+        );
     }
 
     /// `sparkno = -1` (the MUGEN "no spark" sentinel) spawns nothing, and a missing
@@ -7460,8 +7883,14 @@ time = 1
         hd2.resources.sparkno = -999; // own action 999, which is not authored
         let mut m2 = spark_match(hd2, 5);
         m2.tick(MatchInput::none(), MatchInput::none());
-        assert!(m2.p2().life() < 1000, "the hit lands even when the spark action is missing");
-        assert!(m2.effects().is_empty(), "a missing own-spark action spawns nothing");
+        assert!(
+            m2.p2().life() < 1000,
+            "the hit lands even when the spark action is missing"
+        );
+        assert!(
+            m2.effects().is_empty(),
+            "a missing own-spark action spawns nothing"
+        );
     }
 
     /// Sparks do not leak across a round reset: a spawned spark is cleared when the
@@ -7506,14 +7935,26 @@ time = 1
         let Some(mut m) = two_kfm_match() else {
             return; // fixture absent; helper already logged the skip
         };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
         // No hit has connected yet, so no spark should exist.
-        assert!(m.effects().is_empty(), "no spark before the fight is driven");
+        assert!(
+            m.effects().is_empty(),
+            "no spark before the fight is driven"
+        );
         let p2_life_before = m.p2().life();
 
         // Walk into range.
         for _ in 0..240 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
                 break;
             }
@@ -7523,7 +7964,10 @@ time = 1
         let mut hit = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -7572,21 +8016,36 @@ time = 1
             return; // fixture absent; helper already logged the skip
         };
         // Install the shipped common-effects AIR so common sparks resolve.
-        let air = AirFile::load(&shipped_asset("fightfx.air"))
-            .expect("shipped fightfx.air must load");
+        let air =
+            AirFile::load(&shipped_asset("fightfx.air")).expect("shipped fightfx.air must load");
         // Sanity: the set authors KFM's common spark indices.
         for g in [0, 1, 2, 3, 40] {
-            assert!(air.action(g).is_some(), "fightfx.air must author action {g}");
+            assert!(
+                air.action(g).is_some(),
+                "fightfx.air must author action {g}"
+            );
         }
         m.set_common_fx(air);
 
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
-        assert!(m.effects().is_empty(), "no spark before the fight is driven");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
+        assert!(
+            m.effects().is_empty(),
+            "no spark before the fight is driven"
+        );
         let p2_life_before = m.p2().life();
 
         // Walk into range.
         for _ in 0..240 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
                 break;
             }
@@ -7596,7 +8055,10 @@ time = 1
         let mut saw_common_spark = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -7848,7 +8310,10 @@ time = 1
             "a garbage snapshot must be a recoverable Err"
         );
         // Empty blob: recoverable Err.
-        assert!(m.restore_snapshot(&[]).is_err(), "empty must be a recoverable Err");
+        assert!(
+            m.restore_snapshot(&[]).is_err(),
+            "empty must be a recoverable Err"
+        );
 
         // The match is still usable after the failed restores (no corruption).
         m.tick(MatchInput::none(), MatchInput::none());
@@ -7931,7 +8396,10 @@ time = 1
         same.restore_snapshot(&saved)
             .expect("same-character restore still succeeds");
         // Sanity: `before` is non-trivial (the source actually advanced).
-        assert_ne!(before, named_rng_probe_match("FighterA").snapshot().unwrap());
+        assert_ne!(
+            before,
+            named_rng_probe_match("FighterA").snapshot().unwrap()
+        );
     }
 
     #[test]
@@ -7971,7 +8439,10 @@ time = 1
         };
         // The recorder stamped the real fingerprints (not the unstamped sentinel).
         let (fp_a, _) = named_rng_probe_match("FighterA").character_fingerprints();
-        assert_eq!(log.p1_fingerprint, fp_a, "recorder stamps the source fingerprint");
+        assert_eq!(
+            log.p1_fingerprint, fp_a,
+            "recorder stamps the source fingerprint"
+        );
 
         // Replaying into the SAME character succeeds.
         let mut ok = named_rng_probe_match("FighterA");
@@ -8226,7 +8697,10 @@ time = 1
     }
 
     /// A bare stand state `number` (type=S, physics=N) with the given controllers.
-    fn stand_state(number: i32, controllers: Vec<fp_character::CompiledController>) -> CompiledState {
+    fn stand_state(
+        number: i32,
+        controllers: Vec<fp_character::CompiledController>,
+    ) -> CompiledState {
         CompiledState {
             number,
             state_type: Some("S".to_string()),
@@ -8280,9 +8754,18 @@ time = 1
         // iff `parent, Life == 555`. Both prove the helper runs its state machine
         // and that the redirect resolves to the owner (whose life the test sets to
         // 555).
-        let set_root = ctrl_gated(1000, "VarSet", "root, Life = 555", &[("v", "0"), ("value", "1")]);
-        let set_parent =
-            ctrl_gated(1000, "VarSet", "parent, Life = 555", &[("v", "1"), ("value", "1")]);
+        let set_root = ctrl_gated(
+            1000,
+            "VarSet",
+            "root, Life = 555",
+            &[("v", "0"), ("value", "1")],
+        );
+        let set_parent = ctrl_gated(
+            1000,
+            "VarSet",
+            "parent, Life = 555",
+            &[("v", "1"), ("value", "1")],
+        );
         let st1000 = stand_state(1000, vec![set_root, set_parent]);
 
         let mut loaded = loaded_with(air_with(
@@ -8349,7 +8832,10 @@ time = 1
         // tick_helpers within the same frame), so its state-1000 controllers run.
         m.tick(MatchInput::none(), MatchInput::none());
         let helper = &m.p1().helpers()[0];
-        assert_eq!(helper.character.state_no, 1000, "helper entered its start state");
+        assert_eq!(
+            helper.character.state_no, 1000,
+            "helper entered its start state"
+        );
         assert_eq!(
             helper.character.vars[0], 1,
             "`root, life` redirect resolved to the owner (life 555) — the spawning chain, not 0"
@@ -8417,12 +8903,21 @@ time = 1
             ],
         );
         // Latch: once fighting, mark `var(30) = 1` so the spawn never re-fires.
-        let latch = ctrl_gated(0, "VarSet", "RoundState = 1", &[("v", "30"), ("value", "1")]);
+        let latch = ctrl_gated(
+            0,
+            "VarSet",
+            "RoundState = 1",
+            &[("v", "30"), ("value", "1")],
+        );
         let st0 = stand_state(0, vec![spawn, latch]);
 
         // AIR: action 2000 = the projectile's wide attack box; action 0 = a hurt
         // box (about the axis) so the owner is well-formed / hittable.
-        let mut air = air_with(PROJ_ANIM, vec![Rect::new(-30.0, -70.0, 60.0, 70.0)], Vec::new());
+        let mut air = air_with(
+            PROJ_ANIM,
+            vec![Rect::new(-30.0, -70.0, 60.0, 70.0)],
+            Vec::new(),
+        );
         air.actions.insert(
             0,
             AnimAction {
@@ -8512,7 +9007,11 @@ time = 1
         assert!(x1 > x0, "projectile moved right (x1={x1} > x0={x0})");
         assert!(x2 > x1, "projectile kept moving right (x2={x2} > x1={x1})");
         // Velocity 8/tick: each step advances ~8px (mirrored by the right facing).
-        assert!((x1 - x0 - 8.0).abs() < 1e-3, "advanced 8px/tick, got {}", x1 - x0);
+        assert!(
+            (x1 - x0 - 8.0).abs() < 1e-3,
+            "advanced 8px/tick, got {}",
+            x1 - x0
+        );
     }
 
     /// AC: a projectile that overlaps the opponent's `Clsn2` resolves a hit —
@@ -8548,7 +9047,10 @@ time = 1
                 break;
             }
         }
-        assert!(connected, "projectile connected and reduced the opponent's life");
+        assert!(
+            connected,
+            "projectile connected and reduced the opponent's life"
+        );
         // Damage applied (30 hit damage; defence_mul defaults to 1.0).
         assert!(
             m.p2().life() <= life_before - 30,
@@ -8584,7 +9086,11 @@ time = 1
         let p2 = Player::new(p2c, defender_loaded());
         let mut m = Match::new(p1, p2, StageBounds::new(-150.0, 150.0));
         into_fight(&mut m);
-        assert_eq!(m.p1().projectiles().len(), 1, "projectile present after spawn");
+        assert_eq!(
+            m.p1().projectiles().len(),
+            1,
+            "projectile present after spawn"
+        );
 
         // Fly it well past the right edge (150 + 80 margin) at 8px/tick.
         for _ in 0..40 {
@@ -8619,10 +9125,18 @@ time = 1
     /// CONDITIONS (single compiled expressions) so the redirect comma is preserved.
     fn redirect_reader_loaded() -> LoadedCharacter {
         // var(0) = 1 iff `target, Life == 444`; var(1) = 1 iff `playerid(2), Life == 444`.
-        let read_target =
-            ctrl_gated(0, "VarSet", "target, Life = 444", &[("v", "0"), ("value", "1")]);
-        let read_playerid =
-            ctrl_gated(0, "VarSet", "playerid(2), Life = 444", &[("v", "1"), ("value", "1")]);
+        let read_target = ctrl_gated(
+            0,
+            "VarSet",
+            "target, Life = 444",
+            &[("v", "0"), ("value", "1")],
+        );
+        let read_playerid = ctrl_gated(
+            0,
+            "VarSet",
+            "playerid(2), Life = 444",
+            &[("v", "1"), ("value", "1")],
+        );
         let st0 = stand_state(0, vec![read_target, read_playerid]);
         let mut loaded = loaded_with(air_with(
             0,
@@ -8652,7 +9166,8 @@ time = 1
         // P1 has not hit P2 yet, so `target` is None (var(0) stays 0); but
         // `playerid(2)` always resolves to P2 (var(1) becomes 1).
         assert_eq!(
-            m.p1().character.vars[1], 1,
+            m.p1().character.vars[1],
+            1,
             "`playerid(2)` resolved to the opponent (life 444), not 0"
         );
     }
@@ -8682,12 +9197,25 @@ time = 1
                 ("pausetime", "1, 1"),
             ],
         );
-        let latch = ctrl_gated(0, "VarSet", "RoundState = 1", &[("v", "30"), ("value", "1")]);
+        let latch = ctrl_gated(
+            0,
+            "VarSet",
+            "RoundState = 1",
+            &[("v", "30"), ("value", "1")],
+        );
         // var(0) = 1 whenever `target` resolves to a live opponent (life > 0).
-        let read_target =
-            ctrl_gated(0, "VarSet", "target, Life > 0", &[("v", "0"), ("value", "1")]);
+        let read_target = ctrl_gated(
+            0,
+            "VarSet",
+            "target, Life > 0",
+            &[("v", "0"), ("value", "1")],
+        );
         let st0 = stand_state(0, vec![spawn, latch, read_target]);
-        let mut air = air_with(PROJ_ANIM, vec![Rect::new(-30.0, -70.0, 60.0, 70.0)], Vec::new());
+        let mut air = air_with(
+            PROJ_ANIM,
+            vec![Rect::new(-30.0, -70.0, 60.0, 70.0)],
+            Vec::new(),
+        );
         air.actions.insert(
             0,
             AnimAction {
@@ -8741,7 +9269,8 @@ time = 1
         // One more tick so the `target` read runs WITH the target now wired.
         m.tick(MatchInput::none(), MatchInput::none());
         assert_eq!(
-            m.p1().character.vars[0], 1,
+            m.p1().character.vars[0],
+            1,
             "`target` redirect resolved to the hit opponent (life > 0), not 0"
         );
     }

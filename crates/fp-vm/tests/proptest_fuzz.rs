@@ -215,17 +215,19 @@ fn expr_strategy() -> impl Strategy<Value = Expr> {
                     operand: Box::new(operand),
                 }),
                 // Binary.
-                (binary_op_strategy(), inner.clone(), inner.clone()).prop_map(
-                    |(op, lhs, rhs)| Expr::Binary {
+                (binary_op_strategy(), inner.clone(), inner.clone()).prop_map(|(op, lhs, rhs)| {
+                    Expr::Binary {
                         op,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     }
-                ),
+                }),
                 // Call: a mix of known function names and arbitrary trigger names.
-                (call_name_strategy(), prop::collection::vec(inner.clone(), 0..4)).prop_map(
-                    |(name, args)| Expr::Call { name, args }
-                ),
+                (
+                    call_name_strategy(),
+                    prop::collection::vec(inner.clone(), 0..4)
+                )
+                    .prop_map(|(name, args)| Expr::Call { name, args }),
                 // Member-keyed call (GetHitVar / const) with a bare-ident member.
                 ("(?:GetHitVar|const)", "[A-Za-z_][A-Za-z0-9_.]{0,10}").prop_map(
                     |(name, member)| Expr::Call {
@@ -267,7 +269,11 @@ fn expr_strategy() -> impl Strategy<Value = Expr> {
 
 /// All [`UnaryOp`] variants.
 fn unary_op_strategy() -> impl Strategy<Value = UnaryOp> {
-    prop_oneof![Just(UnaryOp::Not), Just(UnaryOp::Neg), Just(UnaryOp::BitNot)]
+    prop_oneof![
+        Just(UnaryOp::Not),
+        Just(UnaryOp::Neg),
+        Just(UnaryOp::BitNot)
+    ]
 }
 
 /// All [`BinaryOp`] variants — covers logical, bitwise, relational, arithmetic,
@@ -597,7 +603,10 @@ fn div_and_mod_by_zero_are_zero() {
 fn unresolved_redirect_is_zero() {
     let ctx = FuzzCtx::populated();
     // `parent` never resolves in FuzzCtx → the whole redirected read is 0.
-    assert_eq!(eval(&parse_str("parent, Life").unwrap(), &ctx), Value::Int(0));
+    assert_eq!(
+        eval(&parse_str("parent, Life").unwrap(), &ctx),
+        Value::Int(0)
+    );
 }
 
 #[test]
@@ -620,7 +629,14 @@ fn nan_leak_from_float_multiply_is_closed() {
     // `A` is an unknown trigger → Int(0); the literal overflows f32 to -inf, so
     // the multiply is non-finite and funnels to bottom → 0.
     let v = eval(&parse_str("A * -5.8751624776690396e128").unwrap(), &ctx);
-    assert_eq!(v, Value::Int(0), "the NaN leak must now collapse to 0, got {v:?}");
+    assert_eq!(
+        v,
+        Value::Int(0),
+        "the NaN leak must now collapse to 0, got {v:?}"
+    );
     // No public NaN survived: the result is a plain finite integer.
-    assert!(!matches!(v, Value::Float(f) if f.is_nan()), "no public NaN may escape eval");
+    assert!(
+        !matches!(v, Value::Float(f) if f.is_nan()),
+        "no public NaN may escape eval"
+    );
 }

@@ -72,7 +72,10 @@ fn collect_triggers(cns: &CnsFile, file_label: &str, out: &mut Vec<RawTrigger>) 
             let ctype = c.controller_type.as_deref().unwrap_or("?");
             for cond in &c.triggerall {
                 out.push(RawTrigger {
-                    origin: format!("{file_label} [State {},{}] triggerall ({ctype})", sd.number, c.label),
+                    origin: format!(
+                        "{file_label} [State {},{}] triggerall ({ctype})",
+                        sd.number, c.label
+                    ),
                     expr: cond.clone(),
                 });
             }
@@ -173,11 +176,7 @@ fn all_real_triggers_lex_and_parse_without_panic() {
     for (_t, e) in &failures {
         let msg = e.to_string();
         // Trim positional suffixes so identical shapes coalesce.
-        let category = msg
-            .split(" at column")
-            .next()
-            .unwrap_or(&msg)
-            .to_string();
+        let category = msg.split(" at column").next().unwrap_or(&msg).to_string();
         *by_category.entry(category).or_insert(0) += 1;
     }
     if !by_category.is_empty() {
@@ -204,7 +203,11 @@ fn all_real_triggers_lex_and_parse_without_panic() {
     if !unexpected.is_empty() {
         eprintln!("  UNEXPECTED parse failures (not a known-unsupported form):");
         for (t, e) in &unexpected {
-            eprintln!("    {origin}: {expr:?} -> {e}", origin = t.origin, expr = t.expr);
+            eprintln!(
+                "    {origin}: {expr:?} -> {e}",
+                origin = t.origin,
+                expr = t.expr
+            );
         }
     }
     assert!(
@@ -237,7 +240,11 @@ fn trigger_key(name: &str, args: &[Value]) -> String {
 /// Renders `(name, member)` into a stable, case-insensitive lookup key for the
 /// member-keyed trigger path (`GetHitVar(member)`, task 4.11 item a).
 fn member_key(name: &str, member: &str) -> String {
-    format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+    format!(
+        "{}#{}",
+        name.to_ascii_lowercase(),
+        member.to_ascii_lowercase()
+    )
 }
 
 /// A deterministic in-memory [`EvalContext`] for evaluating curated triggers.
@@ -273,8 +280,7 @@ impl Ctx {
 
     /// Seeds a member-keyed trigger value (`GetHitVar(member)`, task 4.11 item a).
     fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
-        self.member_triggers
-            .insert(member_key(name, member), value);
+        self.member_triggers.insert(member_key(name, member), value);
         self
     }
 
@@ -329,7 +335,9 @@ fn run(expr: &str, ctx: &dyn EvalContext) -> Value {
 #[test]
 fn curated_real_kfm_triggers_evaluate_to_expected_values() {
     if kfm_assets_dir().is_none() {
-        eprintln!("skipping curated_real_kfm_triggers_evaluate_to_expected_values: test-assets/ absent");
+        eprintln!(
+            "skipping curated_real_kfm_triggers_evaluate_to_expected_values: test-assets/ absent"
+        );
         return;
     }
 
@@ -341,9 +349,17 @@ fn curated_real_kfm_triggers_evaluate_to_expected_values() {
 
     // 1. `Time = 0` — pervasive "first tick of the state" trigger. (kfm.cns)
     let ctx = Ctx::new().with_trigger("Time", &[], Value::Int(0));
-    assert_eq!(run("Time = 0", &ctx), Value::Int(1), "Time=0 on tick 0 is true");
+    assert_eq!(
+        run("Time = 0", &ctx),
+        Value::Int(1),
+        "Time=0 on tick 0 is true"
+    );
     let ctx = Ctx::new().with_trigger("Time", &[], Value::Int(7));
-    assert_eq!(run("Time = 0", &ctx), Value::Int(0), "Time=0 on tick 7 is false");
+    assert_eq!(
+        run("Time = 0", &ctx),
+        Value::Int(0),
+        "Time=0 on tick 7 is false"
+    );
 
     // 2. `AnimTime = 0` — "animation finished this tick". (kfm.cns)
     let ctx = Ctx::new().with_trigger("AnimTime", &[], Value::Int(0));
@@ -393,9 +409,17 @@ fn curated_real_kfm_triggers_evaluate_to_expected_values() {
     // 7. A range form on the RHS of `=`: `anim = [5051,5059]`. (common1.cns,
     //    inside an `ifelse`; here we exercise the range comparison directly.)
     let ctx = Ctx::new().with_trigger("anim", &[], Value::Int(5055));
-    assert_eq!(run("anim = [5051,5059]", &ctx), Value::Int(1), "5055 ∈ [5051,5059]");
+    assert_eq!(
+        run("anim = [5051,5059]", &ctx),
+        Value::Int(1),
+        "5055 ∈ [5051,5059]"
+    );
     let ctx = Ctx::new().with_trigger("anim", &[], Value::Int(5060));
-    assert_eq!(run("anim = [5051,5059]", &ctx), Value::Int(0), "5060 ∉ [5051,5059]");
+    assert_eq!(
+        run("anim = [5051,5059]", &ctx),
+        Value::Int(0),
+        "5060 ∉ [5051,5059]"
+    );
 
     // 8. An `||` combo with ranges, the real common1.cns shape:
     //    `(anim = [5051,5059]) || (anim = [5061,5069])`.
@@ -519,33 +543,35 @@ fn round_no_and_rounds_existed_evaluate_across_a_multi_round_match() {
 #[test]
 fn tokenize_and_parse_never_panic_on_adversarial_input() {
     let nasties = [
-        "",                       // empty
-        "   ",                    // whitespace only
-        "; just a comment",       // comment only
-        "@#$%^",                  // all-unknown characters
-        "(((((",                  // unbalanced open parens
-        ")))))",                  // unbalanced close parens
-        "[1,2",                   // unterminated range
-        "1,2]",                   // dangling range close
-        "Time >=",                // trailing binary operator
-        "&& Time",                // leading binary operator
-        "Time && && AnimTime",    // doubled operator
-        "var(",                   // unterminated call
-        "var(0,",                 // unterminated call args
-        "cond(1,2)",              // wrong-arity builtin (parses; eval-time concern)
-        "enemy,",                 // redirect with no target expr
-        "helper(,",               // malformed redirect id
-        "\"unterminated string",  // unterminated string literal
-        ":= 5",                   // deferred assignment form (4.9)
-        "Vel Y",                  // space-separated component trigger
-        "GetHitVar(fall.yvel)",   // dotted member in call args
-        "AnimElem = 2, >= 0",     // extended trailing-comma comparison
-        "1 2 3 4 5",              // adjacent atoms, no operators
+        "",                                  // empty
+        "   ",                               // whitespace only
+        "; just a comment",                  // comment only
+        "@#$%^",                             // all-unknown characters
+        "(((((",                             // unbalanced open parens
+        ")))))",                             // unbalanced close parens
+        "[1,2",                              // unterminated range
+        "1,2]",                              // dangling range close
+        "Time >=",                           // trailing binary operator
+        "&& Time",                           // leading binary operator
+        "Time && && AnimTime",               // doubled operator
+        "var(",                              // unterminated call
+        "var(0,",                            // unterminated call args
+        "cond(1,2)",                         // wrong-arity builtin (parses; eval-time concern)
+        "enemy,",                            // redirect with no target expr
+        "helper(,",                          // malformed redirect id
+        "\"unterminated string",             // unterminated string literal
+        ":= 5",                              // deferred assignment form (4.9)
+        "Vel Y",                             // space-separated component trigger
+        "GetHitVar(fall.yvel)",              // dotted member in call args
+        "AnimElem = 2, >= 0",                // extended trailing-comma comparison
+        "1 2 3 4 5",                         // adjacent atoms, no operators
         "((((((((((((((((1))))))))))))))))", // deep nesting
-        "----------1",            // operator pileup (valid: nested negation)
-        "!!!!!!!!Time",           // unary pileup
-        "1.2.3.4",                // malformed float
-        "0x", "1e", "1e+",        // malformed numeric tails
+        "----------1",                       // operator pileup (valid: nested negation)
+        "!!!!!!!!Time",                      // unary pileup
+        "1.2.3.4",                           // malformed float
+        "0x",
+        "1e",
+        "1e+", // malformed numeric tails
     ];
 
     for src in nasties {
@@ -639,7 +665,10 @@ fn animelem_comma_tail_and_dotted_args_now_parse() {
         let ast = parse_str(src).unwrap_or_else(|e| panic!("{src:?} should now parse: {e}"));
         // Evaluating against an empty context yields a concrete Value, no panic.
         let v = eval(&ast, &EmptyCtx);
-        assert!(matches!(v, Value::Int(_) | Value::Float(_)), "{src:?} -> {v:?}");
+        assert!(
+            matches!(v, Value::Int(_) | Value::Float(_)),
+            "{src:?} -> {v:?}"
+        );
         assert!(
             !is_known_unsupported(src),
             "guard must NOT whitelist {src:?}: it parses now (task 4.10)"
@@ -709,7 +738,7 @@ fn mugen_boolean_and_comparison_semantics_end_to_end() {
     assert_eq!(run("1 && -5", &ctx), Value::Int(1));
     assert_eq!(run("0 || 0", &ctx), Value::Int(0));
     assert_eq!(run("0 && (1 / 0)", &ctx), Value::Int(0)); // short-circuit: no DBZ surfacing
-    // Logical NOT of nonzero is 0; of zero is 1.
+                                                          // Logical NOT of nonzero is 0; of zero is 1.
     assert_eq!(run("!5", &ctx), Value::Int(0));
     assert_eq!(run("!0", &ctx), Value::Int(1));
     // `&&` binds tighter than `||` (precedence ladder).
@@ -767,7 +796,7 @@ fn mugen_builtin_functions_and_ranges_end_to_end() {
     assert_eq!(run("anim = (5,10)", &n(10)), Value::Int(0)); // exclusive upper excludes 10
     assert_eq!(run("anim = (5,10]", &n(6)), Value::Int(1)); // mixed bounds
     assert_eq!(run("anim = [5,10)", &n(5)), Value::Int(1)); // mixed bounds
-    // `!=` negates membership.
+                                                            // `!=` negates membership.
     assert_eq!(run("anim != [5,10]", &n(7)), Value::Int(0));
     assert_eq!(run("anim != [5,10]", &n(99)), Value::Int(1));
 }
@@ -876,7 +905,9 @@ fn harvest_trigger_rhs(text: &str) -> Vec<String> {
 #[test]
 fn real_fixture_gap_forms_parse_and_eval_without_panic() {
     let Some(dir) = kfm_assets_dir() else {
-        eprintln!("skipping real_fixture_gap_forms_parse_and_eval_without_panic: test-assets/ absent");
+        eprintln!(
+            "skipping real_fixture_gap_forms_parse_and_eval_without_panic: test-assets/ absent"
+        );
         return;
     };
 
@@ -959,11 +990,26 @@ fn real_fixture_gap_forms_parse_and_eval_without_panic() {
     // Each gap category must actually be present in the production content, or
     // this test is not exercising what it claims. (Grounded in grep counts:
     // axis ~80, tail 4, dotted 3, command ~49 across the two files.)
-    assert!(axis_seen >= 10, "expected axis-suffixed forms in fixtures, saw {axis_seen}");
-    assert!(tail_seen >= 1, "expected AnimElem comma-tail forms, saw {tail_seen}");
-    assert!(dotted_seen >= 1, "expected dotted GetHitVar args, saw {dotted_seen}");
-    assert!(command_seen >= 1, "expected command string compares, saw {command_seen}");
-    assert!(evaluated > 50, "expected many parseable gap RHS, evaluated {evaluated}");
+    assert!(
+        axis_seen >= 10,
+        "expected axis-suffixed forms in fixtures, saw {axis_seen}"
+    );
+    assert!(
+        tail_seen >= 1,
+        "expected AnimElem comma-tail forms, saw {tail_seen}"
+    );
+    assert!(
+        dotted_seen >= 1,
+        "expected dotted GetHitVar args, saw {dotted_seen}"
+    );
+    assert!(
+        command_seen >= 1,
+        "expected command string compares, saw {command_seen}"
+    );
+    assert!(
+        evaluated > 50,
+        "expected many parseable gap RHS, evaluated {evaluated}"
+    );
 }
 
 /// Whole-word detection of an axis-suffixed component trigger inside a lowercased
@@ -971,8 +1017,16 @@ fn real_fixture_gap_forms_parse_and_eval_without_panic() {
 /// spaces) by a lone axis word `x`/`y`/`z`. Avoids a regex dependency.
 fn regex_like_axis(lower: &str) -> bool {
     const NAMES: &[&str] = &[
-        "vel", "pos", "p2dist", "p2bodydist", "p1bodydist", "screenpos",
-        "backedgedist", "frontedgedist", "parentdist", "rootdist",
+        "vel",
+        "pos",
+        "p2dist",
+        "p2bodydist",
+        "p1bodydist",
+        "screenpos",
+        "backedgedist",
+        "frontedgedist",
+        "parentdist",
+        "rootdist",
     ];
     // Tokenize on non-alphanumeric, then look for [name, axis] adjacency.
     let words: Vec<&str> = lower
@@ -1064,7 +1118,7 @@ fn task_4_11_three_followups_end_to_end_asset_independent() {
     // is the function-form trigger `AnimElemNo(t)`, not any comma-tail family, so
     // both its forms degrade. Never a panic, never a silently-wrong tree.
     for src in [
-        "TimeMod = 2, >= 0",  // TimeMod has no `, op M` operator form
+        "TimeMod = 2, >= 0", // TimeMod has no `, op M` operator form
         "AnimElemNo = 2, >= 0",
         "ANIMELEMNO = 3, 1",
     ] {
@@ -1208,9 +1262,18 @@ fn task_4_11_real_fixture_member_and_tail_forms_eval_without_panic() {
     );
     // KFM uses both the AnimElem comma-tail and dotted GetHitVar member forms; if
     // they vanished, this test is no longer exercising item (a)/(c) on real data.
-    assert!(tail_seen >= 1, "expected AnimElem comma-tail forms in fixtures, saw {tail_seen}");
-    assert!(member_seen >= 1, "expected GetHitVar member forms in fixtures, saw {member_seen}");
-    assert!(evaluated > 50, "expected many parseable RHS, evaluated {evaluated}");
+    assert!(
+        tail_seen >= 1,
+        "expected AnimElem comma-tail forms in fixtures, saw {tail_seen}"
+    );
+    assert!(
+        member_seen >= 1,
+        "expected GetHitVar member forms in fixtures, saw {member_seen}"
+    );
+    assert!(
+        evaluated > 50,
+        "expected many parseable RHS, evaluated {evaluated}"
+    );
 }
 
 // =============================================================================
@@ -1325,7 +1388,10 @@ fn real_fixture_const_member_forms_route_through_string_seam() {
         let src = format!("const({m})");
         let ast = parse_str(&src).unwrap_or_else(|e| panic!("{src:?} should parse: {e}"));
         let got = eval(&ast, &ctx);
-        assert_eq!(got, *v, "const({m}) must route through the seeded string seam");
+        assert_eq!(
+            got, *v,
+            "const({m}) must route through the seeded string seam"
+        );
         evaluated += 1;
     }
     eprintln!(
@@ -1354,7 +1420,9 @@ fn task_4_11_real_fixture_clean_parse_rate_is_100_percent() {
     // and the expected total so a regression in either the parser OR the fixtures
     // is caught precisely.
     let Some(dir) = kfm_assets_dir() else {
-        eprintln!("skipping task_4_11_real_fixture_clean_parse_rate_is_100_percent: test-assets/ absent");
+        eprintln!(
+            "skipping task_4_11_real_fixture_clean_parse_rate_is_100_percent: test-assets/ absent"
+        );
         return;
     };
 
@@ -1383,5 +1451,8 @@ fn task_4_11_real_fixture_clean_parse_rate_is_100_percent() {
     // Provenance for the documented 812/812 figure: these particular fixtures
     // yield 812 triggers. Pin it so a fixture swap that changes the count is a
     // conscious update, not a silent drift of the acceptance figure.
-    assert_eq!(total, 812, "expected 812 real triggers across kfm.cns + common1.cns, got {total}");
+    assert_eq!(
+        total, 812,
+        "expected 812 real triggers across kfm.cns + common1.cns, got {total}"
+    );
 }

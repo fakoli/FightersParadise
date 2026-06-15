@@ -507,10 +507,7 @@ mod tests {
 
     #[test]
     fn identifiers_preserve_case() {
-        assert_eq!(
-            kinds("AnimElem"),
-            vec![TokenKind::Ident("AnimElem".into())]
-        );
+        assert_eq!(kinds("AnimElem"), vec![TokenKind::Ident("AnimElem".into())]);
         assert_eq!(kinds("var"), vec![TokenKind::Ident("var".into())]);
         assert_eq!(kinds("_x1"), vec![TokenKind::Ident("_x1".into())]);
     }
@@ -647,7 +644,11 @@ mod tests {
         let ks = kinds("1 @ 2");
         assert_eq!(
             ks,
-            vec![TokenKind::Int(1), TokenKind::Unknown('@'), TokenKind::Int(2)]
+            vec![
+                TokenKind::Int(1),
+                TokenKind::Unknown('@'),
+                TokenKind::Int(2)
+            ]
         );
         assert_eq!(kinds(":"), vec![TokenKind::Unknown(':')]);
     }
@@ -694,10 +695,7 @@ mod tests {
     #[test]
     fn negative_looking_input_lexes_as_minus_then_int() {
         // The lexer does not fold signs into literals; that is the parser's job.
-        assert_eq!(
-            kinds("-5"),
-            vec![TokenKind::Minus, TokenKind::Int(5)]
-        );
+        assert_eq!(kinds("-5"), vec![TokenKind::Minus, TokenKind::Int(5)]);
     }
 
     // ---------------------------------------------------------------------
@@ -725,7 +723,11 @@ mod tests {
         // identifier and the `+` becomes a Plus operator.
         assert_eq!(
             kinds("1e+"),
-            vec![TokenKind::Int(1), TokenKind::Ident("e".into()), TokenKind::Plus]
+            vec![
+                TokenKind::Int(1),
+                TokenKind::Ident("e".into()),
+                TokenKind::Plus
+            ]
         );
     }
 
@@ -777,10 +779,7 @@ mod tests {
     fn integer_overflow_falls_back_to_zero() {
         // A literal too large for i64 must not panic; the lexer substitutes 0
         // (the engine-wide "bad expression -> 0" safe default).
-        assert_eq!(
-            kinds("99999999999999999999999999"),
-            vec![TokenKind::Int(0)]
-        );
+        assert_eq!(kinds("99999999999999999999999999"), vec![TokenKind::Int(0)]);
     }
 
     #[test]
@@ -815,10 +814,7 @@ mod tests {
     #[test]
     fn assign_then_eq_adjacent() {
         // `:==` is `:=` followed by `=`, not `:` then `==`.
-        assert_eq!(
-            kinds(":=="),
-            vec![TokenKind::Assign, TokenKind::Eq]
-        );
+        assert_eq!(kinds(":=="), vec![TokenKind::Assign, TokenKind::Eq]);
     }
 
     #[test]
@@ -877,8 +873,8 @@ mod tests {
         assert_eq!(toks[0].column, 0); // "hi"
         assert_eq!(toks[1].column, 5); // +
         assert_eq!(toks[2].column, 7); // 9
-        // ...and after a comment is skipped on the same logical input across a
-        // newline.
+                                       // ...and after a comment is skipped on the same logical input across a
+                                       // newline.
         let toks = tokenize("; lead comment\nfoo");
         assert_eq!(toks.len(), 1);
         assert_eq!(toks[0].kind, TokenKind::Ident("foo".into()));
@@ -1121,8 +1117,7 @@ mod tests {
         use std::path::Path;
 
         // crates/fp-vm/src/lexer.rs -> repo root is three levels up.
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-assets/kfm/kfm.cns");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-assets/kfm/kfm.cns");
         if !path.exists() {
             eprintln!("skipping real_kfm_cns_triggers_lex_cleanly: {path:?} absent");
             return;
@@ -1212,7 +1207,8 @@ mod tests {
         assert_eq!(ks.first(), Some(&TokenKind::Ident("a".into())));
         // ...and the trailing `b` survives as its own ident somewhere after.
         assert!(
-            ks.iter().any(|k| matches!(k, TokenKind::Ident(s) if s == "b")),
+            ks.iter()
+                .any(|k| matches!(k, TokenKind::Ident(s) if s == "b")),
             "trailing member should remain a separate ident: {ks:?}"
         );
     }
