@@ -34,6 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use fp_core::{FpResult, Rect, Vec2};
+use fp_formats::air::AnimAction;
 
 /// Free-text metadata about a stage, from its `[Info]` section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -198,6 +199,13 @@ pub struct BgElement {
     /// caller can advance the whole stage's scroll with [`Stage::advance_scroll`]
     /// once per tick and read it back when drawing.
     pub scroll: Vec2<f32>,
+    /// Runtime animation clock, in game ticks since this element's AIR action
+    /// started, advanced one tick at a time by [`BgElement::advance_anim`].
+    /// **Not parsed** — it starts at `0` and is only meaningful for a
+    /// [`BgType::Anim`] element (one with an [`action_no`](BgElement::action_no));
+    /// a static element ignores it. The currently-displayed AIR element is read
+    /// back from it via [`BgElement::current_anim_elem`] / [`anim_elem_at_tick`].
+    pub anim_tick: i32,
 }
 
 impl Default for BgElement {
@@ -215,6 +223,7 @@ impl Default for BgElement {
             layer: BgLayer::Back,
             mask: true,
             scroll: Vec2::new(0.0, 0.0),
+            anim_tick: 0,
         }
     }
 }
@@ -236,6 +245,153 @@ impl BgElement {
         self.scroll.x = advance_axis(self.scroll.x, self.velocity.x, tile_size.x);
         self.scroll.y = advance_axis(self.scroll.y, self.velocity.y, tile_size.y);
     }
+
+    /// Advances this element's [`anim_tick`](BgElement::anim_tick) clock by one
+    /// game tick.
+    ///
+    /// `action` is the AIR action driving this element (resolved by the caller
+    /// from the element's [`action_no`](BgElement::action_no) against the stage's
+    /// own `.air`). The clock is only bumped while the action is *still looping or
+    /// running*: once it has played out a non-looping action (its `loopstart`
+    /// equals the frame count — i.e. there is no loop region) the clock is held at
+    /// the action's total duration so the last frame stays on screen instead of
+    /// the modulo wrapping it back to the start. A looping action (the usual case)
+    /// advances forever; the wrap is applied by [`anim_elem_at_tick`] when the
+    /// frame is selected. The clock saturates rather than overflowing.
+    ///
+    /// Only meaningful for a [`BgType::Anim`] element; a caller may skip calling it
+    /// for static elements (their `anim_tick` simply stays `0`).
+    pub fn advance_anim(&mut self, action: &AnimAction) {
+        self.anim_tick = self.anim_tick.saturating_add(1);
+        // Guard the clock against unbounded growth on a looping action by wrapping
+        // it back into one loop period once it has cleared the action's total
+        // duration. A non-looping action (no real loop region) is held at its end
+        // instead so the final frame persists.
+        let total = action_total_ticks(action);
+        if total > 0 {
+            let loop_ticks = action_loop_ticks(action);
+            if loop_ticks > 0 {
+                // Looping action: keep the clock in `[0, total)` ∪ the loop region
+                // by subtracting whole loop periods once past the end. This is
+                // visually identical (the loop region repeats) while bounding the
+                // value.
+                while self.anim_tick >= total {
+                    self.anim_tick -= loop_ticks;
+                }
+            } else {
+                // Non-looping (loopstart == frame count): pin to the last frame.
+                self.anim_tick = self.anim_tick.min(total);
+            }
+        }
+    }
+
+    /// Returns the index of the AIR frame this element currently displays, given
+    /// the AIR `action` it is bound to and its running
+    /// [`anim_tick`](BgElement::anim_tick) clock. A convenience wrapper over
+    /// [`anim_elem_at_tick`].
+    pub fn current_anim_elem(&self, action: &AnimAction) -> usize {
+        anim_elem_at_tick(action, self.anim_tick)
+    }
+
+    /// Returns the `(group, image)` sprite this element currently displays.
+    ///
+    /// For a [`BgType::Anim`] element this is the sprite of the AIR frame selected
+    /// by [`current_anim_elem`](BgElement::current_anim_elem); the element's own
+    /// [`sprite`](BgElement::sprite) field is the fallback used when the action has
+    /// no usable frame (and for non-animated elements, whose drawn sprite is
+    /// always their static `sprite`). The caller resolves the action from this
+    /// element's [`action_no`](BgElement::action_no) against the stage's `.air`.
+    pub fn current_anim_sprite(&self, action: &AnimAction) -> Vec2<i32> {
+        match action.frames.get(self.current_anim_elem(action)) {
+            Some(frame) => Vec2::new(frame.sprite.group() as i32, frame.sprite.image() as i32),
+            None => self.sprite,
+        }
+    }
+}
+
+/// Sum of the `ticks` of every frame in `action`, treating a hold-forever frame
+/// (`ticks <= 0`) as contributing `0` (it never ends, so nothing after it ever
+/// begins). Saturates rather than overflowing. `0` for an empty action.
+fn action_total_ticks(action: &AnimAction) -> i32 {
+    action
+        .frames
+        .iter()
+        .fold(0i32, |acc, f| acc.saturating_add(f.ticks.max(0)))
+}
+
+/// Sum of the `ticks` of the frames in `action`'s loop region (from `loopstart`
+/// to the end), i.e. the period the animation repeats with. `0` when there is no
+/// loop region (`loopstart` is at or past the last frame) or every looped frame
+/// is hold-forever — in which case the action does not cycle.
+fn action_loop_ticks(action: &AnimAction) -> i32 {
+    action
+        .frames
+        .iter()
+        .skip(action.loopstart)
+        .fold(0i32, |acc, f| acc.saturating_add(f.ticks.max(0)))
+}
+
+/// Selects the index of the AIR frame an animated background element displays at
+/// `tick` ticks into its action.
+///
+/// This is the pure core of stage-layer animation (no GPU/SFF state), so the
+/// frame-selection rule can be unit-tested independently of rendering. It walks
+/// the action's frames accumulating each frame's `ticks` duration; the frame
+/// whose `[start, start + ticks)` window contains `tick` is the one shown. The
+/// rules match the character executor's [`advance_animation`] semantics:
+///
+/// - A frame with `ticks <= 0` is **hold-forever** (MUGEN's `-1`): the animation
+///   never advances past it, so any `tick` from its start onward shows it.
+/// - At the end of the action the cursor loops back to `loopstart` (the frame
+///   index marked by AIR's `Loopstart`), so a long-running `tick` wraps through
+///   the loop region rather than running off the end.
+/// - A negative `tick` clamps to `0` (the first frame); an empty action yields
+///   `0` (the caller treats an out-of-range index as "no frame").
+///
+/// The returned index is always a valid index into `action.frames` for a
+/// non-empty action.
+pub fn anim_elem_at_tick(action: &AnimAction, tick: i32) -> usize {
+    let n = action.frames.len();
+    if n == 0 {
+        return 0;
+    }
+
+    // Negative ticks (defensive) show the first frame.
+    let mut remaining = tick.max(0);
+
+    // The intro region `[0, loopstart)` plays once; the loop region
+    // `[loopstart, n)` repeats. Clamp a malformed loopstart into range.
+    let loopstart = action.loopstart.min(n.saturating_sub(1));
+
+    // Walk forward, looping at the end, until `remaining` lands inside a frame's
+    // window or we hit a hold-forever frame. Bound the walk so a pathological
+    // all-zero-duration loop region can never spin forever.
+    const MAX_STEPS: usize = 1 << 20;
+    let mut elem = 0usize;
+    for _ in 0..MAX_STEPS {
+        // SAFETY of indexing: `elem` is always kept in `0..n` below.
+        let dur = action.frames[elem].ticks;
+        if dur <= 0 {
+            // Hold-forever frame: the animation parks here.
+            return elem;
+        }
+        if remaining < dur {
+            // `tick` falls within this frame's window.
+            return elem;
+        }
+        remaining -= dur;
+        elem += 1;
+        if elem >= n {
+            elem = loopstart;
+            // A loop region of zero total duration would never consume
+            // `remaining`; stop on the loop's first frame rather than spin.
+            if action_loop_ticks(action) <= 0 {
+                return elem;
+            }
+        }
+    }
+    // Bound hit (only reachable for a degenerate action): a safe, valid index.
+    loopstart
 }
 
 /// Advances one scroll axis by `velocity`, wrapping into `[0, period)` when
@@ -347,6 +503,38 @@ impl Stage {
         midpoint.clamp(lo, hi)
     }
 
+    /// Computes the camera's vertical offset so its view tracks how high the
+    /// fighters are, clamped to the camera's vertical bounds.
+    ///
+    /// `p1_y`/`p2_y` are the fighters' world Y positions, in MUGEN's convention
+    /// where `0` is the ground plane and **negative Y is up** (a jumping fighter
+    /// has a negative Y). The camera follows the higher (more negative) reaches of
+    /// the fighters' midpoint, scaled by the `[Camera] verticalfollow` factor in
+    /// `[0, 1]`: `0` disables vertical travel entirely (the view stays put even
+    /// while fighters jump), `1` tracks the midpoint one-to-one. The result is the
+    /// world Y the camera offsets its view by, clamped to
+    /// `[bound_top, bound_bottom]` so it never scrolls past the authored stage
+    /// edges. Robust against an inverted bound pair (`top > bottom`): it clamps to
+    /// the normalized `[min, max]`. A non-finite `verticalfollow` (defensive)
+    /// disables follow rather than poisoning the offset.
+    ///
+    /// This mirrors [`camera_follow_x`](Stage::camera_follow_x) for the vertical
+    /// axis; it is a pure function so the clamp/scale math is unit-testable
+    /// independently of rendering.
+    pub fn camera_follow_y(&self, p1_y: f32, p2_y: f32) -> f32 {
+        let midpoint = (p1_y + p2_y) * 0.5;
+        let follow = if self.camera.vertical_follow.is_finite() {
+            // Negative/over-unit factors are clamped into the documented [0, 1].
+            self.camera.vertical_follow.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let offset = midpoint * follow;
+        let lo = self.camera.bound_top.min(self.camera.bound_bottom);
+        let hi = self.camera.bound_top.max(self.camera.bound_bottom);
+        offset.clamp(lo, hi)
+    }
+
     /// Advances every background element's auto-scroll offset by one tick,
     /// wrapping each within its tile period.
     ///
@@ -364,6 +552,35 @@ impl Stage {
         for bg in &mut self.backgrounds {
             let size = tile_size(bg.sprite).unwrap_or(Vec2::new(0.0, 0.0));
             bg.advance_scroll(size);
+        }
+    }
+
+    /// Advances every animated ([`BgType::Anim`]) background element's animation
+    /// clock by one tick, leaving static elements untouched.
+    ///
+    /// Call this once per fixed tick. `action_for` resolves an element's parsed
+    /// [`action_no`](BgElement::action_no) to its AIR [`AnimAction`] (looked up in
+    /// the stage's own `.air` by the caller, which owns it) — or `None` when the
+    /// action is missing, in which case the element is skipped (its clock holds).
+    /// This indirection keeps `fp-stage` free of any concrete AIR-ownership /
+    /// file-IO concern: the caller supplies the actions.
+    ///
+    /// An element with no [`action_no`](BgElement::action_no), or whose `kind` is
+    /// not [`BgType::Anim`], is never advanced.
+    pub fn advance_anim<'a, F>(&mut self, mut action_for: F)
+    where
+        F: FnMut(i32) -> Option<&'a AnimAction>,
+    {
+        for bg in &mut self.backgrounds {
+            if bg.kind != BgType::Anim {
+                continue;
+            }
+            let Some(action_no) = bg.action_no else {
+                continue;
+            };
+            if let Some(action) = action_for(action_no) {
+                bg.advance_anim(action);
+            }
         }
     }
 }
@@ -768,6 +985,26 @@ fn parse_bg(section: &Section) -> Option<BgElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fp_core::SpriteId;
+    use fp_formats::air::AnimFrame;
+
+    /// Builds a synthetic AIR action from `(group, image, ticks)` frame tuples and
+    /// a `loopstart` index — enough to exercise frame selection without parsing a
+    /// real `.air`.
+    fn anim_action(number: i32, loopstart: usize, frames: &[(u16, u16, i32)]) -> AnimAction {
+        AnimAction {
+            action_number: number,
+            loopstart,
+            frames: frames
+                .iter()
+                .map(|&(g, i, t)| AnimFrame {
+                    sprite: SpriteId::new(g, i),
+                    ticks: t,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
 
     /// A small but representative synthetic stage `.def` exercising every section
     /// plus an unknown section and an unknown key (which must be tolerated), two
@@ -1226,5 +1463,218 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
             .expect("Floor BG present");
         assert!((floor.scroll.x - 2.0).abs() < 1e-4, "got {}", floor.scroll.x);
         assert!((0.0..3.0).contains(&floor.scroll.x));
+    }
+
+    // -----------------------------------------------------------------------
+    // T004 — animated-layer frame selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anim_frame_selection_picks_the_right_frame_per_tick() {
+        // Three frames of 7 ticks each (sprites 0,1,2), no loop region offset.
+        // Window layout: frame 0 = [0,7), frame 1 = [7,14), frame 2 = [14,21).
+        let action = anim_action(10, 0, &[(0, 0, 7), (0, 1, 7), (0, 2, 7)]);
+
+        // Within frame 0's window.
+        assert_eq!(anim_elem_at_tick(&action, 0), 0);
+        assert_eq!(anim_elem_at_tick(&action, 6), 0);
+        // Boundary: tick 7 begins frame 1.
+        assert_eq!(anim_elem_at_tick(&action, 7), 1);
+        assert_eq!(anim_elem_at_tick(&action, 13), 1);
+        // Frame 2's window.
+        assert_eq!(anim_elem_at_tick(&action, 14), 2);
+        assert_eq!(anim_elem_at_tick(&action, 20), 2);
+    }
+
+    #[test]
+    fn anim_frame_selection_wraps_at_loopstart() {
+        // loopstart = 1: the action plays frame 0 once (the intro), then loops
+        // frames 1 and 2 forever. Total = 21 ticks, loop region = 14 ticks.
+        let action = anim_action(10, 1, &[(0, 0, 7), (0, 1, 7), (0, 2, 7)]);
+
+        // First pass through all three frames.
+        assert_eq!(anim_elem_at_tick(&action, 0), 0);
+        assert_eq!(anim_elem_at_tick(&action, 7), 1);
+        assert_eq!(anim_elem_at_tick(&action, 14), 2);
+        // At tick 21 the cursor wraps to loopstart (frame 1), NOT back to frame 0.
+        assert_eq!(anim_elem_at_tick(&action, 21), 1);
+        assert_eq!(anim_elem_at_tick(&action, 28), 2);
+        // And keeps looping the [1, 2] region.
+        assert_eq!(anim_elem_at_tick(&action, 35), 1);
+    }
+
+    #[test]
+    fn anim_frame_selection_holds_forever_on_nonpositive_ticks() {
+        // A -1 (hold-forever) middle frame parks the animation there for any tick
+        // from its start onward; nothing after it ever shows.
+        let action = anim_action(10, 0, &[(0, 0, 5), (0, 1, -1), (0, 2, 5)]);
+        assert_eq!(anim_elem_at_tick(&action, 0), 0);
+        assert_eq!(anim_elem_at_tick(&action, 5), 1);
+        assert_eq!(anim_elem_at_tick(&action, 999), 1, "hold-forever parks here");
+    }
+
+    #[test]
+    fn anim_frame_selection_clamps_negative_and_handles_empty() {
+        let action = anim_action(10, 0, &[(0, 0, 7), (0, 1, 7)]);
+        // Negative tick clamps to the first frame.
+        assert_eq!(anim_elem_at_tick(&action, -100), 0);
+        // An empty action never panics and yields index 0.
+        let empty = anim_action(11, 0, &[]);
+        assert_eq!(anim_elem_at_tick(&empty, 50), 0);
+    }
+
+    #[test]
+    fn anim_frame_selection_does_not_spin_on_zero_duration_loop() {
+        // A loop region whose frames are all hold-forever (ticks <= 0) must not
+        // spin: selection stops on the loop's first frame after the intro.
+        let action = anim_action(10, 1, &[(0, 0, 7), (0, 1, -1), (0, 2, -1)]);
+        // Within the intro frame.
+        assert_eq!(anim_elem_at_tick(&action, 3), 0);
+        // After the intro, the hold-forever loop parks on its first frame.
+        assert_eq!(anim_elem_at_tick(&action, 1_000_000), 1);
+    }
+
+    #[test]
+    fn bg_advance_anim_loops_and_resolves_current_sprite() {
+        // A looping 2-frame action: sprites (5,0) then (5,1), 3 ticks each.
+        let action = anim_action(1, 0, &[(5, 0, 3), (5, 1, 3)]);
+        let mut bg = BgElement {
+            kind: BgType::Anim,
+            action_no: Some(1),
+            ..Default::default()
+        };
+
+        // Tick 0: frame 0, sprite (5, 0).
+        assert_eq!(bg.current_anim_elem(&action), 0);
+        assert_eq!(bg.current_anim_sprite(&action), Vec2::new(5, 0));
+
+        // Advance into frame 1.
+        for _ in 0..3 {
+            bg.advance_anim(&action);
+        }
+        assert_eq!(bg.anim_tick, 3);
+        assert_eq!(bg.current_anim_elem(&action), 1);
+        assert_eq!(bg.current_anim_sprite(&action), Vec2::new(5, 1));
+
+        // Keep advancing for many ticks: the clock stays bounded (wraps within one
+        // loop period) and the element keeps cycling 0,1,0,1...
+        for _ in 0..1000 {
+            bg.advance_anim(&action);
+        }
+        let total = action_total_ticks(&action);
+        assert!(bg.anim_tick < total, "clock stayed bounded: {}", bg.anim_tick);
+        // The selected element is always a valid frame index.
+        assert!(bg.current_anim_elem(&action) < action.frames.len());
+    }
+
+    #[test]
+    fn bg_advance_anim_non_looping_pins_to_last_frame() {
+        // loopstart == frame count → no loop region: the clock pins at the total
+        // duration and the last frame stays on screen.
+        let action = anim_action(2, 2, &[(7, 0, 4), (7, 1, 4)]);
+        let mut bg = BgElement {
+            kind: BgType::Anim,
+            action_no: Some(2),
+            ..Default::default()
+        };
+        for _ in 0..100 {
+            bg.advance_anim(&action);
+        }
+        let total = action_total_ticks(&action);
+        assert_eq!(bg.anim_tick, total, "non-looping clock pins at total duration");
+        assert_eq!(bg.current_anim_elem(&action), 1, "last frame held");
+    }
+
+    #[test]
+    fn stage_advance_anim_only_drives_anim_layers() {
+        let mut stage = Stage::default();
+        stage.backgrounds.push(BgElement {
+            name: "static".into(),
+            kind: BgType::Normal,
+            ..Default::default()
+        });
+        stage.backgrounds.push(BgElement {
+            name: "animated".into(),
+            kind: BgType::Anim,
+            action_no: Some(1),
+            ..Default::default()
+        });
+        // An anim element whose action is missing must hold (skipped, no panic).
+        stage.backgrounds.push(BgElement {
+            name: "anim_missing_action".into(),
+            kind: BgType::Anim,
+            action_no: Some(99),
+            ..Default::default()
+        });
+
+        let action = anim_action(1, 0, &[(0, 0, 1), (0, 1, 1)]);
+        for _ in 0..5 {
+            stage.advance_anim(|n| if n == 1 { Some(&action) } else { None });
+        }
+
+        // Static element never animates.
+        assert_eq!(stage.backgrounds[0].anim_tick, 0);
+        // The animated element with a resolvable action advanced 5 ticks (wrapped
+        // within the 2-tick loop period → 1).
+        assert_eq!(stage.backgrounds[1].anim_tick, 1);
+        // The anim element whose action did not resolve stayed put.
+        assert_eq!(stage.backgrounds[2].anim_tick, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // T004 — vertical camera follow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn camera_follow_y_tracks_midpoint_scaled_by_verticalfollow() {
+        let mut stage = Stage::default();
+        stage.camera.bound_top = -100.0; // up
+        stage.camera.bound_bottom = 0.0; // ground
+        stage.camera.vertical_follow = 0.5;
+
+        // Both grounded → no vertical offset.
+        assert_eq!(stage.camera_follow_y(0.0, 0.0), 0.0);
+        // Both at y = -40 (in the air): midpoint -40, scaled by 0.5 → -20.
+        assert_eq!(stage.camera_follow_y(-40.0, -40.0), -20.0);
+        // Asymmetric: midpoint (-80 + -20)/2 = -50, * 0.5 → -25.
+        assert_eq!(stage.camera_follow_y(-80.0, -20.0), -25.0);
+    }
+
+    #[test]
+    fn camera_follow_y_clamps_to_vertical_bounds() {
+        let mut stage = Stage::default();
+        stage.camera.bound_top = -100.0;
+        stage.camera.bound_bottom = 0.0;
+        stage.camera.vertical_follow = 1.0;
+
+        // A huge jump (very negative Y) clamps to the top bound.
+        assert_eq!(stage.camera_follow_y(-500.0, -600.0), -100.0);
+        // A downward (positive Y) midpoint clamps to the bottom bound.
+        assert_eq!(stage.camera_follow_y(50.0, 90.0), 0.0);
+    }
+
+    #[test]
+    fn camera_follow_y_zero_factor_disables_vertical_travel() {
+        let mut stage = Stage::default();
+        stage.camera.bound_top = -100.0;
+        stage.camera.bound_bottom = 0.0;
+        stage.camera.vertical_follow = 0.0;
+        // Even a big jump produces no offset when verticalfollow is 0.
+        assert_eq!(stage.camera_follow_y(-90.0, -90.0), 0.0);
+    }
+
+    #[test]
+    fn camera_follow_y_handles_inverted_bounds_and_bad_factor() {
+        // Inverted vertical bounds must not produce NaN/empty clamp.
+        let mut stage = Stage::default();
+        stage.camera.bound_top = 0.0;
+        stage.camera.bound_bottom = -100.0; // inverted (top > bottom)
+        stage.camera.vertical_follow = 0.5;
+        let y = stage.camera_follow_y(-40.0, -40.0);
+        assert!((-100.0..=0.0).contains(&y), "clamped into normalized range: {y}");
+
+        // A non-finite verticalfollow disables follow (offset 0) rather than NaN.
+        stage.camera.vertical_follow = f32::NAN;
+        assert_eq!(stage.camera_follow_y(-40.0, -40.0), 0.0);
     }
 }
