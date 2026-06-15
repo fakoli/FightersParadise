@@ -2879,7 +2879,22 @@ fn match_hud_state(m: &Match) -> MatchHudState {
         // Convert here so a real fight.def clock reads e.g. 99, not 5940.
         timer_seconds: Some(timer_frames_to_seconds(m.timer())),
         round_text: round_readout(m),
+        combo_count: active_combo_count(m),
     }
+}
+
+/// The hit count of the currently active combo for the screenpack combo counter.
+///
+/// MUGEN tracks the running combo on the *defender* (`GetHitVar(hitcount)`), so a
+/// side's combo length is read off the opponent it is hitting. We surface
+/// whichever side is comboing harder (the max of the two), which the renderer
+/// then only draws once it reaches 2 (see [`fp_ui::combo_text`]).
+fn active_combo_count(m: &Match) -> i32 {
+    m.p1()
+        .character
+        .get_hit_vars
+        .hitcount
+        .max(m.p2().character.get_hit_vars.hitcount)
 }
 
 /// Converts the engine's frame-based round clock ([`Match::timer`], "frames

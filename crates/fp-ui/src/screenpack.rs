@@ -62,15 +62,21 @@ pub struct SpriteRef {
 /// One player's life-bar layout: layered background / middle / front sprites,
 /// the anchor position, and the pixel `range` the full (100%) bar spans.
 ///
-/// MUGEN layers a life bar as `bg` (static backing) → `mid` (a damage "ghost"
-/// that lags) → `front` (the live fill clipped to the current life fraction).
+/// MUGEN layers a life bar as one or more `bg0..bgN` (static backing) → `mid`
+/// (a damage "ghost" that lags) → `front` (the live fill clipped to the current
+/// life fraction). The background is a *stack*: MUGEN screenpacks routinely
+/// author `bg0`, `bg1`, … and the engine paints them in slot order (bg0 first,
+/// the highest `bgN` last), so [`bg_layers`](Self::bg_layers) holds all of them
+/// rather than just `bg0`.
+///
 /// `range` is `(x0, x1)`: the front fill spans `[x0, x1]` at full life and
 /// shrinks toward `x0` as life drops (toward `x1` for a right-anchored P2 bar —
 /// the renderer decides anchoring from the player side).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LifebarSide {
-    /// Static background sprite (drawn first).
-    pub bg: Option<SpriteRef>,
+    /// Static background sprites in `bg0..bgN` slot order, drawn first (bg0 at
+    /// the back, the last entry just under `mid`). Empty when none are authored.
+    pub bg_layers: Vec<SpriteRef>,
     /// Mid / "ghost" damage sprite (drawn over the background).
     pub mid: Option<SpriteRef>,
     /// Front live-fill sprite (clipped to the life fraction).
@@ -85,8 +91,9 @@ pub struct LifebarSide {
 /// per-level "meter filled" sounds.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PowerbarSide {
-    /// Static background sprite.
-    pub bg: Option<SpriteRef>,
+    /// Static background sprites in `bg0..bgN` slot order (drawn back-to-front),
+    /// mirroring [`LifebarSide::bg_layers`]. Empty when none are authored.
+    pub bg_layers: Vec<SpriteRef>,
     /// Mid sprite.
     pub mid: Option<SpriteRef>,
     /// Front live-fill sprite (clipped to the power fraction).
@@ -296,7 +303,7 @@ fn parse_font_slot(def: &DefFile, section: &str, key: &str) -> usize {
 /// Parses one side (`p1`/`p2`) of `[Lifebar]`.
 fn parse_lifebar_side(def: &DefFile, section: &str, side: &str) -> LifebarSide {
     LifebarSide {
-        bg: parse_bar_layer(def, section, side, "bg0"),
+        bg_layers: parse_bg_layers(def, section, side),
         mid: parse_bar_layer(def, section, side, "mid"),
         front: parse_bar_layer(def, section, side, "front"),
         pos: parse_pos(def, section, &format!("{side}.pos")).unwrap_or_default(),
@@ -307,13 +314,35 @@ fn parse_lifebar_side(def: &DefFile, section: &str, side: &str) -> LifebarSide {
 /// Parses one side (`p1`/`p2`) of `[Powerbar]`.
 fn parse_powerbar_side(def: &DefFile, section: &str, side: &str) -> PowerbarSide {
     PowerbarSide {
-        bg: parse_bar_layer(def, section, side, "bg0"),
+        bg_layers: parse_bg_layers(def, section, side),
         mid: parse_bar_layer(def, section, side, "mid"),
         front: parse_bar_layer(def, section, side, "front"),
         pos: parse_pos(def, section, &format!("{side}.pos")).unwrap_or_default(),
         range: parse_range(def, section, &format!("{side}.range.x")),
         level_sounds: parse_level_sounds(def, section, side),
     }
+}
+
+/// Collects a bar's contiguous `bg0..bgN` background layers (each with its own
+/// `.spr` + optional `.offset`) into z-order — `bg0` first.
+///
+/// MUGEN background slots are contiguous, so this stops at the first missing
+/// `bgN`: a non-contiguous higher slot is ignored (matching how `font0..fontN`
+/// slots are collected). The returned vector is empty when no `bg0` is authored.
+fn parse_bg_layers(def: &DefFile, section: &str, side: &str) -> Vec<SpriteRef> {
+    let mut layers = Vec::new();
+    let mut n = 0;
+    loop {
+        let layer = format!("bg{n}");
+        match parse_bar_layer(def, section, side, &layer) {
+            Some(spr) => {
+                layers.push(spr);
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    layers
 }
 
 /// Parses one bar layer's sprite + its `.offset`, merging the offset into the
@@ -428,6 +457,8 @@ font2 = font/cbig.fnt
 p1.pos        = 80, 33
 p1.bg0.spr    = 0, 0
 p1.bg0.offset = 0, 0
+p1.bg1.spr    = 0, 2
+p1.bg1.offset = 3, 3
 p1.mid.spr    = 1, 0
 p1.front.spr  = 2, 0
 p1.front.offset = 4, 4
@@ -500,9 +531,16 @@ mystery.key = should be ignored
     #[test]
     fn parses_p1_lifebar_layers_and_positions() {
         let l = sample();
-        let lb = l.p1_lifebar;
+        let lb = &l.p1_lifebar;
         assert_eq!(lb.pos, Pos::new(80, 33));
-        assert_eq!(lb.bg, Some(SpriteRef { group: 0, image: 0, offset: Pos::new(0, 0) }));
+        // Two background layers authored (bg0, bg1) in z-order.
+        assert_eq!(
+            lb.bg_layers,
+            vec![
+                SpriteRef { group: 0, image: 0, offset: Pos::new(0, 0) },
+                SpriteRef { group: 0, image: 2, offset: Pos::new(3, 3) },
+            ]
+        );
         assert_eq!(lb.mid, Some(SpriteRef { group: 1, image: 0, offset: Pos::default() }));
         assert_eq!(
             lb.front,
@@ -514,19 +552,55 @@ mystery.key = should be ignored
     #[test]
     fn parses_p2_lifebar_with_mirrored_range_and_missing_mid() {
         let l = sample();
-        let lb = l.p2_lifebar;
+        let lb = &l.p2_lifebar;
         assert_eq!(lb.pos, Pos::new(240, 33));
-        assert_eq!(lb.bg, Some(SpriteRef { group: 0, image: 1, offset: Pos::default() }));
+        assert_eq!(
+            lb.bg_layers,
+            vec![SpriteRef { group: 0, image: 1, offset: Pos::default() }],
+            "p2 has a single bg0 layer authored"
+        );
         assert_eq!(lb.mid, None, "p2 has no mid layer authored");
         assert_eq!(lb.front, Some(SpriteRef { group: 2, image: 1, offset: Pos::default() }));
         assert_eq!(lb.range, (0, -256), "p2 fill range mirrors to the left");
     }
 
     #[test]
+    fn bg_layers_collect_contiguous_slots_and_stop_at_gap() {
+        // bg0, bg1, bg3 present; bg2 missing -> only bg0, bg1 collected, in order.
+        let def = DefFile::from_str(
+            "[Lifebar]\n\
+             p1.bg0.spr = 0, 0\n\
+             p1.bg1.spr = 0, 1\n\
+             p1.bg3.spr = 0, 3\n",
+        )
+        .unwrap();
+        let l = ScreenpackLayout::parse(&def);
+        assert_eq!(
+            l.p1_lifebar.bg_layers,
+            vec![
+                SpriteRef { group: 0, image: 0, offset: Pos::default() },
+                SpriteRef { group: 0, image: 1, offset: Pos::default() },
+            ],
+            "collection stops at the first missing bgN (the non-contiguous bg3 is ignored)"
+        );
+    }
+
+    #[test]
+    fn no_bg_layers_when_none_authored() {
+        let def = DefFile::from_str("[Lifebar]\np1.front.spr = 2, 0\n").unwrap();
+        let l = ScreenpackLayout::parse(&def);
+        assert!(l.p1_lifebar.bg_layers.is_empty());
+    }
+
+    #[test]
     fn parses_powerbar_with_level_sounds() {
         let l = sample();
-        let pb = l.p1_powerbar;
+        let pb = &l.p1_powerbar;
         assert_eq!(pb.pos, Pos::new(80, 200));
+        assert_eq!(
+            pb.bg_layers,
+            vec![SpriteRef { group: 10, image: 0, offset: Pos::default() }]
+        );
         assert_eq!(pb.front, Some(SpriteRef { group: 12, image: 0, offset: Pos::default() }));
         assert_eq!(pb.range, (0, 144));
         assert_eq!(pb.level_sounds, vec![(60, 0), (60, 1), (60, 2)]);
