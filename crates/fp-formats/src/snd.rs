@@ -64,6 +64,25 @@ const HEADER_SIZE: usize = 24;
 /// Byte size of a single sound sub-header (next, length, group, sample).
 const SUBHEADER_SIZE: usize = 16;
 
+/// The codec of a sound payload, sniffed from its leading magic bytes.
+///
+/// An SND container is codec-agnostic — it just bundles opaque blobs — so a
+/// single `.snd` can in principle hold any audio format. MUGEN/Ikemen content
+/// is overwhelmingly RIFF/WAVE, which the sibling crate `fp-audio` decodes.
+/// Classic console-MUGEN ports occasionally embed **ADX** (the CRI ADX codec,
+/// sync byte `0x80`); that is **not** decodable today, so flagging it here lets
+/// a consumer warn-and-skip it instead of handing garbage to the WAV decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundFormat {
+    /// RIFF/WAVE (`"RIFF" ...`) — the supported, decodable case.
+    Wav,
+    /// CRI ADX (sync byte `0x80`) — recognised but **not** supported; a consumer
+    /// should warn and skip rather than attempt to decode it.
+    Adx,
+    /// Anything else (or a payload too short to sniff) — format unknown.
+    Unknown,
+}
+
 /// A single sound entry parsed from an SND container.
 ///
 /// The payload is the raw, undecoded blob stored in the file — in practice a
@@ -76,6 +95,35 @@ pub struct SndEntry {
     pub sample: u32,
     /// Raw sound payload bytes (typically a RIFF/WAVE blob).
     pub data: Vec<u8>,
+}
+
+impl SndEntry {
+    /// Sniffs the payload's codec from its leading magic bytes.
+    ///
+    /// This is a pure, allocation-free header check — it reads at most the first
+    /// four bytes and never decodes the audio. Use it to skip an undecodable
+    /// payload (e.g. [`SoundFormat::Adx`]) before handing the blob to the WAV
+    /// decoder. A too-short or unrecognised payload returns
+    /// [`SoundFormat::Unknown`].
+    pub fn format(&self) -> SoundFormat {
+        sniff_sound_format(&self.data)
+    }
+}
+
+/// Sniffs the audio codec of a raw sound payload from its leading magic bytes.
+///
+/// - **WAV**: starts with the `"RIFF"` chunk magic (the supported case).
+/// - **ADX (CRI)**: starts with the `0x80` sync byte (the high bit of the
+///   copyright-offset field). This codec is not decodable today.
+/// - Everything else (including an empty/short payload): [`SoundFormat::Unknown`].
+pub fn sniff_sound_format(data: &[u8]) -> SoundFormat {
+    if data.first() == Some(&0x80) {
+        return SoundFormat::Adx;
+    }
+    if data.len() >= 4 && &data[0..4] == b"RIFF" {
+        return SoundFormat::Wav;
+    }
+    SoundFormat::Unknown
 }
 
 /// A fully loaded SND sound container.
@@ -634,5 +682,47 @@ mod tests {
         assert_eq!(snd.sound(0, 0), Some(b"RIFF-one".as_slice()));
         assert_eq!(snd.sound(0, 1), Some(b"RIFF-two".as_slice()));
         assert!(snd.sound(2, 2).is_none());
+    }
+
+    // --- Payload codec sniffing (compat-matrix gap: WAV supported, ADX not) ---
+
+    #[test]
+    fn sniffs_wav_payload() {
+        // A real RIFF/WAVE blob is the supported, decodable case.
+        assert_eq!(sniff_sound_format(b"RIFF\x24\x00\x00\x00WAVE"), SoundFormat::Wav);
+        // A bare RIFF magic (no WAVE form type yet) still reads as WAV.
+        assert_eq!(sniff_sound_format(b"RIFF...."), SoundFormat::Wav);
+    }
+
+    #[test]
+    fn sniffs_adx_payload_as_unsupported() {
+        // CRI ADX begins with the 0x80 sync byte. We must recognise it as ADX so
+        // a consumer can warn-and-skip rather than feed it to the WAV decoder.
+        let adx: &[u8] = &[0x80, 0x00, 0x00, 0x20, 0x03, 0x12, 0x04, 0x00];
+        assert_eq!(sniff_sound_format(adx), SoundFormat::Adx);
+    }
+
+    #[test]
+    fn sniffs_unknown_and_short_payloads() {
+        // Neither RIFF nor ADX.
+        assert_eq!(sniff_sound_format(b"OggS...."), SoundFormat::Unknown);
+        // Too short to carry a 4-byte RIFF magic, and not the ADX sync byte.
+        assert_eq!(sniff_sound_format(b"RIF"), SoundFormat::Unknown);
+        assert_eq!(sniff_sound_format(&[]), SoundFormat::Unknown);
+    }
+
+    #[test]
+    fn entry_format_reflects_payload() {
+        // A container mixing a WAV and an ADX payload: the WAV entry is decodable,
+        // the ADX entry is flagged so a consumer can skip it.
+        let adx: &[u8] = &[0x80, 0x00, 0x00, 0x20, 0xAA, 0xBB];
+        let data = make_test_snd(4, &[(0, 0, b"RIFF....WAVEpcm"), (0, 1, adx)]);
+        let snd = SndFile::from_bytes(&data).unwrap();
+
+        assert_eq!(snd.len(), 2);
+        let wav = snd.sounds.iter().find(|s| s.sample == 0).unwrap();
+        let bad = snd.sounds.iter().find(|s| s.sample == 1).unwrap();
+        assert_eq!(wav.format(), SoundFormat::Wav);
+        assert_eq!(bad.format(), SoundFormat::Adx);
     }
 }
