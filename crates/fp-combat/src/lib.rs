@@ -37,6 +37,7 @@
 
 use fp_core::Vec2;
 use fp_physics::{any_overlap, place_clsn, Clsn, Facing};
+use serde::{Deserialize, Serialize};
 
 // Re-export the geometry types callers need so they can build the slices for
 // [`detect_hit`] without depending on `fp-physics` directly.
@@ -45,7 +46,7 @@ pub use fp_physics::{Clsn as ClsnBox, Facing as ClsnFacing};
 /// MUGEN state-class of an attack: which stance the *attacker* is in.
 ///
 /// This is the first token of a HitDef `attr` string (e.g. the `S` in `S, NA`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateClass {
     /// Standing (`S`).
     Standing,
@@ -66,7 +67,7 @@ impl Default for StateClass {
 /// The "power class" of an attack: the first character of the 2-char attack string.
 ///
 /// `{N|S|H}` = Normal / Special / Hyper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttackPower {
     /// Normal attack (`N`).
     Normal,
@@ -86,7 +87,7 @@ impl Default for AttackPower {
 /// The "delivery kind" of an attack: the second character of the 2-char attack string.
 ///
 /// `{A|T|P}` = Attack (normal strike) / Throw / Projectile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttackKind {
     /// A normal attack / strike (`A`).
     Attack,
@@ -107,7 +108,7 @@ impl Default for AttackKind {
 ///
 /// Composed of the attacker's [`StateClass`] plus a 2-character attack string
 /// ([`AttackPower`] + [`AttackKind`]). Build one with [`AttackAttr::parse`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct AttackAttr {
     /// State-class of the attacker (`S`/`C`/`A`).
     pub class: StateClass,
@@ -244,7 +245,7 @@ impl AttackAttr {
 /// // Empty guardflag = unblockable.
 /// assert!(HitFlags::parse("").is_empty());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct HitFlags(u8);
 
 impl HitFlags {
@@ -338,7 +339,7 @@ impl HitFlags {
 }
 
 /// The MUGEN `ground.type` / `air.type` of a hit — how the defender reacts on the ground.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HitType {
     /// `High` — a high hit (e.g. a standing reaction).
     High,
@@ -387,7 +388,7 @@ impl Default for HitType {
 /// reactions. Defaults to [`AnimType::Light`] (MUGEN's default, code `0`) — which
 /// is exactly the bug this fixes: an unset `animtype` previously made *every* hit
 /// read back as `Light`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnimType {
     /// `Light` — a light hit reaction (MUGEN default; code `0`).
     Light,
@@ -505,7 +506,7 @@ impl AnimType {
 /// The MUGEN `priority` type, used to resolve simultaneous (trading) hits.
 ///
 /// Resolution itself is task 6.3; this enum is just the data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PriorityType {
     /// `Hit` — both attacks connect (trade).
     Hit,
@@ -523,7 +524,7 @@ impl Default for PriorityType {
 }
 
 /// Hit/guard priority: a numeric value (MUGEN `1..=7`, default `4`) plus a [`PriorityType`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Priority {
     /// Numeric priority value (MUGEN clamps to `1..=7`; default `4`).
     pub value: i32,
@@ -655,7 +656,7 @@ pub fn resolve_clash(a: Priority, b: Priority) -> ClashOutcome {
 }
 
 /// A `(hit, guard)` pair of damage values: damage dealt on a clean hit vs. on block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Damage {
     /// Damage dealt when the attack lands cleanly.
     pub hit: i32,
@@ -666,7 +667,7 @@ pub struct Damage {
 /// A `(p1, p2)` pause-time pair, in ticks.
 ///
 /// `p1` is how long the attacker pauses; `p2` is the defender's shake time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct PauseTime {
     /// Ticks the attacker (P1) is paused.
     pub p1: i32,
@@ -683,7 +684,7 @@ pub struct PauseTime {
 /// from the HitDef's [`Damage`] via a *life-to-power* multiplier (see
 /// [`HitDef::default_getpower`] / [`HitDef::default_givepower`]), and the guard
 /// amount defaults to half the hit amount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct PowerGain {
     /// Power added when the attack lands cleanly (`getpower`/`givepower` first
     /// component, MUGEN `p1power`/`p2power`).
@@ -694,7 +695,7 @@ pub struct PowerGain {
 }
 
 /// Per-situation hit-time values (ticks the defender stays in hit-stun), in ticks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HitTimes {
     /// `ground.hittime` — hit-stun on the ground (MUGEN default `0`).
     pub ground: i32,
@@ -728,7 +729,7 @@ impl Default for HitTimes {
 /// [03-engine-architecture.md §state-controllers]). That distinction is captured
 /// in [`common`](SoundId::common). This type is pure data and carries no playback
 /// logic — a downstream player (`fp-audio`) resolves and plays it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SoundId {
     /// The sound *group* number (with any leading `S` flag already stripped and
     /// reflected in [`common`](SoundId::common)).
@@ -822,7 +823,7 @@ impl SoundId {
 /// (an authored `-1`, or an absent / unparseable value). The `S`-prefix on
 /// `sparkno` (use the character's own AIR rather than the common set) is not
 /// modelled here — it is resolved by the controller in task 6.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HitResources {
     /// `sparkno` — spark animation action id (`-1` = none).
     pub sparkno: i32,
@@ -867,7 +868,7 @@ impl Default for HitResources {
 /// // p2stateno defaults to "no change".
 /// assert_eq!(hd.p2stateno, None);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HitDef {
     /// `attr` — the attack attribute (state-class + 2-char attack string).
     pub attr: AttackAttr,

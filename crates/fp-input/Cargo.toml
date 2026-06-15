@@ -8,3 +8,9 @@ license.workspace = true
 [dependencies]
 fp-core.workspace = true
 tracing.workspace = true
+# Runtime-state serialization (#38): a faithful Match save-state must restore
+# each player's input ring-buffer and command-recognition timers, so the raw
+# `InputState` and the buffer / matcher snapshot helpers derive
+# Serialize/Deserialize. The compiled command definitions (parsed from `.cmd`)
+# are static and NOT serialized — only the transient recognition state is.
+serde.workspace = true

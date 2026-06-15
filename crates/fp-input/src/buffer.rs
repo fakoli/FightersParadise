@@ -5,9 +5,24 @@
 //! sequences.
 
 use crate::state::InputState;
+use serde::{Deserialize, Serialize};
 
 /// Maximum number of frames stored in the ring buffer.
 const BUFFER_SIZE: usize = 60;
+
+/// A serializable snapshot of an [`InputBuffer`]'s contents (replay / rollback,
+/// #38).
+///
+/// Captures the live frames **oldest-first** (so it is layout-independent of the
+/// ring's internal `head`), letting [`InputBuffer::restore_snapshot`] rebuild an
+/// equivalent buffer by replaying the pushes. Used by `fp-engine`'s whole-Match
+/// save-state to restore each player's command-recognition history exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputBufferSnapshot {
+    /// The stored frames, **oldest first** (index `len-1` is the most recent).
+    /// At most [`BUFFER_SIZE`] entries.
+    frames: Vec<InputState>,
+}
 
 /// Ring buffer storing the last 60 frames of input.
 ///
@@ -67,6 +82,41 @@ impl InputBuffer {
     /// Returns `true` if no frames have been pushed yet.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Captures the buffer's contents as a serializable
+    /// [`InputBufferSnapshot`] (replay / rollback, #38).
+    ///
+    /// The frames are emitted **oldest-first** so the snapshot is independent of
+    /// the ring's internal write head; [`restore_snapshot`](Self::restore_snapshot)
+    /// rebuilds an equivalent buffer from it.
+    #[must_use]
+    pub fn snapshot(&self) -> InputBufferSnapshot {
+        // Walk from the oldest stored frame (offset `count-1`) to the newest
+        // (offset 0), so a replay of pushes reproduces the same ring contents.
+        let mut frames = Vec::with_capacity(self.count);
+        for ago in (0..self.count).rev() {
+            if let Some(s) = self.get(ago) {
+                frames.push(*s);
+            }
+        }
+        InputBufferSnapshot { frames }
+    }
+
+    /// Restores the buffer from an [`InputBufferSnapshot`].
+    ///
+    /// Clears the buffer and re-pushes the snapshot's frames oldest-first, so the
+    /// resulting buffer is equivalent to the one the snapshot was taken from. A
+    /// snapshot carrying more than [`BUFFER_SIZE`] frames is tolerated — the
+    /// excess oldest frames are simply evicted by the ring, exactly as if they had
+    /// been pushed live (never panics).
+    pub fn restore_snapshot(&mut self, snap: &InputBufferSnapshot) {
+        self.frames = [InputState::default(); BUFFER_SIZE];
+        self.head = 0;
+        self.count = 0;
+        for frame in &snap.frames {
+            self.push(*frame);
+        }
     }
 }
 

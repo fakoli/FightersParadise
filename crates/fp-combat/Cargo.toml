@@ -9,3 +9,8 @@ license.workspace = true
 fp-core.workspace = true
 fp-physics.workspace = true
 tracing.workspace = true
+# Runtime-state serialization (#38): a character's active `HitDef` and the
+# attack-attribute / hit-flag data it carries are part of the per-tick mutable
+# state captured in a Match snapshot, so the `HitDef` data model derives
+# Serialize/Deserialize.
+serde.workspace = true

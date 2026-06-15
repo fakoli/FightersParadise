@@ -4,6 +4,8 @@
 //! MUGEN file formats. Each wraps a (group, index) pair that references content
 //! within container files (SFF for sprites, SND for sounds, etc.).
 
+use serde::{Deserialize, Serialize};
+
 /// Identifies a sprite within an SFF (Sprite File Format) container.
 ///
 /// MUGEN sprites are organized by group number (e.g., 0 = idle, 200 = walk)
@@ -19,7 +21,7 @@
 /// assert_eq!(idle_frame_0.group(), 0);
 /// assert_eq!(idle_frame_0.image(), 0);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct SpriteId {
     group: u16,
     image: u16,
@@ -65,7 +67,7 @@ impl std::fmt::Display for SpriteId {
 /// let idle_anim = AnimId::new(0);
 /// assert_eq!(idle_anim.action(), 0);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct AnimId {
     action: i32,
 }
@@ -102,7 +104,7 @@ impl std::fmt::Display for AnimId {
 /// assert_eq!(hit_sound.group(), 1);
 /// assert_eq!(hit_sound.sample(), 0);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct SoundId {
     group: u32,
     sample: u32,

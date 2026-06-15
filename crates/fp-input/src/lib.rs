@@ -10,8 +10,11 @@ pub mod buffer;
 pub mod command;
 pub mod state;
 
-pub use buffer::InputBuffer;
-pub use command::{compile_command, CommandDef, CommandElement, CommandMatcher, InputModifier};
+pub use buffer::{InputBuffer, InputBufferSnapshot};
+pub use command::{
+    compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,
+    InputModifier,
+};
 pub use state::{
     dir_matches, dir_matches_detect, logical_direction, Button, DirToken, Direction, InputState,
     LogicalDirection, BUTTON_COUNT,

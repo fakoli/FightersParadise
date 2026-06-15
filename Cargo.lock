@@ -70,6 +70,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -468,11 +477,13 @@ dependencies = [
 name = "fp-character"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "fp-combat",
  "fp-core",
  "fp-formats",
  "fp-input",
  "fp-vm",
+ "serde",
  "tracing",
  "tracing-subscriber",
 ]
@@ -483,6 +494,7 @@ version = "0.1.0"
 dependencies = [
  "fp-core",
  "fp-physics",
+ "serde",
  "tracing",
 ]
 
@@ -490,6 +502,7 @@ dependencies = [
 name = "fp-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -498,12 +511,15 @@ dependencies = [
 name = "fp-engine"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "fp-character",
  "fp-combat",
  "fp-core",
  "fp-formats",
  "fp-input",
  "fp-physics",
+ "serde",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -523,6 +539,7 @@ name = "fp-input"
 version = "0.1.0"
 dependencies = [
  "fp-core",
+ "serde",
  "tracing",
 ]
 
@@ -1446,6 +1463,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "version-compare",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+dependencies = [
+ "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

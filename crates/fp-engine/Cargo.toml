@@ -18,9 +18,25 @@ fp-input.workspace = true
 fp-combat.workspace = true
 fp-formats.workspace = true
 tracing.workspace = true
+# The replay codec exposes a recoverable `ReplayError` (`thiserror`-derived).
+thiserror.workspace = true
+# Whole-Match runtime-state snapshot / record-replay / determinism (#38): the
+# coordinator's own runtime fields (round phase, timer, freeze, effects, …) plus
+# each player's `CharacterSnapshot` are captured into a `MatchSnapshot`, and the
+# per-frame input pairs into a `ReplayLog`; both derive Serialize/Deserialize
+# (serde) and are encoded with the compact, deterministic `bincode` codec.
+serde.workspace = true
+bincode.workspace = true
 
 [dev-dependencies]
 # Test-only: synthetic LoadedCharacter/HitDef construction for the headless
 # Match tests. (Both are also direct dependencies above for the clash probe.)
 fp-formats.workspace = true
 fp-combat.workspace = true
+# Test-only: the gated real-KFM determinism/replay integration test
+# (`tests/kfm_replay.rs`) loads a `LoadedCharacter` and builds a `Character`
+# directly, and resolves `Vec2` start positions. Both already arrive
+# transitively (via the library deps); naming them here lets the external test
+# crate reach them.
+fp-character.workspace = true
+fp-core.workspace = true

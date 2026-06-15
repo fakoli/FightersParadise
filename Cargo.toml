@@ -51,5 +51,13 @@ bytemuck = { version = "1", features = ["derive"] }
 rodio = "0.20"
 slotmap = "1"
 pollster = "0.4"
+# Runtime-state serialization for whole-Match snapshot / record-replay /
+# determinism (#38). `serde` (derive) marks the mutable runtime-state types
+# Serialize/Deserialize; `bincode` is the compact, deterministic little-endian
+# binary codec the snapshot blob and the replay log are encoded with. Static,
+# reloaded-from-`.def` data (the CompiledState graph, sprites, AIR, CMD) is NOT
+# serialized — only the per-tick mutable state.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 # Dev-only: property/fuzz testing (fp-vm never-panic contract, audit #37).
 proptest = "1"

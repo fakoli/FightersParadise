@@ -70,12 +70,16 @@
 
 pub mod combat;
 pub mod executor;
+pub mod identity;
 pub mod invuln;
 pub mod loader;
+pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{FreezeKind, FreezeRequest, SoundRequest, TargetOp, TickReport};
+pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
+pub use snapshot::CharacterSnapshot;
 // Re-export the combat sound reference so downstream crates (e.g. fp-engine) can
 // name the type of [`AttackResolution::hit_sound`] without taking a direct
 // dependency on fp-combat.
@@ -91,6 +95,7 @@ use std::collections::HashMap;
 use fp_core::Vec2;
 use fp_formats::air::AnimAction;
 use fp_vm::{EvalContext, Redirect, Rng, Value};
+use serde::{Deserialize, Serialize};
 
 /// The fixed default seed for a fresh character's `random` RNG stream.
 ///
@@ -116,7 +121,7 @@ pub const NUM_SYSFVARS: usize = 5;
 ///
 /// MUGEN's `facing` is `1` (right) or `-1` (left); the engine multiplies
 /// relative offsets by this sign. [`Facing::sign`] yields that multiplier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Facing {
     /// Facing right; relative-X offsets are applied as written (sign `+1`).
     #[default]
@@ -143,7 +148,7 @@ impl Facing {
 /// stable integer [`code`](StateType::code) so that `StateType = A` (where the
 /// bare `A` resolves to [`StateType::code`] for [`StateType::Air`]) compares
 /// equal. See the [crate-level letter-coded triggers note](crate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StateType {
     /// `S` — standing.
     #[default]
@@ -199,7 +204,7 @@ impl StateType {
 ///
 /// This is the value read by the `MoveType` trigger; see [`MoveType::code`] and
 /// the [crate-level letter-coded triggers note](crate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MoveType {
     /// `A` — attacking.
     Attack,
@@ -249,7 +254,7 @@ impl MoveType {
 ///
 /// This is the value read by the `Physics` trigger; see [`Physics::code`] and
 /// the [crate-level letter-coded triggers note](crate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Physics {
     /// `S` — standing friction.
     Stand,
@@ -682,7 +687,7 @@ impl CommandSource for ActiveCommands {
 /// [`others`](Self::others) so [`is_asserted`](Self::is_asserted) can report it
 /// without the engine needing a field per flag — an unmodeled flag is recorded,
 /// never dropped, and simply has no consumer yet (a safe no-op).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertedFlags {
     /// `NoWalk` — suppress the engine's built-in stand↔walk locomotion this tick
     /// (common1 run state 100 asserts this so a run does not fall back to a walk).
@@ -760,7 +765,7 @@ impl AssertedFlags {
 /// `front`/`back` are facing-relative half-widths (front = toward the direction
 /// the character faces). When [`active`](Self::active) is `false` the engine
 /// falls back to the static `[Size] ground.front`/`ground.back` constants.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct WidthOverride {
     /// Whether a `Width` override is in effect this tick. When `false`, push/bounds
     /// use the static `[Size]` width.
@@ -805,7 +810,7 @@ impl WidthOverride {
 /// [`Default`]/[`IDENTITY`](Self::IDENTITY) effect (`remaining = 0`) is a no-op:
 /// [`Character::palfx`] returns the identity tint, so the sprite renders
 /// unchanged.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CurPalFx {
     /// Signed per-channel add, as a fraction of full scale (`±1.0` = ±255).
     pub add: [f32; 3],
@@ -864,7 +869,7 @@ impl Default for CurPalFx {
 /// and decay to the renderer (`fp-app`), which fakes the trail from the current
 /// frame at decreasing alpha. While [`time`](Self::time) `> 0` the trail is
 /// active and counts down each (non-hit-paused) tick.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AfterImageState {
     /// Remaining trail duration in ticks. `0` (or less) = inactive.
     pub time: i32,
@@ -929,7 +934,7 @@ pub const NUM_HIT_OVERRIDE_SLOTS: usize = 8;
 /// to [`stateno`](Self::stateno) and consumes the slot, *bypassing* the normal
 /// get-hit path (no damage/knockback/get-hit-state is applied — MUGEN treats the
 /// override state as fully taking over the reaction).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HitOverrideSlot {
     /// The parsed attack-attribute set that arms this slot (the `attr` param).
     /// Reuses the `NotHitBy`/`HitBy` grammar via [`AttackAttrSet`].
@@ -967,7 +972,7 @@ impl HitOverrideSlot {
 /// they are ticked alongside the other per-tick timers); and hit resolution
 /// consults the slots **before** the normal get-hit, redirecting and consuming the
 /// first matching active slot.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HitOverrides {
     /// The 8 override slots, indexed by MUGEN `slot` number.
     pub slots: [HitOverrideSlot; NUM_HIT_OVERRIDE_SLOTS],
@@ -1044,7 +1049,7 @@ impl HitOverrides {
 /// g.xvel = -4.0;
 /// assert_eq!(g.damage, 30);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GetHitVars {
     /// `GetHitVar(xvel)` — X velocity imparted by the hit (pixels/tick).
     pub xvel: f32,
@@ -1596,7 +1601,7 @@ pub struct Character {
 /// guarded` flag also enforces `hitonce` (`numhits = 1`): once a move has
 /// connected, [`resolve_attack`] will not let it connect again until the move is
 /// reset with [`MoveConnect::reset`] (called on a fresh `HitDef`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MoveConnect {
     /// `true` once the current move landed a clean hit (`MoveHit`).
     pub hit: bool,
@@ -1723,6 +1728,32 @@ impl Character {
         // Round-trip through `Rng::new` so the stored cell is always a valid,
         // in-range Park–Miller state regardless of the caller's seed.
         self.rng_seed.set(Rng::new(seed).seed());
+    }
+
+    /// Captures this character's mutable runtime state as a serializable
+    /// [`CharacterSnapshot`] (replay / rollback, #38).
+    ///
+    /// The snapshot mirrors only the runtime fields (position, velocity, life,
+    /// the state-machine cursor, the variable banks, the RNG position, combat
+    /// bookkeeping, …); it does **not** carry the loaded static data
+    /// ([`LoadedCharacter`], [`CharacterConstants`], the command source), which is
+    /// reloaded from the `.def`. See [`crate::snapshot`]. Pair it with
+    /// [`restore_from_snapshot`](Self::restore_from_snapshot) on a character loaded
+    /// from the same `.def`.
+    #[must_use]
+    pub fn snapshot(&self) -> crate::snapshot::CharacterSnapshot {
+        crate::snapshot::CharacterSnapshot::capture(self)
+    }
+
+    /// Restores a [`CharacterSnapshot`] onto this already-loaded character.
+    ///
+    /// Overwrites the mutable runtime fields and leaves the static handles
+    /// (`commands`, `constants`, the loaded assets) untouched — so it must be
+    /// applied to a character loaded from the **same** `.def` the snapshot was
+    /// taken from. Never panics (the variable banks are length-clamped). See
+    /// [`crate::snapshot`].
+    pub fn restore_from_snapshot(&mut self, snap: &crate::snapshot::CharacterSnapshot) {
+        snap.apply_to(self);
     }
 
     /// Draws one raw Park–Miller value and advances this character's RNG state.
@@ -2463,7 +2494,7 @@ impl EvalContext for Character {
 ///   total game ticks elapsed (it does **not** reset between rounds).
 /// - [`match_over`](Self::match_over) — MUGEN's `MatchOver`: `true` once the whole
 ///   best-of-N match is decided, else `false`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoundView {
     /// MUGEN's `RoundState` code: `0` intro, `1` fight, `2` pre-over (KO / time
     /// over), `3` over. Defaults to `0` (intro) for a character with no round
