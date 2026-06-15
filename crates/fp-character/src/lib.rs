@@ -3403,6 +3403,20 @@ pub struct EntityGraph<'a> {
     /// when the owner wired no id table, in which case `playerid(n), …` collapses
     /// to `0`.
     players: &'a [(i32, &'a Character)],
+    /// The owning player's full live-helper id list — the `helper_id` of every
+    /// helper the *owning player* currently has alive, for the `NumHelper` /
+    /// `NumHelper(id)` count triggers (NUMHELPER).
+    ///
+    /// Distinct from [`helpers`](Self::helpers): `helpers` carries the
+    /// `(id, &Character)` pairs *this* entity can address via the `helper(id)`
+    /// **redirect** (only populated for the root, since a helper has no sibling
+    /// lookup, to avoid aliasing the slot-map mid-tick). `own_helper_ids` is a flat
+    /// id-only slice the owner builds once per tick from its slot-map and installs
+    /// on **both** the root's and every helper's context, so `NumHelper` reports
+    /// the owning player's count regardless of which entity reads it. Empty for a
+    /// root with no helpers (and for a bare/test context), in which case
+    /// `NumHelper` reports `0`.
+    own_helper_ids: &'a [i32],
 }
 
 impl<'a> EntityGraph<'a> {
@@ -3429,6 +3443,7 @@ impl<'a> EntityGraph<'a> {
             target: None,
             partner: None,
             players: &[],
+            own_helper_ids: &[],
         }
     }
 
@@ -3456,6 +3471,40 @@ impl<'a> EntityGraph<'a> {
     pub fn with_players(mut self, players: &'a [(i32, &'a Character)]) -> Self {
         self.players = players;
         self
+    }
+
+    /// Installs the owning player's full live-helper id list — the source for the
+    /// `NumHelper` / `NumHelper(id)` count triggers (NUMHELPER), returning the
+    /// updated graph.
+    ///
+    /// The owner (`fp-engine`) builds this once per tick from its helper slot-map
+    /// and installs the **same** slice on the root's and every helper's context, so
+    /// `NumHelper` reports the owning player's count from any entity. The slice must
+    /// outlive the [`EvalCtx`] the graph is installed on. A builder method so
+    /// existing [`EntityGraph::new`] call sites keep working unchanged.
+    #[must_use]
+    pub fn with_own_helper_ids(mut self, own_helper_ids: &'a [i32]) -> Self {
+        self.own_helper_ids = own_helper_ids;
+        self
+    }
+
+    /// Counts the owning player's live helpers for the `NumHelper` triggers
+    /// (NUMHELPER): with `id = None` the **total** number of live helpers; with
+    /// `id = Some(n)` the number whose `helper_id == n`. Returns `0` when the owner
+    /// has none (or wired no list — e.g. a bare/test context), never panics.
+    ///
+    /// This counts the flat [`own_helper_ids`](Self::own_helper_ids) slice the
+    /// owner installs on both the root and the helpers, so the answer is the
+    /// owning player's count regardless of which entity reads it.
+    #[must_use]
+    pub fn num_helpers(&self, id: Option<i32>) -> i32 {
+        let count = match id {
+            None => self.own_helper_ids.len(),
+            Some(n) => self.own_helper_ids.iter().filter(|&&hid| hid == n).count(),
+        };
+        // The slot-map is bounded (`MAX_HELPERS_PER_PLAYER`), so this never
+        // overflows i32; saturate defensively anyway rather than risk a panic.
+        i32::try_from(count).unwrap_or(i32::MAX)
     }
 
     /// The immediate parent entity (`parent` redirect), if any.
@@ -3701,6 +3750,23 @@ impl<'a> EvalCtx<'a> {
         if name.eq_ignore_ascii_case("SelfAnimExist") {
             let exists = args.first().is_some_and(|v| self.anim.contains(v.to_int()));
             return Some(Value::from(exists));
+        }
+
+        // `NumHelper` / `NumHelper(id)` — the count of the owning player's live
+        // helpers (NUMHELPER). Resolved here because the helper slot-map lives with
+        // the entity owner (`fp-engine`'s `Player`), not on the self-only
+        // `Character`; the owner installs its full live-helper id list on the graph
+        // each tick (see [`EntityGraph::with_own_helper_ids`]) for both the root and
+        // every helper. Bare `NumHelper` (no argument) is the total; `NumHelper(id)`
+        // (the VM parses the parenthesized form as a function-call trigger, so `id`
+        // arrives as the first argument) counts only helpers carrying that id. A
+        // root with no helpers — or any context with no list wired — reports `0`.
+        // This is the spawn-once latch: once a helper of id N exists,
+        // `NumHelper(N) = 0` becomes false, so a `triggerall`-guarded `Helper`
+        // controller fires exactly once instead of every tick. Never panics.
+        if name.eq_ignore_ascii_case("NumHelper") {
+            let id = args.first().map(|v| v.to_int());
+            return Some(Value::Int(self.graph.num_helpers(id)));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -6780,6 +6846,53 @@ mod tests {
         assert!(empty.target().is_none());
         assert!(empty.partner().is_none());
         assert!(empty.player(0).is_none());
+        // NUMHELPER: no own-helper list wired → every count is 0, never panics.
+        assert_eq!(empty.num_helpers(None), 0);
+        assert_eq!(empty.num_helpers(Some(3)), 0);
+    }
+
+    /// NUMHELPER (AC: `fp-character` unit test): with the owning player's
+    /// live-helper id list installed, [`EntityGraph::num_helpers`] returns the
+    /// total (`None`) or the per-id count (`Some(id)`), and the `NumHelper` /
+    /// `NumHelper(id)` triggers resolve to the same counts end-to-end through the
+    /// VM eval path the executor uses.
+    #[test]
+    fn num_helper_counts_owning_players_live_helpers() {
+        let me = Character::new();
+        // Owning player has 3 live helpers: two of id 3, one of id 7 — the kind of
+        // multi-helper-per-id slot-map evilken's spawn guards latch against.
+        let own_helper_ids: [i32; 3] = [3, 7, 3];
+        let graph = EntityGraph::default().with_own_helper_ids(&own_helper_ids);
+
+        // Direct accessor: total is 3; id 3 appears twice; id 7 once; unknown 0.
+        assert_eq!(graph.num_helpers(None), 3, "total live helpers");
+        assert_eq!(graph.num_helpers(Some(3)), 2, "two helpers carry id 3");
+        assert_eq!(graph.num_helpers(Some(7)), 1, "one helper carries id 7");
+        assert_eq!(graph.num_helpers(Some(99)), 0, "no helper carries id 99");
+
+        // End-to-end through the VM: bare `NumHelper` is the total; `NumHelper(id)`
+        // counts that id. This is the path the `[State -2]` spawn guard evaluates.
+        assert_eq!(ev_graph("NumHelper", &me, graph), Value::Int(3));
+        assert_eq!(ev_graph("NumHelper(3)", &me, graph), Value::Int(2));
+        assert_eq!(ev_graph("NumHelper(7)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("NumHelper(99)", &me, graph), Value::Int(0));
+
+        // The spawn-once guard latches: once id 3 exists, `NumHelper(3) = 0` reads
+        // false, so a `triggerall`-guarded `Helper` controller no longer fires.
+        assert_eq!(ev_graph("NumHelper(3) = 0", &me, graph), Value::Int(0));
+    }
+
+    /// NUMHELPER: a context with no own-helper list (a root with no helpers, or any
+    /// bare context) reports `0` for both forms — the spawn-once guard's open state
+    /// (`NumHelper(N) = 0` is true), so the FIRST spawn is allowed.
+    #[test]
+    fn num_helper_is_zero_with_no_helpers() {
+        let me = Character::new();
+        let graph = EntityGraph::default();
+        assert_eq!(ev_graph("NumHelper", &me, graph), Value::Int(0));
+        assert_eq!(ev_graph("NumHelper(3)", &me, graph), Value::Int(0));
+        // The open guard reads true while there are no helpers of that id.
+        assert_eq!(ev_graph("NumHelper(3) = 0", &me, graph), Value::Int(1));
     }
 
     // =====================================================================

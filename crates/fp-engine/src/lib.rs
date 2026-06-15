@@ -827,10 +827,18 @@ impl Player {
             .iter()
             .map(|h| (h.helper_id, &h.character))
             .collect();
+        // (NUMHELPER) The owning player's full live-helper id list, for the root's
+        // `NumHelper` / `NumHelper(id)` triggers. Built from the same slot-map as
+        // `lookup`; an id-only slice so it threads through the `Copy` graph without
+        // the `&Character` aliasing concern, and so helpers (which carry no
+        // `helper(id)` lookup) can be handed the identical list — see
+        // [`Player::tick_helpers`].
+        let own_helper_ids: Vec<i32> = self.helpers.iter().map(|h| h.helper_id).collect();
         let graph = EntityGraph::new(None, None, &lookup)
             .with_target(relations.target)
             .with_partner(relations.partner)
-            .with_players(relations.players);
+            .with_players(relations.players)
+            .with_own_helper_ids(&own_helper_ids);
         self.character
             .tick_as_helper(&self.loaded, opponent, stage, graph)
     }
@@ -846,10 +854,17 @@ impl Player {
     fn tick_helpers(&mut self, opponent: Option<&Character>, stage: StageView) {
         let root = &self.character;
         let loaded = &self.loaded;
+        // (NUMHELPER) Snapshot the owning player's full live-helper id list BEFORE
+        // the `&mut self.helpers` loop — an owned copy of the ids, so it does not
+        // alias the mutable per-helper borrow below. Installed on every helper's
+        // graph so a helper that reads `NumHelper` / `NumHelper(id)` sees the
+        // owning player's count (not its own empty sibling lookup).
+        let own_helper_ids: Vec<i32> = self.helpers.iter().map(|h| h.helper_id).collect();
         for helper in &mut self.helpers {
             // parent and root both resolve to the owning root character (a single
             // spawn level; nested helper chains are T013). No sibling lookup.
-            let graph = EntityGraph::new(Some(root), Some(root), &[]);
+            let graph =
+                EntityGraph::new(Some(root), Some(root), &[]).with_own_helper_ids(&own_helper_ids);
             let _ = helper
                 .character
                 .tick_as_helper(loaded, opponent, stage, graph);
@@ -8857,6 +8872,91 @@ time = 1
         m.tick(MatchInput::none(), MatchInput::none());
         let t_after = m.p1().helpers()[0].character.state_time;
         assert!(t_after > t_before, "helper's state Time advances each tick");
+    }
+
+    /// (NUMHELPER) A loaded character whose **`[State -2]`** (the always-run
+    /// special state) spawns a helper of id `N` into state 1000, guarded by the
+    /// standard MUGEN spawn-once pattern `NumHelper(N) = 0`. The `Helper` controller
+    /// has NO `Time = 0` gate, so without a working `NumHelper` the guard would be
+    /// permanently true and it would spawn `N` every tick until the slot-map caps.
+    /// State 1000 (the helper's start state) is an inert stand state, so the helper
+    /// persists (never self-retires) — exactly the saturation scenario the bug
+    /// describes. `N` is parameterised so the test can assert the per-id count.
+    fn numhelper_guard_loaded(helper_id: i32) -> LoadedCharacter {
+        let id_str = helper_id.to_string();
+        // `[State -2]`: spawn helper `N` only while `NumHelper(N) = 0` (the latch).
+        let spawn = ctrl_gated(
+            -2,
+            "Helper",
+            &format!("NumHelper({helper_id}) = 0"),
+            &[
+                ("id", id_str.as_str()),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "30, 0"),
+                ("facing", "1"),
+            ],
+        );
+        let st_neg2 = stand_state(-2, vec![spawn]);
+        // The helper's start state: inert (no DestroySelf), so it stays alive.
+        let st1000 = stand_state(1000, Vec::new());
+
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(-2, st_neg2);
+        loaded.states.insert(1000, st1000);
+        loaded
+    }
+
+    /// (NUMHELPER, AC: `fp-engine` integration test) A player whose `[State -2]`
+    /// spawns a helper of id `N` guarded by `NumHelper(N) = 0` ends up with
+    /// **exactly one** helper of id `N` after many ticks — the spawn-once guard
+    /// latches once helper `N` exists, instead of saturating the bounded slot-map
+    /// (the evilken CPU/RAM-hog bug). Before this fix, `NumHelper` always read `0`,
+    /// so the guard never closed and the slot-map filled to `MAX_HELPERS_PER_PLAYER`.
+    #[test]
+    fn numhelper_guard_latches_spawn_to_exactly_one_helper() {
+        const HELPER_ID: i32 = 3; // the id evilken's guard checks (NumHelper(3) = 0)
+
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, numhelper_guard_loaded(HELPER_ID));
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        assert!(m.p1().helpers().is_empty(), "no helper before any tick");
+
+        // Tick far more than the slot-map cap: a broken `NumHelper` would let the
+        // guard stay open and saturate at MAX_HELPERS_PER_PLAYER (56) within this
+        // many frames; a working one latches after the first spawn.
+        for _ in 0..(MAX_HELPERS_PER_PLAYER * 2) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+
+        let helpers = m.p1().helpers();
+        let count_id = helpers
+            .iter()
+            .filter(|h| h.helper_id() == HELPER_ID)
+            .count();
+        assert_eq!(
+            count_id,
+            1,
+            "exactly one helper of id {HELPER_ID} (spawn-once guard latched), \
+             not the {MAX_HELPERS_PER_PLAYER}-cap saturation; total helpers = {}",
+            helpers.len()
+        );
+        assert_eq!(
+            helpers.len(),
+            1,
+            "the player owns exactly one helper in total"
+        );
     }
 
     /// A match whose players never spawn helpers keeps empty slot-maps and ticks
