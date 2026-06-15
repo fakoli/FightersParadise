@@ -106,15 +106,38 @@ are still stubs, and several content-rendering paths are unwired.
   load those sprites (true-color 24/32-bit also routes through this stub).
 - **Workaround:** Use indexed (RLE/LZ5) SFF v2 content such as KFM.
 
-### Hit sparks are not spawned or rendered (#17) — Missing
+### Hit sparks: own-spark infrastructure only; KFM still shows none (#17) — Partial
 
-- **What's wrong:** The hit primitive `detect_hit_contact` already computes the
-  spark anchor point and `HitResources` carries `sparkno`
-  ([fp-combat/src/lib.rs](../crates/fp-combat/src/lib.rs)), but `fp-engine` never
-  emits a spark request — there is no Explod/effect entity to draw it.
-- **Impact:** Hits connect (damage, hitpause, sound all fire) but there is no
-  visual impact spark.
-- **Workaround:** None; the hit sound and life-bar drop confirm the hit landed.
+- **What works now:** `fp-engine` has a real effect-entity path. On a connecting
+  hit it classifies the attacker's `sparkno` via
+  [`SparkSource`](../crates/fp-combat/src/lib.rs), and for an **attacker-own**
+  spark it spawns an [`Effect`](../crates/fp-engine/src/lib.rs) at the contact
+  anchor (`detect_hit_contact`'s overlap center), ticks it frame-by-frame against
+  the attacker's own AIR, and drops it when its (bounded) lifetime expires;
+  `fp-app` draws the live effects additively over the fighters
+  ([draw_effects](../crates/fp-app/src/main.rs)).
+- **What's still missing — and why KFM shows no spark:** A spark is spawned **only**
+  for the attacker-own form (`SparkSource::Own`). Two things keep that path dark
+  for conventional content:
+  1. **No `fightfx.sff` is loaded.** A *common* `sparkno` (any non-negative value)
+     resolves against the shared `fightfx` set, which the engine does not load yet,
+     so it is a documented best-effort **skip** (the hit still lands; no effect).
+  2. **The `S`-prefix is lost upstream.** MUGEN authors an own-spark as `Sxx`, but
+     `fp-character`'s `parse_resource_id`
+     ([executor.rs](../crates/fp-character/src/executor.rs)) strips the `S` and
+     keeps a *positive* id, so an authored own-spark currently classifies as
+     `Common`. The `Own` path is therefore reachable only by a *literal-negative*
+     `sparkno`, which real content rarely uses.
+- **Impact:** **Kung Fu Man (and any conventional character) renders no impact
+  spark.** KFM's `sparkno` values are all common-`fightfx` (`0/1/2/3/40`, plus one
+  `-1` "none") with zero own-sparks, so the default KFM-vs-KFM match spawns no
+  effects. Hits still connect (damage, hitpause, sound all fire) — this is
+  *own-spark infrastructure*, not a working KFM spark.
+- **To finish it:** load a `fightfx.sff`/`fightfx.air` set and route `Common`
+  sparks to it, and/or preserve the `S`-prefix in `parse_resource_id` so the
+  authored own-spark form reaches `SparkSource::Own`.
+- **Workaround:** None for the visual; the hit sound and life-bar drop confirm the
+  hit landed.
 
 ### AfterImage / PalFX color effects do nothing (#33) — Missing
 

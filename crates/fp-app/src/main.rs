@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::SpriteId;
-use fp_engine::{Match, MatchInput, Player, RoundState, StageBounds, Winner};
+use fp_engine::{EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
@@ -954,6 +954,82 @@ fn draw_player(
         ..Default::default()
     };
     frame.draw_sprite(&cached.texture, &cached.palette, &params);
+}
+
+// ---------------------------------------------------------------------------
+// Hit-spark effect rendering (audit #17)
+// ---------------------------------------------------------------------------
+
+/// Ensures the GPU textures for every live hit-spark effect's current sprite are
+/// cached (audit #17). Run once per frame **before** `begin_frame`, like
+/// [`cache_player_sprite`], because decoding needs `&Renderer` while a live
+/// [`fp_render::RenderFrame`] holds it borrowed. Each effect's sprite is decoded
+/// from its owning side's SFF into that side's per-character cache. A
+/// missing/undecodable sprite is a no-op (logged once by the cache).
+fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
+    // Collect (side, sprite) pairs first to avoid borrowing the match while the
+    // per-side caches are mutated.
+    let effects: Vec<(EffectSide, SpriteId)> = run
+        .m
+        .effects()
+        .iter()
+        .map(|fx| (fx.side, fx.sprite))
+        .collect();
+    for (side, sprite) in effects {
+        let (cache, sff) = match side {
+            EffectSide::P1 => (&mut run.p1_render, &run.m.p1().loaded.sff),
+            EffectSide::P2 => (&mut run.p2_render, &run.m.p2().loaded.sff),
+        };
+        cache.get_or_create_sprite(sff, sprite, renderer);
+    }
+}
+
+/// Draws every live hit-spark effect at its world position, over the fighters
+/// (audit #17).
+///
+/// Each effect's sprite was cached by [`cache_effect_sprites`] in the owning
+/// side's per-character cache; this maps the effect's world position to screen
+/// (the same `world_to_screen_x` + ground-plane mapping the fighters use, offset
+/// by `camera_x`), anchors the sprite by its axis, and draws it additively (a
+/// spark glows). A missing/uncached sprite is skipped — never a panic. This draws
+/// only over the player/effect region; it does not touch the HUD/screenpack.
+fn draw_effects(
+    frame: &mut fp_render::RenderFrame<'_>,
+    p1_render: &FighterRender,
+    p2_render: &FighterRender,
+    m: &Match,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
+) {
+    let ground_y = win_h * 0.8;
+    for fx in m.effects() {
+        let cache = match fx.side {
+            EffectSide::P1 => p1_render,
+            EffectSide::P2 => p2_render,
+        };
+        let Some(cached) = cache.sprite_cache.get(&fx.sprite) else {
+            continue;
+        };
+        // Map the spark's world anchor into screen space exactly like a fighter
+        // (X centered + camera offset, Y on the ground plane), then anchor the
+        // sprite by its axis and apply the AIR frame's authored offset.
+        // TODO(audit #17): this is a minimal first cut — it draws at a fixed 1:1
+        // scale with no facing mirror and ignores the AIR frame's other transforms
+        // (per-frame scale/angle/flip and the spark's own blend value); a future
+        // pass should honor those + the attacker's facing for the spark, as MUGEN
+        // does. The fixed Additive blend below is likewise a deliberate placeholder.
+        let screen_x = world_to_screen_x(fx.pos.x - camera_x, win_w);
+        let draw_x = screen_x - cached.axis_x as f32 + fx.offset.x as f32;
+        let draw_y = ground_y + fx.pos.y - cached.axis_y as f32 + fx.offset.y as f32;
+        let params = SpriteDrawParams {
+            x: draw_x,
+            y: draw_y,
+            blend: fp_render::BlendMode::Additive,
+            ..Default::default()
+        };
+        frame.draw_sprite(&cached.texture, &cached.palette, &params);
+    }
 }
 
 /// Converts the character-side [`fp_character::CurPalFx`] into the renderer's
@@ -1876,6 +1952,9 @@ fn run() -> fp_core::FpResult<()> {
             Mode::Match(ref mut run) => {
                 cache_player_sprite(&mut run.p1_render, run.m.p1(), &renderer);
                 cache_player_sprite(&mut run.p2_render, run.m.p2(), &renderer);
+                // Decode any live hit-spark sprites (audit #17) into the owning
+                // side's cache, also before `begin_frame` borrows the renderer.
+                cache_effect_sprites(run, &renderer);
                 // Decode the stage's background sprites too (also needs `&Renderer`
                 // before the frame borrows it). A no-op when there is no stage.
                 if let Some(stage) = run.stage.as_mut() {
@@ -1931,6 +2010,18 @@ fn run() -> fp_core::FpResult<()> {
                     draw_player(&mut frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
                     draw_player(&mut frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
                 }
+
+                // Hit-spark effects (audit #17), drawn OVER both fighters at their
+                // contact points (additive glow), but under the front BG and HUD.
+                draw_effects(
+                    &mut frame,
+                    &run.p1_render,
+                    &run.p2_render,
+                    &run.m,
+                    camera_x,
+                    win_wf,
+                    win_hf,
+                );
 
                 // Front background layers, over the fighters but under the HUD.
                 if let Some(stage) = run.stage.as_ref() {

@@ -59,9 +59,11 @@ use fp_character::{
     combat::resolve_attack, ActiveCommands, Character, Facing, LoadedCharacter, MoveType,
     RoundView, StageView, StateType,
 };
-use fp_combat::{detect_hit, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing};
-use fp_core::{Rect, Vec2};
-use fp_formats::air::AirFile;
+use fp_combat::{
+    detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
+};
+use fp_core::{Rect, SpriteId, Vec2};
+use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
     logical_direction, Button, CommandDef, CommandMatcher, Direction, InputBuffer, InputState,
 };
@@ -264,6 +266,95 @@ const TICKS_PER_SECOND: i32 = 60;
 /// `rounds.to.win` is `2` — best of three rounds. Override per-match with
 /// [`Match::with_rounds_to_win`] / [`Match::set_rounds_to_win`].
 const DEFAULT_ROUNDS_TO_WIN: i32 = 2;
+
+/// Which fighter's SFF/AIR a hit-spark [`Effect`] draws from (audit #17).
+///
+/// A MUGEN attacker-own spark (`sparkno` negative / `S`-prefixed) plays an action
+/// from the **attacker's own** sprite/animation set, so an [`Effect`] records the
+/// attacking side and a renderer resolves its frames against that fighter's
+/// [`LoadedCharacter::sff`](fp_character::LoadedCharacter)/`air`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectSide {
+    /// The spark draws from player 1's SFF/AIR.
+    P1,
+    /// The spark draws from player 2's SFF/AIR.
+    P2,
+}
+
+/// A short-lived hit-spark / `Explod`-like effect entity spawned on a connecting
+/// hit (faithfulness audit #17).
+///
+/// MUGEN draws a *spark* animation at the contact point of every connecting
+/// attack. [`Match`] keeps a small list of these, spawns one at the contact anchor
+/// when an attack lands, advances each one frame-by-frame, and drops it when its
+/// animation finishes — a minimal, self-contained effect system (no general
+/// `Explod` graph, helper tree, or binding yet).
+///
+/// # Sprite source — own-sparks only today (important)
+///
+/// An [`Effect`] is **only** spawned for an *attacker-own* spark (see
+/// [`SparkSource::Own`]): its frames come from the **attacker's own** SFF/AIR (see
+/// [`EffectSide`] / [`Effect::side`]). A *common* `fightfx` spark
+/// ([`SparkSource::Common`]) has **no asset loaded**, so [`Match`] does **not**
+/// spawn an effect for it — a documented best-effort skip that never blocks the
+/// hit (see [`Match::tick`]).
+///
+/// In practice this means **conventional characters render no hit-spark yet**: the
+/// own-spark path is reached only by a *literal-negative* `sparkno`, and real
+/// content (Kung Fu Man's `sparkno` values are all `0/1/2/3/40` plus one `-1`)
+/// authors only common-`fightfx` values — partly because the upstream parser
+/// strips the `S`-prefix that would mark an own-spark (see [`SparkSource`] and
+/// `docs/known-issues.md`, audit #17). So in the default KFM-vs-KFM match this
+/// list stays **empty**; this is *own-spark infrastructure*, not a working KFM
+/// spark, until a `fightfx` set is wired or the parser preserves `S`.
+///
+/// The owning side's [`fp_formats::air::AirFile`] action id is [`Effect::anim`];
+/// the resolved current-frame [`fp_core::SpriteId`] is [`Effect::sprite`]. All
+/// fields are read accessors a renderer consumes; the cursor/lifetime are advanced
+/// only by [`Match`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Effect {
+    /// Which fighter's SFF/AIR this spark's frames are resolved against.
+    pub side: EffectSide,
+    /// The attacker-own AIR action (animation) id the spark plays.
+    pub anim: i32,
+    /// World position the spark is anchored at (the hit's contact center).
+    pub pos: Vec2<f32>,
+    /// The current frame's sprite id (group/image), resolved from the owning
+    /// side's AIR action each tick. A renderer draws this sprite at [`pos`](Self::pos).
+    pub sprite: SpriteId,
+    /// The current frame's pixel offset (from the AIR frame), applied on top of
+    /// [`pos`](Self::pos) by a renderer exactly as a fighter frame's offset is.
+    pub offset: Vec2<i16>,
+    /// Zero-based index of the current frame within the action.
+    elem: usize,
+    /// Ticks the current frame has been displayed (advances the cursor at the
+    /// frame's `ticks` duration).
+    elem_time: i32,
+    /// Frames of life remaining before the effect is dropped. Decremented each
+    /// tick; the effect expires (and is removed) when this reaches `0`.
+    remaining: i32,
+}
+
+impl Effect {
+    /// Zero-based index of the spark's current animation frame.
+    #[must_use]
+    pub fn elem(&self) -> usize {
+        self.elem
+    }
+
+    /// Frames of life remaining before this effect is dropped.
+    #[must_use]
+    pub fn remaining(&self) -> i32 {
+        self.remaining
+    }
+}
+
+/// Hard cap on the number of frames a hit-spark effect lives, regardless of its
+/// AIR action length — bounds the effect list and guards against an infinite
+/// (`ticks = -1`) hold frame keeping a spark alive forever. MUGEN sparks are
+/// short; this is a generous ceiling.
+const EFFECT_MAX_LIFETIME: i32 = 60;
 
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
 /// and the input/command source feeding its state machine.
@@ -506,6 +597,15 @@ pub struct Match {
     /// so a caller (e.g. `fp-app`) that builds a [`Match`] via [`Match::new`] needs
     /// no change.
     freeze: Freeze,
+    /// Live hit-spark / effect entities (audit #17), spawned at the contact point
+    /// of a connecting attack and advanced/dropped each [`Match::tick`].
+    ///
+    /// Each connecting hit whose attacker authored an own-spark (`sparkno`
+    /// negative / `S`-prefixed) pushes one [`Effect`] here; a common-`fightfx`
+    /// spark is skipped (no asset loaded). Expired effects are removed in-place, so
+    /// this only ever holds the sparks visible *this* frame. Cleared at the start
+    /// of each round. Read it via [`Match::effects`].
+    effects: Vec<Effect>,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -665,6 +765,7 @@ impl Match {
             round_frames,
             game_time: 0,
             freeze: Freeze::inactive(),
+            effects: Vec::new(),
         }
     }
 
@@ -820,6 +921,19 @@ impl Match {
     #[must_use]
     pub fn match_winner(&self) -> Option<Winner> {
         self.match_winner
+    }
+
+    /// The live hit-spark / effect entities to draw this frame (audit #17).
+    ///
+    /// Each connecting attack with an attacker-own `sparkno` spawns one [`Effect`]
+    /// at the hit's contact point; [`Match::tick`] advances each one and drops it
+    /// when its animation finishes, so this slice holds exactly the sparks visible
+    /// this frame (empty when nothing is connecting). A renderer (`fp-app`) draws
+    /// each effect's [`Effect::sprite`] at its [`Effect::pos`], resolving the
+    /// sprite against the owning side's ([`Effect::side`]) SFF.
+    #[must_use]
+    pub fn effects(&self) -> &[Effect] {
+        &self.effects
     }
 
     /// Player 1's sound-play requests for the MOST RECENT [`Match::tick`], in
@@ -995,6 +1109,22 @@ impl Match {
             //      exactly as before.
             self.resolve_priority_clash();
 
+            // (3b) Hit-spark spawn (audit #17). Capture each direction's contact
+            //      anchor (the world-space overlap center) and the attacker's
+            //      `sparkno` BEFORE `resolve_attack` runs — the resolve sends the
+            //      defender into its get-hit state, which changes its anim and so
+            //      its hurt boxes, making a post-hit geometry probe unreliable. The
+            //      anchor is only USED if the resolve actually returns a connection
+            //      (so a probe that overlaps but the hitflag rejects spawns no
+            //      spark). `active_hitdef` is read here, after the clash arbitration
+            //      may have cleared the loser's, so a cancelled side carries no spark.
+            let p1_spark = self
+                .p1
+                .character
+                .active_hitdef
+                .map(|hd| hd.resources.sparkno);
+            let p1_anchor = directional_contact_point(&self.p1, &self.p2);
+
             let p2_states = &self.p2.loaded.states;
             let p1_attack = resolve_attack(
                 &mut self.p1.character,
@@ -1006,6 +1136,13 @@ impl Match {
             if let Some(res) = p1_attack {
                 if let Some(s) = res.hit_sound {
                     self.p1_sound_requests.push(hit_sound_request(s));
+                }
+                // Spawn P1's hit spark at the captured contact anchor (audit #17).
+                // A common-`fightfx` spark or a missing anchor is a documented
+                // best-effort no-op (logged in `spawn_effect`) — never a panic and
+                // never blocks the hit.
+                if let (Some(sparkno), Some(anchor)) = (p1_spark, p1_anchor) {
+                    self.spawn_effect(EffectSide::P1, sparkno, anchor.point);
                 }
                 // P8b: the HitDef's `p1stateno` moves the ATTACKER (P1) into its
                 // throw-/move-specific state via its OWN state graph. `p2stateno`
@@ -1019,6 +1156,13 @@ impl Match {
                 }
             }
 
+            let p2_spark = self
+                .p2
+                .character
+                .active_hitdef
+                .map(|hd| hd.resources.sparkno);
+            let p2_anchor = directional_contact_point(&self.p2, &self.p1);
+
             let p1_states = &self.p1.loaded.states;
             let p2_attack = resolve_attack(
                 &mut self.p2.character,
@@ -1031,6 +1175,9 @@ impl Match {
                 if let Some(s) = res.hit_sound {
                     self.p2_sound_requests.push(hit_sound_request(s));
                 }
+                if let (Some(sparkno), Some(anchor)) = (p2_spark, p2_anchor) {
+                    self.spawn_effect(EffectSide::P2, sparkno, anchor.point);
+                }
                 if let Some(state) = res.attacker_state {
                     let states = &self.p2.loaded.states;
                     tracing::debug!(player = "p2", to_state = state, "attacker enters p1stateno");
@@ -1038,6 +1185,12 @@ impl Match {
                 }
             }
         }
+
+        // (3c) Advance the live hit-spark effects (audit #17): step each spark's
+        //      animation cursor against its owning side's AIR action and drop any
+        //      that have expired. Runs every fight tick, after this frame's sparks
+        //      are spawned, so a brand-new spark shows its first frame this frame.
+        self.tick_effects();
 
         // (4) Separate overlapping bodies, then clamp each to the stage.
         self.apply_push_and_bounds();
@@ -1439,6 +1592,9 @@ impl Match {
         // A freeze (`Pause`/`SuperPause`) does not carry across a round boundary.
         self.freeze = Freeze::inactive();
 
+        // Stale hit-sparks must not linger into the new round (audit #17).
+        self.effects.clear();
+
         tracing::info!(
             round = self.round_number,
             p1_round_wins = self.p1_round_wins,
@@ -1455,6 +1611,156 @@ impl Match {
         self.p1.character.ctrl = false;
         self.p2.character.ctrl = false;
     }
+
+    /// Spawns a hit-spark [`Effect`] for a connecting attack (audit #17).
+    ///
+    /// `side` is the **attacker** (whose own SFF/AIR an own-spark draws from),
+    /// `raw_sparkno` is its `HitDef`'s `sparkno`, and `pos` is the contact-center
+    /// anchor. The spark source is classified via [`SparkSource`]:
+    ///
+    /// - [`SparkSource::None`] (`-1`): no spark — nothing spawned.
+    /// - [`SparkSource::Own`]: play that action from the attacker's own AIR. The
+    ///   first frame's sprite/offset are resolved immediately so the spark is
+    ///   visible the frame it spawns; a missing/empty action logs and spawns nothing.
+    /// - [`SparkSource::Common`]: a common-`fightfx` spark — no `fightfx` asset is
+    ///   loaded yet, so this is a documented best-effort **skip** (logged once at
+    ///   debug). It never panics and never blocks the hit.
+    ///
+    /// The effect's lifetime is the action's total frame ticks, clamped to
+    /// [`EFFECT_MAX_LIFETIME`] (so an infinite-hold final frame cannot leak).
+    fn spawn_effect(&mut self, side: EffectSide, raw_sparkno: i32, pos: Vec2<f32>) {
+        let anim = match SparkSource::classify(raw_sparkno) {
+            SparkSource::None => return,
+            SparkSource::Common { anim } => {
+                tracing::debug!(
+                    sparkno = raw_sparkno,
+                    anim,
+                    "common fightfx spark requested but no fightfx.sff is loaded; skipping spark"
+                );
+                return;
+            }
+            SparkSource::Own { anim } => anim,
+        };
+
+        // Resolve the owning side's AIR action; an absent/empty action means there
+        // is nothing to draw, so spawn no effect (best-effort, never a panic).
+        let air = match side {
+            EffectSide::P1 => &self.p1.loaded.air,
+            EffectSide::P2 => &self.p2.loaded.air,
+        };
+        let Some(action) = air.action(anim) else {
+            tracing::debug!(?side, anim, "own spark action not found in AIR; skipping spark");
+            return;
+        };
+        let Some(first) = action.frames.first() else {
+            tracing::debug!(?side, anim, "own spark action has no frames; skipping spark");
+            return;
+        };
+
+        let lifetime = effect_lifetime(action);
+        let effect = Effect {
+            side,
+            anim,
+            pos,
+            sprite: first.sprite,
+            offset: first.offset,
+            elem: 0,
+            elem_time: 0,
+            remaining: lifetime,
+        };
+        tracing::debug!(?side, anim, x = pos.x, y = pos.y, lifetime, "spawned hit spark");
+        self.effects.push(effect);
+    }
+
+    /// Advances every live hit-spark [`Effect`] one tick and drops the expired
+    /// ones (audit #17).
+    ///
+    /// For each effect: decrement its lifetime, advance its animation cursor
+    /// against the owning side's AIR action (re-resolving the current frame's
+    /// sprite/offset), and remove it once its lifetime hits `0` or its action can
+    /// no longer be resolved. Pure field writes over a bounded list; never panics.
+    fn tick_effects(&mut self) {
+        // Snapshot the two AIR files once (immutable) so the closure can resolve
+        // each effect's frames without re-borrowing `self` mutably per element.
+        let p1_air = &self.p1.loaded.air;
+        let p2_air = &self.p2.loaded.air;
+        self.effects.retain_mut(|fx| {
+            fx.remaining -= 1;
+            if fx.remaining <= 0 {
+                return false;
+            }
+            let air = match fx.side {
+                EffectSide::P1 => p1_air,
+                EffectSide::P2 => p2_air,
+            };
+            advance_effect_frame(fx, air)
+        });
+    }
+}
+
+/// Advances one hit-spark [`Effect`]'s animation cursor by a tick against its
+/// owning AIR `air`, updating its current-frame [`Effect::sprite`]/[`Effect::offset`]
+/// (audit #17).
+///
+/// Returns `true` to keep the effect, `false` to drop it. The cursor advances when
+/// the current frame's `ticks` budget elapses. A hit-spark plays through **once
+/// and stops** — unlike a looping fighter animation it does **not** wrap to the
+/// action's `loopstart`; once it reaches the final frame it **holds** there until
+/// the effect's own [`Effect::remaining`] lifetime reaps it. This is the MUGEN
+/// behavior (sparks are one-shot, non-looping) and means a short spark ends on its
+/// last frame rather than visibly repeating. A frame with `ticks <= 0` (an
+/// infinite hold) never advances the cursor — it is held until the lifetime
+/// expires. A missing/empty action drops the effect. Never panics.
+fn advance_effect_frame(fx: &mut Effect, air: &AirFile) -> bool {
+    let Some(action) = air.action(fx.anim) else {
+        return false;
+    };
+    if action.frames.is_empty() {
+        return false;
+    }
+    let last = action.frames.len() - 1;
+    fx.elem_time += 1;
+    // Advance past any elapsed frames (a loop guard bounds odd data: never iterate
+    // more than the frame count, so a run of zero-duration frames cannot spin).
+    let mut guard = action.frames.len() + 1;
+    while guard > 0 {
+        guard -= 1;
+        // Already parked on the final frame: a one-shot spark holds here until its
+        // lifetime reaps it (no loop back to `loopstart`).
+        if fx.elem >= last {
+            fx.elem = last;
+            break;
+        }
+        let Some(frame) = action.frames.get(fx.elem) else {
+            break;
+        };
+        if frame.ticks <= 0 || fx.elem_time < frame.ticks {
+            break;
+        }
+        fx.elem_time = 0;
+        fx.elem += 1;
+    }
+    // Re-resolve the (possibly advanced) current frame's sprite + offset.
+    if let Some(frame) = action.frames.get(fx.elem) {
+        fx.sprite = frame.sprite;
+        fx.offset = frame.offset;
+    }
+    true
+}
+
+/// The lifetime (in frames) a hit-spark effect from `action` lives: the sum of its
+/// frames' positive `ticks`, clamped to `[1, `[`EFFECT_MAX_LIFETIME`]`]`.
+///
+/// An infinite-hold frame (`ticks <= 0`) contributes nothing to the sum, so a
+/// short spark whose final frame holds forever still gets a finite, bounded life.
+/// An action with no positive-duration frames falls back to a single-frame life.
+fn effect_lifetime(action: &AnimAction) -> i32 {
+    let total: i32 = action
+        .frames
+        .iter()
+        .map(|f| f.ticks.max(0))
+        .fold(0i32, |acc, t| acc.saturating_add(t));
+    total.clamp(1, EFFECT_MAX_LIFETIME)
 }
 
 impl Player {
@@ -1714,6 +2020,41 @@ fn directional_contact(attacker: &Player, defender: &Player) -> bool {
         return false;
     }
     detect_hit(
+        &clsn1,
+        attacker.character.pos,
+        to_clsn_facing(attacker.character.facing),
+        &clsn2,
+        defender.character.pos,
+        to_clsn_facing(defender.character.facing),
+    )
+}
+
+/// Like [`directional_contact`], but returns *where* the attack connects — the
+/// [`fp_combat::HitContact`] overlap (its center is the hit-spark anchor, audit #17).
+///
+/// This mirrors the geometric probe inside
+/// [`fp_character::combat::resolve_attack`] using the same pure
+/// [`fp_combat::detect_hit_contact`], positioned by each character's `pos`/`facing`,
+/// but *without* requiring or consuming a `HitDef`. The coordinator captures this
+/// **before** running the resolve (which moves the defender into its get-hit state
+/// and so changes its hurt boxes), and only uses it when the resolve actually
+/// reports a connection. An absent action/frame or empty box set yields `None`
+/// (no contact); never panics.
+fn directional_contact_point(attacker: &Player, defender: &Player) -> Option<fp_combat::HitContact> {
+    let clsn1 = current_frame_clsn1(
+        &attacker.loaded.air,
+        attacker.character.anim,
+        attacker.character.anim_elem,
+    );
+    let clsn2 = current_frame_clsn2(
+        &defender.loaded.air,
+        defender.character.anim,
+        defender.character.anim_elem,
+    );
+    if clsn1.is_empty() || clsn2.is_empty() {
+        return None;
+    }
+    detect_hit_contact(
         &clsn1,
         attacker.character.pos,
         to_clsn_facing(attacker.character.facing),
@@ -5896,5 +6237,268 @@ time = 1
         assert_eq!(m.freeze_time(), 0, "time=0 leaves no freeze armed");
         assert!(!m.p1_frozen());
         assert!(!m.p2_frozen());
+    }
+
+    // ---- Hit-spark effects (audit #17) -----------------------------------
+
+    /// An attacker-style loaded character (punch on action 200, hurt on action 0)
+    /// that ALSO carries a multi-frame spark action at `spark_anim`, so a connecting
+    /// HitDef whose `sparkno` resolves to that action can spawn a spark from the
+    /// attacker's own AIR. The spark action has 3 frames (sprites (10,0)/(10,1)/
+    /// (10,2), 2 ticks each → a 6-frame lifetime) so cursor advance and expiry are
+    /// observable.
+    fn spark_attacker_loaded(spark_anim: i32) -> LoadedCharacter {
+        let mut loaded = attacker_loaded();
+        let mk = |img: u16| AnimFrame {
+            sprite: SpriteId::new(10, img),
+            offset: Vec2::new(3, -4),
+            ticks: 2,
+            ..Default::default()
+        };
+        loaded.air.actions.insert(
+            spark_anim,
+            AnimAction {
+                action_number: spark_anim,
+                frames: vec![mk(0), mk(1), mk(2)],
+                loopstart: 0,
+            },
+        );
+        loaded
+    }
+
+    /// Builds a fight-phase match where P1 is armed with `hd` on its punch frame
+    /// (action 200) facing a standing, open P2 it overlaps, ready to connect this
+    /// tick. P1's loaded AIR carries the spark action `spark_anim`.
+    fn spark_match(hd: HitDef, spark_anim: i32) -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+
+        let p1 = Player::new(p1c, spark_attacker_loaded(spark_anim));
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(hd);
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.holding_back = false;
+        m
+    }
+
+    /// A connecting hit with an attacker-own `sparkno` spawns one effect, sourced
+    /// from the attacker's own AIR action, anchored near the contact point.
+    #[test]
+    fn connecting_hit_spawns_own_spark_at_contact() {
+        // sparkno = -5 → own action 5 (negative = attacker's own set).
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = -5;
+        let mut m = spark_match(hd, 5);
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "the attack must connect");
+        assert_eq!(m.effects().len(), 1, "exactly one spark spawned on the hit");
+        let fx = &m.effects()[0];
+        assert_eq!(fx.side, EffectSide::P1, "the spark is sourced from the attacker (P1)");
+        assert_eq!(fx.anim, 5, "the own-spark plays action 5 (magnitude of -5)");
+        // The spark's sprite is the spark action's CURRENT frame (group 10). After
+        // spawning, `tick_effects` advanced one frame-tick (still on elem 0 of a
+        // 2-tick frame), so the sprite is still the first frame (10, 0).
+        assert_eq!(fx.sprite, SpriteId::new(10, 0));
+        // The anchor sits between the attacker (x=0) and defender (x=60) overlap —
+        // a positive, finite X near the contact region, not at either origin.
+        assert!(
+            fx.pos.x > 0.0 && fx.pos.x < 60.0,
+            "spark anchored in the overlap region, got x={}",
+            fx.pos.x
+        );
+    }
+
+    /// No hit → no spark: a tick with no connecting attack spawns nothing.
+    #[test]
+    fn no_hit_spawns_no_spark() {
+        // Place the attacker far from the defender so the punch box cannot overlap.
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = -5;
+        let mut m = spark_match(hd, 5);
+        // Move P1 far left so no overlap this tick, and re-pin the frame.
+        m.p1.character.pos = Vec2::new(-250.0, 0.0);
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.active_hitdef = Some(HitDef {
+            resources: fp_combat::HitResources { sparkno: -5, ..Default::default() },
+            ..sample_hitdef()
+        });
+        m.p1.character.move_connect.reset();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(m.p2().life(), 1000, "no overlap → no hit");
+        assert!(m.effects().is_empty(), "no spark without a connecting hit");
+    }
+
+    /// A spark ticks down and expires: after its action's total lifetime elapses,
+    /// the effect is dropped from the list.
+    #[test]
+    fn spark_ticks_down_and_expires() {
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = -5;
+        let mut m = spark_match(hd, 5);
+
+        // First tick: connect + spawn the spark (lifetime = 3 frames × 2 ticks = 6).
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.effects().len(), 1, "spark spawned");
+        // Clear the attacker's HitDef so no NEW spark spawns on later ticks; the
+        // existing one must age out on its own.
+        m.p1.character.active_hitdef = None;
+        m.p1.character.move_connect.reset();
+
+        // The spark spawned with remaining = 6 and was decremented once on the
+        // spawn tick (tick_effects ran after spawn), so 5 more ticks expire it.
+        let mut ticked = 0;
+        for _ in 0..10 {
+            if m.effects().is_empty() {
+                break;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+            ticked += 1;
+        }
+        assert!(m.effects().is_empty(), "the spark eventually expires");
+        assert!(ticked <= 6, "expiry is bounded by the action lifetime, took {ticked}");
+    }
+
+    /// A common (`fightfx`) spark — a non-negative `sparkno` — spawns nothing today
+    /// (no fightfx asset is loaded), but the hit still connects and deals damage.
+    #[test]
+    fn common_spark_spawns_nothing_but_hit_lands() {
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = 0; // non-negative → common fightfx set
+        let mut m = spark_match(hd, 5);
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(m.p2().life() < 1000, "a common-spark hit still connects + damages");
+        assert!(
+            m.effects().is_empty(),
+            "no fightfx asset loaded → common spark is a best-effort skip"
+        );
+    }
+
+    /// `sparkno = -1` (the MUGEN "no spark" sentinel) spawns nothing, and a missing
+    /// own-spark action also spawns nothing — neither blocks the hit nor panics.
+    #[test]
+    fn sentinel_and_missing_spark_action_spawn_nothing() {
+        // (a) sparkno = -1 sentinel.
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = -1;
+        let mut m = spark_match(hd, 5);
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(m.p2().life() < 1000, "the hit still lands with no spark");
+        assert!(m.effects().is_empty(), "-1 sentinel spawns no spark");
+
+        // (b) own-spark action id that does NOT exist in the attacker's AIR.
+        let mut hd2 = sample_hitdef();
+        hd2.resources.sparkno = -999; // own action 999, which is not authored
+        let mut m2 = spark_match(hd2, 5);
+        m2.tick(MatchInput::none(), MatchInput::none());
+        assert!(m2.p2().life() < 1000, "the hit lands even when the spark action is missing");
+        assert!(m2.effects().is_empty(), "a missing own-spark action spawns nothing");
+    }
+
+    /// Sparks do not leak across a round reset: a spawned spark is cleared when the
+    /// next round begins.
+    #[test]
+    fn round_reset_clears_sparks() {
+        let mut hd = sample_hitdef();
+        hd.resources.sparkno = -5;
+        let mut m = spark_match(hd, 5);
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.effects().len(), 1, "spark present mid-round");
+        // Reset to the next round directly; sparks must be cleared.
+        m.reset_for_next_round();
+        assert!(m.effects().is_empty(), "round reset clears live sparks");
+    }
+
+    /// AC (gated, skip-if-missing): drive a REAL KFM punch through the actual
+    /// [`Match::tick`] **command + combat** path (the same flow the app uses) and
+    /// lock in the **documented reality** of audit #17 — KFM's `sparkno` values are
+    /// all common-`fightfx` (`0/1/2/3/40`, plus a `-1` "none"), so with no
+    /// `fightfx.sff` loaded a connecting KFM hit lands and deals damage but spawns
+    /// **no** [`Effect`]. This is the regression net the reviewer asked for: it
+    /// asserts the best-effort common-spark skip against real content via the real
+    /// tick path, not via a contrived literal-negative `sparkno` real KFM never
+    /// authors.
+    ///
+    /// This deliberately mirrors `real_command_attack_connects_and_drops_life`
+    /// (walk into range with `right`, throw light punches) because that is the
+    /// proven-deterministic way to land a real KFM hit through `Match::tick`; the
+    /// only addition is the spark assertions.
+    #[test]
+    fn real_kfm_common_spark_hit_lands_but_spawns_no_effect() {
+        // Sanity-anchor the classification this test relies on: KFM's real hit
+        // sparks (`sparkno = 0/1/2/3/40`) are all common-fightfx. (Pure, ungated.)
+        for sparkno in [0, 1, 2, 3, 40] {
+            assert!(
+                matches!(SparkSource::classify(sparkno), SparkSource::Common { .. }),
+                "KFM sparkno={sparkno} must classify as a common fightfx spark"
+            );
+        }
+
+        let Some(mut m) = two_kfm_match() else {
+            return; // fixture absent; helper already logged the skip
+        };
+        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        // No hit has connected yet, so no spark should exist.
+        assert!(m.effects().is_empty(), "no spark before the fight is driven");
+        let p2_life_before = m.p2().life();
+
+        // Walk into range.
+        for _ in 0..240 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
+                break;
+            }
+        }
+        // Throw light punches on alternate frames; over a generous budget one must
+        // connect via KFM's real `[State 200]` HitDef (whose `sparkno` is common).
+        let mut hit = false;
+        for i in 0..400 {
+            let inp = if i % 3 == 0 {
+                MatchInput { x: true, ..MatchInput::none() }
+            } else {
+                MatchInput::none()
+            };
+            m.tick(inp, MatchInput::none());
+            // Invariant across the whole drive: with only common-fightfx sparks and
+            // no fightfx asset loaded, NO effect is ever spawned — connecting or not.
+            assert!(
+                m.effects().is_empty(),
+                "real KFM (common-fightfx sparkno, no fightfx loaded) must spawn no hit-spark effect"
+            );
+            if m.p2().life() < p2_life_before {
+                hit = true;
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert!(
+            hit,
+            "a real KFM punch must connect through Match::tick and drop P2's life; P2 at {} ({:?})",
+            m.p2().life(),
+            m.round_state()
+        );
     }
 }

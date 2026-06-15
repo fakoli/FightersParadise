@@ -1172,6 +1172,105 @@ pub fn detect_hit_contact(
     None
 }
 
+/// Which sprite/animation set a HitDef's `sparkno` resolves against, plus the
+/// (non-negative) animation id to play from that set — the MUGEN spark-source rule
+/// **as it actually arrives in this codebase**.
+///
+/// In *authored* MUGEN, `sparkno` selects the hit-spark animation when an attack
+/// connects, and an `S` prefix (`S2`) means "use my **own** set" while a bare
+/// number (`2`) means "use the **common** `fightfx` set". The magnitude is the
+/// action id either way, and `-1` is the documented "no spark" sentinel.
+///
+/// **Important — what reaches this type is *not* the authored string.** The
+/// `HitDef` controller's `parse_resource_id` (in `fp-character`) **strips** the
+/// leading `S`/`s` and keeps the bare *positive* magnitude — it does **not** fold
+/// an `S` prefix into a negative integer. So given the current parser:
+///
+/// - `sparkno = -1` arrives as `-1` → [`SparkSource::None`] (no spark).
+/// - Any other **negative** value (a *literal* `sparkno = -N` in the CNS) arrives
+///   negative → [`SparkSource::Own`] at id `N` (attacker's own SFF/AIR).
+/// - Every **non-negative** value — **including the `S`-prefixed own-spark form**
+///   `S2`, which the parser flattens to `2` — arrives non-negative →
+///   [`SparkSource::Common`] at that id.
+///
+/// Consequence (tracked in `docs/known-issues.md`, audit #17): because the `S`
+/// prefix is lost upstream, the [`SparkSource::Own`] path is reachable **only** by
+/// a literal-negative `sparkno`, which authored content rarely uses. Conventional
+/// characters (Kung Fu Man included — its `sparkno` values are all `0/1/2/3/40`
+/// plus one `-1`) therefore classify as [`SparkSource::Common`], and with no
+/// `fightfx.sff` loaded those spawn no visible spark today. Restoring the
+/// `S`-prefix → own-spark distinction is an `fp-character` parser change (out of
+/// this type's scope); this enum classifies faithfully *given the value it is
+/// handed*.
+///
+/// Use [`SparkSource::classify`] to turn a raw `sparkno` into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SparkSource {
+    /// No spark at all (the `-1` sentinel, or any value MUGEN treats as "none").
+    None,
+    /// Play action `anim` from the **attacker's own** SFF/AIR. Reached by a
+    /// *literal* negative `sparkno` (e.g. `-2` → own action `2`); the `S`-prefixed
+    /// authoring form does **not** reach here today (the parser strips the `S` and
+    /// keeps a positive id — see the type-level note). `anim` is the non-negative
+    /// action id.
+    Own {
+        /// The attacker-own animation (action) id to play.
+        anim: i32,
+    },
+    /// Play action `anim` from the **common** `fightfx` set (any non-negative
+    /// `sparkno`, including the `S`-flattened own-spark form). `anim` is that
+    /// action id.
+    Common {
+        /// The common-`fightfx` animation (action) id to play.
+        anim: i32,
+    },
+}
+
+impl SparkSource {
+    /// Classifies a raw [`HitResources::sparkno`] into a [`SparkSource`].
+    ///
+    /// `-1` (and only `-1`) is the MUGEN "no spark" sentinel → [`SparkSource::None`].
+    /// Any other **negative** value (a *literal* `sparkno = -N`) is an attacker-own
+    /// spark whose action id is the magnitude (`-2` → own action `2`). A
+    /// **non-negative** value is a common `fightfx` spark at that action id — note
+    /// the `S`-prefixed own-spark form arrives here non-negative (the parser strips
+    /// the `S`), so it classifies as `Common`, not `Own` (see the type-level note).
+    /// Total and never panics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::SparkSource;
+    ///
+    /// // The default / sentinel: no spark.
+    /// assert_eq!(SparkSource::classify(-1), SparkSource::None);
+    /// // A LITERAL negative → attacker's own set, id = magnitude.
+    /// assert_eq!(SparkSource::classify(-2), SparkSource::Own { anim: 2 });
+    /// // Non-negative → the common fightfx set (this is also where an
+    /// // `S`-prefixed own-spark lands today, since the parser strips the `S`).
+    /// assert_eq!(SparkSource::classify(0), SparkSource::Common { anim: 0 });
+    /// assert_eq!(SparkSource::classify(5), SparkSource::Common { anim: 5 });
+    /// ```
+    #[must_use]
+    pub const fn classify(sparkno: i32) -> Self {
+        if sparkno == -1 {
+            SparkSource::None
+        } else if sparkno < 0 {
+            // Own spark: the action id is the magnitude. `-i32::MIN` would
+            // overflow, so use `unsigned_abs` semantics via wrapping then cast —
+            // but a const fn can't call that, so guard the extreme explicitly.
+            let anim = if sparkno == i32::MIN {
+                i32::MAX
+            } else {
+                -sparkno
+            };
+            SparkSource::Own { anim }
+        } else {
+            SparkSource::Common { anim: sparkno }
+        }
+    }
+}
+
 /// The defender's stance at the moment of a hit — which body height they occupy.
 ///
 /// This maps to the MUGEN guardflag/hitflag height letters: standing -> `H`,
@@ -3007,5 +3106,53 @@ mod tests {
         assert_eq!(SoundId::parse("nope"), None);
         // A bare `S` flag with no digits → unparseable group → None.
         assert_eq!(SoundId::parse("S"), None);
+    }
+
+    /// `SparkSource::classify` maps a raw `sparkno` onto the MUGEN spark-source
+    /// rule: `-1` = none, other negatives = attacker-own (id = magnitude),
+    /// non-negative = the common `fightfx` set.
+    #[test]
+    fn spark_source_classify_maps_mugen_rule() {
+        // The default / sentinel.
+        assert_eq!(SparkSource::classify(-1), SparkSource::None);
+        // Negative → attacker's own set, id = magnitude.
+        assert_eq!(SparkSource::classify(-2), SparkSource::Own { anim: 2 });
+        assert_eq!(SparkSource::classify(-50), SparkSource::Own { anim: 50 });
+        // Non-negative → the common fightfx set at that id.
+        assert_eq!(SparkSource::classify(0), SparkSource::Common { anim: 0 });
+        assert_eq!(SparkSource::classify(5), SparkSource::Common { anim: 5 });
+    }
+
+    /// Even the saturating `i32::MIN` edge classifies as an own spark without
+    /// panicking (no `-i32::MIN` overflow).
+    #[test]
+    fn spark_source_classify_extreme_negative_does_not_overflow() {
+        assert_eq!(
+            SparkSource::classify(i32::MIN),
+            SparkSource::Own { anim: i32::MAX }
+        );
+    }
+
+    /// The discarded-no-longer contact anchor: `detect_hit_contact` reports the
+    /// center of the overlap region, the world-space point a hit spark anchors to.
+    #[test]
+    fn hit_contact_point_is_overlap_center() {
+        // Attacker at x=0 facing right; a punch box reaching x=10..55, y=-60..-40.
+        let attack = [ClsnBox::new(10.0, -60.0, 55.0, -40.0)];
+        // Defender at x=60 facing left; hurt box ±18 about its axis -> world 42..78.
+        let hurt = [ClsnBox::new(-18.0, -70.0, 18.0, 0.0)];
+        let c = detect_hit_contact(
+            &attack,
+            Vec2::new(0.0, 0.0),
+            ClsnFacing::Right,
+            &hurt,
+            Vec2::new(60.0, 0.0),
+            ClsnFacing::Left,
+        )
+        .expect("boxes overlap");
+        // Overlap X is [42, 55], Y is [-60, -40]; the point is the center.
+        assert!((c.point.x - 48.5).abs() < 1e-4, "x center {}", c.point.x);
+        assert!((c.point.y - (-50.0)).abs() < 1e-4, "y center {}", c.point.y);
+        assert!(c.w > 0.0 && c.h > 0.0);
     }
 }
