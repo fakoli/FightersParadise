@@ -298,6 +298,77 @@ pub enum Expr {
         /// The secondary operand `M` the element time is compared against.
         operand: Box<Expr>,
     },
+    /// The two-argument `TimeMod = d, c` trigger form (MUGEN
+    /// [trigger.html](https://www.elecbyte.com/mugendocs/trigger.html)),
+    /// written for example `TimeMod = 20, 19` or the spaced `TimeMod = 4, 3`.
+    ///
+    /// MUGEN semantics: true iff `(time % d) == c` — the state-time modulo `d`
+    /// equals `c`. It is the idiom for "fire once every `d` ticks" (used
+    /// pervasively for after-image trails, repeating effects, and timed cancels).
+    /// The evaluator computes `(Time % d) == c` directly against
+    /// [`EvalContext::trigger`](crate::eval::EvalContext::trigger)'s `"Time"`.
+    ///
+    /// The bare `TimeMod = d` form (no comma tail) keeps parsing as an ordinary
+    /// [`Expr::Binary`] equality — this variant is produced *only* when the comma
+    /// tail is present.
+    TimeModTail {
+        /// The divisor `d` (the right-hand side of the leading `= d`).
+        divisor: Box<Expr>,
+        /// The remainder `c` the modulo result is compared against (the value
+        /// after the comma).
+        remainder: Box<Expr>,
+    },
+    /// The two-argument `HitDefAttr = <standtype>, <attr-list>` trigger form
+    /// (MUGEN [trigger.html](https://www.elecbyte.com/mugendocs/trigger.html)),
+    /// written for example `HitDefAttr = C, NA` or `HitDefAttr = S, NA, SA, HA`.
+    ///
+    /// MUGEN semantics: true iff the character's currently-active `HitDef` has a
+    /// stand-type (`S`/`C`/`A`) matching `standtype` **and** an attack-attribute
+    /// 2-char code (`NA`/`SA`/`HA`/`NT`/`ST`/`HT`/`NP`/`SP`/`HP`) present in the
+    /// comma-separated `attr_codes` list. The standtype and codes are parsed and
+    /// stored upper-cased; the evaluator routes the match through the
+    /// [`EvalContext::hitdef_attr_matches`](crate::eval::EvalContext::hitdef_attr_matches)
+    /// seam (a safe default of "no match" when no `HitDef` is active).
+    ///
+    /// The key win is that this **parses** so a surrounding `&& movecontact`
+    /// survives instead of collapsing the whole expression to const `0`.
+    ///
+    /// The bare `HitDefAttr = <standtype>` form (no comma tail) keeps parsing as
+    /// an ordinary [`Expr::Binary`] equality — this variant is produced *only*
+    /// when the comma tail is present.
+    HitDefAttrTail {
+        /// The stand-type letter, upper-cased: `"S"`, `"C"`, or `"A"`.
+        standtype: String,
+        /// The attack-attribute codes after the comma, each upper-cased 2-char
+        /// (e.g. `["NA"]`, `["NA", "SA", "HA"]`).
+        attr_codes: Vec<String>,
+    },
+    /// The two-argument projectile-info trigger form
+    /// `ProjContact<id> / ProjHit<id> / ProjGuarded<id> / ProjContactTime<id> = value, op time`
+    /// (MUGEN [trigger.html](https://www.elecbyte.com/mugendocs/trigger.html)),
+    /// written for example `ProjContact2000 = 1, < 20`.
+    ///
+    /// Projectiles are not yet implemented in this engine, so this variant exists
+    /// purely so the form **parses** (keeping a surrounding boolean alive) and
+    /// evaluates to `0` (no projectiles → the trigger never fires). The
+    /// `value`/`op`/`time` sub-expressions are retained on the node for
+    /// diagnostics and a future projectile implementation, but the evaluator does
+    /// not consult them today.
+    ///
+    /// The bare `ProjContact<id> = value` form (no comma tail) keeps parsing as an
+    /// ordinary [`Expr::Binary`] equality — this variant is produced *only* when
+    /// the comma tail is present.
+    ProjTail {
+        /// The trigger name as written, case preserved (e.g. `ProjContact2000`).
+        name: String,
+        /// The leading `value` (the right-hand side of the leading `= value`).
+        value: Box<Expr>,
+        /// The comparison operator applied to the projectile time. An omitted
+        /// operator (`ProjContact2000 = 1, 20`) defaults to [`BinaryOp::Eq`].
+        op: BinaryOp,
+        /// The secondary operand (`time`) the projectile time is compared against.
+        time: Box<Expr>,
+    },
 }
 
 /// A recoverable parse failure.
@@ -396,16 +467,14 @@ pub fn parse(tokens: &[Token]) -> Result<Expr, ParseError> {
     if p.is_at_end() {
         return Err(ParseError::Empty);
     }
-    let mut expr = p.parse_expr(0)?;
-    // The `AnimElem = N, op M` two-parameter comparison form (task 4.10, gap 2)
-    // leaves a top-level `,` after the leading `= N` equality. Try to fold it
-    // into an `AnimElemTail`; a non-matching shape leaves `expr` and the comma
-    // untouched, so the trailing-token check below still rejects a stray comma.
-    if p.peek().map(|t| &t.kind) == Some(&TokenKind::Comma) {
-        if let Some(folded) = p.try_fold_animelem_tail(&expr)? {
-            expr = folded;
-        }
-    }
+    let expr = p.parse_expr(0)?;
+    // The two-argument trigger forms (`TimeMod = d, c`, `AnimElem = N, op M`,
+    // `HitDefAttr = S, NA`, `ProjContact<id> = v, op t`) leave a top-level `,`
+    // after the leading `<trigger> = <arg1>` equality. They are now folded inside
+    // `fold_binary_ops` (reached from `parse_expr(0)` above), at every recursion
+    // depth, so a stray comma reaching here genuinely has no matching tail and is
+    // correctly rejected as a trailing-token error below.
+    //
     // Reject trailing tokens (e.g. `1 2` or `(a) b`).
     if let Some(tok) = p.peek() {
         return Err(ParseError::UnexpectedToken {
@@ -534,6 +603,78 @@ fn is_animelem_family(name: &str) -> bool {
     )
 }
 
+/// Returns whether `name` is the `TimeMod` trigger (case-insensitive), which
+/// accepts the two-argument `TimeMod = d, c` comma-tail form (Task A).
+///
+/// `TimeMod = d, c` means `(time % d) == c` — a modulo-of-time test, distinct
+/// from the `AnimElem` family's element-time semantics, so it gets its own node
+/// ([`Expr::TimeModTail`]) rather than (mis)using the AnimElem tail.
+fn is_timemod_trigger(name: &str) -> bool {
+    name.eq_ignore_ascii_case("timemod")
+}
+
+/// Returns whether `name` is the `HitDefAttr` trigger (case-insensitive), which
+/// accepts the two-argument `HitDefAttr = <standtype>, <attr-list>` comma-tail
+/// form (Task A).
+fn is_hitdefattr_trigger(name: &str) -> bool {
+    name.eq_ignore_ascii_case("hitdefattr")
+}
+
+/// Returns whether `name` is a projectile-info trigger that accepts the
+/// two-argument `<trigger><id> = value, op time` comma-tail form (Task A):
+/// `ProjContact<id>`, `ProjHit<id>`, `ProjGuarded<id>`, `ProjContactTime<id>`,
+/// `ProjHitTime<id>`, `ProjGuardedTime<id>` (case-insensitive).
+///
+/// These triggers are always written with a projectile-id suffix appended to the
+/// base name (`ProjContact2000`), so the match is a case-insensitive *prefix*
+/// test against the known projectile-trigger base names. Projectiles are not yet
+/// implemented, so the matched form parses (keeping a surrounding boolean alive)
+/// and evaluates to `0`.
+fn is_proj_trigger(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // Order longest-first so `projcontacttime` is preferred over `projcontact`.
+    const BASES: [&str; 6] = [
+        "projcontacttime",
+        "projguardedtime",
+        "projhittime",
+        "projcontact",
+        "projguarded",
+        "projhit",
+    ];
+    BASES.iter().any(|base| lower.starts_with(base))
+}
+
+/// Parses a bare attack-attribute token (`NA`, `SA`, `HA`, `NT`, …) from an
+/// expression, returning its upper-cased 2-char form, or [`None`] if `expr` is
+/// not a bare identifier that looks like a 2-char attribute code.
+///
+/// MUGEN attack codes are two letters: a power class `{N|S|H}` followed by a
+/// kind `{A|T|P}`. The check is lenient on the exact letters (the evaluator's
+/// `HitDef` comparison tolerates unknown codes as "no match") but requires a bare
+/// 2-char identifier so a malformed tail degrades cleanly rather than folding a
+/// nonsensical operand.
+fn attr_code_from_expr(expr: &Expr) -> Option<String> {
+    let Expr::Ident(name) = expr else {
+        return None;
+    };
+    if name.chars().count() != 2 || !name.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(name.to_ascii_uppercase())
+}
+
+/// Parses a bare stand-type token (`S`/`C`/`A`, case-insensitive) from an
+/// expression, returning its upper-cased single-letter form, or [`None`].
+fn standtype_from_expr(expr: &Expr) -> Option<String> {
+    let Expr::Ident(name) = expr else {
+        return None;
+    };
+    match name.to_ascii_uppercase().as_str() {
+        s @ ("S" | "C" | "A") => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 // Note on the two highest precedence levels: unary prefixes conceptually sit at
 // level 7 and the exponent `**` at level 8 (above every infix operator listed in
 // `binary_binding_power`). Both are handled structurally — unary in
@@ -650,11 +791,24 @@ impl RedirectKeyword {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// Suppression depth for the two-argument comma-tail folds (Task A). The
+    /// folds turn a top-level `<trigger> = <arg1> , <arg2…>` into a single node,
+    /// but a comma inside a *call argument list* (`cond(a, b, c)`) or a *range*
+    /// (`[1, 2]`) is a delimiter, not a trigger tail — so the fold must be
+    /// disabled while parsing those nested bounds. This is incremented around a
+    /// call-arg / range bound and decremented after, so a comma tail still folds
+    /// at the top level and inside boolean chains but never steals a call/range
+    /// separator. (A simple non-zero counter, since these contexts nest.)
+    suppress_comma_tail: u32,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            suppress_comma_tail: 0,
+        }
     }
 
     /// Returns the current token without consuming it.
@@ -711,27 +865,64 @@ impl<'a> Parser<'a> {
 
     /// Left-folds binary operators with binding power `>= min_bp` onto an
     /// already-parsed `lhs` (precedence climbing). This is the operator loop of
-    /// [`parse_expr`], factored out so the `AnimElem` comma-tail fold can resume
-    /// the loop with the folded tail as its left operand — letting a trailing
-    /// `&& …` / `|| …` bind the tail correctly instead of being stranded
-    /// (task 4.11, item c).
+    /// [`parse_expr`], factored out so the comma-tail folds (`AnimElem`,
+    /// `TimeMod`, `HitDefAttr`, `Proj*`) can resume the loop with the folded tail
+    /// as its left operand — letting a trailing `&& …` / `|| …` bind the tail
+    /// correctly instead of being stranded (task 4.11, item c).
+    ///
+    /// ## In-loop comma-tail folding (Task A)
+    ///
+    /// MUGEN's two-argument trigger forms — `TimeMod = d, c`, `AnimElem = N, op M`,
+    /// `HitDefAttr = S, NA`, `ProjContact<id> = v, op t` — are written
+    /// `<trigger> = <arg1> , <arg2…>`. The expression grammar has no notion of a
+    /// top-level comma, so after the leading `<trigger> = <arg1>` equality is
+    /// folded the loop stops at the `,`. Because a real `&&`/`||` chain can put one
+    /// of these forms *in the middle* (`var(30) = 59 && timemod = 2,1 && time > 2`),
+    /// the fold must run **at every recursion depth**, not just at the top level:
+    /// when the operator loop halts on a comma we try to fold the current `lhs`
+    /// (which is the just-built `<trigger> = <arg1>` equality) into the matching
+    /// comma-tail node, then resume the loop so the trailing `&& …` binds the
+    /// folded tail. A non-matching shape leaves the comma in place, so an unrelated
+    /// stray comma still surfaces as a recoverable trailing-token error upstream.
     fn fold_binary_ops(&mut self, mut lhs: Expr, min_bp: u8) -> Result<Expr, ParseError> {
-        while let Some(tok) = self.peek() {
-            let Some((bp, op)) = binary_binding_power(&tok.kind) else {
-                break;
-            };
-            if bp < min_bp {
-                break;
+        loop {
+            // First, drain the ordinary binary operators with bp >= min_bp.
+            while let Some(tok) = self.peek() {
+                let Some((bp, op)) = binary_binding_power(&tok.kind) else {
+                    break;
+                };
+                if bp < min_bp {
+                    break;
+                }
+                self.advance(); // consume the operator
+                // Left-associative: parse the RHS with a higher threshold so equal
+                // precedence binds to the left.
+                let rhs = self.parse_expr(bp + 1)?;
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
             }
-            self.advance(); // consume the operator
-            // Left-associative: parse the RHS with a higher threshold so equal
-            // precedence binds to the left.
-            let rhs = self.parse_expr(bp + 1)?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
+
+            // The operator loop halted. If it halted on a top-level comma — and we
+            // are NOT inside a call-arg list / range bound (where a comma is a
+            // delimiter, not a trigger tail) — the current `lhs` may be the
+            // `<trigger> = <arg1>` head of a two-argument trigger form; try to fold
+            // the comma tail. On a successful fold we loop again so a trailing
+            // `&& …` / `|| …` (or further commas in a multi-code `HitDefAttr`)
+            // binds the folded node.
+            if self.suppress_comma_tail == 0
+                && self.peek().map(|t| &t.kind) == Some(&TokenKind::Comma)
+            {
+                if let Some(folded) = self.try_fold_comma_tail(&lhs)? {
+                    lhs = folded;
+                    continue;
+                }
+            }
+
+            // Nothing more to fold at this level.
+            break;
         }
 
         Ok(lhs)
@@ -835,26 +1026,31 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Tries to fold an already-parsed `<AnimElem-family> = N` equality plus a
-    /// trailing `, [op] M` into an [`Expr::AnimElemTail`] (task 4.10, gap 2).
+    /// Tries to fold an already-parsed `<trigger> = <arg1>` equality plus a
+    /// trailing `, <arg2…>` into the matching two-argument trigger node
+    /// (`AnimElem`, `TimeMod`, `HitDefAttr`, or `Proj*`; Task A, generalizing
+    /// task 4.10's `AnimElem` tail).
     ///
-    /// The current token must be the top-level `,`. The supplied `expr` must be
-    /// an equality `Binary { op: Eq, lhs, rhs }` whose `lhs` names a member of
-    /// the `AnimElem` comparison-tail family (`AnimElem` or `AnimElemTime`; see
-    /// [`is_animelem_family`]); the `rhs` is the element number `N`. On a match this
-    /// consumes the comma and the tail (`[op] M`, where an omitted operator
-    /// defaults to `=`) and returns the folded node. On any non-match it returns
-    /// `Ok(None)` **without consuming** the comma, so the caller's
-    /// trailing-token check still rejects an unrelated stray comma (e.g.
-    /// `foo, bar`).
+    /// The current token must be the top-level `,`. The supplied `expr` must be an
+    /// equality `Binary { op: Eq, lhs, rhs }` whose `lhs` names one of the
+    /// comma-tail trigger families; otherwise this returns `Ok(None)` **without
+    /// consuming** the comma, so an unrelated stray comma still surfaces as a
+    /// recoverable trailing-token error upstream (e.g. a redirect `foo, bar`).
+    ///
+    /// On a family match it commits (consumes the comma and the family-specific
+    /// tail) and returns the folded node. Unlike the old single-family helper it
+    /// does **not** resume `fold_binary_ops` itself — its caller's operator loop
+    /// (in [`fold_binary_ops`]) does that — so the same fold works at any
+    /// recursion depth, letting a two-argument trigger appear in the middle of an
+    /// `&&` / `||` chain.
     ///
     /// # Errors
     ///
-    /// Returns a [`ParseError`] only when the comma *was* consumed (the shape
+    /// Returns a [`ParseError`] only when the comma *was* consumed (the family
     /// matched) but the tail is malformed — e.g. `AnimElem = 2,` with nothing
     /// after the comma. That keeps the never-panic / recoverable-error contract.
-    fn try_fold_animelem_tail(&mut self, expr: &Expr) -> Result<Option<Expr>, ParseError> {
-        // The leading clause must be `<family-trigger> = N`.
+    fn try_fold_comma_tail(&mut self, expr: &Expr) -> Result<Option<Expr>, ParseError> {
+        // The leading clause must be `<trigger> = <arg1>`.
         let Expr::Binary {
             op: BinaryOp::Eq,
             lhs,
@@ -866,12 +1062,38 @@ impl<'a> Parser<'a> {
         let Expr::Ident(name) = lhs.as_ref() else {
             return Ok(None);
         };
-        if !is_animelem_family(name) {
-            return Ok(None);
+
+        // Dispatch by family. Each helper assumes the current token is the comma
+        // and is responsible for consuming it (and the family-specific tail).
+        if is_animelem_family(name) {
+            return self.fold_animelem_tail(name, rhs).map(Some);
+        }
+        if is_timemod_trigger(name) {
+            return self.fold_timemod_tail(rhs).map(Some);
+        }
+        if is_hitdefattr_trigger(name) {
+            return self.fold_hitdefattr_tail(rhs).map(Some);
+        }
+        if is_proj_trigger(name) {
+            return self.fold_proj_tail(name, rhs).map(Some);
         }
 
+        // Not a two-argument trigger form: leave the comma for the caller.
+        Ok(None)
+    }
+
+    /// Consumes the top-level comma plus an optional comparison operator, then
+    /// parses one secondary operand bound as a *relational right-hand side*
+    /// (`RELATIONAL_BP + 1`).
+    ///
+    /// This is the shared tail-parser for the `op M` family forms (`AnimElem`,
+    /// `Proj*`): it absorbs additive (`+ -`) and tighter operators but STOPS
+    /// before relational, bitwise, `&&`, and `||`, so a trailing `&& …` / `|| …`
+    /// binds the folded node rather than being swallowed into the operand
+    /// (task 4.11, item c). An omitted operator defaults to [`BinaryOp::Eq`].
+    /// Assumes the current token is the comma.
+    fn parse_op_operand_tail(&mut self, what: &str) -> Result<(BinaryOp, Expr), ParseError> {
         // Commit: consume the top-level comma.
-        let comma_col = self.peek().map_or(0, |t| t.column);
         self.advance();
 
         // Optional comparison operator; an omitted operator means `=`.
@@ -879,7 +1101,7 @@ impl<'a> Parser<'a> {
             Some(kind) => relational_op(kind).unwrap_or(BinaryOp::Eq),
             None => {
                 return Err(ParseError::UnexpectedEof {
-                    expected: "a comparison operand after `,` in the AnimElem tail".to_string(),
+                    expected: format!("a comparison operand after `,` in the {what} tail"),
                 });
             }
         };
@@ -893,35 +1115,119 @@ impl<'a> Parser<'a> {
             self.advance();
         }
 
-        // The secondary operand `M` binds as a relational *right-hand side*, NOT
-        // a full expression: parse at `RELATIONAL_BP + 1` so it absorbs additive
-        // (`+ -`) and tighter operators but STOPS before relational, bitwise,
-        // `&&`, and `||`. This prevents `AnimElem = 2, >= 0 && Time > 0` from
-        // greedily swallowing `&& Time > 0` into the operand (task 4.11, item c).
         if self.is_at_end() {
             return Err(ParseError::UnexpectedEof {
-                expected: "a comparison operand after the AnimElem tail operator".to_string(),
+                expected: format!("a comparison operand after the {what} tail operator"),
             });
         }
-        // Guard against an immediate second comma (`AnimElem = 2,,`) producing a
-        // confusing error: parse_expr will report the comma as unexpected.
-        let _ = comma_col;
         let operand = self.parse_expr(RELATIONAL_BP + 1)?;
+        Ok((op, operand))
+    }
 
-        let tail = Expr::AnimElemTail {
-            name: name.clone(),
-            element: rhs.clone(),
+    /// Folds the `AnimElem = N, op M` tail into an [`Expr::AnimElemTail`]
+    /// (task 4.10, gap 2). Assumes the current token is the comma; `name` is the
+    /// family trigger as written and `element` is the leading `= N` operand.
+    fn fold_animelem_tail(&mut self, name: &str, element: &Expr) -> Result<Expr, ParseError> {
+        let (op, operand) = self.parse_op_operand_tail("AnimElem")?;
+        Ok(Expr::AnimElemTail {
+            name: name.to_string(),
+            element: Box::new(element.clone()),
             op,
             operand: Box::new(operand),
-        };
+        })
+    }
 
-        // Resume the binary left-fold with the tail as the left operand, so a
-        // trailing `&& …` / `|| …` binds the whole tail correctly:
-        // `AnimElem = 2, >= 0 && Time > 0` parses as `(AnimElem tail) && (Time>0)`,
-        // not by absorbing the `&&` into the operand (task 4.11, item c). With no
-        // trailing operator this is a no-op and returns the bare tail.
-        let folded = self.fold_binary_ops(tail, 0)?;
-        Ok(Some(folded))
+    /// Folds the `TimeMod = d, c` tail into an [`Expr::TimeModTail`] (Task A).
+    /// Assumes the current token is the comma; `divisor` is the leading `= d`
+    /// operand. The remainder `c` is parsed as a relational right-hand side so a
+    /// trailing `&& …` binds the whole tail (the operand itself is just `c`, with
+    /// no comparison operator — `TimeMod` has the fixed `==` semantics).
+    fn fold_timemod_tail(&mut self, divisor: &Expr) -> Result<Expr, ParseError> {
+        // Commit: consume the top-level comma.
+        self.advance();
+        if self.is_at_end() {
+            return Err(ParseError::UnexpectedEof {
+                expected: "a remainder operand after `,` in the TimeMod tail".to_string(),
+            });
+        }
+        // The remainder binds as a relational RHS (additive and tighter only), so
+        // `timemod = 2, 1 && time > 2` keeps `&& time > 2` out of the operand.
+        let remainder = self.parse_expr(RELATIONAL_BP + 1)?;
+        Ok(Expr::TimeModTail {
+            divisor: Box::new(divisor.clone()),
+            remainder: Box::new(remainder),
+        })
+    }
+
+    /// Folds the `HitDefAttr = <standtype>, <attr-list>` tail into an
+    /// [`Expr::HitDefAttrTail`] (Task A). Assumes the current token is the comma;
+    /// `standtype_expr` is the leading `= <standtype>` operand (a bare `S`/`C`/`A`
+    /// identifier). The tail is a comma-separated list of bare 2-char attack codes
+    /// (`NA`, `SA`, `HA`, …).
+    ///
+    /// On a malformed standtype or a non-code token in the list the fold declines
+    /// to a recoverable [`ParseError`] (after the comma was consumed) — keeping the
+    /// never-panic contract — rather than producing a wrong tree.
+    fn fold_hitdefattr_tail(&mut self, standtype_expr: &Expr) -> Result<Expr, ParseError> {
+        let column = self.peek().map_or(0, |t| t.column);
+        let Some(standtype) = standtype_from_expr(standtype_expr) else {
+            return Err(ParseError::UnexpectedToken {
+                token: ",".to_string(),
+                column,
+            });
+        };
+        // Commit: consume the top-level comma.
+        self.advance();
+
+        // At least one attack code must follow.
+        let mut attr_codes = Vec::new();
+        loop {
+            if self.is_at_end() {
+                return Err(ParseError::UnexpectedEof {
+                    expected: "an attack code (e.g. NA) in the HitDefAttr tail".to_string(),
+                });
+            }
+            // Each code is a bare 2-char identifier; parse it as a relational RHS
+            // (so the surrounding `&& …` is not swallowed) and re-validate it as a
+            // code rather than an arbitrary sub-expression.
+            let col = self.peek().map_or(0, |t| t.column);
+            let code_expr = self.parse_expr(RELATIONAL_BP + 1)?;
+            let Some(code) = attr_code_from_expr(&code_expr) else {
+                return Err(ParseError::UnexpectedToken {
+                    token: "HitDefAttr attack code".to_string(),
+                    column: col,
+                });
+            };
+            attr_codes.push(code);
+
+            // A further `, <code>` continues the list; anything else ends it (and
+            // is left for the caller's operator loop, e.g. a trailing `&& …`).
+            if self.peek().map(|t| &t.kind) == Some(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(Expr::HitDefAttrTail {
+            standtype,
+            attr_codes,
+        })
+    }
+
+    /// Folds the `Proj*<id> = value, op time` tail into an [`Expr::ProjTail`]
+    /// (Task A). Assumes the current token is the comma; `name` is the projectile
+    /// trigger as written (with its id suffix) and `value` is the leading `= value`
+    /// operand. Projectiles are unimplemented, so the node evaluates to `0`; the
+    /// fold exists purely so the form parses.
+    fn fold_proj_tail(&mut self, name: &str, value: &Expr) -> Result<Expr, ParseError> {
+        let (op, time) = self.parse_op_operand_tail("projectile")?;
+        Ok(Expr::ProjTail {
+            name: name.to_string(),
+            value: Box::new(value.clone()),
+            op,
+            time: Box::new(time),
+        })
     }
 
     /// Scans an `(id)` redirect index starting at `open` (which must index the
@@ -1050,6 +1356,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses one expression in a context where a comma is a **delimiter** —
+    /// a call argument or a range bound — with the two-argument comma-tail folds
+    /// (Task A) suppressed for its whole duration.
+    ///
+    /// Inside `cond(a, b, c)` or `[1, 2]` the comma separates operands; it must
+    /// never be mistaken for a `<trigger> = arg1, arg2` trigger tail. Bumping the
+    /// suppression counter around the sub-parse disables the fold here (and in any
+    /// nested sub-parse, e.g. a redirect body) while leaving it enabled at the top
+    /// level and inside boolean chains. The counter is always restored, even on an
+    /// error path.
+    fn parse_delimited_operand(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        self.suppress_comma_tail += 1;
+        let result = self.parse_expr(min_bp);
+        self.suppress_comma_tail -= 1;
+        result
+    }
+
     /// Parses the argument list of a call after the opening `(` has been
     /// consumed, up to and including the closing `)`. Handles zero args
     /// (`random`-style calls written `f()`).
@@ -1063,7 +1386,9 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            args.push(self.parse_expr(0)?);
+            // Each argument is comma-delimited: suppress the trigger comma-tail
+            // fold so an arg like `timemod = 2` does not swallow the `,` separator.
+            args.push(self.parse_delimited_operand(0)?);
             match self.peek().map(|t| &t.kind) {
                 Some(TokenKind::Comma) => {
                     self.advance(); // consume `,` and continue
@@ -1084,7 +1409,10 @@ impl<'a> Parser<'a> {
     /// The two are distinguished by whether a comma follows the first
     /// sub-expression.
     fn parse_paren_or_range(&mut self, lower_bound: Bound) -> Result<Expr, ParseError> {
-        let first = self.parse_expr(0)?;
+        // The first sub-expression is comma-delimited (a `,` here separates the
+        // two range bounds), so suppress the trigger comma-tail fold while parsing
+        // it; a plain `( expr )` grouping is unaffected (no comma follows).
+        let first = self.parse_delimited_operand(0)?;
         match self.peek().map(|t| &t.kind) {
             Some(TokenKind::Comma) => {
                 self.advance(); // consume `,`
@@ -1101,7 +1429,8 @@ impl<'a> Parser<'a> {
     /// Parses a range that opened with `[` (inclusive lower bound). The opening
     /// bracket has already been consumed.
     fn parse_range(&mut self, lower_bound: Bound) -> Result<Expr, ParseError> {
-        let lower = self.parse_expr(0)?;
+        // The lower bound is comma-delimited; suppress the comma-tail fold.
+        let lower = self.parse_delimited_operand(0)?;
         match self.peek().map(|t| &t.kind) {
             Some(TokenKind::Comma) => {
                 self.advance(); // consume `,`
@@ -1115,7 +1444,9 @@ impl<'a> Parser<'a> {
     /// been consumed: reads the upper bound and the closing delimiter, which
     /// determines the upper bound's inclusivity (`]` inclusive, `)` exclusive).
     fn finish_range(&mut self, lower_bound: Bound, lower: Expr) -> Result<Expr, ParseError> {
-        let upper = self.parse_expr(0)?;
+        // The upper bound closes with `]`/`)`, not a comma, but parse it delimited
+        // too for symmetry / defense against a malformed extra comma.
+        let upper = self.parse_delimited_operand(0)?;
         let upper_bound = match self.peek().map(|t| &t.kind) {
             Some(TokenKind::RBracket) => {
                 self.advance();
@@ -3303,13 +3634,20 @@ mod tests {
             Err(ParseError::UnexpectedToken { .. })
         ));
         // (c) When the family equality is buried inside a larger boolean on its
-        //     LEFT, the top-level expr is the `&&`, not a bare `<family> = N`
-        //     equality, so the fold declines and the stranded comma surfaces as a
-        //     recoverable trailing-token error (clean degrade, no wrong tree).
-        assert!(matches!(
-            parse_str("Time > 0 && AnimElem = 2, >= 0"),
-            Err(ParseError::UnexpectedToken { .. })
-        ));
+        //     LEFT, the comma tail now folds *in place* (Task A generalized the
+        //     fold to fire at every recursion depth, not just the top level), so
+        //     `Time > 0 && AnimElem = 2, >= 0` is `(Time > 0) && (AnimElem tail)`.
+        //     This is the behavior the real evilken/KFM `&&`-chains rely on.
+        match parse_str("Time > 0 && AnimElem = 2, >= 0").unwrap() {
+            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+                assert_eq!(*lhs, bin(BinaryOp::Gt, ident("Time"), int(0)));
+                assert!(
+                    matches!(*rhs, Expr::AnimElemTail { op: BinaryOp::Ge, ref operand, .. } if **operand == int(0)),
+                    "RHS should be the folded AnimElem tail, got {rhs:?}"
+                );
+            }
+            other => panic!("expected `(Time > 0) && (AnimElem tail)`, got {other:?}"),
+        }
     }
 
     // ---- Gap 3: dotted member args — multi-dot, composition ----
@@ -3500,23 +3838,27 @@ mod tests {
         }
     }
 
-    // ---- Item (c): parenthesized and left-side cases degrade cleanly ----
+    // ---- Item (c): parenthesized and mid-chain comma-tail folding ----
 
     #[test]
-    fn animelem_tail_left_side_equality_strands_comma_cleanly() {
-        // When the family equality is on the LEFT of a larger boolean, the
-        // top-level expr is the `&&`/`||`, not a bare `<family> = N`, so the fold
-        // declines and the stranded comma is a recoverable trailing-token error.
+    fn animelem_tail_mid_chain_equality_folds_in_place() {
+        // Task A: the comma-tail fold fires at every recursion depth, so an
+        // `AnimElem = N, op M` form on the RIGHT of an `&&`/`||` (the common
+        // real-content shape) now folds in place rather than stranding the comma.
+        // The RHS of each chain is the folded AnimElem tail.
         for src in [
             "Time > 0 && AnimElem = 2, >= 0",
             "1 || AnimElem = 2, >= 0",
             "AnimElem = 2 && AnimElem = 3, >= 0",
         ] {
-            let err = parse_str(src).unwrap_err();
-            assert!(
-                matches!(err, ParseError::UnexpectedToken { .. }),
-                "{src:?} should cleanly degrade, got {err:?}"
-            );
+            let parsed = parse_str(src).unwrap_or_else(|e| panic!("{src:?} should parse, got {e:?}"));
+            match parsed {
+                Expr::Binary { rhs, .. } => assert!(
+                    matches!(*rhs, Expr::AnimElemTail { .. }),
+                    "{src:?}: RHS should be the folded AnimElem tail, got {rhs:?}"
+                ),
+                other => panic!("{src:?}: expected a binary with a folded tail RHS, got {other:?}"),
+            }
         }
     }
 
@@ -3532,24 +3874,40 @@ mod tests {
         }
     }
 
-    // ---- Item (b): TimeMod / AnimElemNo are NOT comparison-tail (case-insensitive) ----
+    // ---- Item (b): TimeMod folds to its OWN node; AnimElemNo is NOT a tail ----
 
     #[test]
-    fn timemod_animelemno_excluded_from_family_all_casings() {
-        // The family exclusion is case-insensitive: every casing of TimeMod /
-        // AnimElemNo with a comma tail must degrade, never fold.
-        for src in [
-            "TimeMod = 2, >= 0",
-            "timemod = 2, >= 0",
-            "TIMEMOD = 2, 1",
-            "AnimElemNo = 2, >= 0",
-            "animelemno = 2, 1",
-            "ANIMELEMNO = 5, < 3",
+    fn timemod_comma_tail_folds_to_timemodtail_all_casings() {
+        // Task A: `TimeMod = d, c` is its own two-argument trigger (modulo-of-time
+        // semantics `(time % d) == c`), NOT an AnimElem tail. Every casing folds to
+        // a `TimeModTail` (never an `AnimElemTail`, which would be the wrong
+        // meaning). The remainder is a bare value (no comparison operator — that is
+        // fixed `==` for TimeMod), matching the real evilken forms `20,19` / `4, 3`.
+        for (src, d, c) in [
+            ("timemod = 20,19", 20, 19),
+            ("TimeMod = 4, 3", 4, 3),
+            ("TIMEMOD = 2,1", 2, 1),
         ] {
+            match parse_str(src).unwrap_or_else(|e| panic!("{src:?} should parse, got {e:?}")) {
+                Expr::TimeModTail { divisor, remainder } => {
+                    assert_eq!(*divisor, int(d), "{src:?} divisor");
+                    assert_eq!(*remainder, int(c), "{src:?} remainder");
+                }
+                other => panic!("{src:?} must fold to a TimeModTail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn animelemno_comma_tail_is_not_a_family_and_strands_cleanly() {
+        // `AnimElemNo` is the function-form `AnimElemNo(t)`, not a comma-tail
+        // trigger, so a comma tail still degrades to a recoverable error (never a
+        // wrong tree, never a panic) — case-insensitively.
+        for src in ["AnimElemNo = 2, >= 0", "animelemno = 2, 1", "ANIMELEMNO = 5, < 3"] {
             let err = parse_str(src).unwrap_err();
             assert!(
                 matches!(err, ParseError::UnexpectedToken { .. }),
-                "{src:?} must not fold into an AnimElemTail, got {err:?}"
+                "{src:?} must not fold into a tail node, got {err:?}"
             );
         }
     }
@@ -3593,5 +3951,177 @@ mod tests {
             parse_str("GetHitVar(1 + 1)").unwrap(),
             call("GetHitVar", vec![bin(BinaryOp::Add, int(1), int(1))])
         );
+    }
+
+    // =====================================================================
+    // Task A: the other two-argument trigger comma-tail forms (TimeMod,
+    // HitDefAttr, Proj*) — the evilken bad-expression set. These pin the EXACT
+    // failing forms the loader logged, plus the regression guards that call-arg
+    // and range commas are untouched.
+    // =====================================================================
+
+    /// Shorthand for the exact `Expr` shapes the new variants produce.
+    fn timemod(d: Expr, c: Expr) -> Expr {
+        Expr::TimeModTail {
+            divisor: Box::new(d),
+            remainder: Box::new(c),
+        }
+    }
+
+    #[test]
+    fn evilken_timemod_exact_failing_forms_parse() {
+        // The EXACT strings the loader logged as "unexpected token , -> const 0".
+        assert_eq!(parse_str("timemod = 20,19").unwrap(), timemod(int(20), int(19)));
+        assert_eq!(parse_str("TimeMod = 4, 3").unwrap(), timemod(int(4), int(3)));
+        // A bare `TimeMod = d` (no tail) is still an ordinary equality.
+        assert_eq!(
+            parse_str("TimeMod = 2").unwrap(),
+            bin(BinaryOp::Eq, ident("TimeMod"), int(2))
+        );
+    }
+
+    #[test]
+    fn evilken_compound_var_timemod_time_expression_parses() {
+        // The EXACT compound the loader logged failing at col 41: a `timemod = 2,1`
+        // form buried in the MIDDLE of an `&&` chain must fold in place so the whole
+        // boolean survives (this is the heart of Task A). Spot-check that the
+        // `TimeModTail` is one conjunct and `time > 2` is the trailing conjunct.
+        let parsed = parse_str("Var(30) = 59 && p2life > 0 && timemod = 2,1 && time > 2")
+            .expect("compound evilken expression must parse");
+        // Left-associative `&&`: top is `(((var=59) && (p2life>0)) && timemodtail) && (time>2)`.
+        match parsed {
+            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+                assert_eq!(*rhs, bin(BinaryOp::Gt, ident("time"), int(2)), "last conjunct is time > 2");
+                // The third conjunct (the RHS of the inner `&&`) is the TimeModTail.
+                match *lhs {
+                    Expr::Binary { op: BinaryOp::And, rhs: inner_rhs, .. } => {
+                        assert_eq!(*inner_rhs, timemod(int(2), int(1)), "third conjunct is the TimeMod tail");
+                    }
+                    other => panic!("expected nested `&&` chain, got {other:?}"),
+                }
+            }
+            other => panic!("expected a top-level `&&` chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evilken_hitdefattr_exact_failing_form_parses() {
+        // The EXACT string the loader logged failing at col 14: `hitdefattr = C, NA
+        // && movecontact`. It must parse as `(HitDefAttrTail) && (movecontact)`, so
+        // the special-cancel gate survives instead of collapsing to const 0.
+        match parse_str("hitdefattr = C, NA && movecontact").unwrap() {
+            Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
+                assert_eq!(
+                    *lhs,
+                    Expr::HitDefAttrTail {
+                        standtype: "C".to_string(),
+                        attr_codes: vec!["NA".to_string()],
+                    }
+                );
+                assert_eq!(*rhs, ident("movecontact"));
+            }
+            other => panic!("expected `(HitDefAttr tail) && movecontact`, got {other:?}"),
+        }
+        // A multi-code list folds every code, upper-cased.
+        assert_eq!(
+            parse_str("HitDefAttr = S, NA, SA, HA").unwrap(),
+            Expr::HitDefAttrTail {
+                standtype: "S".to_string(),
+                attr_codes: vec!["NA".into(), "SA".into(), "HA".into()],
+            }
+        );
+        // A bare `HitDefAttr = S` (no tail) stays an ordinary equality.
+        assert_eq!(
+            parse_str("HitDefAttr = S").unwrap(),
+            bin(BinaryOp::Eq, ident("HitDefAttr"), ident("S"))
+        );
+    }
+
+    #[test]
+    fn evilken_projcontact_exact_failing_form_parses() {
+        // The EXACT string the loader logged failing at col 19: `projcontact2000 =
+        // 1, < 20`. It must parse (eval is `0` — projectiles unimplemented).
+        match parse_str("projcontact2000 = 1, < 20").unwrap() {
+            Expr::ProjTail { name, value, op, time } => {
+                assert_eq!(name, "projcontact2000");
+                assert_eq!(*value, int(1));
+                assert_eq!(op, BinaryOp::Lt);
+                assert_eq!(*time, int(20));
+            }
+            other => panic!("expected a ProjTail, got {other:?}"),
+        }
+        // The other projectile-info bases also fold (with their id suffix).
+        for src in [
+            "ProjHit1000 = 1, > 5",
+            "ProjGuarded2 = 1, <= 3",
+            "ProjContactTime0 = 1, = 0",
+        ] {
+            assert!(
+                matches!(parse_str(src), Ok(Expr::ProjTail { .. })),
+                "{src:?} should fold to a ProjTail"
+            );
+        }
+        // A bare `ProjContact2000 = 1` (no tail) stays an ordinary equality.
+        assert_eq!(
+            parse_str("projcontact2000 = 1").unwrap(),
+            bin(BinaryOp::Eq, ident("projcontact2000"), int(1))
+        );
+    }
+
+    #[test]
+    fn task_a_comma_tails_do_not_break_call_or_range_commas() {
+        // REGRESSION GUARD: the new comma-tail folds must NOT steal a call-argument
+        // or range separator. A `timemod = 2` / `hitdefattr` inside a call arg
+        // keeps the outer commas as separators.
+        assert_eq!(
+            parse_str("cond(timemod = 2, 1, 0)").unwrap(),
+            call(
+                "cond",
+                vec![
+                    bin(BinaryOp::Eq, ident("timemod"), int(2)),
+                    int(1),
+                    int(0),
+                ],
+            )
+        );
+        // Plain three-arg call is unaffected.
+        assert_eq!(
+            parse_str("cond(a, b, c)").unwrap(),
+            call("cond", vec![ident("a"), ident("b"), ident("c")])
+        );
+        // Range commas are untouched: `timemod = [1,2]` is an ordinary equality
+        // against an inclusive range (the comma is the range separator).
+        assert_eq!(
+            parse_str("timemod = [1,2]").unwrap(),
+            bin(
+                BinaryOp::Eq,
+                ident("timemod"),
+                range(Bound::Inclusive, int(1), int(2), Bound::Inclusive),
+            )
+        );
+        // A redirect-separator comma is still a redirect, not a TimeMod tail.
+        assert_eq!(
+            parse_str("enemy, life").unwrap(),
+            redirected(Redirect::Enemy, ident("life"))
+        );
+    }
+
+    #[test]
+    fn task_a_malformed_tails_are_recoverable_errors_never_panic() {
+        // Each family's malformed tail degrades to a recoverable error (the comma
+        // was committed but the tail is bad), never a panic.
+        for src in [
+            "timemod = 2,",          // TimeMod: nothing after the comma
+            "hitdefattr = X, NA",    // HitDefAttr: bad standtype (X)
+            "hitdefattr = C,",       // HitDefAttr: no code
+            "hitdefattr = C, 5",     // HitDefAttr: non-code token
+            "projcontact1 = 1,",     // Proj*: nothing after the comma
+        ] {
+            assert!(
+                parse_str(src).is_err(),
+                "{src:?} should be a recoverable error, not Ok"
+            );
+            // And tokenizing/parsing never panics (implicitly: we reached here).
+        }
     }
 }

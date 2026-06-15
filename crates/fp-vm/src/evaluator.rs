@@ -391,7 +391,64 @@ fn eval_inner(expr: &Expr, ctx: &dyn EvalContext) -> Eval {
             op,
             operand,
         } => eval_animelem_tail(name, element, *op, operand, ctx),
+        Expr::TimeModTail { divisor, remainder } => {
+            eval_timemod_tail(divisor, remainder, ctx)
+        }
+        Expr::HitDefAttrTail {
+            standtype,
+            attr_codes,
+        } => eval_hitdefattr_tail(standtype, attr_codes, ctx),
+        // Projectiles are unimplemented; the parsed two-argument projectile-info
+        // form (Task A) exists only so the surrounding boolean survives. It always
+        // reports "no projectiles" → `0`, so it never fires a trigger.
+        Expr::ProjTail { .. } => Eval::Int(0),
     }
+}
+
+/// Evaluates the two-argument `TimeMod = d, c` form (Task A).
+///
+/// MUGEN semantics: true iff `(Time % d) == c`, where `Time` is the state-time.
+/// The evaluator reads `Time` once via [`EvalContext::trigger`] and computes the
+/// modulo in integer arithmetic. A zero (or bottom) divisor makes the modulo
+/// undefined; per the engine-wide "bad expression → never fires" rule this yields
+/// `0` rather than panicking. Both operands narrow to int (MUGEN's `Time` and the
+/// modulo operands are integers).
+fn eval_timemod_tail(divisor: &Expr, remainder: &Expr, ctx: &dyn EvalContext) -> Eval {
+    let d = eval_inner(divisor, ctx);
+    let c = eval_inner(remainder, ctx);
+    if Eval::either_bottom(d, c) {
+        return Eval::Bottom;
+    }
+    let d = d.to_int();
+    let c = c.to_int();
+    if d == 0 {
+        // Modulo by zero is undefined → the trigger never fires (safe default).
+        return Eval::Int(0);
+    }
+    let time = Eval::from_value(ctx.trigger("Time", &[])).to_int();
+    // MUGEN's `%` is the C-style remainder (`rem`), which `i32::rem_euclid` does
+    // not match for negative `time`; `time` is non-negative in practice (a state
+    // clock), and the wrapping rem guards the lone `i32::MIN % -1` overflow case.
+    let modulo = time.wrapping_rem(d);
+    Eval::Int(i32::from(modulo == c))
+}
+
+/// Evaluates the two-argument `HitDefAttr = <standtype>, <attr-list>` form
+/// (Task A).
+///
+/// MUGEN semantics: true iff the character's currently-active `HitDef` has a
+/// stand-type matching `standtype` (`S`/`C`/`A`) **and** an attack-attribute
+/// 2-char code present in `attr_codes`. The decision is delegated to the
+/// [`EvalContext::hitdef_attr_matches`] seam, which a concrete entity answers
+/// against its active `HitDef`. With no `HitDef` active (or on a context that
+/// does not model one — the default seam) the match is `false`, so the form
+/// evaluates to `0` and the surrounding `&& movecontact` simply does not fire.
+fn eval_hitdefattr_tail(
+    standtype: &str,
+    attr_codes: &[String],
+    ctx: &dyn EvalContext,
+) -> Eval {
+    Eval::Int(i32::from(ctx.hitdef_attr_matches(standtype, attr_codes)))
 }
 
 /// Evaluates the two-parameter `AnimElem = N, op M` comparison form (task 4.10,
@@ -3272,18 +3329,23 @@ mod tests {
     }
 
     #[test]
-    fn animelem_tail_after_redirect_is_unsupported_documented_limitation() {
-        // KNOWN LIMITATION (reported to Forge): the comma-tail fold is top-level
-        // only and does NOT compose with a redirect prefix. `enemy, AnimElem = 2,
-        // >= 0` fails to parse — the redirect eats the first comma, leaving the
-        // tail's comma stranded with a `Redirected` (not a bare equality) as the
-        // top-level expr, so the fold never fires. This is a recoverable parse
-        // error (never a panic) and does not occur in the real fixtures, but is
-        // pinned so the limitation is explicit.
-        assert!(matches!(
-            parse_str("enemy, AnimElem = 2, >= 0"),
-            Err(ParseError::UnexpectedToken { .. })
-        ));
+    fn animelem_tail_after_redirect_now_composes() {
+        // Task A generalized the comma-tail fold to run at every recursion depth,
+        // including inside a redirect body. `enemy, AnimElem = 2, >= 0` now parses:
+        // the redirect eats the first comma and its body `AnimElem = 2, >= 0` folds
+        // into an AnimElemTail (the previously-documented limitation is lifted).
+        match parse_str("enemy, AnimElem = 2, >= 0")
+            .expect("redirected AnimElem tail should now parse")
+        {
+            Expr::Redirected { target, expr } => {
+                assert_eq!(target, Redirect::Enemy);
+                assert!(
+                    matches!(*expr, Expr::AnimElemTail { .. }),
+                    "redirect body should be the folded AnimElem tail, got {expr:?}"
+                );
+            }
+            other => panic!("expected a redirected AnimElem tail, got {other:?}"),
+        }
         // The non-redirected tail still evaluates correctly against a context.
         let ctx = MockContext::new()
             .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0));
@@ -3534,18 +3596,29 @@ mod tests {
     }
 
     #[test]
-    fn timemod_comma_tail_is_recoverable_error_not_wrong_eval() {
-        // The crux of item (b): `TimeMod = 2, op M` must NOT fold into an
-        // AnimElemTail (which would give it AnimElemTime semantics). It is a
-        // recoverable parse error, so it can never be evaluated with the wrong
-        // meaning. Confirm via the public parse API (eval is unreachable for it).
-        for src in ["TimeMod = 2, >= 0", "timemod = 4, 1", "AnimElemNo = 2, >= 0"] {
-            let err = parse_str(src).unwrap_err();
-            assert!(
-                matches!(err, ParseError::UnexpectedToken { .. }),
-                "{src:?} must degrade to a recoverable error, got {err:?}"
-            );
-        }
+    fn timemod_comma_tail_evaluates_modulo_of_time_not_animelem() {
+        // Task A: `TimeMod = d, c` is now its own node with the correct
+        // modulo-of-time meaning `(Time % d) == c` — it must NOT carry AnimElemTime
+        // semantics. Seed `Time` and confirm the modulo decides the result, with
+        // `animelemtime` seeded as a decoy that the TimeMod path must ignore.
+        // `timemod = 20, 19`: true exactly when Time % 20 == 19.
+        let yes = MockContext::new()
+            .with_trigger("Time", &[], Value::Int(39)) // 39 % 20 == 19
+            .with_trigger("animelemtime", &[Value::Int(20)], Value::Int(0)); // decoy
+        assert_eq!(ev("TimeMod = 20, 19", &yes), Value::Int(1));
+        let no = MockContext::new().with_trigger("Time", &[], Value::Int(38)); // 38 % 20 == 18
+        assert_eq!(ev("TimeMod = 20, 19", &no), Value::Int(0));
+        // `TimeMod = 4, 3` (the spaced evilken form) at Time 7 → 7 % 4 == 3 → true.
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(7));
+        assert_eq!(ev("TimeMod = 4, 3", &ctx), Value::Int(1));
+        // A zero divisor never fires (safe default, no panic).
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(7));
+        assert_eq!(ev("TimeMod = 0, 0", &ctx), Value::Int(0));
+        // `AnimElemNo` is still NOT a comma-tail family → recoverable parse error.
+        assert!(matches!(
+            parse_str("AnimElemNo = 2, >= 0").unwrap_err(),
+            ParseError::UnexpectedToken { .. }
+        ));
     }
 
     // ---- Item (c): AnimElem tail binds at relational precedence (eval-path) ----
@@ -3627,5 +3700,119 @@ mod tests {
             .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0))
             .with_trigger("Time", &[], Value::Int(3));
         assert_eq!(ev("AnimElem = 2, >= 0 && Time > 0", &ctx), Value::Int(1));
+    }
+
+    // =====================================================================
+    // Task A: TimeMod / HitDefAttr / Proj* two-argument trigger eval. These
+    // pin the evaluation of the new comma-tail nodes for the evilken forms.
+    // =====================================================================
+
+    #[test]
+    fn timemod_tail_evaluates_time_modulo_remainder() {
+        // `timemod = 20, 19` is true exactly when `Time % 20 == 19`.
+        for (time, expect) in [(19, 1), (39, 1), (59, 1), (18, 0), (20, 0), (0, 0)] {
+            let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(time));
+            assert_eq!(
+                ev("timemod = 20, 19", &ctx),
+                Value::Int(expect),
+                "Time={time}"
+            );
+        }
+        // The spaced evilken form `TimeMod = 4, 3`.
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(7));
+        assert_eq!(ev("TimeMod = 4, 3", &ctx), Value::Int(1)); // 7 % 4 == 3
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(6));
+        assert_eq!(ev("TimeMod = 4, 3", &ctx), Value::Int(0)); // 6 % 4 == 2
+    }
+
+    #[test]
+    fn timemod_tail_zero_divisor_never_fires_no_panic() {
+        // A zero divisor is modulo-by-zero → the trigger never fires (safe default),
+        // and crucially does not panic.
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(5));
+        assert_eq!(ev("timemod = 0, 0", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn timemod_tail_default_context_is_zero_remainder() {
+        // With no Time seeded the context reads 0, so `timemod = d, 0` fires
+        // (0 % d == 0) and `timemod = d, 1` does not. Concrete, panic-free.
+        let ctx = MockContext::new();
+        assert_eq!(ev("timemod = 9, 0", &ctx), Value::Int(1));
+        assert_eq!(ev("timemod = 9, 8", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn compound_var_timemod_time_expression_evaluates_via_timemod_gate() {
+        // The full evilken compound: only the TimeMod conjunct varies here. With the
+        // other conjuncts satisfied, the expression fires iff `Time % 2 == 1`.
+        let base = |time: i32| {
+            MockContext::new()
+                // `var(30)` routes through the typed `var` bank, not `trigger`.
+                .with_var(30, 59)
+                .with_trigger("p2life", &[], Value::Int(100))
+                .with_trigger("Time", &[], Value::Int(time))
+        };
+        let src = "Var(30) = 59 && p2life > 0 && timemod = 2,1 && time > 2";
+        // Time=5: var ok, p2life>0, 5%2==1 ok, 5>2 ok → fires.
+        assert_eq!(ev(src, &base(5)), Value::Int(1));
+        // Time=4: 4%2==0 != 1 → the TimeMod gate blocks it → 0.
+        assert_eq!(ev(src, &base(4)), Value::Int(0));
+        // Time=1: TimeMod ok (1%2==1) but `time > 2` fails → 0.
+        assert_eq!(ev(src, &base(1)), Value::Int(0));
+    }
+
+    /// A context that reports a `HitDefAttr` match for a fixed standtype + code,
+    /// to exercise the `hitdef_attr_matches` seam from the evaluator.
+    struct HitDefCtx {
+        standtype: &'static str,
+        code: &'static str,
+    }
+    impl EvalContext for HitDefCtx {
+        fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+            Value::DEFAULT
+        }
+        fn hitdef_attr_matches(&self, standtype: &str, attr_codes: &[String]) -> bool {
+            standtype.eq_ignore_ascii_case(self.standtype)
+                && attr_codes.iter().any(|c| c.eq_ignore_ascii_case(self.code))
+        }
+    }
+
+    #[test]
+    fn hitdefattr_tail_routes_through_seam_and_composes_with_and() {
+        // `hitdefattr = C, NA && movecontact`: the HitDefAttr tail routes through
+        // the `hitdef_attr_matches` seam, and the `&& movecontact` survives.
+        let ctx = HitDefCtx { standtype: "C", code: "NA" };
+        // The seam matches → tail is 1; `movecontact` is unseeded (0) so the AND is
+        // 0 — but the point is it EVALUATES rather than collapsing to const 0.
+        assert_eq!(ev("hitdefattr = C, NA && movecontact", &ctx), Value::Int(0));
+        // The bare tail is 1 (the seam matches C, NA).
+        assert_eq!(ev("hitdefattr = C, NA", &ctx), Value::Int(1));
+        // A different standtype / code does not match → 0.
+        assert_eq!(ev("hitdefattr = S, NA", &ctx), Value::Int(0));
+        assert_eq!(ev("hitdefattr = C, SA", &ctx), Value::Int(0));
+        // A multi-code list fires if ANY code matches.
+        assert_eq!(ev("hitdefattr = C, SA, NA", &ctx), Value::Int(1));
+    }
+
+    #[test]
+    fn hitdefattr_tail_default_context_is_zero_no_panic() {
+        // The default `hitdef_attr_matches` (no HitDef modeled) is false, so the
+        // tail is 0 and the surrounding boolean simply does not fire — never panics.
+        let ctx = MockContext::new();
+        assert_eq!(ev("hitdefattr = C, NA", &ctx), Value::Int(0));
+        assert_eq!(ev("hitdefattr = C, NA && movecontact", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn proj_tail_always_zero_projectiles_unimplemented() {
+        // The projectile-info tail parses but always evaluates to 0 (projectiles
+        // are unimplemented), so it never fires and never panics.
+        let ctx = MockContext::new();
+        assert_eq!(ev("projcontact2000 = 1, < 20", &ctx), Value::Int(0));
+        assert_eq!(ev("ProjHit1000 = 1, > 5", &ctx), Value::Int(0));
+        // It still composes in a boolean without collapsing the whole expression.
+        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(5));
+        assert_eq!(ev("projcontact2000 = 1, < 20 || time > 2", &ctx), Value::Int(1));
     }
 }

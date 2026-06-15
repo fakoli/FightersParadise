@@ -381,6 +381,23 @@ fn render(expr: &Expr) -> String {
         } => {
             format!("{name} = {}, {op} {}", render(element), render(operand))
         }
+        Expr::TimeModTail { divisor, remainder } => {
+            format!("TimeMod = {}, {}", render(divisor), render(remainder))
+        }
+        Expr::HitDefAttrTail {
+            standtype,
+            attr_codes,
+        } => {
+            format!("HitDefAttr = {standtype}, {}", attr_codes.join(", "))
+        }
+        Expr::ProjTail {
+            name,
+            value,
+            op,
+            time,
+        } => {
+            format!("{name} = {}, {op} {}", render(value), render(time))
+        }
     }
 }
 

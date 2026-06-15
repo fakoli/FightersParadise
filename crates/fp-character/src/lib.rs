@@ -2026,6 +2026,56 @@ impl Character {
         Some(code)
     }
 
+    /// Tests an attack attribute against a parsed `HitDefAttr = <standtype>,
+    /// <attr-list>` query (Task A).
+    ///
+    /// Returns `true` iff `attr`'s state-class matches `standtype` (`"S"`/`"C"`/
+    /// `"A"`, case-insensitive) **and** its 2-char attack code (power + kind, e.g.
+    /// `"NA"`) equals one of `attr_codes` (case-insensitive). `attr_codes` is
+    /// already upper-cased by the parser, but the comparison is made
+    /// case-insensitively for robustness. An empty / malformed standtype or an
+    /// empty code list yields `false` (never a panic), matching the
+    /// "bad expression → never fires" rule.
+    fn attack_attr_matches(
+        attr: &fp_combat::AttackAttr,
+        standtype: &str,
+        attr_codes: &[String],
+    ) -> bool {
+        // Stand-type letter of the attacker's class.
+        let class_letter = match attr.class {
+            fp_combat::StateClass::Standing => "S",
+            fp_combat::StateClass::Crouching => "C",
+            fp_combat::StateClass::Air => "A",
+        };
+        if !class_letter.eq_ignore_ascii_case(standtype) {
+            return false;
+        }
+
+        // The 2-char attack code: power class {N|S|H} + kind {A|T|P}.
+        let power = match attr.power {
+            fp_combat::AttackPower::Normal => 'N',
+            fp_combat::AttackPower::Special => 'S',
+            fp_combat::AttackPower::Hyper => 'H',
+        };
+        let kind = match attr.kind {
+            fp_combat::AttackKind::Attack => 'A',
+            fp_combat::AttackKind::Throw => 'T',
+            fp_combat::AttackKind::Projectile => 'P',
+        };
+        let code = [power, kind];
+
+        attr_codes.iter().any(|wanted| {
+            let mut wc = wanted.chars();
+            match (wc.next(), wc.next(), wc.next()) {
+                // Exactly two chars, compared case-insensitively.
+                (Some(a), Some(b), None) => {
+                    a.eq_ignore_ascii_case(&code[0]) && b.eq_ignore_ascii_case(&code[1])
+                }
+                _ => false,
+            }
+        })
+    }
+
     /// Resolves the `Pos`/`Vel` component for an axis-coded argument.
     ///
     /// The evaluator encodes the axis suffix as `X = 0`, `Y = 1`; any other code
@@ -2507,6 +2557,18 @@ impl EvalContext for Character {
         self.draw_random()
     }
 
+    fn hitdef_attr_matches(&self, standtype: &str, attr_codes: &[String]) -> bool {
+        // The `HitDefAttr = <standtype>, <attr-list>` seam (Task A): test this
+        // character's currently-active HitDef against the requested stand-type and
+        // attack-code list. With no HitDef active the answer is `false` (the
+        // trigger never fires), which is correct — `HitDefAttr` is only meaningful
+        // while an attack is in flight.
+        match &self.active_hitdef {
+            Some(hd) => Self::attack_attr_matches(&hd.attr, standtype, attr_codes),
+            None => false,
+        }
+    }
+
     fn redirect(&self, _target: fp_vm::Redirect) -> Option<&dyn EvalContext> {
         // A bare `Character` is a *self-only* evaluation context with no view of
         // its relations, so every redirect resolves to `None` here. The
@@ -2959,6 +3021,12 @@ impl EvalContext for EvalCtx<'_> {
         self.me.random()
     }
 
+    fn hitdef_attr_matches(&self, standtype: &str, attr_codes: &[String]) -> bool {
+        // `HitDefAttr` reads the *self* character's active HitDef, so it delegates
+        // to the wrapped character's impl (no opponent/stage view needed).
+        self.me.hitdef_attr_matches(standtype, attr_codes)
+    }
+
     fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
         match target {
             // The opposing player. In standard 1-v-1 play `p2`, `enemy`, and the
@@ -3396,6 +3464,42 @@ mod tests {
         // Every GetHitVar member reads its no-hit default through the seam.
         assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(0));
         assert_eq!(ch.trigger_str("GetHitVar", "chainid"), Value::Int(-1));
+    }
+
+    #[test]
+    fn hitdefattr_trigger_matches_active_hitdef_attribute() {
+        // Task A: `HitDefAttr = <standtype>, <attr-list>` reads the character's
+        // active HitDef attribute through the `hitdef_attr_matches` seam, end to
+        // end via the VM (parse → eval against the Character context).
+
+        // No active HitDef → the trigger never fires (it's only meaningful in-move).
+        let ch = Character::new();
+        assert_eq!(ev("hitdefattr = C, NA && movecontact", &ch), Value::Int(0));
+        assert_eq!(ev("hitdefattr = C, NA", &ch), Value::Int(0));
+
+        // Give the character an active `C, NA` HitDef (the exact evilken form).
+        let mut ch = Character::new();
+        ch.active_hitdef = Some(fp_combat::HitDef {
+            attr: fp_combat::AttackAttr::parse("C, NA"),
+            ..Default::default()
+        });
+        assert_eq!(ev("hitdefattr = C, NA", &ch), Value::Int(1));
+        // Case-insensitive standtype + code.
+        assert_eq!(ev("hitdefattr = c, na", &ch), Value::Int(1));
+        // A multi-code list fires if ANY code matches.
+        assert_eq!(ev("hitdefattr = C, SA, NA", &ch), Value::Int(1));
+        // A different standtype or code does not match.
+        assert_eq!(ev("hitdefattr = S, NA", &ch), Value::Int(0));
+        assert_eq!(ev("hitdefattr = C, SA", &ch), Value::Int(0));
+
+        // A `S, SP` (standing special projectile) HitDef matches only S, SP.
+        let mut ch = Character::new();
+        ch.active_hitdef = Some(fp_combat::HitDef {
+            attr: fp_combat::AttackAttr::parse("S, SP"),
+            ..Default::default()
+        });
+        assert_eq!(ev("hitdefattr = S, SP", &ch), Value::Int(1));
+        assert_eq!(ev("hitdefattr = S, NA", &ch), Value::Int(0));
     }
 
     #[test]
