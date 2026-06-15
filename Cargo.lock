@@ -445,6 +445,7 @@ dependencies = [
  "fp-physics",
  "fp-render",
  "fp-stage",
+ "fp-storyboard",
  "fp-ui",
  "fp-vm",
  "pollster",

@@ -16,6 +16,7 @@ fp-input.workspace = true
 fp-physics.workspace = true
 fp-render.workspace = true
 fp-stage.workspace = true
+fp-storyboard.workspace = true
 fp-ui.workspace = true
 sdl2.workspace = true
 wgpu.workspace = true
