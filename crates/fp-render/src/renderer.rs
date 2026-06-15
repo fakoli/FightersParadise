@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 
 use crate::params::{BlendMode, SpriteDrawParams};
 use crate::text::{GlyphFont, TextDrawParams};
-use crate::texture::{PaletteTexture, SpriteTexture};
+use crate::texture::{ImageTexture, PaletteTexture, SpriteTexture};
 use crate::vertex::{DebugVertex, SpriteVertex};
 
 /// Quad index data: two triangles forming a rectangle.
@@ -115,8 +115,13 @@ pub struct Renderer {
     pipeline_additive: wgpu::RenderPipeline,
     pipeline_subtractive: wgpu::RenderPipeline,
     pipeline_debug: wgpu::RenderPipeline,
+    /// Full-color RGBA image pipeline (stage backgrounds); see
+    /// [`RenderFrame::draw_image`].
+    pipeline_image: wgpu::RenderPipeline,
     _uniform_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind-group layout for the RGBA image pipeline (texture + sampler only).
+    image_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
@@ -354,6 +359,51 @@ impl Renderer {
             "sprite_pipeline_subtractive",
         );
 
+        // --- Full-color RGBA image pipeline (stage backgrounds) ---
+        // Shares the projection uniform (group 0) and the `SpriteVertex` layout
+        // (so it reuses the bump-allocated vertex buffer), but binds a plain RGBA
+        // texture + sampler (group 1) and samples it directly — no palette.
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("image_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/image.wgsl").into()),
+        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("image_pipeline_layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout, &image_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline_image = create_pipeline(
+            &device,
+            &image_pipeline_layout,
+            &image_shader,
+            surface_format,
+            wgpu::BlendState::ALPHA_BLENDING,
+            "image_pipeline",
+        );
+
         // --- Debug overlay pipeline (unlit colored triangles) ---
         // Shares the projection uniform (group 0) but uses no textures, so it
         // gets its own pipeline layout and a separate WGSL shader.
@@ -462,8 +512,10 @@ impl Renderer {
             pipeline_additive,
             pipeline_subtractive,
             pipeline_debug,
+            pipeline_image,
             _uniform_bind_group_layout: uniform_bind_group_layout,
             texture_bind_group_layout,
+            image_bind_group_layout,
             uniform_buffer,
             uniform_bind_group,
             vertex_buffer,
@@ -727,6 +779,78 @@ impl RenderFrame<'_> {
             // untouched.
             pass.draw_indexed(0..6, base_vertex as i32, 0..1);
         }
+    }
+
+    /// Draw a full-color RGBA image as a quad at `(x, y)` sized `w × h` screen
+    /// pixels (e.g. a stage background scaled to fill the window). Samples the
+    /// texture directly with linear filtering — no palette, no PalFX, no flip.
+    ///
+    /// Drawn opaque (`alpha = 1.0`) via the dedicated image pipeline; call this
+    /// **before** the sprites so they layer on top. Like every textured quad it
+    /// bump-allocates a vertex slot, so it coexists with sprites/glyphs in the
+    /// same frame (and is dropped past the per-frame quad cap, with a debug log).
+    pub fn draw_image(&mut self, image: &ImageTexture, x: f32, y: f32, w: f32, h: f32) {
+        let vertices = [
+            SpriteVertex { position: [x, y], uv: [0.0, 0.0], alpha: 1.0 },
+            SpriteVertex { position: [x + w, y], uv: [1.0, 0.0], alpha: 1.0 },
+            SpriteVertex { position: [x + w, y + h], uv: [1.0, 1.0], alpha: 1.0 },
+            SpriteVertex { position: [x, y + h], uv: [0.0, 1.0], alpha: 1.0 },
+        ];
+        let quad = self.sprite_quad_count;
+        if quad >= MAX_SPRITE_QUADS {
+            tracing::debug!("sprite quad cap {MAX_SPRITE_QUADS} reached this frame; dropping image");
+            return;
+        }
+        let vertex_stride = std::mem::size_of::<SpriteVertex>() as u64;
+        let base_vertex = (quad * 4) as u64;
+        self.renderer.queue.write_buffer(
+            &self.renderer.vertex_buffer,
+            base_vertex * vertex_stride,
+            bytemuck::cast_slice(&vertices),
+        );
+        self.sprite_quad_count += 1;
+
+        let image_bind_group = self
+            .renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image_bind_group"),
+                layout: &self.renderer.image_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&image.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&image.sampler),
+                    },
+                ],
+            });
+
+        let mut pass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("image_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.renderer.pipeline_image);
+        pass.set_bind_group(0, &self.renderer.uniform_bind_group, &[]);
+        pass.set_bind_group(1, &image_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.renderer.vertex_buffer.slice(..));
+        pass.set_index_buffer(
+            self.renderer.index_buffer.slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        pass.draw_indexed(0..6, base_vertex as i32, 0..1);
     }
 
     /// Draw a string with a bitmap font at the origin in `params`.

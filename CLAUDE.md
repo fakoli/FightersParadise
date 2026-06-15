@@ -209,6 +209,12 @@ MUGEN community content is messy. Parsers and the evaluator must:
   `stcommon` reference resolves to a missing file (e.g. evilken's `stcommon = common1.cns`); a character
   that bundles its own common1 (KFM) is unaffected. `.cns` is not globally gitignored, so it is tracked
   directly.
+  One **original image** asset ships under `assets/stages/`: `assets/stages/dojo/bg.png` (MIT — an original,
+  AI-generated dojo-stage backdrop authored from scratch, no Elecbyte/third-party art). `fp-app` draws it as
+  a full-window RGBA background (via `fp_render::ImageTexture` / `RenderFrame::draw_image`) behind the
+  fighters whenever no MUGEN `[BGdef]` stage is loaded, so the default match renders over a real backdrop
+  instead of a flat clear color. Like `assets/banner.png`, `.png` is not globally gitignored, so it is
+  tracked directly.
   Beyond these originals, `git ls-files` shows zero third-party `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
   files — the only tracked such files are the originals named above (the `assets/trainingdummy/*` character
   set incl. `trainingdummy.def`, the `assets/data/` effects/font/common-states, and `assets/data/system.def` +

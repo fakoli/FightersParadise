@@ -457,6 +457,7 @@ dependencies = [
  "fp-storyboard",
  "fp-ui",
  "fp-vm",
+ "png",
  "pollster",
  "sdl2",
  "tracing",

@@ -183,6 +183,94 @@ fn select_palette_bytes<'a>(
     override_rgba.unwrap_or(embedded)
 }
 
+/// GPU texture wrapper for a full-color **RGBA** image (e.g. a stage background).
+///
+/// Unlike [`SpriteTexture`] (palette-indexed `R8Unorm`, recolored in the shader),
+/// this stores the colors directly as `Rgba8UnormSrgb` and is drawn by
+/// [`RenderFrame::draw_image`](crate::RenderFrame::draw_image) with **linear**
+/// filtering, so a background scaled to fill the window stays smooth rather than
+/// blocky. No palette, no index-0 transparency, no PalFX.
+pub struct ImageTexture {
+    /// The GPU texture.
+    pub texture: wgpu::Texture,
+    /// A view into the texture for binding.
+    pub view: wgpu::TextureView,
+    /// Linear sampler (full-color art is scaled, so it should be filtered).
+    pub sampler: wgpu::Sampler,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl ImageTexture {
+    /// Uploads `width * height * 4` bytes of `RGBA` pixel data to a new GPU
+    /// texture. `rgba` must be exactly that length (row-major, 4 bytes/pixel).
+    #[must_use]
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Self {
+        // The GPU upload below requires exactly `width*height*4` bytes; a short
+        // slice would trip a wgpu validation error (an abort inside wgpu) rather
+        // than fail gracefully. Catch a misuse in dev/test at zero release cost.
+        debug_assert_eq!(
+            rgba.len(),
+            width as usize * height as usize * 4,
+            "ImageTexture::new: rgba must be width*height*4 bytes"
+        );
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image_texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            texture,
+            view,
+            sampler,
+            width,
+            height,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2450,6 +2450,13 @@ struct MatchRun {
     /// (`fightfx`) hit-sparks simply don't render (no panic, no regression). The
     /// matching AIR is installed on [`MatchRun::m`] via [`Match::set_common_fx`].
     common_fx: Option<CommonFxRender>,
+    /// A full-color background image drawn behind the fighters, used when no MUGEN
+    /// `[BGdef]`-style [`stage`](Self::stage) is loaded. Defaults to the shipped
+    /// clean-room dojo backdrop so the match no longer plays over a flat grey
+    /// clear color; `None` only if even that asset is absent (then the flat
+    /// clear-color path is unchanged). A real loaded stage takes precedence and
+    /// this stays `None`.
+    background: Option<fp_render::ImageTexture>,
 }
 
 /// Which storyboard overlay (if any) is *active* for the current frame, given the
@@ -2647,6 +2654,67 @@ fn stage_arg(args: &[String], i: usize) -> Option<&Path> {
 /// falling back to the test pattern on a character-load failure (so a bad/missing
 /// character never crashes the app). A bad/missing `stage_def` only drops the
 /// background to the flat clear color — the match still runs.
+/// The shipped clean-room default stage background, drawn behind the fighters
+/// when no MUGEN `[BGdef]` stage is loaded.
+const DEFAULT_STAGE_BG: &str = "assets/stages/dojo/bg.png";
+
+/// Loads a PNG file as a full-color [`fp_render::ImageTexture`] (decoded to RGBA),
+/// or `None` — warn/info-logged, never a panic — when the file is absent or can't
+/// be decoded, so the match simply falls back to the flat clear color.
+fn load_background_image(path: &str, renderer: &Renderer) -> Option<fp_render::ImageTexture> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::info!("no background image at {path}: {e}; using flat clear color");
+            return None;
+        }
+    };
+    let (rgba, w, h) = decode_png_rgba(&bytes).or_else(|| {
+        tracing::warn!("background image {path} failed to decode; using flat clear color");
+        None
+    })?;
+    tracing::info!("loaded stage background {path} ({w}x{h})");
+    Some(fp_render::ImageTexture::new(
+        renderer.device(),
+        renderer.queue(),
+        w,
+        h,
+        &rgba,
+    ))
+}
+
+/// Decodes 8-bit PNG bytes into `(rgba, width, height)`, expanding palette /
+/// grayscale and adding an opaque alpha channel as needed. Returns `None`
+/// (never panics) for a malformed PNG or an unsupported 16-bit depth.
+fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().ok()?;
+    // Reject 16-bit-per-channel PNGs up front: `EXPAND` only widens *up* to 8-bit,
+    // never down from 16, so decoding one would yield a double-width buffer our
+    // 8-bit RGBA conversion can't interpret. Bail before allocating + decoding.
+    if reader.info().bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some((rgba, info.width, info.height))
+}
+
 fn load_match_or_fallback(
     p1_def: &Path,
     p2_def: &Path,
@@ -2671,6 +2739,16 @@ fn load_match_or_fallback(
             // Loading the stage is best-effort: `None` (no path, bad parse, or
             // missing SFF) keeps today's flat clear color (no regression).
             let stage = stage_def.and_then(StageRender::load);
+            // With no MUGEN stage loaded, fall back to the shipped clean-room dojo
+            // background image so the match renders over a real backdrop instead of
+            // the flat grey clear color. A loaded stage draws its own backgrounds,
+            // so the image is skipped there. Best-effort: a missing/bad asset just
+            // leaves the flat clear color (no panic, no regression).
+            let background = if stage.is_none() {
+                load_background_image(DEFAULT_STAGE_BG, renderer)
+            } else {
+                None
+            };
             // The screenpack HUD is best-effort too: `None` (no `fight.def` found,
             // bad parse, or missing `fight.sff`) falls back to the hand-rolled quad
             // HUD, so the default match looks exactly as before (no regression).
@@ -2697,6 +2775,7 @@ fn load_match_or_fallback(
                 ending_storyboard,
                 intro_storyboard_done: false,
                 common_fx,
+                background,
             }))
         }
         Err(e) => {
@@ -3188,6 +3267,12 @@ fn draw_match_run(
         .as_ref()
         .map(|s| s.stage.camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x))
         .unwrap_or(0.0);
+
+    // Full-color background image first of all (behind everything), when no MUGEN
+    // stage is loaded. Scaled to fill the whole window.
+    if let Some(bg) = run.background.as_ref() {
+        frame.draw_image(bg, 0.0, 0.0, win_wf, win_hf);
+    }
 
     // Back background layers first (behind the fighters).
     if let Some(stage) = run.stage.as_ref() {
