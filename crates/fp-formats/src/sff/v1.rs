@@ -275,10 +275,15 @@ fn extract_pcx_palette(data: &[u8], pcx_start: usize, pcx_end: usize) -> Option<
     // exactly at the buffer end, so clamping recovers it correctly.
     let pcx_end = pcx_end.min(data.len());
     if pcx_end < pcx_start || pcx_end - pcx_start < PCX_PALETTE_BLOCK_SIZE {
-        tracing::warn!(
+        // Not an error: SFF v1 shares one palette across many sprites (the CvS /
+        // `.act`-costume style, e.g. evilken), so most sprites carry no trailing
+        // palette and correctly reuse the previous real one. Logging this per
+        // sprite floods the console (hundreds of lines on a real character), so it
+        // is `debug!`, not `warn!` — the reuse is the designed shared-palette path.
+        tracing::debug!(
             pcx_start,
             pcx_end,
-            "SFF v1: PCX image too short for a trailing palette; reusing previous"
+            "SFF v1: PCX image carries no trailing palette; reusing previous (shared palette)"
         );
         return None;
     }
@@ -296,10 +301,13 @@ fn extract_pcx_palette(data: &[u8], pcx_start: usize, pcx_end: usize) -> Option<
     let rgb_start = marker_pos + 1;
     let rgb_end = pcx_end; // rgb_start + 768 == pcx_end by construction
     if rgb_end > data.len() || rgb_end - rgb_start < 768 {
-        tracing::warn!(
+        // Same recoverable shared-palette fallback as above (a truncated trailing
+        // block): reuse the previous real palette. `debug!`, not `warn!`, to keep
+        // a real character's load quiet.
+        tracing::debug!(
             rgb_start,
             rgb_end,
-            "SFF v1: trailing palette out of range; reusing previous"
+            "SFF v1: trailing palette out of range; reusing previous (shared palette)"
         );
         return None;
     }
