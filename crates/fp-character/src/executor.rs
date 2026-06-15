@@ -84,7 +84,10 @@
 //! - A **documented MUGEN controller blocked on an unbuilt subsystem** (helpers /
 //!   explods / projectiles, multi-entity redirects, the stage/background owner, or
 //!   the full global PalFX modulation — see [`is_tracked_deferred_controller`] and
-//!   T007-T014) routes to a named, `tracing::warn!`-logged no-op.
+//!   T007-T014) routes to a named, `tracing::warn!`-logged no-op. The
+//!   target/projectile-graph controllers `HitAdd`, `AttackDist`, and `TargetDrop`
+//!   are tracked here too: they act on a target / active-HitDef / projectile that
+//!   the multi-entity graph (T013/T014) does not yet exist to address.
 //! - A **genuinely unrecognized** token (a typo / non-MUGEN extension) routes to a
 //!   `tracing::debug!`-logged no-op.
 //!
@@ -3615,6 +3618,16 @@ fn is_tracked_deferred_controller(kind: &str) -> bool {
         // fall-state env-shake wiring (the EnvShake render path is itself a
         // renderer follow-up).
         "FallEnvShake",
+        // Operate on the target / projectile / helper entity graph — blocked on
+        // the multi-entity slot-map + Target/Projectile/helper redirect
+        // resolution (T013/T014). `HitAdd` adds to the combo/hit counter the
+        // current move has scored on the *target*; `AttackDist` overrides the
+        // guard distance of an *active HitDef / projectile*; `TargetDrop`
+        // releases entities currently bound as this player's *targets*. None can
+        // be implemented faithfully until that entity graph exists.
+        "HitAdd",
+        "AttackDist",
+        "TargetDrop",
     ];
     DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(kind))
 }
@@ -12041,6 +12054,9 @@ mod tests {
             // T015 follow-up review: documented controllers that depend on an
             // unbuilt subsystem must be tracked, not silently no-op'd.
             "ReversalDef", "ScreenBound", "FallEnvShake",
+            // Target / active-HitDef / projectile controllers — blocked on the
+            // T013/T014 entity graph; must be tracked, not silent no-ops.
+            "HitAdd", "AttackDist", "TargetDrop",
         ] {
             assert!(
                 is_tracked_deferred_controller(kind),
