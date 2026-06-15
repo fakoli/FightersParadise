@@ -2444,6 +2444,7 @@ time = 1
             air,
             cmd: None,
             snd: None,
+            palettes: Vec::new(),
         }
     }
 

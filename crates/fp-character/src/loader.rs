@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use fp_core::{FpError, FpResult};
+use fp_formats::act::ActPalette;
 use fp_formats::air::AirFile;
 use fp_formats::cmd::CmdFile;
 use fp_formats::cns::{CnsFile, StateController, Statedef};
@@ -452,6 +453,33 @@ pub struct LoadedCharacter {
     pub cmd: Option<CmdFile>,
     /// Loaded sounds, if a `sound` file was referenced and parsed.
     pub snd: Option<SndFile>,
+    /// External `.act` palette overrides loaded from `[Files] pal1`..`pal12`, in
+    /// ascending palette-slot order (skipping absent / unparsable slots).
+    ///
+    /// MUGEN lets a character ship up to twelve alternate costume palettes as
+    /// `.act` files referenced by `pal1`..`pal12` in `[Files]`. Each entry here
+    /// records the 1-based MUGEN palette **slot** ([`LoadedPalette::slot`]) and
+    /// the parsed [`ActPalette`] ([`LoadedPalette::palette`]). A missing or
+    /// unparsable `.act` is warn-logged and skipped (never fatal), so this vector
+    /// can be shorter than the number of `pal*` keys — or empty when the
+    /// character (like stock KFM, which ships none) references no `.act` files.
+    /// Resolve a runtime selection with
+    /// [`override_palette`](LoadedCharacter::override_palette).
+    pub palettes: Vec<LoadedPalette>,
+}
+
+/// One external `.act` costume palette loaded from a `[Files] palN` slot.
+///
+/// Pairs the 1-based MUGEN palette slot number with the parsed RGBA palette so a
+/// runtime selection ([`Character::active_palette`](crate::Character::active_palette))
+/// can be resolved back to the bytes the GPU palette-lookup uploads. See
+/// [`LoadedCharacter::palettes`].
+#[derive(Debug, Clone)]
+pub struct LoadedPalette {
+    /// The 1-based MUGEN palette slot (`palN` → `N`, so `1..=12`).
+    pub slot: u32,
+    /// The parsed external palette (256-colour RGBA, index-0-transparent).
+    pub palette: ActPalette,
 }
 
 impl LoadedCharacter {
@@ -497,6 +525,12 @@ impl LoadedCharacter {
         // ---- [Files]: optional assets ----
         let cmd = load_optional(def.get("Files", "cmd"), def_path, "CMD", CmdFile::load);
         let snd = load_optional(def.get("Files", "sound"), def_path, "SND", SndFile::load);
+
+        // ---- [Files]: external .act costume palettes (pal1..pal12) ----
+        // MUGEN lists up to twelve alternate palettes; each missing/bad slot is
+        // skipped (best-effort), so the default behaviour (no override, use the
+        // SFF-embedded palette) is unchanged for characters that ship none.
+        let palettes = load_act_palettes(&def, def_path);
 
         // ---- CNS state files in MUGEN merge order ----
         // The character's own state files come first (st, st0..st9, plus the
@@ -602,6 +636,7 @@ impl LoadedCharacter {
             air,
             cmd,
             snd,
+            palettes,
         })
     }
 
@@ -615,6 +650,27 @@ impl LoadedCharacter {
     #[must_use]
     pub fn state_count(&self) -> usize {
         self.states.len()
+    }
+
+    /// Resolves a runtime palette selection into the override palette's RGBA
+    /// bytes, or `None` to use the SFF-embedded palette.
+    ///
+    /// `selection` is a 0-based index into [`palettes`](Self::palettes) (the
+    /// loaded `.act` overrides in ascending slot order) — exactly the value a
+    /// runtime [`Character::active_palette`](crate::Character::active_palette)
+    /// carries. `None`, or an out-of-range index, returns `None` so callers fall
+    /// back to the SFF-embedded palette (the default, byte-identical to today).
+    /// A present, in-range selection returns the 1024-byte (256 × RGBA) override
+    /// buffer to upload as the GPU palette texture.
+    #[must_use]
+    pub fn override_palette(&self, selection: Option<usize>) -> Option<&[u8; 1024]> {
+        resolve_override_palette(&self.palettes, selection)
+    }
+
+    /// Number of external `.act` palette overrides successfully loaded.
+    #[must_use]
+    pub fn palette_count(&self) -> usize {
+        self.palettes.len()
     }
 
     /// Compiles this character's `.cmd` command list into a
@@ -690,6 +746,64 @@ fn load_optional<T>(
             None
         }
     }
+}
+
+/// The maximum number of external `.act` palette slots MUGEN reads from
+/// `[Files]` (`pal1`..`pal12`).
+const MAX_ACT_PALETTE_SLOTS: u32 = 12;
+
+/// Loads the external `.act` costume palettes referenced by `[Files] pal1`..
+/// `pal12`, resolving each relative to the `.def` directory.
+///
+/// MUGEN lists up to twelve alternate palettes (`pal1`..`pal12`); each is an
+/// `.act` file [parsed by `fp_formats`](ActPalette). This walks the slots in
+/// ascending order, skipping any slot whose key is absent/empty and (best-effort)
+/// any slot whose `.act` fails to load — every skip is `tracing::warn!`-logged,
+/// never a panic. The returned vector is therefore in ascending slot order and
+/// may be shorter than the number of `pal*` keys, or empty when the character
+/// references no `.act` files (the stock-KFM case, which keeps the SFF-embedded
+/// palette and so default rendering unchanged).
+fn load_act_palettes(def: &DefFile, def_path: &Path) -> Vec<LoadedPalette> {
+    let mut palettes = Vec::new();
+    for slot in 1..=MAX_ACT_PALETTE_SLOTS {
+        let key = format!("pal{slot}");
+        let Some(rel) = def.get("Files", &key) else {
+            continue;
+        };
+        let rel = rel.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        let path = DefFile::resolve_path(def_path, rel);
+        match ActPalette::load(&path) {
+            Ok(palette) => {
+                tracing::info!("loaded palette {key} ({rel}) from {}", path.display());
+                palettes.push(LoadedPalette { slot, palette });
+            }
+            Err(e) => {
+                // Best-effort: a missing or malformed .act is skipped, never fatal.
+                tracing::warn!("palette {key} ({}) skipped: {e}", path.display());
+            }
+        }
+    }
+    if !palettes.is_empty() {
+        tracing::info!("loaded {} external .act palette(s)", palettes.len());
+    }
+    palettes
+}
+
+/// Resolves a 0-based palette `selection` against the loaded `.act` overrides,
+/// returning the override RGBA or `None` (use the SFF-embedded palette).
+///
+/// Backs [`LoadedCharacter::override_palette`]. `None` and any out-of-range index
+/// return `None`, so the default / no-override path always falls back to the
+/// embedded palette and never panics.
+fn resolve_override_palette(
+    palettes: &[LoadedPalette],
+    selection: Option<usize>,
+) -> Option<&[u8; 1024]> {
+    let idx = selection?;
+    palettes.get(idx).map(|p| &p.palette.rgba)
 }
 
 /// Loads and merges a CNS state file into `states`, applying the MUGEN
@@ -2123,6 +2237,160 @@ mod tests {
         let got = load_optional(Some("nope.snd"), &def, "SND", SndFile::load);
         assert!(got.is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- External .act palette overrides (pal1..pal12) ----
+
+    /// Builds a synthetic 768-byte `.act` whose palette index 1 (and only it) is
+    /// the given RGB, so two fixtures with different `tag` colours yield clearly
+    /// different RGBA buffers. (On disk the palette is reverse-ordered: index 1
+    /// lives at on-disk position `255 - 1 = 254`.)
+    fn make_act_bytes(tag: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 768];
+        let pos = 255 - 1; // on-disk position of palette index 1
+        buf[pos * 3] = tag; // R
+        buf[pos * 3 + 1] = tag.wrapping_add(1); // G
+        buf[pos * 3 + 2] = tag.wrapping_add(2); // B
+        buf
+    }
+
+    /// Writes `bytes` to `dir/name`, returning the full path (binary sibling of
+    /// [`write_file`]).
+    fn write_bytes(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("write scratch binary");
+        path
+    }
+
+    #[test]
+    fn load_act_palettes_reads_pal_slots_in_order() {
+        let dir = scratch_dir("pal_order");
+        // pal1, pal3 present; pal2 absent; pal4 references a missing file.
+        let def = write_file(
+            &dir,
+            "c.def",
+            "[Files]\npal1 = a.act\npal3 = c.act\npal4 = missing.act\n",
+        );
+        write_bytes(&dir, "a.act", &make_act_bytes(10));
+        write_bytes(&dir, "c.act", &make_act_bytes(30));
+        let parsed = DefFile::load(&def).unwrap();
+        let pals = load_act_palettes(&parsed, &def);
+        // Only the two existing, parseable slots load, in ascending slot order;
+        // the missing pal4 is skipped (best-effort), not fatal.
+        assert_eq!(pals.len(), 2);
+        assert_eq!(pals[0].slot, 1);
+        assert_eq!(pals[1].slot, 3);
+        // The two palettes differ in their RGBA (different fixture colours).
+        assert_ne!(pals[0].palette.rgba, pals[1].palette.rgba);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_act_palettes_empty_when_no_pal_keys() {
+        let dir = scratch_dir("pal_none");
+        // No pal* keys at all (the stock-KFM shape) → no overrides loaded.
+        let def = write_file(&dir, "c.def", "[Files]\nsprite = x.sff\n");
+        let parsed = DefFile::load(&def).unwrap();
+        assert!(load_act_palettes(&parsed, &def).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_act_palettes_skips_bad_act_without_panic() {
+        let dir = scratch_dir("pal_bad");
+        // pal1 points at a present-but-too-short .act; the parser pads with black
+        // and still yields a palette (never a panic). pal2 is missing entirely.
+        let def = write_file(&dir, "c.def", "[Files]\npal1 = short.act\npal2 = gone.act\n");
+        write_bytes(&dir, "short.act", &[1, 2, 3]);
+        let parsed = DefFile::load(&def).unwrap();
+        let pals = load_act_palettes(&parsed, &def);
+        // The short .act still parses (recoverable); the missing one is skipped.
+        assert_eq!(pals.len(), 1);
+        assert_eq!(pals[0].slot, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loaded_palettes_carry_distinct_rgba() {
+        // Two different .act fixtures load into distinct RGBA buffers — the core
+        // requirement for a costume swap to be visible.
+        let dir = scratch_dir("pal_distinct");
+        let def = write_file(&dir, "c.def", "[Files]\npal1 = a.act\npal2 = b.act\n");
+        write_bytes(&dir, "a.act", &make_act_bytes(10));
+        write_bytes(&dir, "b.act", &make_act_bytes(40));
+        let parsed = DefFile::load(&def).unwrap();
+        let palettes = load_act_palettes(&parsed, &def);
+        assert_eq!(palettes.len(), 2);
+        // The two loaded palettes differ from each other...
+        assert_ne!(palettes[0].palette.rgba, palettes[1].palette.rgba);
+        // ...and each carries the fixture's distinctive index-1 colour (the .act
+        // is reverse-ordered on disk; the parser de-reverses it to natural order).
+        assert_eq!(palettes[0].palette.rgba[4], 10);
+        assert_eq!(palettes[1].palette.rgba[4], 40);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_override_palette_selection_or_none() {
+        let dir = scratch_dir("pal_resolve");
+        let def = write_file(&dir, "c.def", "[Files]\npal1 = a.act\npal2 = b.act\n");
+        write_bytes(&dir, "a.act", &make_act_bytes(10));
+        write_bytes(&dir, "b.act", &make_act_bytes(40));
+        let parsed = DefFile::load(&def).unwrap();
+        let palettes = load_act_palettes(&parsed, &def);
+        // None → no override (use the SFF-embedded palette).
+        assert!(resolve_override_palette(&palettes, None).is_none());
+        // In-range selections resolve to the loaded palettes' RGBA, and differ.
+        let p0 = resolve_override_palette(&palettes, Some(0)).expect("slot 0");
+        let p1 = resolve_override_palette(&palettes, Some(1)).expect("slot 1");
+        assert_ne!(p0, p1);
+        // The override RGBA differs from the no-override (None) path by definition.
+        assert!(resolve_override_palette(&palettes, None).is_none());
+        // Out-of-range → None (safe default, never a panic).
+        assert!(resolve_override_palette(&palettes, Some(99)).is_none());
+        // Empty list → always None regardless of selection.
+        assert!(resolve_override_palette(&[], Some(0)).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Gated real-content check: evilken ships 12 `.act` palettes referenced by
+    /// `pal1`..`pal12`. The loader must read them all and they must not all be
+    /// identical. Skips cleanly when test-assets/ is absent.
+    #[test]
+    fn evilken_act_palettes_load_from_def() {
+        let def = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("evilken/evilken.def");
+        if !def.exists() {
+            eprintln!("skipping evilken .act test: {} not present", def.display());
+            return;
+        }
+        let loaded = match LoadedCharacter::load(&def) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: evilken.def failed to load: {e}");
+                return;
+            }
+        };
+        // evilken.def lists pal1..pal12; all twelve .act files ship, so all load.
+        assert_eq!(
+            loaded.palette_count(),
+            12,
+            "expected 12 loaded .act palettes, got {}",
+            loaded.palette_count()
+        );
+        // The slots are ascending 1..=12.
+        let slots: Vec<u32> = loaded.palettes.iter().map(|p| p.slot).collect();
+        assert_eq!(slots, (1..=12).collect::<Vec<_>>());
+        // Selecting an override yields a concrete RGBA; the no-override path is
+        // None (SFF-embedded). At least two distinct palettes exist among them.
+        assert!(loaded.override_palette(None).is_none());
+        let p0 = loaded.override_palette(Some(0)).expect("pal1 present");
+        // Find some other slot whose RGBA differs (real costumes differ).
+        let differs = (1..loaded.palette_count())
+            .filter_map(|i| loaded.override_palette(Some(i)))
+            .any(|p| p != p0);
+        assert!(differs, "all evilken .act palettes were identical");
     }
 
     // ---- AC1: load_constants reads [Data] and falls back per-field ----

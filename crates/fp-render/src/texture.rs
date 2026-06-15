@@ -88,6 +88,33 @@ pub struct PaletteTexture {
 }
 
 impl PaletteTexture {
+    /// Uploads a palette texture, choosing an external `.act` override when one
+    /// is supplied and otherwise the sprite's embedded palette.
+    ///
+    /// This is the runtime `.act` costume-swap path: MUGEN characters may ship up
+    /// to twelve alternate palettes (`pal1`..`pal12`), and selecting one renders
+    /// the character with that palette instead of the SFF-embedded one. Since the
+    /// GPU palette lookup is a plain 256×1 RGBA texture, swapping costumes is just
+    /// swapping which 1024-byte buffer is uploaded — no sprite re-upload.
+    ///
+    /// - `embedded` is the SFF-embedded palette (the default, e.g. what
+    ///   `fp_formats::sff::SffFile::palette` returns).
+    /// - `override_rgba` is the selected `.act` override's RGBA, or `None` to use
+    ///   the embedded palette.
+    ///
+    /// When `override_rgba` is `None` this is **byte-identical** to
+    /// [`PaletteTexture::new`] called on `embedded`, so the default (no-override)
+    /// render path is unchanged. Resolve a runtime selection to `override_rgba`
+    /// with `fp_character::LoadedCharacter::override_palette`.
+    pub fn from_override(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        embedded: &[u8; 1024],
+        override_rgba: Option<&[u8; 1024]>,
+    ) -> Self {
+        Self::new(device, queue, select_palette_bytes(embedded, override_rgba))
+    }
+
     /// Uploads 256 RGBA entries (1024 bytes) to a new GPU texture.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8; 1024]) -> Self {
         let size = wgpu::Extent3d {
@@ -139,5 +166,45 @@ impl PaletteTexture {
             view,
             sampler,
         }
+    }
+}
+
+/// Chooses the palette bytes to upload: the external `.act` override when
+/// present, otherwise the SFF-embedded palette.
+///
+/// The pure selection logic behind [`PaletteTexture::from_override`], extracted
+/// so it is unit-testable without a GPU device. Returns `embedded` unchanged
+/// (same `&` reference) when `override_rgba` is `None`, guaranteeing the
+/// no-override upload is byte-identical to the embedded-palette path.
+fn select_palette_bytes<'a>(
+    embedded: &'a [u8; 1024],
+    override_rgba: Option<&'a [u8; 1024]>,
+) -> &'a [u8; 1024] {
+    override_rgba.unwrap_or(embedded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_palette_bytes_uses_embedded_when_no_override() {
+        let embedded = [7u8; 1024];
+        let chosen = select_palette_bytes(&embedded, None);
+        // No override → the embedded palette, byte-identical (same pointer even).
+        assert!(std::ptr::eq(chosen, &embedded));
+        assert_eq!(chosen, &embedded);
+    }
+
+    #[test]
+    fn select_palette_bytes_uses_override_when_present() {
+        let embedded = [7u8; 1024];
+        let mut over = [7u8; 1024];
+        // Make the override differ from the embedded palette at one index.
+        over[4] = 200;
+        let chosen = select_palette_bytes(&embedded, Some(&over));
+        assert!(std::ptr::eq(chosen, &over));
+        assert_ne!(chosen, &embedded);
+        assert_eq!(chosen[4], 200);
     }
 }

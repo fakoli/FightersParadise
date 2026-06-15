@@ -86,7 +86,7 @@ pub use snapshot::CharacterSnapshot;
 pub use fp_combat::SoundId;
 pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
-    LoadedCharacter,
+    LoadedCharacter, LoadedPalette,
 };
 
 use std::cell::Cell;
@@ -1583,6 +1583,26 @@ pub struct Character {
     /// (`RoundState 0`, `GameTime 0`, match not over), so the three triggers read
     /// their safe defaults when there is no coordinator in view. See [`RoundView`].
     pub round_view: RoundView,
+
+    /// The selected external `.act` palette override, as a 0-based index into the
+    /// owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes), or
+    /// `None` to render with the SFF-embedded palette (the default).
+    ///
+    /// MUGEN characters may ship up to twelve alternate costume palettes (`.act`
+    /// files referenced by `pal1`..`pal12`); this selects which one the renderer
+    /// uploads instead of the sprite's embedded palette. `None` (the default)
+    /// preserves today's behaviour exactly — the SFF-embedded palette is used and
+    /// the GPU upload is byte-identical. Set it with
+    /// [`set_active_palette`](Character::set_active_palette); resolve it to RGBA
+    /// bytes with
+    /// [`LoadedCharacter::override_palette`](crate::LoadedCharacter::override_palette).
+    ///
+    /// Stored as a bare selection index (not the RGBA) because the loaded
+    /// palettes live on the static [`LoadedCharacter`](crate::LoadedCharacter),
+    /// not on this runtime entity — keeping the runtime struct cheap to clone /
+    /// snapshot. An index past the end of the loaded palettes resolves to `None`
+    /// (the SFF-embedded palette), never a panic.
+    pub active_palette: Option<usize>,
 }
 
 /// Tracks whether the attacker's current move has connected, for the
@@ -1684,6 +1704,9 @@ impl Default for Character {
             // Safe default round clock (intro / time 0 / not over) until a
             // coordinator pushes the live view in via `set_round_view`.
             round_view: RoundView::default(),
+            // No external palette override by default: render with the
+            // SFF-embedded palette, byte-identical to today.
+            active_palette: None,
         }
     }
 }
@@ -1728,6 +1751,38 @@ impl Character {
         // Round-trip through `Rng::new` so the stored cell is always a valid,
         // in-range Park–Miller state regardless of the caller's seed.
         self.rng_seed.set(Rng::new(seed).seed());
+    }
+
+    /// Returns the selected external `.act` palette override as a 0-based index
+    /// into the owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes),
+    /// or `None` to render with the SFF-embedded palette.
+    ///
+    /// See [`active_palette`](Character::active_palette) for the full contract.
+    /// Resolve the index to RGBA bytes with
+    /// [`LoadedCharacter::override_palette`](crate::LoadedCharacter::override_palette).
+    #[must_use]
+    pub fn active_palette(&self) -> Option<usize> {
+        self.active_palette
+    }
+
+    /// Selects an external `.act` palette override by 0-based index into the
+    /// owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes).
+    ///
+    /// Pass `None` (or call [`clear_active_palette`](Character::clear_active_palette))
+    /// to revert to the SFF-embedded palette, the default. The index is **not**
+    /// validated here — an index past the loaded palettes resolves to `None` (the
+    /// SFF-embedded palette) at render time via
+    /// [`LoadedCharacter::override_palette`](crate::LoadedCharacter::override_palette),
+    /// never a panic — so callers may set a selection before the palette list is
+    /// known.
+    pub fn set_active_palette(&mut self, selection: Option<usize>) {
+        self.active_palette = selection;
+    }
+
+    /// Clears any external palette override, reverting to the SFF-embedded
+    /// palette (equivalent to `set_active_palette(None)`).
+    pub fn clear_active_palette(&mut self) {
+        self.active_palette = None;
     }
 
     /// Captures this character's mutable runtime state as a serializable
@@ -3341,6 +3396,32 @@ mod tests {
         // Every GetHitVar member reads its no-hit default through the seam.
         assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(0));
         assert_eq!(ch.trigger_str("GetHitVar", "chainid"), Value::Int(-1));
+    }
+
+    #[test]
+    fn character_default_has_no_active_palette_override() {
+        // Default: no external .act palette override → the SFF-embedded palette is
+        // used and the GPU upload is byte-identical to today.
+        let ch = Character::new();
+        assert_eq!(ch.active_palette(), None);
+        assert_eq!(Character::default().active_palette(), None);
+    }
+
+    #[test]
+    fn character_set_and_clear_active_palette() {
+        let mut ch = Character::new();
+        // Selecting a palette index records it on the runtime entity.
+        ch.set_active_palette(Some(7));
+        assert_eq!(ch.active_palette(), Some(7));
+        // Re-selecting overwrites; clearing reverts to the SFF-embedded default.
+        ch.set_active_palette(Some(2));
+        assert_eq!(ch.active_palette(), Some(2));
+        ch.clear_active_palette();
+        assert_eq!(ch.active_palette(), None);
+        // set_active_palette(None) is equivalent to clearing.
+        ch.set_active_palette(Some(3));
+        ch.set_active_palette(None);
+        assert_eq!(ch.active_palette(), None);
     }
 
     // ---- const(<member>) resolver (task 5.6e) ------------------------------
