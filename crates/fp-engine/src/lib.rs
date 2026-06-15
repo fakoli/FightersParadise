@@ -496,6 +496,16 @@ pub struct Match {
     /// `GameTime` trigger reads. Pushed onto each character via its
     /// [`RoundView`](fp_character::RoundView) before that character ticks.
     game_time: i32,
+    /// The active whole-match freeze (`Pause`/`SuperPause`, audit #24), or the
+    /// inactive default when nothing is frozen.
+    ///
+    /// While this is active [`Match::tick`] holds the frozen players' simulation
+    /// and the round timer / `GameTime` still — only the `SuperPause` triggerer
+    /// keeps ticking — counting the freeze down one tick per frame. It is reset to
+    /// inactive at the start of each round. Constructed inside [`Match::with_config`]
+    /// so a caller (e.g. `fp-app`) that builds a [`Match`] via [`Match::new`] needs
+    /// no change.
+    freeze: Freeze,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -514,6 +524,61 @@ struct RoundResetState {
     facing: Facing,
     /// The fighter's maximum life, the value `life` is restored to each round.
     life_max: i32,
+}
+
+/// Which player triggered the active [`SuperPause`](fp_character::FreezeKind::SuperPause)
+/// and is therefore **exempt** from the freeze (keeps ticking while everyone else
+/// is frozen). A [`Pause`](fp_character::FreezeKind::Pause) freezes everyone, so it
+/// has no exempt player ([`FreezeExempt::None`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreezeExempt {
+    /// No player is exempt — every fighter is frozen (a `Pause`).
+    None,
+    /// Player 1 triggered the `SuperPause` and keeps ticking.
+    P1,
+    /// Player 2 triggered the `SuperPause` and keeps ticking.
+    P2,
+}
+
+/// The whole-match freeze state driven by `Pause` / `SuperPause` controllers
+/// (faithfulness audit #24).
+///
+/// While [`active`](Self::active) is true the coordinator holds the **frozen**
+/// players' simulation and the round timer / `GameTime` still for
+/// [`remaining`](Self::remaining) ticks; the [`exempt`](Self::exempt) player (the
+/// `SuperPause` triggerer, if any) keeps ticking so its super move animates. The
+/// freeze counts down one tick per frame and clears at `0`.
+#[derive(Debug, Clone, Copy)]
+struct Freeze {
+    /// Ticks of freeze remaining; `0` (the inactive default) means no freeze.
+    remaining: i32,
+    /// Which player, if any, is exempt from this freeze.
+    exempt: FreezeExempt,
+}
+
+impl Freeze {
+    /// The inactive freeze: nothing frozen, no exempt player.
+    const fn inactive() -> Self {
+        Self {
+            remaining: 0,
+            exempt: FreezeExempt::None,
+        }
+    }
+
+    /// Whether a freeze is currently holding the match still.
+    const fn active(self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Whether the player on the given side is frozen this tick (i.e. a freeze is
+    /// active and that side is not the exempt triggerer).
+    const fn freezes(self, side: FreezeExempt) -> bool {
+        self.active()
+            && !matches!(
+                (self.exempt, side),
+                (FreezeExempt::P1, FreezeExempt::P1) | (FreezeExempt::P2, FreezeExempt::P2)
+            )
+    }
 }
 
 impl Match {
@@ -599,6 +664,7 @@ impl Match {
             p2_reset,
             round_frames,
             game_time: 0,
+            freeze: Freeze::inactive(),
         }
     }
 
@@ -696,6 +762,32 @@ impl Match {
         self.game_time
     }
 
+    /// Ticks of `Pause`/`SuperPause` freeze remaining (audit #24), or `0` when the
+    /// match is not frozen.
+    ///
+    /// While this is positive [`Match::tick`] holds the frozen players, the round
+    /// timer, and [`game_time`](Match::game_time) still, counting down one tick per
+    /// frame. A renderer can read it to drive a freeze/flash overlay.
+    #[must_use]
+    pub fn freeze_time(&self) -> i32 {
+        self.freeze.remaining.max(0)
+    }
+
+    /// Whether player 1's simulation is frozen this frame by an active
+    /// `Pause`/`SuperPause` (audit #24): `true` when a freeze is active and P1 is
+    /// not its exempt `SuperPause` triggerer.
+    #[must_use]
+    pub fn p1_frozen(&self) -> bool {
+        self.freeze.freezes(FreezeExempt::P1)
+    }
+
+    /// Whether player 2's simulation is frozen this frame by an active
+    /// `Pause`/`SuperPause` (audit #24). See [`Match::p1_frozen`].
+    #[must_use]
+    pub fn p2_frozen(&self) -> bool {
+        self.freeze.freezes(FreezeExempt::P2)
+    }
+
     /// The engine-global round / match clock the characters' `RoundState`,
     /// `GameTime`, and `MatchOver` triggers read this tick (audit #21).
     ///
@@ -762,6 +854,17 @@ impl Match {
     /// face-the-opponent, and round-state/timer advance. See the
     /// [crate-level overview](crate) for the full description. Never panics.
     pub fn tick(&mut self, p1_input: MatchInput, p2_input: MatchInput) {
+        // (F) Whole-match freeze (`Pause`/`SuperPause`, audit #24). While a freeze
+        //     is active the engine holds the frozen players' simulation, the round
+        //     timer, AND `GameTime` still; only the `SuperPause` triggerer (if any)
+        //     keeps ticking so its super animates. This branch returns early — it
+        //     does NOT advance `game_time`, run combat/push, or advance the round —
+        //     so a frozen tick is a no-op for everyone but the exempt player.
+        if self.freeze.active() {
+            self.tick_frozen();
+            return;
+        }
+
         // (0) Advance the monotonic game clock, then push the engine-global round
         //     view (RoundState / GameTime / MatchOver) onto both characters BEFORE
         //     they tick, so their CNS triggers read this frame's values (audit
@@ -813,6 +916,9 @@ impl Match {
             .p1
             .character
             .tick(&self.p1.loaded, Some(&self.p2.character), stage);
+        // Capture any `Pause`/`SuperPause` P1 requested this tick (audit #24); the
+        // freeze is armed after BOTH players tick so the later request wins.
+        let p1_freeze = p1_report.freeze_request;
         self.p1_sound_requests = p1_report.sound_requests;
         // (2a) Apply P1's deferred `Target*` ops to P1's target, the OPPONENT (P2).
         //      `self.p1`/`self.p2` are distinct fields, so the split borrow of the
@@ -837,6 +943,7 @@ impl Match {
             .p2
             .character
             .tick(&self.p2.loaded, Some(&self.p1.character), stage);
+        let p2_freeze = p2_report.freeze_request;
         self.p2_sound_requests = p2_report.sound_requests;
         // (2b) Apply P2's deferred `Target*` ops to its target, the OPPONENT (P1).
         if fighting {
@@ -846,6 +953,18 @@ impl Match {
                 &self.p1.loaded.states,
                 &p2_report.target_ops,
             );
+        }
+
+        // (2c) Arm a whole-match freeze if either fighter ran a `Pause`/`SuperPause`
+        //      this tick (audit #24). Both players have already advanced this frame
+        //      — the freeze begins NEXT frame (the `freeze.active()` early-return at
+        //      the top of `tick`). P2's request is considered after P1's so the
+        //      later controller to fire wins, matching the single-effect nature of
+        //      the controller. Only effective during the live fight phase: a freeze
+        //      must not stall the intro/KO/win flow.
+        if fighting {
+            self.arm_freeze(p1_freeze, FreezeExempt::P1);
+            self.arm_freeze(p2_freeze, FreezeExempt::P2);
         }
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
@@ -928,6 +1047,98 @@ impl Match {
 
         // (6) Advance the round state machine and timer.
         self.advance_round();
+    }
+
+    /// Arms the whole-match freeze from a fighter's `Pause`/`SuperPause` request
+    /// (audit #24), recording its duration and exempt player on [`Match::freeze`].
+    ///
+    /// `req` is the [`FreezeRequest`](fp_character::FreezeRequest) the fighter on
+    /// `side` emitted this tick (or [`None`] if it ran no `Pause`/`SuperPause`). A
+    /// [`Pause`](fp_character::FreezeKind::Pause) freezes everyone (no exempt
+    /// player); a [`SuperPause`](fp_character::FreezeKind::SuperPause) exempts the
+    /// triggering `side`. A non-positive `time` (already clamped to `>= 0` in
+    /// `fp-character`) leaves no freeze armed. The freeze takes effect on the NEXT
+    /// `tick` (this frame's simulation has already advanced).
+    fn arm_freeze(&mut self, req: Option<fp_character::FreezeRequest>, side: FreezeExempt) {
+        let Some(req) = req else {
+            return;
+        };
+        if req.time <= 0 {
+            return;
+        }
+        let exempt = match req.kind {
+            fp_character::FreezeKind::Pause => FreezeExempt::None,
+            fp_character::FreezeKind::SuperPause => side,
+        };
+        self.freeze = Freeze {
+            remaining: req.time,
+            exempt,
+        };
+        tracing::debug!(
+            ?req.kind,
+            time = req.time,
+            ?exempt,
+            "freeze armed"
+        );
+    }
+
+    /// Runs one frozen frame while a `Pause`/`SuperPause` holds the match still
+    /// (audit #24).
+    ///
+    /// Only the [`exempt`](Freeze::exempt) player (the `SuperPause` triggerer, if
+    /// any) ticks — its super move keeps animating; every frozen player, the round
+    /// timer, and `GameTime` are held still. No combat, push, face, or round
+    /// advance runs. The freeze counts down by one; when it reaches `0` the next
+    /// `tick` resumes normal processing. Mirrors how MUGEN treats a `SuperPause`:
+    /// the world stops except the trigger.
+    ///
+    /// The exempt player still gets the engine-global round view installed (so its
+    /// `GameTime`/`RoundState` triggers read the held — unchanged — values) and an
+    /// empty command source (inputs are not buffered during a freeze, matching the
+    /// frozen world). Its deferred `Target*` ops are intentionally NOT applied: a
+    /// frozen opponent must not be moved/damaged mid-freeze.
+    fn tick_frozen(&mut self) {
+        let stage = self.bounds.view();
+        let view = self.round_view();
+
+        // Each frozen frame surfaces only the exempt player's own sound requests
+        // (replaced, never accumulated); the frozen player produces none.
+        self.p1_sound_requests.clear();
+        self.p2_sound_requests.clear();
+
+        // The exempt triggerer keeps animating; everyone else is frozen.
+        match self.freeze.exempt {
+            FreezeExempt::P1 => {
+                self.p1.character.set_round_view(view);
+                self.p1
+                    .character
+                    .set_command_source(Box::new(fp_character::NoCommands));
+                let report =
+                    self.p1
+                        .character
+                        .tick(&self.p1.loaded, Some(&self.p2.character), stage);
+                self.p1_sound_requests = report.sound_requests;
+            }
+            FreezeExempt::P2 => {
+                self.p2.character.set_round_view(view);
+                self.p2
+                    .character
+                    .set_command_source(Box::new(fp_character::NoCommands));
+                let report =
+                    self.p2
+                        .character
+                        .tick(&self.p2.loaded, Some(&self.p1.character), stage);
+                self.p2_sound_requests = report.sound_requests;
+            }
+            // A `Pause` exempts no one — nothing ticks this frame.
+            FreezeExempt::None => {}
+        }
+
+        // Count the freeze down; `GameTime` and the round timer do NOT advance.
+        self.freeze.remaining -= 1;
+        if self.freeze.remaining <= 0 {
+            self.freeze = Freeze::inactive();
+        }
     }
 
     /// Arbitrates a MUGEN priority / trade clash between the two fighters'
@@ -1224,6 +1435,9 @@ impl Match {
         // No stale sound requests carry into the new round's first tick.
         self.p1_sound_requests.clear();
         self.p2_sound_requests.clear();
+
+        // A freeze (`Pause`/`SuperPause`) does not carry across a round boundary.
+        self.freeze = Freeze::inactive();
 
         tracing::info!(
             round = self.round_number,
@@ -5489,5 +5703,198 @@ time = 1
         face_each_other_when_neutral(&mut a, &mut b);
         assert_eq!(b.facing, Facing::Right, "NoAutoTurn keeps B's facing");
         assert_eq!(a.facing, Facing::Right, "A (no assertion) is unaffected / already correct");
+    }
+
+    // ---- audit #24: Pause / SuperPause whole-match freeze --------------------
+
+    /// A `Pause`/`SuperPause` controller of the given `kind` and `time`, gated on
+    /// `var(0) = 1` so the test can fire it on a precise tick.
+    fn pause_controller(kind: &str, time: &str) -> CompiledController {
+        CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some(kind.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("var(0) = 1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [("time".to_string(), CompiledParam::compile(time))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A `VarSet var(0) = 0` controller gated on `var(0) = 1`, so it clears the
+    /// fire flag the SAME tick the pause fires (the pause arms exactly once).
+    fn clear_flag_controller() -> CompiledController {
+        let mut c = varset_controller(0, "0");
+        c.triggers = vec![CompiledTriggerGroup {
+            number: 1,
+            conditions: vec![CompiledExpr::compile("var(0) = 1")],
+        }];
+        c
+    }
+
+    /// A [`LoadedCharacter`] whose state 0, when `var(0) = 1`, runs the given
+    /// pause controller and then clears `var(0)` — so the freeze arms once when the
+    /// test sets the flag. Otherwise state 0 is inert (no physics, no movement).
+    fn pause_loaded(kind: &str, time: &str) -> LoadedCharacter {
+        let mut loaded =
+            loaded_with(air_with(0, Vec::new(), vec![Rect::new(-18.0, -70.0, 36.0, 70.0)]));
+        let st = CompiledState {
+            number: 0,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            anim: None,
+            ctrl: None,
+            velset: None,
+            poweradd: None,
+            controllers: vec![pause_controller(kind, time), clear_flag_controller()],
+            ..Default::default()
+        };
+        loaded.states.insert(0, st);
+        loaded
+    }
+
+    /// Builds a match whose P1 can fire a `Pause`/`SuperPause` (via `var(0) = 1`)
+    /// and whose P2 is inert, already in the live fight phase. Returns the match.
+    fn freeze_match(kind: &str, time: &str) -> Match {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        p2c.state_no = 0;
+        let p1 = Player::new(p1c, pause_loaded(kind, time));
+        // P2 has an inert state 0 too (idle stand) so its Time advances normally.
+        let p2 = Player::new(p2c, loaded_with(air_with(0, Vec::new(), Vec::new())));
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+        into_fight(&mut m);
+        m
+    }
+
+    #[test]
+    fn superpause_freezes_opponent_and_timer_while_trigger_keeps_ticking() {
+        let mut m = freeze_match("SuperPause", "5");
+        // Fire the SuperPause on the next tick.
+        m.p1.character.vars[0] = 1;
+        let p2_time_before = m.p2().character.state_time;
+        let timer_before = m.timer();
+        let game_time_before = m.game_time();
+
+        // (A) The fire tick: everyone still advances this frame; the freeze arms
+        //     for the FOLLOWING ticks.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.freeze_time(), 5, "5-tick freeze armed");
+        assert!(m.p2_frozen(), "P2 is frozen");
+        assert!(!m.p1_frozen(), "the SuperPause trigger (P1) is exempt");
+
+        // Snapshot the frozen P2's state-time and the trigger P1's state-time.
+        let p2_time_frozen = m.p2().character.state_time;
+        let p1_time_at_freeze_start = m.p1().character.state_time;
+        let timer_at_freeze_start = m.timer();
+        let game_time_at_freeze_start = m.game_time();
+        assert!(p2_time_frozen > p2_time_before, "P2 advanced on the fire tick");
+
+        // (B) Run the full freeze: P2 + timer + GameTime are held; P1 keeps ticking.
+        for i in 0..5 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            // P2 frozen → its state Time does not advance.
+            assert_eq!(
+                m.p2().character.state_time,
+                p2_time_frozen,
+                "P2 state Time frozen on frozen tick {i}"
+            );
+            // Round timer + GameTime held still.
+            assert_eq!(m.timer(), timer_at_freeze_start, "timer frozen");
+            assert_eq!(
+                m.game_time(),
+                game_time_at_freeze_start,
+                "GameTime frozen"
+            );
+            // P1 (the trigger) keeps animating: its state Time advances each frame.
+            assert_eq!(
+                m.p1().character.state_time,
+                p1_time_at_freeze_start + (i + 1),
+                "P1 (exempt) keeps ticking during the freeze"
+            );
+        }
+
+        // (C) The freeze has expired; normal processing resumes.
+        assert_eq!(m.freeze_time(), 0, "freeze expired after 5 ticks");
+        assert!(!m.p2_frozen(), "P2 unfrozen");
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p2().character.state_time > p2_time_frozen,
+            "P2 resumes advancing after the freeze"
+        );
+        assert!(
+            m.game_time() > game_time_at_freeze_start,
+            "GameTime resumes after the freeze"
+        );
+
+        // Sanity: the freeze genuinely held things relative to the pre-fire reads.
+        let _ = (timer_before, game_time_before);
+    }
+
+    #[test]
+    fn pause_freezes_both_players() {
+        let mut m = freeze_match("Pause", "4");
+        m.p1.character.vars[0] = 1;
+
+        // Fire tick arms the freeze.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.freeze_time(), 4, "4-tick Pause armed");
+        assert!(m.p1_frozen(), "Pause freezes P1 too (no exempt)");
+        assert!(m.p2_frozen(), "Pause freezes P2");
+
+        let p1_time = m.p1().character.state_time;
+        let p2_time = m.p2().character.state_time;
+        let game_time = m.game_time();
+
+        // During the Pause NOTHING advances: both players, timer, and GameTime hold.
+        for _ in 0..4 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert_eq!(m.p1().character.state_time, p1_time, "P1 frozen by Pause");
+            assert_eq!(m.p2().character.state_time, p2_time, "P2 frozen by Pause");
+            assert_eq!(m.game_time(), game_time, "GameTime frozen by Pause");
+        }
+
+        // The Pause expires and the world resumes.
+        assert_eq!(m.freeze_time(), 0, "Pause expired");
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(m.game_time() > game_time, "GameTime resumes after the Pause");
+    }
+
+    #[test]
+    fn freeze_does_not_advance_game_time() {
+        // Focused check: GameTime is held for exactly the freeze duration.
+        let mut m = freeze_match("SuperPause", "3");
+        m.p1.character.vars[0] = 1;
+        m.tick(MatchInput::none(), MatchInput::none()); // fire tick: GameTime +1
+        let gt = m.game_time();
+        assert_eq!(m.freeze_time(), 3);
+
+        for _ in 0..3 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert_eq!(m.game_time(), gt, "GameTime does not advance while frozen");
+        }
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.game_time(), gt + 1, "GameTime advances again once unfrozen");
+    }
+
+    #[test]
+    fn zero_time_pause_does_not_freeze() {
+        // A `time = 0` Pause requests no freeze (clamped to a no-op).
+        let mut m = freeze_match("Pause", "0");
+        m.p1.character.vars[0] = 1;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.freeze_time(), 0, "time=0 leaves no freeze armed");
+        assert!(!m.p1_frozen());
+        assert!(!m.p2_frozen());
     }
 }

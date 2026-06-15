@@ -74,7 +74,7 @@ pub mod invuln;
 pub mod loader;
 
 pub use combat::{resolve_attack, AttackResolution};
-pub use executor::{SoundRequest, TargetOp, TickReport};
+pub use executor::{FreezeKind, FreezeRequest, SoundRequest, TargetOp, TickReport};
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
 // Re-export the combat sound reference so downstream crates (e.g. fp-engine) can
 // name the type of [`AttackResolution::hit_sound`] without taking a direct
