@@ -76,7 +76,9 @@ pub mod loader;
 pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
-pub use executor::{FreezeKind, FreezeRequest, SoundRequest, TargetOp, TickReport};
+pub use executor::{
+    FreezeKind, FreezeRequest, HelperPosType, HelperSpawn, SoundRequest, TargetOp, TickReport,
+};
 pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
 pub use snapshot::CharacterSnapshot;
@@ -3068,6 +3070,91 @@ pub struct EvalCtx<'a> {
     /// `me`'s loaded animation action set, for `SelfAnimExist(n)`. Empty (the
     /// [`AnimSet::default`]) when no `.air` is in view.
     anim: AnimSet<'a>,
+    /// The helper-entity graph this context resolves `parent`/`root`/`helper(id)`
+    /// redirects against (T012). Empty (the [`EntityGraph::default`]) for a
+    /// root player with no spawning chain, in which case `root` falls back to
+    /// `me` and `parent`/`helper(id)` resolve to `None`.
+    graph: EntityGraph<'a>,
+}
+
+/// The slice of the live helper-entity graph one [`EvalCtx`] can see, for
+/// resolving the entity-relationship redirects `parent`, `root`, and
+/// `helper(id)` (T012).
+///
+/// MUGEN entities form a tree: a root player spawns helpers (each addressable by
+/// a `helper(id)`), and every helper knows its immediate `parent` (its creator)
+/// and the `root` at the top of the chain. The entity owner (`fp-engine`'s
+/// `Player`, which holds the slot-map of live helpers) populates this graph for
+/// the duration of one tick so the executor's redirect resolution
+/// ([`EvalCtx::redirect`]) can hop to a related entity instead of bottoming out
+/// at `0`.
+///
+/// The graph is a tiny `Copy` bundle of immutable references (two optional
+/// `&Character`s plus a borrowed slice), so it threads through the `Copy`
+/// [`EvalCtx`] / executor env with no allocation. A redirected related entity is
+/// surfaced as a **self-only** context (a bare `&Character`), so a single hop —
+/// `parent, life`, `root, stateno`, `helper(1), pos x` — resolves while that
+/// related entity's own nested redirects bottom out, exactly mirroring how the
+/// opponent (`p2, …`) redirect is depth-limited.
+#[derive(Clone, Copy, Default)]
+pub struct EntityGraph<'a> {
+    /// The immediate creator of `me` (the `parent` redirect), or `None` when `me`
+    /// is a root player (no parent).
+    parent: Option<&'a Character>,
+    /// The root player at the top of `me`'s spawning chain (the `root` redirect),
+    /// or `None` when `me` is itself the root — in which case `root` resolves to
+    /// `me`.
+    root: Option<&'a Character>,
+    /// The helpers addressable from `me` via `helper(id)`, as `(id, entity)`
+    /// pairs. The first pair whose id matches wins (MUGEN resolves the
+    /// most-recently-spawned matching helper, but a single match is enough for
+    /// the common one-helper-per-id case). Empty when `me` owns no helpers.
+    helpers: &'a [(i32, &'a Character)],
+}
+
+impl<'a> EntityGraph<'a> {
+    /// Builds an entity graph from the optional `parent`/`root` chain and the
+    /// borrowed `(id, &Character)` helper lookup.
+    ///
+    /// Pass `None` for `parent`/`root` and an empty slice for a root player that
+    /// owns no helpers (equivalent to [`EntityGraph::default`]). The references
+    /// must outlive the [`EvalCtx`] the graph is installed on; the owner
+    /// (`fp-engine`) builds this for the span of one tick.
+    #[must_use]
+    pub fn new(
+        parent: Option<&'a Character>,
+        root: Option<&'a Character>,
+        helpers: &'a [(i32, &'a Character)],
+    ) -> Self {
+        Self {
+            parent,
+            root,
+            helpers,
+        }
+    }
+
+    /// The immediate parent entity (`parent` redirect), if any.
+    #[must_use]
+    pub fn parent(&self) -> Option<&'a Character> {
+        self.parent
+    }
+
+    /// The root entity (`root` redirect), if a distinct root is recorded.
+    /// `None` means `me` is itself the root.
+    #[must_use]
+    pub fn root(&self) -> Option<&'a Character> {
+        self.root
+    }
+
+    /// Looks up the helper addressable by `id` (`helper(id)` redirect), returning
+    /// the first matching entity or `None` when no helper carries that id.
+    #[must_use]
+    pub fn helper(&self, id: i32) -> Option<&'a Character> {
+        self.helpers
+            .iter()
+            .find(|(hid, _)| *hid == id)
+            .map(|(_, ent)| *ent)
+    }
 }
 
 impl<'a> EvalCtx<'a> {
@@ -3083,6 +3170,7 @@ impl<'a> EvalCtx<'a> {
             opponent,
             stage,
             anim: AnimSet::default(),
+            graph: EntityGraph::default(),
         }
     }
 
@@ -3101,7 +3189,22 @@ impl<'a> EvalCtx<'a> {
             opponent,
             stage,
             anim,
+            graph: EntityGraph::default(),
         }
+    }
+
+    /// Installs the helper-entity [`graph`](EvalCtx::graph) on this context so the
+    /// `parent`/`root`/`helper(id)` redirects resolve against the spawning chain
+    /// (T012), returning the updated context.
+    ///
+    /// A builder method (rather than another positional constructor) so existing
+    /// call sites keep working unchanged: a context without a graph behaves as a
+    /// root player (`root` → self, `parent`/`helper(id)` → `None`), and a caller
+    /// that owns a helper chain layers it on with `.with_graph(graph)`.
+    #[must_use]
+    pub fn with_graph(mut self, graph: EntityGraph<'a>) -> Self {
+        self.graph = graph;
+        self
     }
 
     /// The opponent `Character`, if any (the entity behind the opponent context).
@@ -3328,16 +3431,25 @@ impl EvalContext for EvalCtx<'_> {
             Redirect::Enemy | Redirect::EnemyNear(_) => {
                 self.opponent.map(|o| o as &dyn EvalContext)
             }
-            // A non-helper entity's `root` is itself.
-            Redirect::Root => Some(self),
-            // No helper graph / teams / targeting modeled in this flat 1-v-1, so
-            // these resolve to `None` (the redirected sub-expression → 0). This is
-            // a documented deferral, not a silent error.
-            Redirect::Parent
-            | Redirect::Helper(_)
-            | Redirect::Target(_)
-            | Redirect::Partner
-            | Redirect::PlayerId(_) => None,
+            // `root` — the player at the top of the spawning chain (T012). A
+            // helper's context carries its root in the entity graph; a root
+            // player (no graph entry) resolves `root` to itself.
+            Redirect::Root => Some(
+                self.graph
+                    .root()
+                    .map_or(self as &dyn EvalContext, |r| r as &dyn EvalContext),
+            ),
+            // `parent` — the immediate creator (T012). Resolves to the parent
+            // entity from the graph, or `None` for a root player (no parent), in
+            // which case the redirected sub-expression collapses to `0`.
+            Redirect::Parent => self.graph.parent().map(|p| p as &dyn EvalContext),
+            // `helper(id)` — a helper owned by this entity, looked up by id in the
+            // graph (T012). `None` (→ `0`) when no helper carries that id.
+            Redirect::Helper(id) => self.graph.helper(id).map(|h| h as &dyn EvalContext),
+            // Targeting / teams are not modeled in this flat 1-v-1, so these
+            // resolve to `None` (the redirected sub-expression → 0). A documented
+            // deferral, not a silent error.
+            Redirect::Target(_) | Redirect::Partner | Redirect::PlayerId(_) => None,
         }
     }
 }
@@ -5930,6 +6042,112 @@ mod tests {
                 "`{expr}` should resolve to 0 (unsupported redirect)"
             );
         }
+    }
+
+    // =====================================================================
+    // T012 — Helper entity graph: parent / root / helper(id) redirects resolve
+    // through EvalCtx against an installed EntityGraph (the spawning chain),
+    // exercised end-to-end through the same VM eval path the executor uses.
+    // =====================================================================
+
+    /// Evaluates a trigger expression against `me` with an [`EntityGraph`]
+    /// installed — i.e. `me` is a *helper* whose `parent`/`root`/`helper(id)`
+    /// redirects resolve to the supplied chain. Panics only in test code on a
+    /// parse error. Drives the real VM eval path, so the redirect/VM seam is
+    /// exercised exactly as the executor calls it.
+    fn ev_graph(expr: &str, me: &Character, graph: EntityGraph<'_>) -> Value {
+        let ast = parse_str(expr).expect("test expression should parse");
+        let ctx = EvalCtx::new(me, None, StageView::default()).with_graph(graph);
+        eval(&ast, &ctx)
+    }
+
+    /// AC: `parent` / `root` redirects from a helper resolve to the spawning
+    /// chain (not 0). With a graph installed, `parent, life` reads the parent's
+    /// life and `root, stateno` reads the root's state — distinct from the
+    /// helper's own values.
+    #[test]
+    fn helper_parent_and_root_redirects_resolve_to_chain() {
+        // The spawning chain: root → parent → me(helper). Give each a distinct
+        // life and state so the reads are unambiguous.
+        let mut root = Character::new();
+        root.life = 999;
+        root.state_no = 1500;
+
+        let mut parent = Character::new();
+        parent.life = 432;
+        parent.state_no = 640;
+
+        let mut helper = Character::new();
+        helper.life = 50;
+        helper.state_no = 1000;
+
+        let graph = EntityGraph::new(Some(&parent), Some(&root), &[]);
+
+        // `parent, life` → the parent's life (432), NOT the helper's 50 or 0.
+        assert_eq!(ev_graph("parent, Life", &helper, graph), Value::Int(432));
+        // `root, stateno` → the root's state (1500).
+        assert_eq!(ev_graph("root, StateNo", &helper, graph), Value::Int(1500));
+        // A bare self read still reports the helper's own value.
+        assert_eq!(ev_graph("Life", &helper, graph), Value::Int(50));
+    }
+
+    /// AC: `helper(id)` resolves to the matching helper, and a non-matching id is
+    /// the safe default `0`.
+    #[test]
+    fn helper_id_redirect_resolves_matching_entity() {
+        // A root that owns two helpers with distinct ids/lives.
+        let root = Character::new();
+
+        let mut h1 = Character::new();
+        h1.life = 111;
+        let mut h2 = Character::new();
+        h2.life = 222;
+
+        let helpers: [(i32, &Character); 2] = [(1, &h1), (2, &h2)];
+        let graph = EntityGraph::new(None, None, &helpers);
+
+        // `helper(1), life` → 111; `helper(2), life` → 222.
+        assert_eq!(ev_graph("helper(1), Life", &root, graph), Value::Int(111));
+        assert_eq!(ev_graph("helper(2), Life", &root, graph), Value::Int(222));
+        // An id no helper carries → the redirect is None → the sub-expr is 0.
+        assert_eq!(ev_graph("helper(3), Life", &root, graph), Value::Int(0));
+    }
+
+    /// A root player with NO graph still resolves `root` to itself and leaves
+    /// `parent` / `helper(id)` as the safe default `0` — the pre-T012 behavior is
+    /// preserved for the no-graph case.
+    #[test]
+    fn root_player_without_graph_resolves_root_to_self() {
+        let mut me = Character::new();
+        me.life = 700;
+        me.state_no = 200;
+        let graph = EntityGraph::default();
+        // `root, life` == own life (a root player's root is itself).
+        assert_eq!(ev_graph("root, Life", &me, graph), Value::Int(700));
+        // No parent / helpers: both collapse to 0.
+        assert_eq!(ev_graph("parent, Life", &me, graph), Value::Int(0));
+        assert_eq!(ev_graph("helper(1), Life", &me, graph), Value::Int(0));
+    }
+
+    /// The [`EntityGraph`] accessors return exactly the wired references (and the
+    /// helper lookup returns the first id match / `None`).
+    #[test]
+    fn entity_graph_accessors_round_trip() {
+        let parent = Character::new();
+        let root = Character::new();
+        let h = Character::new();
+        let helpers: [(i32, &Character); 1] = [(7, &h)];
+        let graph = EntityGraph::new(Some(&parent), Some(&root), &helpers);
+        assert!(graph.parent().is_some());
+        assert!(graph.root().is_some());
+        assert!(graph.helper(7).is_some(), "matching id resolves");
+        assert!(graph.helper(8).is_none(), "missing id is None");
+
+        // The default (root-player) graph has no relations.
+        let empty = EntityGraph::default();
+        assert!(empty.parent().is_none());
+        assert!(empty.root().is_none());
+        assert!(empty.helper(0).is_none());
     }
 
     #[test]

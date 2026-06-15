@@ -56,8 +56,9 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, Facing,
-    LoadedCharacter, MoveType, RoundView, StageView, StateType,
+    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, Facing,
+    HelperPosType, HelperSpawn, LoadedCharacter, MoveType, RoundView, StageView, StateType,
+    TickReport,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -410,6 +411,55 @@ impl Effect {
 /// short; this is a generous ceiling.
 const EFFECT_MAX_LIFETIME: i32 = 60;
 
+/// A hard cap on the number of live helpers a single player may own at once
+/// (T012). MUGEN bounds the global helper count (its default is 56); this is a
+/// generous per-player ceiling that keeps the slot-map bounded so a runaway
+/// `Helper`-spawning loop can never grow the simulation without limit.
+const MAX_HELPERS_PER_PLAYER: usize = 56;
+
+/// One live **helper** entity owned by a [`Player`] (T012).
+///
+/// A `Helper` is a child [`Character`] spawned by its owner's `Helper`
+/// controller. It runs the same state machine as a full player — against the
+/// **owner's** [`LoadedCharacter`] (helpers share their root's compiled states /
+/// animations in MUGEN) — and is addressable from its owner by
+/// [`helper_id`](Helper::helper_id) via the `helper(id)` redirect. Its `parent` /
+/// `root` redirects resolve back up the spawning chain (the owning player), which
+/// the slot-map wires into a [`EntityGraph`] each tick.
+///
+/// This minimal model carries what T012 needs — the live entity, its id, and the
+/// facing it was spawned with. Helper *lifecycle* (`DestroySelf`, expiry,
+/// binding) and helper-specific constants (`size.*`, own palette) are out of
+/// scope here (T013).
+pub struct Helper {
+    /// The live child entity, advanced each frame via
+    /// [`Character::tick_as_helper`].
+    pub character: Character,
+    /// The id this helper is addressable by (`helper(id)`), from the spawning
+    /// `Helper` controller's `id` parameter.
+    pub helper_id: i32,
+}
+
+impl Helper {
+    /// The helper's world position in pixels.
+    #[must_use]
+    pub fn pos(&self) -> Vec2<f32> {
+        self.character.pos
+    }
+
+    /// The helper's current animation (action) id.
+    #[must_use]
+    pub fn anim(&self) -> i32 {
+        self.character.anim
+    }
+
+    /// The id this helper is addressable by via `helper(id)`.
+    #[must_use]
+    pub fn helper_id(&self) -> i32 {
+        self.helper_id
+    }
+}
+
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
 /// and the input/command source feeding its state machine.
 ///
@@ -422,6 +472,11 @@ pub struct Player {
     pub character: Character,
     /// The loaded, compiled assets the character ticks against.
     pub loaded: LoadedCharacter,
+    /// The slot-map of live helper entities this player owns (T012). Populated
+    /// from each tick's [`fp_character::TickReport::helper_spawns`] and ticked
+    /// every frame after the root character. Bounded by
+    /// [`MAX_HELPERS_PER_PLAYER`].
+    helpers: Vec<Helper>,
     /// Rolling raw-input history (absolute directions + buttons) this player's
     /// command recognizer scans each tick.
     input_buffer: InputBuffer,
@@ -459,9 +514,115 @@ impl Player {
         Self {
             character,
             loaded,
+            helpers: Vec::new(),
             input_buffer: InputBuffer::new(),
             matcher,
             command_defs,
+        }
+    }
+
+    /// The live helper entities this player currently owns (T012), in spawn
+    /// order. Empty until a `Helper` controller fires and the spawn is applied.
+    #[must_use]
+    pub fn helpers(&self) -> &[Helper] {
+        &self.helpers
+    }
+
+    /// Spawns the helpers requested by this tick's
+    /// [`fp_character::TickReport::helper_spawns`] into the slot-map (T012),
+    /// resolving each [`HelperSpawn`]'s `postype` + offset into a world position
+    /// against this player (`p1`) and the supplied opponent position (`p2`) / stage
+    /// edges. The new helper shares the owner's loaded assets and begins in the
+    /// requested `stateno`.
+    ///
+    /// Bounded by [`MAX_HELPERS_PER_PLAYER`]: once the slot-map is full, further
+    /// spawns this tick are dropped (warn-logged) rather than growing without
+    /// limit. Never panics.
+    fn spawn_helpers(&mut self, spawns: &[HelperSpawn], opponent_x: f32, stage: StageView) {
+        for spawn in spawns {
+            if self.helpers.len() >= MAX_HELPERS_PER_PLAYER {
+                tracing::warn!(
+                    "helper slot-map full ({MAX_HELPERS_PER_PLAYER}); dropping spawn id={}",
+                    spawn.helper_id
+                );
+                break;
+            }
+            let owner = &self.character;
+            // Resolve the spawn anchor (facing-relative on X for the p1 anchor,
+            // mirroring how `PosAdd` and the `Target*` ops mirror the X offset).
+            let (anchor_x, anchor_y) = match spawn.pos_type {
+                HelperPosType::P1 => (owner.pos.x, owner.pos.y),
+                HelperPosType::P2 => (opponent_x, owner.pos.y),
+                HelperPosType::Front => (front_edge_x(owner.facing, stage), owner.pos.y),
+                HelperPosType::Back => (back_edge_x(owner.facing, stage), owner.pos.y),
+                HelperPosType::Left => (stage.left, owner.pos.y),
+                HelperPosType::Right => (stage.right, owner.pos.y),
+            };
+            let (off_x, off_y) = spawn.pos;
+            let world_x = anchor_x + off_x * owner.facing.sign() as f32;
+            let world_y = anchor_y + off_y;
+
+            // The helper faces the same way as (facing=1) or opposite to
+            // (facing=-1) the owner.
+            let facing = if spawn.facing == -1 {
+                flip_facing(owner.facing)
+            } else {
+                owner.facing
+            };
+
+            let mut child = Character::with_constants(owner.constants);
+            child.pos = Vec2::new(world_x, world_y);
+            child.facing = facing;
+            // Enter the requested start state through the owner's loaded states so
+            // the entry params (anim/ctrl/physics) apply; an unknown state still
+            // updates the cursor (never panics).
+            child.change_state(&self.loaded.states, spawn.state_no);
+
+            self.helpers.push(Helper {
+                character: child,
+                helper_id: spawn.helper_id,
+            });
+        }
+    }
+
+    /// Ticks this player's **root** character against `opponent`, with its own
+    /// helper slot-map wired into the redirect graph so the root's `helper(id)`
+    /// redirects resolve to its live helpers (T012).
+    ///
+    /// The root is itself the top of the chain, so `parent`/`root` are `None`
+    /// (the empty entries make `root` resolve to self and `parent` to `0`). The
+    /// helper lookup is built from an immutable borrow of `self.helpers` while
+    /// `self.character` is mutated — distinct fields, so the split borrow is
+    /// sound.
+    fn tick_root(&mut self, opponent: Option<&Character>, stage: StageView) -> TickReport {
+        let lookup: Vec<(i32, &Character)> = self
+            .helpers
+            .iter()
+            .map(|h| (h.helper_id, &h.character))
+            .collect();
+        let graph = EntityGraph::new(None, None, &lookup);
+        self.character
+            .tick_as_helper(&self.loaded, opponent, stage, graph)
+    }
+
+    /// Ticks every live helper this player owns (T012), each with the spawning
+    /// chain installed so its `parent`/`root` redirects resolve to the owning
+    /// root character. Helpers run against the owner's loaded state graph.
+    ///
+    /// Each helper sees `opponent` as its `p2` (the same opponent the root
+    /// faces). Sibling-helper addressing (`helper(id)` *from* a helper) is out of
+    /// scope for T012 — a helper's own helper lookup is empty — so this avoids
+    /// aliasing a single helper element against the rest of the slot-map.
+    fn tick_helpers(&mut self, opponent: Option<&Character>, stage: StageView) {
+        let root = &self.character;
+        let loaded = &self.loaded;
+        for helper in &mut self.helpers {
+            // parent and root both resolve to the owning root character (a single
+            // spawn level; nested helper chains are T013). No sibling lookup.
+            let graph = EntityGraph::new(Some(root), Some(root), &[]);
+            let _ = helper
+                .character
+                .tick_as_helper(loaded, opponent, stage, graph);
         }
     }
 
@@ -572,6 +733,35 @@ fn to_phys_facing(facing: Facing) -> PhysFacing {
     match facing {
         Facing::Right => PhysFacing::Right,
         Facing::Left => PhysFacing::Left,
+    }
+}
+
+/// The opposite of `facing` — used to spawn a helper with `facing = -1`
+/// (opposite to its owner) (T012).
+fn flip_facing(facing: Facing) -> Facing {
+    match facing {
+        Facing::Right => Facing::Left,
+        Facing::Left => Facing::Right,
+    }
+}
+
+/// The world X of the screen edge a character *faces* (its "front" edge): the
+/// right edge when facing right, the left edge when facing left. Used to resolve
+/// a `Helper` `postype = front` spawn (T012).
+fn front_edge_x(facing: Facing, stage: StageView) -> f32 {
+    match facing {
+        Facing::Right => stage.right,
+        Facing::Left => stage.left,
+    }
+}
+
+/// The world X of the screen edge *behind* a character (its "back" edge): the
+/// left edge when facing right, the right edge when facing left. Used to resolve
+/// a `Helper` `postype = back` spawn (T012).
+fn back_edge_x(facing: Facing, stage: StageView) -> f32 {
+    match facing {
+        Facing::Right => stage.left,
+        Facing::Left => stage.right,
     }
 }
 
@@ -1181,13 +1371,17 @@ impl Match {
         //     then P2 ticks against P1's just-updated state, matching MUGEN's
         //     in-order per-player update.
         let stage = self.bounds.view();
-        let p1_report = self
-            .p1
-            .character
-            .tick(&self.p1.loaded, Some(&self.p2.character), stage);
+        // Opponent X positions captured up-front so `Helper postype = p2` spawns
+        // can resolve their anchor without re-borrowing the opponent later (T012).
+        let p2_x = self.p2.character.pos.x;
+        let p1_x = self.p1.character.pos.x;
+        let mut p1_report = self.p1.tick_root(Some(&self.p2.character), stage);
         // Capture any `Pause`/`SuperPause` P1 requested this tick (audit #24); the
         // freeze is armed after BOTH players tick so the later request wins.
         let p1_freeze = p1_report.freeze_request;
+        // Helper spawns P1 requested this tick (T012); applied to P1's slot-map
+        // below, after the opponent borrow is released.
+        let p1_helper_spawns = std::mem::take(&mut p1_report.helper_spawns);
         self.p1_sound_requests = p1_report.sound_requests;
         // (2a) Apply P1's deferred `Target*` ops to P1's target, the OPPONENT (P2).
         //      `self.p1`/`self.p2` are distinct fields, so the split borrow of the
@@ -1208,11 +1402,9 @@ impl Match {
             );
         }
 
-        let p2_report = self
-            .p2
-            .character
-            .tick(&self.p2.loaded, Some(&self.p1.character), stage);
+        let mut p2_report = self.p2.tick_root(Some(&self.p1.character), stage);
         let p2_freeze = p2_report.freeze_request;
+        let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
         self.p2_sound_requests = p2_report.sound_requests;
         // (2b) Apply P2's deferred `Target*` ops to its target, the OPPONENT (P1).
         if fighting {
@@ -1235,6 +1427,19 @@ impl Match {
             self.arm_freeze(p1_freeze, FreezeExempt::P1);
             self.arm_freeze(p2_freeze, FreezeExempt::P2);
         }
+
+        // (2d) Spawn each player's requested helpers into its slot-map, then tick
+        //      every live helper (T012). Spawning is done after both roots ticked
+        //      (so a helper appears the frame its `Helper` controller fired) and
+        //      the helpers then tick this same frame against the opponent. Each
+        //      helper's `parent`/`root` redirect resolves to its owning root.
+        //      `postype = p2` resolves against the pre-tick opponent X captured
+        //      above. Not gated on `fighting`: a helper is an entity, not a combat
+        //      effect, so it lives and animates across phases.
+        self.p1.spawn_helpers(&p1_helper_spawns, p2_x, stage);
+        self.p2.spawn_helpers(&p2_helper_spawns, p1_x, stage);
+        self.p1.tick_helpers(Some(&self.p2.character), stage);
+        self.p2.tick_helpers(Some(&self.p1.character), stage);
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
         //     Each direction reads the attacker's Clsn1 and the defender's Clsn2
@@ -7392,5 +7597,189 @@ time = 1
             p1_draws, p2_draws,
             "unseeded same-character players share one default RNG stream (the bug seed_players fixes)"
         );
+    }
+
+    // =====================================================================
+    // T012 — Helper entity slot-map: a `Helper` controller spawns a child
+    // entity into the player's slot-map, the helper ticks, is addressable by
+    // id, and its parent/root redirects resolve to the owning root character.
+    // =====================================================================
+
+    /// A controller of `kind` firing unconditionally (`trigger1 = 1`) with the
+    /// given params, in state `state_number`.
+    fn ctrl_of(
+        state_number: i32,
+        kind: &str,
+        params: &[(&str, &str)],
+    ) -> fp_character::CompiledController {
+        fp_character::CompiledController {
+            state_number,
+            label: String::new(),
+            controller_type: Some(kind.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![fp_character::CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![fp_character::CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), fp_character::CompiledParam::compile(v)))
+                .collect(),
+        }
+    }
+
+    /// A bare stand state `number` (type=S, physics=N) with the given controllers.
+    fn stand_state(number: i32, controllers: Vec<fp_character::CompiledController>) -> CompiledState {
+        CompiledState {
+            number,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            controllers,
+            ..Default::default()
+        }
+    }
+
+    /// A controller of `kind` gated on a single trigger condition `cond` (one
+    /// compiled expression, so a redirect comma survives) with the given params.
+    fn ctrl_gated(
+        state_number: i32,
+        kind: &str,
+        cond: &str,
+        params: &[(&str, &str)],
+    ) -> fp_character::CompiledController {
+        let mut c = ctrl_of(state_number, kind, params);
+        c.triggers = vec![fp_character::CompiledTriggerGroup {
+            number: 1,
+            conditions: vec![fp_character::CompiledExpr::compile(cond)],
+        }];
+        c
+    }
+
+    /// A loaded character whose state 0 spawns a helper into state 1000 once
+    /// (gated to `Time = 0`), and whose state 1000 (the helper's start state) sets
+    /// flag vars when its `root` / `parent` redirects resolve to the owner — so a
+    /// test can confirm the helper ticks AND that the spawning-chain redirects
+    /// resolve. The redirects are read via trigger CONDITIONS (single compiled
+    /// expressions) so the redirect comma is not comma-split like a param value.
+    fn helper_owner_loaded() -> LoadedCharacter {
+        // State 0: the root. Fire `Helper` only on the first tick (Time = 0) so we
+        // get exactly one helper, spawning it 30px in front, 0 up, in state 1000.
+        let spawn = ctrl_gated(
+            0,
+            "Helper",
+            "Time = 0",
+            &[
+                ("id", "1234"),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "30, 0"),
+                ("facing", "1"),
+            ],
+        );
+        let st0 = stand_state(0, vec![spawn]);
+
+        // State 1000: the helper. var(0) = 1 iff `root, Life == 555`; var(1) = 1
+        // iff `parent, Life == 555`. Both prove the helper runs its state machine
+        // and that the redirect resolves to the owner (whose life the test sets to
+        // 555).
+        let set_root = ctrl_gated(1000, "VarSet", "root, Life = 555", &[("v", "0"), ("value", "1")]);
+        let set_parent =
+            ctrl_gated(1000, "VarSet", "parent, Life = 555", &[("v", "1"), ("value", "1")]);
+        let st1000 = stand_state(1000, vec![set_root, set_parent]);
+
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(0, st0);
+        loaded.states.insert(1000, st1000);
+        loaded
+    }
+
+    /// AC1: a `Helper` controller spawns a child entity into the player's
+    /// slot-map; the helper is addressable by its id and positioned by `postype`.
+    #[test]
+    fn helper_controller_spawns_addressable_child() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 555;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, helper_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        assert!(m.p1().helpers().is_empty(), "no helper before any tick");
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        let helpers = m.p1().helpers();
+        assert_eq!(helpers.len(), 1, "exactly one helper spawned");
+        assert_eq!(helpers[0].helper_id(), 1234, "addressable by its id");
+        // postype=p1, facing Right, pos=(30,0): spawned 30px in front of P1
+        // (-50 + 30*sign(+1) = -20).
+        assert!(
+            (helpers[0].pos().x - (-20.0)).abs() < 1e-3,
+            "helper spawned at the p1-relative anchor, got {}",
+            helpers[0].pos().x
+        );
+        // Firing the spawn was gated to Time = 0, so a second tick does not add a
+        // second helper.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.p1().helpers().len(), 1, "Helper fired once (Time = 0)");
+    }
+
+    /// AC2/AC3: the helper ticks every frame, and its `root` / `parent` redirects
+    /// resolve to the owning root character (not 0). The helper's start state
+    /// copies `root, life` / `parent, life` into its own vars each tick.
+    #[test]
+    fn helper_ticks_and_parent_root_redirects_resolve() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 555; // the distinctive owner life the helper should read
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, helper_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Tick once: spawns the helper AND ticks it (the spawn happens before
+        // tick_helpers within the same frame), so its state-1000 controllers run.
+        m.tick(MatchInput::none(), MatchInput::none());
+        let helper = &m.p1().helpers()[0];
+        assert_eq!(helper.character.state_no, 1000, "helper entered its start state");
+        assert_eq!(
+            helper.character.vars[0], 1,
+            "`root, life` redirect resolved to the owner (life 555) — the spawning chain, not 0"
+        );
+        assert_eq!(
+            helper.character.vars[1], 1,
+            "`parent, life` redirect resolved to the owner (parent == root for a one-level helper), not 0"
+        );
+
+        // The helper keeps ticking: its in-state Time advances across frames.
+        let t_before = m.p1().helpers()[0].character.state_time;
+        m.tick(MatchInput::none(), MatchInput::none());
+        let t_after = m.p1().helpers()[0].character.state_time;
+        assert!(t_after > t_before, "helper's state Time advances each tick");
+    }
+
+    /// A match whose players never spawn helpers keeps empty slot-maps and ticks
+    /// without panicking (the spawn/tick path is a no-op when no `Helper` fires).
+    #[test]
+    fn match_without_helpers_keeps_empty_slot_maps() {
+        let mut m = basic_match();
+        for _ in 0..30 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert!(m.p1().helpers().is_empty(), "no P1 helpers");
+        assert!(m.p2().helpers().is_empty(), "no P2 helpers");
     }
 }
