@@ -1,0 +1,22 @@
+; Training Dummy — Definition file (ORIGINAL, clean-room content)
+; (c) 2025 Sekou Doumbouya, MIT.
+;
+; The first shippable Fighters Paradise character: a minimal, fully original
+; conformance fixture. No Elecbyte / MUGEN assets are used — the SFF sprites,
+; SND blip, and all CNS/CMD/AIR text are authored from scratch for this engine.
+
+[Info]
+name = "Training Dummy"
+displayname = "Training Dummy"
+versiondate = 06,14,2026
+mugenversion = 1.0
+author = "Fighters Paradise"
+localcoord = 320,240
+
+[Files]
+cmd    = trainingdummy.cmd
+cns    = trainingdummy.cns
+st     = trainingdummy.cns
+sprite = trainingdummy.sff
+anim   = trainingdummy.air
+sound  = trainingdummy.snd

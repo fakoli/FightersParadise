@@ -445,6 +445,7 @@ dependencies = [
  "fp-physics",
  "fp-render",
  "fp-stage",
+ "fp-vm",
  "pollster",
  "sdl2",
  "tracing",

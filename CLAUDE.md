@@ -172,9 +172,14 @@ MUGEN community content is messy. Parsers and the evaluator must:
   shared checkout live at `.../FightersParadise`; never edit that directly. (`.git` here is
   `gitdir: .../FightersParadise/.git/worktrees/fp-work`.)
 - **Clean-room contract (must stay true):** no Elecbyte/MUGEN engine source or copyrighted assets are
-  shipped or tracked. `git ls-files` shows zero `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act` files; the
-  only tracked binary asset is the project's own `assets/banner.png`. Real KFM content (CC BY-NC 3.0,
-  Elecbyte) is **local-only** behind the gitignored `test-assets` symlink. Never commit or ship it.
+  shipped or tracked. The **only** tracked content/binaries are the project's own **original** assets:
+  `assets/banner.png` and the original conformance character under `assets/trainingdummy/`
+  (`*.def/.cns/.cmd/.air/.sff/.snd` — MIT, authored from scratch as the shippable default + CI fixture;
+  the only ASCII strings in its `.sff`/`.snd` are the required `ElecbyteSpr\0`/`ElecbyteSnd\0` format
+  magic, not copyrighted data). `*.sff`/`*.snd` stay gitignored globally except those `assets/trainingdummy`
+  paths. Beyond these originals, `git ls-files` shows zero `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
+  files. Real KFM content (CC BY-NC 3.0, Elecbyte) is **local-only** behind the gitignored `test-assets`
+  symlink. Never commit or ship it.
 - Fighters Paradise is an independent project; MUGEN is a trademark of Elecbyte. Code is MIT
   (© 2025 Sekou Doumbouya); see [LICENSE](LICENSE).
 - Commit/push only when asked; if on the default branch, branch first.
