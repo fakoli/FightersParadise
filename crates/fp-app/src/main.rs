@@ -701,27 +701,110 @@ fn build_player(
     Ok(Player::new(entity, loaded))
 }
 
+/// One field of [`MatchInput`] that a keyboard key drives.
+///
+/// Used by [`KEYBOARD_BINDINGS`] so the player-1 key map is a single explicit
+/// data table (each row maps physical scancodes to the engine input bit they
+/// assert) rather than scattered through the polling code, and so the table can
+/// be asserted directly in unit tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputField {
+    /// Absolute screen direction: up (jump).
+    Up,
+    /// Absolute screen direction: down (crouch).
+    Down,
+    /// Absolute screen direction: left.
+    Left,
+    /// Absolute screen direction: right.
+    Right,
+    /// Attack button `a` (light punch).
+    A,
+    /// Attack button `b` (medium punch).
+    B,
+    /// Attack button `c` (heavy punch).
+    C,
+    /// Attack button `x` (light kick).
+    X,
+    /// Attack button `y` (medium kick).
+    Y,
+    /// Attack button `z` (heavy kick).
+    Z,
+}
+
+impl InputField {
+    /// Asserts this field's bit in a [`MatchInput`].
+    fn set(self, m: &mut MatchInput) {
+        match self {
+            InputField::Up => m.up = true,
+            InputField::Down => m.down = true,
+            InputField::Left => m.left = true,
+            InputField::Right => m.right = true,
+            InputField::A => m.a = true,
+            InputField::B => m.b = true,
+            InputField::C => m.c = true,
+            InputField::X => m.x = true,
+            InputField::Y => m.y = true,
+            InputField::Z => m.z = true,
+        }
+    }
+}
+
+/// Player-1 keyboard key map: every physical [`Scancode`] that drives an engine
+/// [`InputField`], as a single explicit table.
+///
+/// Movement uses **WASD or the arrow keys** (either source asserts the same
+/// direction, so both bind to the same field); the six MUGEN attack buttons are
+/// the **U/I/O** (punch row: `a` `b` `c`) and **J/K/L** (kick row: `x` `y` `z`)
+/// home keys. The engine receives these as **absolute** screen directions and
+/// resolves facing internally (inside the [`fp_input::CommandMatcher`]), so this
+/// table stays a pure absolute-direction snapshot — do not pre-rotate here.
+///
+/// There is intentionally **no keyboard `start`/pause binding**: the engine's
+/// `tick` takes no pause signal yet, matching the documented controller-Start
+/// drop in [`controller_to_match_input`].
+const KEYBOARD_BINDINGS: &[(Scancode, InputField)] = &[
+    // Movement: WASD and the arrow keys both drive the same direction.
+    (Scancode::W, InputField::Up),
+    (Scancode::Up, InputField::Up),
+    (Scancode::S, InputField::Down),
+    (Scancode::Down, InputField::Down),
+    (Scancode::A, InputField::Left),
+    (Scancode::Left, InputField::Left),
+    (Scancode::D, InputField::Right),
+    (Scancode::Right, InputField::Right),
+    // Punch row a/b/c.
+    (Scancode::U, InputField::A),
+    (Scancode::I, InputField::B),
+    (Scancode::O, InputField::C),
+    // Kick row x/y/z.
+    (Scancode::J, InputField::X),
+    (Scancode::K, InputField::Y),
+    (Scancode::L, InputField::Z),
+];
+
+/// Builds a [`MatchInput`] from a held-key oracle, using [`KEYBOARD_BINDINGS`].
+///
+/// `is_held(scancode)` reports whether a physical key is currently held. Keeping
+/// this pure (no SDL types) makes the player-1 key map unit-testable without a
+/// live SDL context — the live path ([`match_input_from_keyboard`]) just supplies
+/// the SDL keyboard state as the oracle. Multiple scancodes mapping to the same
+/// field (WASD vs. arrows) are OR'd, so either source asserts the direction.
+fn match_input_from_held(mut is_held: impl FnMut(Scancode) -> bool) -> MatchInput {
+    let mut input = MatchInput::none();
+    for &(scancode, field) in KEYBOARD_BINDINGS {
+        if is_held(scancode) {
+            field.set(&mut input);
+        }
+    }
+    input
+}
+
 /// Builds a [`MatchInput`] (absolute screen directions + button presses) from the
-/// current SDL2 keyboard state, using the same key map as the single-character
-/// path (WASD/arrows + U/I/O/J/K/L). The engine converts these to facing-relative
+/// current SDL2 keyboard state, using the player-1 [`KEYBOARD_BINDINGS`] key map
+/// (WASD/arrows + U/I/O/J/K/L). The engine converts these to facing-relative
 /// commands internally, so this stays a pure absolute-direction snapshot.
 fn match_input_from_keyboard(keyboard: &KeyboardState<'_>) -> MatchInput {
-    MatchInput {
-        up: keyboard.is_scancode_pressed(Scancode::W)
-            || keyboard.is_scancode_pressed(Scancode::Up),
-        down: keyboard.is_scancode_pressed(Scancode::S)
-            || keyboard.is_scancode_pressed(Scancode::Down),
-        left: keyboard.is_scancode_pressed(Scancode::A)
-            || keyboard.is_scancode_pressed(Scancode::Left),
-        right: keyboard.is_scancode_pressed(Scancode::D)
-            || keyboard.is_scancode_pressed(Scancode::Right),
-        a: keyboard.is_scancode_pressed(Scancode::U),
-        b: keyboard.is_scancode_pressed(Scancode::I),
-        c: keyboard.is_scancode_pressed(Scancode::O),
-        x: keyboard.is_scancode_pressed(Scancode::J),
-        y: keyboard.is_scancode_pressed(Scancode::K),
-        z: keyboard.is_scancode_pressed(Scancode::L),
-    }
+    match_input_from_held(|scancode| keyboard.is_scancode_pressed(scancode))
 }
 
 /// Number of controller slots the app tracks. Slot 0 drives player 1 (alongside
@@ -3918,6 +4001,132 @@ mod tests {
         };
         assert_eq!(merge_match_input(only_kbd, MatchInput::none()), only_kbd);
         assert_eq!(merge_match_input(MatchInput::none(), only_kbd), only_kbd);
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard key map (T024): the player-1 scancode -> engine-input path.
+    //
+    // `match_input_from_held` is the pure core of `match_input_from_keyboard`;
+    // it takes a held-key oracle so the key map is testable without a live SDL
+    // context. Tests build a synthetic "held" set and assert every documented
+    // direction and attack button reaches the right `MatchInput` bit, that WASD
+    // and the arrow keys alias the same direction, and that directions stay
+    // absolute (never pre-rotated by facing). The MatchInput -> engine raw
+    // InputState hop is covered in `fp-input` (see `playability_tests`).
+    // -----------------------------------------------------------------------
+
+    /// Builds the `MatchInput` for a set of held scancodes via the pure key map.
+    fn kbd(held: &[Scancode]) -> MatchInput {
+        match_input_from_held(|sc| held.contains(&sc))
+    }
+
+    #[test]
+    fn keyboard_no_keys_held_is_none() {
+        assert_eq!(kbd(&[]), MatchInput::none());
+    }
+
+    #[test]
+    fn keyboard_wasd_drives_each_direction() {
+        assert!(kbd(&[Scancode::A]).left, "A -> left");
+        assert!(kbd(&[Scancode::D]).right, "D -> right");
+        assert!(kbd(&[Scancode::W]).up, "W -> up (jump)");
+        assert!(kbd(&[Scancode::S]).down, "S -> down (crouch)");
+        // Each is exactly one bit, nothing else.
+        let left = kbd(&[Scancode::A]);
+        assert_eq!(
+            left,
+            MatchInput {
+                left: true,
+                ..MatchInput::none()
+            }
+        );
+    }
+
+    #[test]
+    fn keyboard_arrow_keys_drive_each_direction() {
+        assert!(kbd(&[Scancode::Left]).left, "Left arrow -> left");
+        assert!(kbd(&[Scancode::Right]).right, "Right arrow -> right");
+        assert!(kbd(&[Scancode::Up]).up, "Up arrow -> up (jump)");
+        assert!(kbd(&[Scancode::Down]).down, "Down arrow -> down (crouch)");
+    }
+
+    #[test]
+    fn keyboard_wasd_and_arrows_alias_same_direction() {
+        // Either source asserts the same bit, and holding both is just that bit.
+        assert_eq!(kbd(&[Scancode::A]), kbd(&[Scancode::Left]));
+        assert_eq!(kbd(&[Scancode::A, Scancode::Left]), kbd(&[Scancode::A]));
+    }
+
+    #[test]
+    fn keyboard_each_attack_button_maps_to_documented_bit() {
+        // Punch row a/b/c on U/I/O.
+        assert!(kbd(&[Scancode::U]).a, "U -> a");
+        assert!(kbd(&[Scancode::I]).b, "I -> b");
+        assert!(kbd(&[Scancode::O]).c, "O -> c");
+        // Kick row x/y/z on J/K/L.
+        assert!(kbd(&[Scancode::J]).x, "J -> x");
+        assert!(kbd(&[Scancode::K]).y, "K -> y");
+        assert!(kbd(&[Scancode::L]).z, "L -> z");
+
+        // Each attack key sets exactly its own bit and no other.
+        assert_eq!(
+            kbd(&[Scancode::U]),
+            MatchInput {
+                a: true,
+                ..MatchInput::none()
+            }
+        );
+    }
+
+    #[test]
+    fn keyboard_combined_walk_and_attack() {
+        // Holding D + U (walk right + light punch) sets exactly those two bits,
+        // the common "attack while advancing" case.
+        let mi = kbd(&[Scancode::D, Scancode::U]);
+        assert_eq!(
+            mi,
+            MatchInput {
+                right: true,
+                a: true,
+                ..MatchInput::none()
+            }
+        );
+    }
+
+    #[test]
+    fn keyboard_bindings_cover_every_input_field() {
+        // The binding table must reach all four directions and all six attack
+        // buttons, so no documented input is unreachable from the keyboard.
+        let all: Vec<InputField> = KEYBOARD_BINDINGS.iter().map(|&(_, f)| f).collect();
+        for field in [
+            InputField::Up,
+            InputField::Down,
+            InputField::Left,
+            InputField::Right,
+            InputField::A,
+            InputField::B,
+            InputField::C,
+            InputField::X,
+            InputField::Y,
+            InputField::Z,
+        ] {
+            assert!(
+                all.contains(&field),
+                "no keyboard binding produces {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_directions_are_absolute_not_prerotated() {
+        // The keyboard map emits ABSOLUTE screen directions; left and right are
+        // never swapped by the app (facing is resolved later inside the engine's
+        // CommandMatcher). Holding A must always be `left`, never `right`,
+        // regardless of which way the (eventual) fighter faces.
+        let l = kbd(&[Scancode::A]);
+        assert!(l.left && !l.right);
+        let r = kbd(&[Scancode::D]);
+        assert!(r.right && !r.left);
     }
 
     #[test]
