@@ -124,8 +124,9 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    AfterImageState, AnimSet, Character, CurPalFx, EntityGraph, EnvColor, EnvShake, EvalCtx, Facing,
-    LoadedCharacter, MoveType, Physics, StageView, StateType, TransMode, NUM_FVARS, NUM_VARS,
+    AfterImageFrame, AfterImageState, AnimSet, Character, CurPalFx, EntityGraph, EnvColor, EnvShake,
+    EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType, TrailBlend,
+    TransMode, NUM_FVARS, NUM_VARS,
 };
 
 /// The per-tick **cross-entity evaluation environment**: the opponent's context
@@ -239,6 +240,19 @@ const DEFAULT_AFTERIMAGE_LENGTH: i32 = 20;
 /// Cap on `AfterImage length` so a pathological authored value cannot make the
 /// renderer draw an unbounded number of ghost quads.
 const MAX_AFTERIMAGE_LENGTH: i32 = 64;
+
+/// Default `AfterImage timegap` (ticks between captured frames) — MUGEN captures
+/// a frame every tick when the parameter is omitted.
+const DEFAULT_AFTERIMAGE_TIMEGAP: i32 = 1;
+
+/// Default `AfterImage framegap` (history frames stepped between drawn ghosts) —
+/// MUGEN's documented default is `4`.
+const DEFAULT_AFTERIMAGE_FRAMEGAP: i32 = 4;
+
+/// MUGEN `AfterImage PalContrast = r,g,b` is on a `0..255` integer scale where
+/// `255` means ×1 (no contrast change); divide authored values by 255 to get the
+/// renderer's per-step multiplier (T007).
+const PALCONTRAST_SCALE: f32 = 255.0;
 
 /// A request to play one sound, emitted by a `PlaySnd` controller during a tick.
 ///
@@ -717,6 +731,11 @@ impl Character {
         // (During a hit-pause freeze, above, these timers correctly hold — a
         // frozen sprite keeps its current tint.)
         self.cur_palfx.tick();
+        // AfterImage frame-history ring (T007): while the trail is active, snapshot
+        // the *current* drawable frame (anim/elem/pos/facing) into the ring on the
+        // configured `timegap` cadence BEFORE counting the trail down, so an active
+        // tick records the sprite it is about to draw. Then count the trail down.
+        self.capture_afterimage_frame();
         self.afterimage.tick();
         // T015 screen effects (EnvShake / EnvColor) count down the same way.
         self.env_shake.tick();
@@ -2602,22 +2621,51 @@ impl Character {
         };
     }
 
-    /// `AfterImage`: arm the fading-trail effect (faithfulness audit #33).
+    /// Snapshots the character's current drawable frame into the active
+    /// `AfterImage` history ring on the configured `timegap` cadence (T007).
     ///
-    /// MUGEN's `AfterImage` draws a trail of the character's recent frames for
-    /// `time` ticks, `length` ghosts deep, each tinted by the controller's
-    /// `PalAdd`/`PalMul` (and `PalBright`/`PalContrast`, which we fold into the
-    /// add/mul tint). We model the renderer-relevant parameters — `time`,
-    /// `length`, and a single representative [`CurPalFx`] tint applied to the
-    /// ghosts — and leave the frame-history capture and per-ghost decay to the
-    /// renderer (`fp-app`), which fakes the trail from the current frame at
-    /// decreasing alpha.
+    /// A no-op when no trail is active. Captures the sprite identity
+    /// ([`anim`](Character::anim) / [`anim_elem`](Character::anim_elem)), the world
+    /// axis ([`pos`](Character::pos)), and [`facing`](Character::facing) — exactly
+    /// what the renderer needs to redraw the past frame. The ring is bounded to the
+    /// trail's `length`; capture obeys `timegap` (one frame every `timegap` ticks).
+    /// Never panics.
+    fn capture_afterimage_frame(&mut self) {
+        if !self.afterimage.is_active() {
+            return;
+        }
+        let frame = AfterImageFrame {
+            anim: self.anim,
+            anim_elem: self.anim_elem,
+            pos: self.pos,
+            facing: self.facing,
+        };
+        self.afterimage.capture_on_cadence(frame);
+    }
+
+    /// `AfterImage`: arm the true frame-history trail effect (faithfulness audit
+    /// #33; T007).
     ///
-    /// `time` defaults to MUGEN's `1`; `length` defaults to `20` and is clamped to
-    /// a small sane cap so a pathological value cannot blow up the renderer. The
-    /// `PalAdd`/`PalMul` triples are normalized like [`ctrl_palfx`](Self::ctrl_palfx).
-    /// `TimeGap`/`FrameGap`/`Trans` are not modeled (the renderer picks a fixed
-    /// fade). A non-positive `time` arms no trail. Never panics.
+    /// MUGEN's `AfterImage` retains a ring of the character's recent frames and
+    /// draws a fading trail of them behind the live sprite for `time` ticks. The
+    /// controllable parameters are modeled in full:
+    /// - `time` — trail duration in ticks (default MUGEN `1`); a non-positive
+    ///   `time` arms no trail.
+    /// - `length` — how many past frames the ring retains (default `20`), clamped
+    ///   to `1..=`[`MAX_AFTERIMAGE_LENGTH`] so a pathological value cannot grow the
+    ///   ring without bound.
+    /// - `timegap` — ticks between captured frames (default `1`), clamped `>= 1`.
+    /// - `framegap` — history frames stepped between drawn ghosts (default `4`),
+    ///   clamped `>= 1`.
+    /// - `trans` — the ghost blend mode ([`TrailBlend`], default `none`).
+    /// - `paladd`/`palmul` — the base ghost color tint (normalized like
+    ///   [`ctrl_palfx`](Self::ctrl_palfx)); `palbright`/`palcontrast` — the
+    ///   per-ghost progressive add/multiply ramps applied to successive ghosts.
+    ///
+    /// The actual frame capture happens each active tick (see
+    /// [`AfterImageState::capture_on_cadence`]); this controller only arms the
+    /// configuration. Re-arming an already-active trail starts a fresh ring.
+    /// Never panics.
     fn ctrl_afterimage(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         let time = ctrl
             .params
@@ -2625,10 +2673,11 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .map_or(1, |v| v.to_int());
         if time <= 0 {
-            self.afterimage = AfterImageState::INACTIVE;
+            self.afterimage = AfterImageState::inactive();
             return;
         }
-        // `length` = number of ghost frames. Default 20; clamp to a sane cap.
+        // `length` = number of retained history frames. Default 20; clamp to a
+        // sane cap so the ring can never grow unbounded.
         let length = ctrl
             .params
             .get("length")
@@ -2636,15 +2685,41 @@ impl Character {
             .map_or(DEFAULT_AFTERIMAGE_LENGTH, |v| v.to_int())
             .clamp(1, MAX_AFTERIMAGE_LENGTH);
 
-        // The ghost tint: PalAdd is a 0–255 signed add; PalMul is an already-
+        // `timegap` = ticks between captures; `framegap` = history frames stepped
+        // between drawn ghosts. Both are >= 1.
+        let timegap = ctrl
+            .params
+            .get("timegap")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(DEFAULT_AFTERIMAGE_TIMEGAP, |v| v.to_int())
+            .max(1);
+        let framegap = ctrl
+            .params
+            .get("framegap")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(DEFAULT_AFTERIMAGE_FRAMEGAP, |v| v.to_int())
+            .max(1);
+
+        // `trans` selects how the ghosts are composited; default `none`.
+        let trans = raw_param(ctrl, "trans").map_or(TrailBlend::None, TrailBlend::parse);
+
+        // The base ghost tint: PalAdd is a 0–255 signed add; PalMul is an already-
         // fractional float multiplier (KFM authors `.85` etc.), so it uses scale
         // 1.0 and defaults each channel to 1.0 (no change).
         let add = self.read_rgb_triple(ctrl, "paladd", env, 0.0, ADD_SCALE);
         let mul = self.read_rgb_triple(ctrl, "palmul", env, 1.0, PALMUL_SCALE);
 
+        // Per-ghost progressive ramps. `palbright` is a signed 0..255 add (0 = no
+        // brightening); `palcontrast` is a 0..255 multiply where 255 = ×1.
+        let palbright = self.read_rgb_triple(ctrl, "palbright", env, 0.0, ADD_SCALE);
+        let palcontrast = self.read_rgb_triple(ctrl, "palcontrast", env, 1.0, PALCONTRAST_SCALE);
+
         self.afterimage = AfterImageState {
             time,
             length,
+            timegap,
+            framegap,
+            trans,
             palfx: CurPalFx {
                 add,
                 mul,
@@ -2652,6 +2727,10 @@ impl Character {
                 // The trail's own per-ghost lifetime is the whole-trail `time`.
                 remaining: time,
             },
+            palbright,
+            palcontrast,
+            timegap_counter: 0,
+            frames: Vec::new(),
         };
     }
 
@@ -2661,9 +2740,9 @@ impl Character {
     /// MUGEN's `AfterImageTime time = N` resets the active trail's remaining time
     /// to `N` (KFM uses it to keep the trail alive across the move), and `N <= 0`
     /// cancels it. We only adjust the duration of the already-armed trail (its
-    /// `length`/tint are untouched); if no trail is active there is nothing to
-    /// extend, so a positive `time` is a no-op (MUGEN behaves the same — it does
-    /// not start a fresh trail). Never panics.
+    /// `length`/cadence/tint and captured ring are untouched); if no trail is
+    /// active there is nothing to extend, so a positive `time` is a no-op (MUGEN
+    /// behaves the same — it does not start a fresh trail). Never panics.
     fn ctrl_afterimage_time(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         // The duration parameter is `time` (or, in some content, the bare
         // `value`); accept either.
@@ -2674,7 +2753,7 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .map_or(0, |v| v.to_int());
         if time <= 0 {
-            self.afterimage = AfterImageState::INACTIVE;
+            self.afterimage = AfterImageState::inactive();
             return;
         }
         if self.afterimage.is_active() {
@@ -11830,6 +11909,140 @@ mod tests {
         assert!(ch.afterimage().length >= 1);
     }
 
+    /// `AfterImage` parses `timegap`/`framegap`/`trans` and the per-ghost
+    /// `PalBright`/`PalContrast` ramps onto the trail config (T007).
+    #[test]
+    fn afterimage_parses_ring_and_modulation_params() {
+        let ai = ctrl(
+            0,
+            "AfterImage",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[
+                ("time", "20"),
+                ("length", "8"),
+                ("timegap", "2"),
+                ("framegap", "3"),
+                ("trans", "add1"),
+                ("palbright", "30,30,30"),
+                ("palcontrast", "255,128,0"),
+            ],
+        );
+        let st0 = stand_n(0, vec![ai]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        let trail = ch.afterimage();
+        assert_eq!(trail.timegap, 2, "timegap parsed");
+        assert_eq!(trail.framegap, 3, "framegap parsed");
+        assert_eq!(trail.trans, crate::TrailBlend::Add1, "trans parsed");
+        // PalBright is a signed 0..255 add (30/255); PalContrast a 0..255 ×scale.
+        assert!((trail.palbright[0] - 30.0 / 255.0).abs() < 1e-4);
+        assert!((trail.palcontrast[0] - 1.0).abs() < 1e-4, "255 → ×1");
+        assert!((trail.palcontrast[1] - 128.0 / 255.0).abs() < 1e-4);
+        assert!((trail.palcontrast[2] - 0.0).abs() < 1e-4);
+    }
+
+    /// The frame-history ring retains the configured `length` of past frames and
+    /// captures them at the configured `timegap` cadence (T007 acceptance test).
+    #[test]
+    fn afterimage_ring_retains_frames_at_timegap_cadence() {
+        // time = 20 (long-lived), length = 3 (ring caps at 3 retained frames),
+        // timegap = 2 (capture every other tick).
+        let ai = ctrl(
+            0,
+            "AfterImage",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "20"), ("length", "3"), ("timegap", "2")],
+        );
+        let st0 = stand_n(0, vec![ai]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+
+        // Tick 1: arms the trail (countdown runs before controllers, so the trail
+        // is inactive when capture runs this tick — no frame yet).
+        lc.tick(&mut ch);
+        assert!(ch.afterimage().is_active(), "trail armed");
+        assert!(ch.afterimage().frames.is_empty(), "no capture on the arming tick");
+
+        // Drive several more ticks; with timegap = 2 a frame is captured every 2nd
+        // active tick, and the ring is bounded to length = 3.
+        let mut captured_counts = Vec::new();
+        for _ in 0..10 {
+            lc.tick(&mut ch);
+            captured_counts.push(ch.afterimage().frames.len());
+        }
+
+        // The ring never exceeds the configured length.
+        assert!(
+            captured_counts.iter().all(|&n| n <= 3),
+            "ring bounded to length = 3, saw {captured_counts:?}"
+        );
+        // It does eventually fill to exactly the cap.
+        assert_eq!(
+            *captured_counts.last().unwrap(),
+            3,
+            "ring fills to the cap, saw {captured_counts:?}"
+        );
+        // Cadence: counts only increase every 2nd capturing tick (timegap = 2), so
+        // the sequence of ring sizes shows each new frame held for two ticks until
+        // the cap. The number of distinct increments equals the cap (3).
+        let mut increments = 0;
+        let mut prev = 0usize;
+        for &n in &captured_counts {
+            if n > prev {
+                increments += 1;
+            }
+            prev = n;
+        }
+        assert_eq!(increments, 3, "exactly `length` distinct growth steps");
+    }
+
+    /// `ghost_frames` steps the retained ring by `framegap` and stays newest-first
+    /// (T007).
+    #[test]
+    fn afterimage_ghost_frames_step_by_framegap() {
+        let mut st = crate::AfterImageState::inactive();
+        st.time = 10;
+        st.length = 6;
+        st.framegap = 2;
+        // Push 6 frames with distinct `anim` ids so we can identify them; newest
+        // ends up at frames[0].
+        for anim in 0..6 {
+            st.push_frame(crate::AfterImageFrame {
+                anim,
+                anim_elem: 0,
+                pos: fp_core::Vec2 { x: 0.0, y: 0.0 },
+                facing: Facing::Right,
+            });
+        }
+        // frames is newest-first: [5,4,3,2,1,0]. step_by(2) → [5,3,1].
+        let ghosts = st.ghost_frames();
+        let ids: Vec<i32> = ghosts.iter().map(|g| g.anim).collect();
+        assert_eq!(ids, vec![5, 3, 1], "every framegap-th frame, newest-first");
+    }
+
+    /// A trail clears its captured ring when its duration expires (T007).
+    #[test]
+    fn afterimage_ring_clears_on_expiry() {
+        let mut st = crate::AfterImageState::inactive();
+        st.time = 1;
+        st.length = 4;
+        st.push_frame(crate::AfterImageFrame {
+            anim: 7,
+            anim_elem: 0,
+            pos: fp_core::Vec2 { x: 0.0, y: 0.0 },
+            facing: Facing::Right,
+        });
+        assert_eq!(st.frames.len(), 1);
+        st.tick(); // 1 → 0, expires and resets to inactive (empty ring)
+        assert!(!st.is_active());
+        assert!(st.frames.is_empty(), "expiry clears the captured ring");
+    }
+
     /// `AfterImageTime` re-arms the active trail's remaining time; with no active
     /// trail it is a no-op (does not start a fresh one).
     #[test]
@@ -11846,7 +12059,11 @@ mod tests {
         // trail with enough time to survive the pre-controller countdown (3 → 2),
         // so the controller still sees it active and re-arms time to 5.
         let mut ch2 = Character::new();
-        ch2.afterimage = crate::AfterImageState { time: 3, length: 5, palfx: crate::CurPalFx::IDENTITY };
+        ch2.afterimage = crate::AfterImageState {
+            time: 3,
+            length: 5,
+            ..crate::AfterImageState::inactive()
+        };
         lc.tick(&mut ch2);
         assert_eq!(ch2.afterimage().time, 5, "AfterImageTime re-armed the duration");
     }
@@ -11858,7 +12075,11 @@ mod tests {
         let st0 = stand_n(0, vec![ait]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
-        ch.afterimage = crate::AfterImageState { time: 10, length: 5, palfx: crate::CurPalFx::IDENTITY };
+        ch.afterimage = crate::AfterImageState {
+            time: 10,
+            length: 5,
+            ..crate::AfterImageState::inactive()
+        };
         lc.tick(&mut ch);
         assert!(!ch.afterimage().is_active(), "AfterImageTime 0 cancelled the trail");
     }
@@ -11871,7 +12092,11 @@ mod tests {
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
         ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5 };
-        ch.afterimage = crate::AfterImageState { time: 8, length: 4, palfx: crate::CurPalFx::IDENTITY };
+        ch.afterimage = crate::AfterImageState {
+            time: 8,
+            length: 4,
+            ..crate::AfterImageState::inactive()
+        };
         ch.hitpause = 3;
         lc.tick(&mut ch);
         // Hit-paused tick: the color-effect timers must be unchanged.

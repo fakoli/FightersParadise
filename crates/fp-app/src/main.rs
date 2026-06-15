@@ -1446,16 +1446,15 @@ fn draw_player(
 
     let (render_blend, alpha) = map_blend_mode(&anim_frame.blend);
 
-    // AfterImage trail (audit #33): draw a fading row of ghost frames BEHIND the
-    // sprite first, so the live frame is drawn over them. We do not capture frame
-    // history, so the trail re-uses the current frame, stepped back along the
-    // character's facing with decaying alpha and the trail's color tint. Drawn
-    // before the main sprite so it sits behind it.
+    // AfterImage trail (audit #33; T007): draw the trail's *captured* past frames
+    // BEHIND the live sprite, so the live frame draws over them. The frame-history
+    // ring (`AfterImageState::frames`) records each past frame's sprite identity +
+    // world position; we redraw the selected ghosts (`ghost_frames`) at their own
+    // positions, progressively modulated by the trail's PalBright/PalContrast and
+    // composited with its `trans` blend mode.
     let afterimage = player.character.afterimage();
     if afterimage.is_active() {
-        draw_afterimage_trail(
-            frame, cached, &afterimage, draw_x, draw_y, flip_h, anim_frame.flip_v, facing_right,
-        );
+        draw_afterimage_trail(frame, cache, player, afterimage, camera_x, win_w, win_h);
     }
 
     // PalFX color tint (audit #33): the character's active tint (identity when
@@ -1686,50 +1685,97 @@ fn char_palfx_to_render(fx: fp_character::CurPalFx) -> fp_render::PalFx {
     }
 }
 
-/// How far apart (in screen pixels) successive AfterImage ghost frames are
-/// stepped behind the sprite. A small offset gives a readable motion smear
-/// without scattering the trail across the screen.
-const AFTERIMAGE_STEP_PX: f32 = 6.0;
+/// Maps the character-side [`fp_character::TrailBlend`] onto the renderer's
+/// [`fp_render::TrailTrans`] (T007). The two enums mirror each other (the renderer
+/// crate does not depend on `fp-character`), so this is a straight 1:1 translation.
+fn trail_blend_to_render(blend: fp_character::TrailBlend) -> fp_render::TrailTrans {
+    match blend {
+        fp_character::TrailBlend::None => fp_render::TrailTrans::None,
+        fp_character::TrailBlend::Add => fp_render::TrailTrans::Add,
+        fp_character::TrailBlend::Add1 => fp_render::TrailTrans::Add1,
+        fp_character::TrailBlend::Sub => fp_render::TrailTrans::Sub,
+    }
+}
 
-/// The most ghost frames drawn for an AfterImage trail, regardless of the
-/// controller's authored `length`. Caps per-frame draw cost.
-const AFTERIMAGE_MAX_GHOSTS: i32 = 8;
+/// Builds the renderer's [`fp_render::AfterImageModulation`] from a trail's base
+/// tint and per-ghost `PalBright`/`PalContrast` ramps (T007).
+fn afterimage_modulation(
+    afterimage: &fp_character::AfterImageState,
+) -> fp_render::AfterImageModulation {
+    fp_render::AfterImageModulation {
+        base: char_palfx_to_render(afterimage.palfx),
+        palbright: afterimage.palbright,
+        palcontrast: afterimage.palcontrast,
+    }
+}
 
-/// Draws the AfterImage ghost trail behind a fighter's live sprite (audit #33).
+/// Draws the AfterImage ghost trail behind a fighter's live sprite from the
+/// captured frame-history ring (audit #33; T007).
 ///
-/// We have no captured frame history, so the trail is faked from the *current*
-/// frame: each ghost `i` (1-based, oldest last) is the same sprite stepped back
-/// [`AFTERIMAGE_STEP_PX`] per ghost opposite the facing direction, drawn additive
-/// with a linearly decaying alpha and the trail's [`palfx`](fp_character::AfterImageState::palfx)
-/// color tint. Ghosts are drawn far-to-near so nearer (brighter) ghosts overlay
-/// farther ones. The number of ghosts is the trail `length` clamped to
-/// [`AFTERIMAGE_MAX_GHOSTS`]. Pure draw calls; never panics.
-#[allow(clippy::too_many_arguments)]
+/// Walks the trail's selected ghosts ([`AfterImageState::ghost_frames`], every
+/// `framegap`-th retained frame, newest-first) and redraws each at its **own**
+/// captured world position / facing — a true motion trail of where the fighter
+/// *was*, not a smear of the current frame. Each ghost is progressively modulated
+/// by the trail's `PalBright`/`PalContrast` ([`fp_render::ghost_palfx`]) and
+/// composited with its `trans` blend and a decaying per-ghost alpha
+/// ([`fp_render::ghost_alpha`]). Ghosts are drawn oldest-first (back-to-front) so
+/// newer (brighter) ghosts overlay older ones, then the live sprite over all.
+/// A ghost whose sprite cannot be resolved/cached is skipped. Never panics.
+///
+/// [`AfterImageState::ghost_frames`]: fp_character::AfterImageState::ghost_frames
 fn draw_afterimage_trail(
     frame: &mut fp_render::RenderFrame<'_>,
-    cached: &CachedSprite,
+    cache: &FighterRender,
+    player: &Player,
     afterimage: &fp_character::AfterImageState,
-    base_x: f32,
-    base_y: f32,
-    flip_h: bool,
-    flip_v: bool,
-    facing_right: bool,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
 ) {
-    let ghosts = afterimage.length.clamp(1, AFTERIMAGE_MAX_GHOSTS);
-    // Step trails opposite the facing direction (the sprite "leaves" them behind).
-    let dir = if facing_right { -1.0 } else { 1.0 };
-    let palfx = char_palfx_to_render(afterimage.palfx);
-    // Draw the farthest (faintest) ghost first so nearer ghosts overlay it.
-    for i in (1..=ghosts).rev() {
-        // Decaying alpha: nearest ghost ~0.5, fading to ~0 at the tail.
-        let t = i as f32 / (ghosts as f32 + 1.0);
-        let alpha = 0.5 * (1.0 - t);
+    let ground_y = win_h * 0.8;
+    let ghosts = afterimage.ghost_frames();
+    let count = ghosts.len();
+    let trans = trail_blend_to_render(afterimage.trans);
+    let blend = trans.blend_mode();
+    let modulation = afterimage_modulation(afterimage);
+
+    // Draw oldest ghost first (largest index) so newer, brighter ghosts overlay it.
+    for (i, ghost) in ghosts.iter().enumerate().rev() {
+        // Resolve the sprite that was showing when this frame was captured.
+        let Some(action) = player.loaded.air.action(ghost.anim) else {
+            continue;
+        };
+        if action.frames.is_empty() {
+            continue;
+        }
+        let idx = clamp_elem(ghost.anim_elem, action.frames.len());
+        let Some(anim_frame) = action.frames.get(idx) else {
+            continue;
+        };
+        let Some(cached) = cache.sprite_cache.get(&anim_frame.sprite) else {
+            continue;
+        };
+
+        // Place the ghost at its own captured world position (same mapping as the
+        // live sprite in `draw_player`), so the trail follows the actual path.
+        let facing_right = ghost.facing == fp_character::Facing::Right;
+        let screen_x = world_to_screen_x(ghost.pos.x - camera_x, win_w);
+        let draw_x = screen_x - cached.axis_x as f32 + anim_frame.offset.x as f32;
+        let draw_y = ground_y + ghost.pos.y - cached.axis_y as f32 + anim_frame.offset.y as f32;
+        let flip_h = if facing_right {
+            anim_frame.flip_h
+        } else {
+            !anim_frame.flip_h
+        };
+
+        let alpha = fp_render::ghost_alpha(i, count, trans);
+        let palfx = fp_render::ghost_palfx(&modulation, i);
         let params = SpriteDrawParams {
-            x: base_x + dir * AFTERIMAGE_STEP_PX * i as f32,
-            y: base_y,
+            x: draw_x,
+            y: draw_y,
             flip_h,
-            flip_v,
-            blend: fp_render::BlendMode::Additive,
+            flip_v: anim_frame.flip_v,
+            blend,
             alpha,
             palfx,
             ..Default::default()

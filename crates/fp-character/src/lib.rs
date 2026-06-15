@@ -860,36 +860,131 @@ impl Default for CurPalFx {
     }
 }
 
+/// The blend mode applied to every `AfterImage` ghost (MUGEN `AfterImage trans`).
+///
+/// MUGEN's `AfterImage trans` selects how the whole trail is composited over the
+/// background; the renderer (`fp-app`) maps each variant onto its
+/// `fp_render::BlendMode`. `None` (the MUGEN default for `AfterImage`) draws the
+/// ghosts with ordinary alpha blending; `Add`/`Add1`/`Sub` request additive /
+/// half-additive / subtractive compositing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TrailBlend {
+    /// `trans = none` — ordinary alpha blending (the MUGEN `AfterImage` default).
+    #[default]
+    None,
+    /// `trans = add` (or `addalpha`) — additive blending.
+    Add,
+    /// `trans = add1` — half-strength additive blending.
+    Add1,
+    /// `trans = sub` — subtractive blending.
+    Sub,
+}
+
+impl TrailBlend {
+    /// Parses a MUGEN `AfterImage trans` token (case-insensitive), falling back to
+    /// [`TrailBlend::None`] for an empty or unrecognised value (never panics).
+    #[must_use]
+    pub fn parse(token: &str) -> Self {
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("add") || t.eq_ignore_ascii_case("addalpha") {
+            Self::Add
+        } else if t.eq_ignore_ascii_case("add1") {
+            Self::Add1
+        } else if t.eq_ignore_ascii_case("sub") {
+            Self::Sub
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// A single captured frame in an [`AfterImageState`]'s history ring (T007).
+///
+/// Records exactly what the renderer needs to redraw a *past* frame of the
+/// character: which sprite was showing ([`anim`](Self::anim) /
+/// [`anim_elem`](Self::anim_elem)), where the axis was ([`pos`](Self::pos)), and
+/// which way it faced ([`facing`](Self::facing)). The per-ghost color modulation
+/// (`PalBright`/`PalContrast`/`PalAdd`/`PalMul`) is **not** stored per frame — it
+/// is a function of the ghost's *index* in the trail (older = more modulated),
+/// computed by the renderer, so the ring only holds the geometry/sprite identity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AfterImageFrame {
+    /// The animation (action) id that was current when this frame was captured.
+    pub anim: i32,
+    /// The zero-based animation element index that was current when captured.
+    pub anim_elem: i32,
+    /// The character axis (world position, pixels) at capture time.
+    pub pos: Vec2<f32>,
+    /// Which way the character faced at capture time.
+    pub facing: Facing,
+}
+
 /// The live `AfterImage` trail effect a character is displaying (faithfulness
-/// audit #33).
+/// audit #33; true frame-history ring, T007).
 ///
 /// MUGEN's `AfterImage` draws a fading trail of the character's recent frames
 /// behind the sprite for [`time`](Self::time) ticks; `AfterImageTime` re-arms or
-/// cancels the duration. We model the controllable parameters — duration,
-/// trail [`length`](Self::length) (number of ghost frames), and the per-ghost
-/// color [`palfx`](Self::palfx) tint — leaving the actual frame-history capture
-/// and decay to the renderer (`fp-app`), which fakes the trail from the current
-/// frame at decreasing alpha. While [`time`](Self::time) `> 0` the trail is
-/// active and counts down each (non-hit-paused) tick.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// cancels the duration. This models the real behaviour: a **frame-history ring**
+/// ([`frames`](Self::frames)) holds up to [`length`](Self::length) past frame
+/// snapshots, a new one captured every [`timegap`](Self::timegap) ticks; the
+/// renderer draws every [`framegap`](Self::framegap)-th retained frame as a
+/// ghost, composited with [`trans`](Self::trans) and progressively modulated by
+/// the trail's [`palfx`](Self::palfx) base tint plus the per-ghost
+/// [`palbright`](Self::palbright) / [`palcontrast`](Self::palcontrast) ramps.
+/// While [`time`](Self::time) `> 0` the trail is active and counts down each
+/// (non-hit-paused) tick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AfterImageState {
     /// Remaining trail duration in ticks. `0` (or less) = inactive.
     pub time: i32,
-    /// Number of ghost frames in the trail (MUGEN `length`, default `20`,
-    /// clamped to a sane small cap by the controller).
+    /// Maximum number of past frames retained in [`frames`](Self::frames) (MUGEN
+    /// `length`, default `20`, clamped to a sane small cap by the controller).
     pub length: i32,
-    /// The color tint applied to the trail ghosts (the controller's
-    /// `PalAdd`/`PalMul`/`PalBright` etc., folded into a single [`CurPalFx`]).
+    /// How many ticks elapse between successive frame captures (MUGEN `timegap`,
+    /// default `1` = capture every tick). Clamped to `>= 1` when used.
+    pub timegap: i32,
+    /// How many retained frames the renderer steps between drawn ghosts (MUGEN
+    /// `framegap`, default `4`). Clamped to `>= 1` when used.
+    pub framegap: i32,
+    /// The blend mode the renderer composites the ghosts with (MUGEN `trans`).
+    pub trans: TrailBlend,
+    /// The base color tint applied to the (newest) trail ghost — the controller's
+    /// `PalAdd`/`PalMul`, folded into a single [`CurPalFx`].
     pub palfx: CurPalFx,
+    /// Per-ghost additive brightness ramp (MUGEN `PalBright = r,g,b`, signed
+    /// `0..255` normalized to a `±1.0` fraction). Added once per ghost step, so
+    /// the `n`-th ghost gets `n ×` this offset on top of [`palfx`](Self::palfx).
+    pub palbright: [f32; 3],
+    /// Per-ghost multiplicative contrast ramp (MUGEN `PalContrast = r,g,b`, a
+    /// `0..255` value normalized so `255` → `1.0`). Multiplied once per ghost
+    /// step, so the `n`-th ghost gets [`palfx`](Self::palfx)`.mul × contrast^n`.
+    pub palcontrast: [f32; 3],
+    /// Internal capture-cadence counter: counts up each active tick, and a frame
+    /// is pushed into [`frames`](Self::frames) when it reaches
+    /// [`timegap`](Self::timegap). Not part of the public draw contract.
+    pub timegap_counter: i32,
+    /// The frame-history ring, newest-first: `frames[0]` is the most recently
+    /// captured frame. Bounded to [`length`](Self::length) entries.
+    pub frames: Vec<AfterImageFrame>,
 }
 
 impl AfterImageState {
-    /// The inactive default: no trail.
-    pub const INACTIVE: Self = Self {
-        time: 0,
-        length: 0,
-        palfx: CurPalFx::IDENTITY,
-    };
+    /// The inactive default: no trail, empty history.
+    #[must_use]
+    pub fn inactive() -> Self {
+        Self {
+            time: 0,
+            length: 0,
+            timegap: 1,
+            framegap: 4,
+            trans: TrailBlend::None,
+            palfx: CurPalFx::IDENTITY,
+            palbright: [0.0; 3],
+            palcontrast: [1.0; 3],
+            timegap_counter: 0,
+            frames: Vec::new(),
+        }
+    }
 
     /// Returns `true` while the trail is still running ([`time`](Self::time) `> 0`).
     #[must_use]
@@ -897,13 +992,57 @@ impl AfterImageState {
         self.time > 0
     }
 
-    /// Counts the trail down by one tick, clearing it when it expires. Called
-    /// once per non-hit-paused tick.
+    /// Pushes a freshly captured frame onto the front of the history ring,
+    /// dropping the oldest frame(s) so the ring never exceeds
+    /// [`length`](Self::length). A non-positive `length` retains nothing.
+    pub fn push_frame(&mut self, frame: AfterImageFrame) {
+        if self.length <= 0 {
+            self.frames.clear();
+            return;
+        }
+        self.frames.insert(0, frame);
+        let cap = self.length as usize;
+        if self.frames.len() > cap {
+            self.frames.truncate(cap);
+        }
+    }
+
+    /// Captures the given frame into the ring **iff** this tick lands on the
+    /// configured [`timegap`](Self::timegap) cadence, advancing the cadence
+    /// counter. Called once per active, non-hit-paused tick. A frame is recorded
+    /// every `timegap` ticks (counter reaching `timegap`); intermediate ticks only
+    /// advance the counter, so the ring grows one frame per `timegap` ticks. A
+    /// no-op when the trail is inactive.
+    pub fn capture_on_cadence(&mut self, frame: AfterImageFrame) {
+        if !self.is_active() {
+            return;
+        }
+        let gap = self.timegap.max(1);
+        self.timegap_counter += 1;
+        if self.timegap_counter >= gap {
+            self.timegap_counter = 0;
+            self.push_frame(frame);
+        }
+    }
+
+    /// The ghost frames the renderer should actually draw, newest-first: starts at
+    /// the newest retained frame and steps [`framegap`](Self::framegap) frames
+    /// between successive ghosts (MUGEN draws every `framegap`-th history frame).
+    /// Returns at most [`length`](Self::length) entries; empty when no history is
+    /// retained yet.
+    #[must_use]
+    pub fn ghost_frames(&self) -> Vec<AfterImageFrame> {
+        let step = self.framegap.max(1) as usize;
+        self.frames.iter().step_by(step).copied().collect()
+    }
+
+    /// Counts the trail down by one tick, clearing it (and its history) when it
+    /// expires. Called once per non-hit-paused tick.
     pub fn tick(&mut self) {
         if self.time > 0 {
             self.time -= 1;
             if self.time <= 0 {
-                *self = Self::INACTIVE;
+                *self = Self::inactive();
             }
         }
     }
@@ -911,7 +1050,7 @@ impl AfterImageState {
 
 impl Default for AfterImageState {
     fn default() -> Self {
-        Self::INACTIVE
+        Self::inactive()
     }
 }
 
@@ -2147,15 +2286,21 @@ impl Character {
     }
 
     /// Returns the character's live `AfterImage` trail state (faithfulness audit
-    /// #33).
+    /// #33; frame-history ring, T007).
     ///
     /// The renderer (`fp-app`) reads this and, while
-    /// [`AfterImageState::is_active`], draws a fading trail of recent frames
-    /// behind the sprite using the trail's [`palfx`](AfterImageState::palfx)
-    /// tint. Inactive ([`AfterImageState::INACTIVE`]) when no trail is running.
+    /// [`AfterImageState::is_active`], draws the trail's captured
+    /// [`frames`](AfterImageState::frames) (selected via
+    /// [`AfterImageState::ghost_frames`]) behind the sprite, composited with the
+    /// trail's [`trans`](AfterImageState::trans) and progressively modulated by
+    /// its [`palfx`](AfterImageState::palfx) /
+    /// [`palbright`](AfterImageState::palbright) /
+    /// [`palcontrast`](AfterImageState::palcontrast). Returns a borrow (the ring
+    /// owns a `Vec`, so the state is no longer `Copy`); inactive
+    /// ([`AfterImageState::is_active`] is `false`) when no trail is running.
     #[must_use]
-    pub const fn afterimage(&self) -> AfterImageState {
-        self.afterimage
+    pub const fn afterimage(&self) -> &AfterImageState {
+        &self.afterimage
     }
 
     /// Computes MUGEN's `AnimElemTime(n)` for the **one-based** element index
