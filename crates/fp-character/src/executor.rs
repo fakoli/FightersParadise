@@ -98,8 +98,8 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    AnimSet, Character, EvalCtx, Facing, LoadedCharacter, MoveType, Physics, StageView, StateType,
-    NUM_FVARS, NUM_VARS,
+    AfterImageState, AnimSet, Character, CurPalFx, EvalCtx, Facing, LoadedCharacter, MoveType,
+    Physics, StageView, StateType, NUM_FVARS, NUM_VARS,
 };
 
 /// The per-tick **cross-entity evaluation environment**: the opponent's context
@@ -183,6 +183,29 @@ const GROUND_Y: f32 = 0.0;
 /// `const(velocity.airjump.*)` and then proceeds to the jump-up state 50. Kept as
 /// a named constant so the magic state number has a single documented home.
 const AIRJUMP_START_STATE: i32 = 45;
+
+/// MUGEN `PalFX`/`AfterImage` `add` and `PalAdd` are 0–255 signed integers; the
+/// renderer wants a `±1.0` fraction, so divide authored values by 255 (#33).
+const ADD_SCALE: f32 = 255.0;
+
+/// MUGEN `PalFX mul = r,g,b` is on a 0–256 integer scale where `256` means ×1;
+/// divide authored values by 256 for the renderer's plain multiplier (#33).
+const MUL_SCALE: f32 = 256.0;
+
+/// `AfterImage`'s `PalMul` (unlike `PalFX mul`) is authored as an **already-
+/// fractional** float multiplier (`1.0` = ×1, e.g. KFM's `.85`), so it is used
+/// verbatim (scale `1.0`) rather than divided by 256 (#33).
+const PALMUL_SCALE: f32 = 1.0;
+
+/// MUGEN `PalFX color` is `0..256` (256 = full color); normalize to `0.0..=1.0`.
+const COLOR_SCALE: f32 = 256.0;
+
+/// Default `AfterImage length` (ghost-frame count) when the controller omits it.
+const DEFAULT_AFTERIMAGE_LENGTH: i32 = 20;
+
+/// Cap on `AfterImage length` so a pathological authored value cannot make the
+/// renderer draw an unbounded number of ghost quads.
+const MAX_AFTERIMAGE_LENGTH: i32 = 64;
 
 /// A request to play one sound, emitted by a `PlaySnd` controller during a tick.
 ///
@@ -513,6 +536,12 @@ impl Character {
         // Armed `HitOverride` slots (#9b) count down their `time` window alongside
         // the other per-tick timers (the `< 0` "forever" slots are untouched).
         self.hit_overrides.tick();
+        // PalFX / AfterImage color effects (#33) count down their `time` window
+        // each non-hit-paused tick; both expire back to their no-op state at 0.
+        // (During a hit-pause freeze, above, these timers correctly hold — a
+        // frozen sprite keeps its current tint.)
+        self.cur_palfx.tick();
+        self.afterimage.tick();
 
         // Process the special states first, in MUGEN order, then the current
         // state. The current state number is re-read after each special state in
@@ -1085,6 +1114,12 @@ impl Character {
             self.ctrl_pause(ctrl, env, report, FreezeKind::Pause);
         } else if kind.eq_ignore_ascii_case("SuperPause") {
             self.ctrl_pause(ctrl, env, report, FreezeKind::SuperPause);
+        } else if kind.eq_ignore_ascii_case("PalFX") {
+            self.ctrl_palfx(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AfterImage") {
+            self.ctrl_afterimage(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AfterImageTime") {
+            self.ctrl_afterimage_time(ctrl, env);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -2199,6 +2234,177 @@ impl Character {
         if let Some(v) = self.eval_param_component(param, 0, env) {
             self.cur_sprpriority = v.to_int();
         }
+    }
+
+    /// `PalFX`: arm a timed color tint on this character (faithfulness audit #33).
+    ///
+    /// MUGEN's `PalFX` recolors the player for `time` ticks. The parameters are
+    /// 0–255-scale integer triples:
+    ///
+    /// - `add = r,g,b` — signed per-channel add (`±255` = ±full).
+    /// - `mul = r,g,b` — per-channel multiply on a 0–256 scale (`256` = ×1).
+    /// - `color = c` — grayscale blend `0..256` (`256` = full color, `0` = gray).
+    ///
+    /// We normalize these to the renderer's float scale ([`CurPalFx`]): `add`
+    /// becomes `±1.0`, `mul` becomes a plain `0..` multiplier, and `color` a
+    /// `0.0..=1.0` retention fraction. `time` is the duration in ticks (MUGEN's
+    /// `time = -1` "until overridden" is modeled as a long but finite window so it
+    /// always expires; a non-positive `time` arms nothing and clears any current
+    /// tint). The `sinadd` oscillation is **not** modeled (only the static
+    /// add/mul/color); this is a documented approximation. Missing components
+    /// default to the identity for that channel. Never panics.
+    fn ctrl_palfx(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        // `time` (ticks). Default 1 per MUGEN; <=0 (other than -1) clears the tint.
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+        // MUGEN `time = -1` means "until replaced". We have no global override
+        // point, so model it as a long finite window so it always expires.
+        let remaining = if time < 0 { i32::MAX / 2 } else { time };
+        if remaining <= 0 {
+            // A zero/negative explicit time arms nothing and clears any active tint.
+            self.cur_palfx = CurPalFx::IDENTITY;
+            return;
+        }
+
+        let add = self.read_rgb_triple(ctrl, "add", env, 0.0, ADD_SCALE);
+        // `mul = r,g,b` is on a 0–256 scale where 256 = ×1, so PRESENT components
+        // divide by `MUL_SCALE`. The `default` is the renderer-space identity (×1)
+        // applied to a wholly-missing `mul` AND to any unspecified channel of a
+        // partial `mul` — it must already be `1.0`, NOT `MUL_SCALE`, because
+        // `read_rgb_triple` does not scale the default. Passing `MUL_SCALE` here
+        // would make a missing `mul` (e.g. KFM's Blink-Yellow PalFX) multiply every
+        // non-black channel by 256 and clamp the sprite to solid white (#33).
+        let mul = self.read_rgb_triple(ctrl, "mul", env, 1.0, MUL_SCALE);
+        // `color = 0..256` retention; default 256 (full color). Normalize to 0..1.
+        let color = ctrl
+            .params
+            .get("color")
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(1.0, |v| (v.to_float() / COLOR_SCALE).clamp(0.0, 1.0));
+
+        self.cur_palfx = CurPalFx {
+            add,
+            mul,
+            color,
+            remaining,
+        };
+    }
+
+    /// `AfterImage`: arm the fading-trail effect (faithfulness audit #33).
+    ///
+    /// MUGEN's `AfterImage` draws a trail of the character's recent frames for
+    /// `time` ticks, `length` ghosts deep, each tinted by the controller's
+    /// `PalAdd`/`PalMul` (and `PalBright`/`PalContrast`, which we fold into the
+    /// add/mul tint). We model the renderer-relevant parameters — `time`,
+    /// `length`, and a single representative [`CurPalFx`] tint applied to the
+    /// ghosts — and leave the frame-history capture and per-ghost decay to the
+    /// renderer (`fp-app`), which fakes the trail from the current frame at
+    /// decreasing alpha.
+    ///
+    /// `time` defaults to MUGEN's `1`; `length` defaults to `20` and is clamped to
+    /// a small sane cap so a pathological value cannot blow up the renderer. The
+    /// `PalAdd`/`PalMul` triples are normalized like [`ctrl_palfx`](Self::ctrl_palfx).
+    /// `TimeGap`/`FrameGap`/`Trans` are not modeled (the renderer picks a fixed
+    /// fade). A non-positive `time` arms no trail. Never panics.
+    fn ctrl_afterimage(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+        if time <= 0 {
+            self.afterimage = AfterImageState::INACTIVE;
+            return;
+        }
+        // `length` = number of ghost frames. Default 20; clamp to a sane cap.
+        let length = ctrl
+            .params
+            .get("length")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(DEFAULT_AFTERIMAGE_LENGTH, |v| v.to_int())
+            .clamp(1, MAX_AFTERIMAGE_LENGTH);
+
+        // The ghost tint: PalAdd is a 0–255 signed add; PalMul is an already-
+        // fractional float multiplier (KFM authors `.85` etc.), so it uses scale
+        // 1.0 and defaults each channel to 1.0 (no change).
+        let add = self.read_rgb_triple(ctrl, "paladd", env, 0.0, ADD_SCALE);
+        let mul = self.read_rgb_triple(ctrl, "palmul", env, 1.0, PALMUL_SCALE);
+
+        self.afterimage = AfterImageState {
+            time,
+            length,
+            palfx: CurPalFx {
+                add,
+                mul,
+                color: 1.0,
+                // The trail's own per-ghost lifetime is the whole-trail `time`.
+                remaining: time,
+            },
+        };
+    }
+
+    /// `AfterImageTime`: re-arm or cancel the current `AfterImage` trail's
+    /// duration (faithfulness audit #33).
+    ///
+    /// MUGEN's `AfterImageTime time = N` resets the active trail's remaining time
+    /// to `N` (KFM uses it to keep the trail alive across the move), and `N <= 0`
+    /// cancels it. We only adjust the duration of the already-armed trail (its
+    /// `length`/tint are untouched); if no trail is active there is nothing to
+    /// extend, so a positive `time` is a no-op (MUGEN behaves the same — it does
+    /// not start a fresh trail). Never panics.
+    fn ctrl_afterimage_time(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        // The duration parameter is `time` (or, in some content, the bare
+        // `value`); accept either.
+        let time = ctrl
+            .params
+            .get("time")
+            .or_else(|| ctrl.params.get("value"))
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        if time <= 0 {
+            self.afterimage = AfterImageState::INACTIVE;
+            return;
+        }
+        if self.afterimage.is_active() {
+            self.afterimage.time = time;
+            self.afterimage.palfx.remaining = time;
+        }
+        // No active trail → nothing to re-arm (matches MUGEN).
+    }
+
+    /// Reads an `r,g,b` triple parameter for a color effect, normalizing each
+    /// **present** component by `scale` and defaulting a missing component to
+    /// `default`.
+    ///
+    /// Used by `PalFX`/`AfterImage` to read `add`/`mul`/`paladd`/`palmul`. A
+    /// missing parameter entirely yields `[default; 3]`; a partial triple fills the
+    /// unspecified channels with `default`.
+    ///
+    /// IMPORTANT: `default` is **not** divided by `scale` — it must already be in
+    /// renderer space (the identity for that channel). Callers reading a `0..256`-
+    /// scale `mul` must therefore pass `default = 1.0` (the ×1 identity), not the
+    /// raw `256`. Never panics.
+    fn read_rgb_triple(
+        &self,
+        ctrl: &CompiledController,
+        key: &str,
+        env: EvalEnv,
+        default: f32,
+        scale: f32,
+    ) -> [f32; 3] {
+        let Some(param) = ctrl.params.get(key) else {
+            return [default; 3];
+        };
+        let mut out = [default; 3];
+        for (i, slot) in out.iter_mut().enumerate() {
+            if let Some(v) = self.eval_param_component(param, i, env) {
+                *slot = v.to_float() / scale;
+            }
+        }
+        out
     }
 
     /// `Pause` / `SuperPause`: request a whole-match freeze (faithfulness audit
@@ -10586,6 +10792,237 @@ mod tests {
         ch.cur_sprpriority = 2;
         lc.tick(&mut ch);
         assert_eq!(ch.cur_sprpriority, 2, "missing value leaves the priority unchanged");
+    }
+
+    // ---- #33: PalFX / AfterImage color effects -----------------------------
+
+    /// `PalFX` arms a timed color tint, normalizing MUGEN's 0–255 / 0–256 scales
+    /// to the renderer's float scale. The tick that fires it counts down once.
+    #[test]
+    fn palfx_controller_arms_tint() {
+        // add = 255,0,-255 (→ 1.0, 0.0, -1.0), mul = 128,256,256 (→ 0.5,1,1),
+        // color = 128 (→ 0.5), time = 20. Fires only on the first tick (Time = 0).
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[
+                ("time", "20"),
+                ("add", "255, 0, -255"),
+                ("mul", "128, 256, 256"),
+                ("color", "128"),
+            ],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        assert!(!ch.cur_palfx.is_active(), "no tint initially");
+        lc.tick(&mut ch);
+        let fx = ch.palfx();
+        assert!(fx.is_active(), "PalFX armed the tint");
+        // The per-tick countdown runs BEFORE the controllers (like invuln /
+        // hit-overrides), so the firing tick sets `remaining = 20` and does not
+        // decrement it until the next tick.
+        assert_eq!(fx.remaining, 20);
+        assert!((fx.add[0] - 1.0).abs() < 1e-4);
+        assert!((fx.add[1] - 0.0).abs() < 1e-4);
+        assert!((fx.add[2] + 1.0).abs() < 1e-4);
+        assert!((fx.mul[0] - 0.5).abs() < 1e-4);
+        assert!((fx.mul[1] - 1.0).abs() < 1e-4);
+        assert!((fx.color - 0.5).abs() < 1e-4);
+    }
+
+    /// A `PalFX` with **no** `mul` must default every channel to the ×1 identity
+    /// (`mul = [1.0; 3]`), NOT to the raw `256` scale. This is the KFM Blink-Yellow
+    /// regression (#33): KFM's `[State 1020]` PalFX authors `add` + `color` but no
+    /// `mul`; a `256` default would make the shader's `blended * mul` clamp every
+    /// non-black channel to solid white instead of a subtle tint.
+    #[test]
+    fn palfx_missing_mul_defaults_to_identity() {
+        // Mirrors KFM's Blink-Yellow: add = 32,16,0; color = 256; NO mul.
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "20"), ("add", "32, 16, 0"), ("color", "256")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        let fx = ch.palfx();
+        assert!(fx.is_active(), "PalFX armed");
+        assert_eq!(fx.mul, [1.0; 3], "missing mul must be the ×1 identity, not 256");
+        // add = 32,16,0 over the 0–255 scale → ~0.1255, ~0.0627, 0.0.
+        assert!((fx.add[0] - 32.0 / 255.0).abs() < 1e-4);
+        assert!((fx.add[1] - 16.0 / 255.0).abs() < 1e-4);
+        assert!((fx.add[2] - 0.0).abs() < 1e-4);
+        assert!((fx.color - 1.0).abs() < 1e-4, "color = 256 → full color (1.0)");
+    }
+
+    /// A **partial** `PalFX mul` (a single bare component) must normalize the
+    /// specified channel by 256 and leave the unspecified channels at the ×1
+    /// identity — `mul = 128` → `[0.5, 1.0, 1.0]`, never `[0.5, 256.0, 256.0]`.
+    #[test]
+    fn palfx_partial_mul_fills_unspecified_with_identity() {
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "10"), ("mul", "128")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        let fx = ch.palfx();
+        assert!(fx.is_active(), "PalFX armed");
+        assert!((fx.mul[0] - 0.5).abs() < 1e-4, "specified channel scaled by 256");
+        assert_eq!(fx.mul[1], 1.0, "unspecified G channel is the ×1 identity");
+        assert_eq!(fx.mul[2], 1.0, "unspecified B channel is the ×1 identity");
+    }
+
+    /// An active `PalFX` tint ticks down each frame and expires back to identity,
+    /// at which point `palfx()` returns the no-op tint.
+    #[test]
+    fn palfx_ticks_down_and_expires() {
+        // time = 2 → active for the firing tick + 1 more, then identity.
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "2"), ("add", "255,255,255")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        // The controller fires only on the first tick (Time = 0). Countdown runs
+        // before controllers, so: tick1 sets remaining=2 (no decrement); tick2
+        // decrements to 1; tick3 decrements to 0 and expires to identity.
+        lc.tick(&mut ch); // fires, remaining = 2
+        assert!(ch.palfx().is_active());
+        assert_eq!(ch.cur_palfx.remaining, 2);
+        lc.tick(&mut ch); // 2 → 1
+        assert_eq!(ch.cur_palfx.remaining, 1);
+        lc.tick(&mut ch); // 1 → 0, expires
+        assert!(!ch.palfx().is_active(), "tint expired");
+        assert_eq!(ch.palfx(), crate::CurPalFx::IDENTITY, "palfx() returns identity when none");
+    }
+
+    /// `PalFX time = 0` (non-positive) arms nothing and clears any active tint.
+    #[test]
+    fn palfx_zero_time_clears() {
+        let pal = ctrl(0, "PalFX", &[], &[(1, &["1"])], None, &[("time", "0")]);
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        // Pre-seed an active tint; the zero-time PalFX must clear it.
+        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5 };
+        lc.tick(&mut ch);
+        assert!(!ch.palfx().is_active(), "zero-time PalFX cleared the tint");
+    }
+
+    /// `AfterImage` arms the trail with a duration, length, and ghost tint.
+    #[test]
+    fn afterimage_controller_arms_trail() {
+        let ai = ctrl(
+            0,
+            "AfterImage",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[
+                ("time", "10"),
+                ("length", "13"),
+                ("paladd", "-10,-10,-10"),
+                ("palmul", ".85,.85,.50"),
+            ],
+        );
+        let st0 = stand_n(0, vec![ai]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        assert!(!ch.afterimage().is_active(), "no trail initially");
+        lc.tick(&mut ch);
+        let trail = ch.afterimage();
+        assert!(trail.is_active(), "AfterImage armed the trail");
+        // Countdown precedes controllers, so the firing tick sets time = 10 and
+        // does not decrement it this tick.
+        assert_eq!(trail.time, 10);
+        assert_eq!(trail.length, 13);
+        // PalAdd normalized by 255; PalMul used verbatim (already fractional).
+        assert!((trail.palfx.add[0] + 10.0 / 255.0).abs() < 1e-4);
+        assert!((trail.palfx.mul[0] - 0.85).abs() < 1e-4);
+        assert!((trail.palfx.mul[2] - 0.50).abs() < 1e-4);
+    }
+
+    /// `AfterImage length` is clamped to a sane cap so a huge authored value
+    /// cannot drive an unbounded ghost count.
+    #[test]
+    fn afterimage_length_is_clamped() {
+        let ai = ctrl(0, "AfterImage", &[], &[(1, &["1"])], None, &[("time", "5"), ("length", "100000")]);
+        let st0 = stand_n(0, vec![ai]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert!(ch.afterimage().length <= 64, "length clamped to the cap");
+        assert!(ch.afterimage().length >= 1);
+    }
+
+    /// `AfterImageTime` re-arms the active trail's remaining time; with no active
+    /// trail it is a no-op (does not start a fresh one).
+    #[test]
+    fn afterimage_time_re_arms_and_noops_without_trail() {
+        // No trail active: AfterImageTime time = 5 must NOT start a trail.
+        let ait = ctrl(0, "AfterImageTime", &[], &[(1, &["1"])], None, &[("time", "5")]);
+        let st0 = stand_n(0, vec![ait]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert!(!ch.afterimage().is_active(), "AfterImageTime does not start a trail");
+
+        // With a trail active, AfterImageTime resets its remaining time. Seed a
+        // trail with enough time to survive the pre-controller countdown (3 → 2),
+        // so the controller still sees it active and re-arms time to 5.
+        let mut ch2 = Character::new();
+        ch2.afterimage = crate::AfterImageState { time: 3, length: 5, palfx: crate::CurPalFx::IDENTITY };
+        lc.tick(&mut ch2);
+        assert_eq!(ch2.afterimage().time, 5, "AfterImageTime re-armed the duration");
+    }
+
+    /// `AfterImageTime time <= 0` cancels an active trail.
+    #[test]
+    fn afterimage_time_zero_cancels() {
+        let ait = ctrl(0, "AfterImageTime", &[], &[(1, &["1"])], None, &[("time", "0")]);
+        let st0 = stand_n(0, vec![ait]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        ch.afterimage = crate::AfterImageState { time: 10, length: 5, palfx: crate::CurPalFx::IDENTITY };
+        lc.tick(&mut ch);
+        assert!(!ch.afterimage().is_active(), "AfterImageTime 0 cancelled the trail");
+    }
+
+    /// A frozen (hit-paused) character holds its PalFX tint and AfterImage trail —
+    /// the timers do not count down during the freeze.
+    #[test]
+    fn palfx_and_afterimage_hold_during_hitpause() {
+        let st0 = stand_n(0, vec![]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5 };
+        ch.afterimage = crate::AfterImageState { time: 8, length: 4, palfx: crate::CurPalFx::IDENTITY };
+        ch.hitpause = 3;
+        lc.tick(&mut ch);
+        // Hit-paused tick: the color-effect timers must be unchanged.
+        assert_eq!(ch.cur_palfx.remaining, 5, "PalFX held during hitpause");
+        assert_eq!(ch.afterimage.time, 8, "AfterImage held during hitpause");
     }
 
     /// Entering a `facep2 = 1` state turns the character to face the opponent.

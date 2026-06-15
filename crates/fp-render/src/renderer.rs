@@ -9,6 +9,46 @@ use crate::vertex::{DebugVertex, SpriteVertex};
 /// Quad index data: two triangles forming a rectangle.
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
+/// GPU-side layout of the per-draw PalFX color-tint uniform (audit #33).
+///
+/// `vec4` / `vec3+pad` aligned to 16 bytes to satisfy WGSL `uniform` layout
+/// rules. `add`/`mul` carry the three color channels in `.xyz` (`.w` is
+/// padding); `color` is the grayscale-retention fraction (`1.0` = full color),
+/// the rest of that vec4 is unused padding. The shader does NOT branch on the
+/// [identity](Self::IDENTITY) value — `apply_palfx` runs unconditionally — but
+/// the identity uniform makes that an *exact* IEEE-754 no-op (`mix(luma, rgb,
+/// 1.0) == rgb`, then `* 1.0 + 0.0 == rgb`, and the final clamp of already-in-
+/// range palette colors changes nothing), so an untinted sprite is byte-identical
+/// to the pre-feature path.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct PalFxUniform {
+    /// Signed per-channel add in `.xyz` (`.w` padding).
+    add: [f32; 4],
+    /// Per-channel multiply in `.xyz` (`.w` padding).
+    mul: [f32; 4],
+    /// Color-retention fraction in `.x`; `.yzw` padding.
+    color: [f32; 4],
+}
+
+impl PalFxUniform {
+    /// The identity (no-op) uniform: full color, unit multiply, zero add.
+    const IDENTITY: Self = Self {
+        add: [0.0, 0.0, 0.0, 0.0],
+        mul: [1.0, 1.0, 1.0, 0.0],
+        color: [1.0, 0.0, 0.0, 0.0],
+    };
+
+    /// Packs a CPU-side [`PalFx`] into the 16-byte-aligned GPU layout.
+    fn from_palfx(fx: &crate::params::PalFx) -> Self {
+        Self {
+            add: [fx.add[0], fx.add[1], fx.add[2], 0.0],
+            mul: [fx.mul[0], fx.mul[1], fx.mul[2], 0.0],
+            color: [fx.color, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
 /// Maximum number of debug boxes drawn per frame. Each box contributes a
 /// translucent fill plus a four-edge outline; the per-frame debug vertex buffer
 /// is sized for this cap and additional boxes in a single frame are dropped
@@ -73,6 +113,9 @@ pub struct Renderer {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     debug_vertex_buffer: wgpu::Buffer,
+    /// Per-draw PalFX color-tint uniform (audit #33), rewritten before each
+    /// sprite draw. Holds [`PalFxUniform::IDENTITY`] for an untinted sprite.
+    palfx_buffer: wgpu::Buffer,
 }
 
 /// Creates a render pipeline with the given blend state.
@@ -224,6 +267,19 @@ impl Renderer {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // PalFX color-tint uniform (audit #33). Fragment-only; the
+                    // identity effect makes this a no-op so untinted draws are
+                    // byte-identical.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -370,6 +426,14 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        // Per-draw PalFX tint uniform (audit #33), initialized to identity so an
+        // untinted sprite drawn before any write produces unchanged colors.
+        let palfx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palfx_uniform_buffer"),
+            contents: bytemuck::bytes_of(&PalFxUniform::IDENTITY),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Per-frame debug-overlay vertex buffer, sized for the box cap. One
         // box's geometry is written and drawn per `draw_debug_box` call.
         let debug_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -396,6 +460,7 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             debug_vertex_buffer,
+            palfx_buffer,
         })
     }
 
@@ -557,6 +622,17 @@ impl RenderFrame<'_> {
             bytemuck::cast_slice(&vertices),
         );
 
+        // Upload this draw's PalFX tint (audit #33). The identity effect packs to
+        // `PalFxUniform::IDENTITY`; `apply_palfx` runs unconditionally but is an
+        // exact IEEE-754 no-op on that value, so an untinted sprite is
+        // byte-identical to the pre-feature path.
+        let palfx_uniform = PalFxUniform::from_palfx(&params.palfx);
+        self.renderer.queue.write_buffer(
+            &self.renderer.palfx_buffer,
+            0,
+            bytemuck::bytes_of(&palfx_uniform),
+        );
+
         let texture_bind_group =
             self.renderer
                 .device
@@ -579,6 +655,10 @@ impl RenderFrame<'_> {
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(&palette.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.renderer.palfx_buffer.as_entire_binding(),
                         },
                     ],
                 });
@@ -981,6 +1061,45 @@ mod tests {
     fn blend_mode_default_is_normal() {
         let params = SpriteDrawParams::default();
         assert_eq!(params.blend, BlendMode::Normal);
+    }
+
+    // ---- #33: PalFX uniform packing ----------------------------------------
+
+    #[test]
+    fn default_params_carry_identity_palfx() {
+        // The new optional field must default to the no-op effect so every
+        // existing `..Default::default()` construction is pixel-identical.
+        assert!(SpriteDrawParams::default().palfx.is_identity());
+    }
+
+    #[test]
+    fn palfx_uniform_identity_matches_from_identity() {
+        // Packing the identity effect must equal the hardcoded GPU IDENTITY the
+        // buffer is initialized with, so an untinted draw uploads no change.
+        let packed = PalFxUniform::from_palfx(&crate::params::PalFx::IDENTITY);
+        assert_eq!(packed.add, PalFxUniform::IDENTITY.add);
+        assert_eq!(packed.mul, PalFxUniform::IDENTITY.mul);
+        assert_eq!(packed.color, PalFxUniform::IDENTITY.color);
+    }
+
+    #[test]
+    fn palfx_uniform_packs_channels_into_xyz() {
+        let fx = crate::params::PalFx {
+            add: [0.1, -0.2, 0.3],
+            mul: [0.5, 1.5, 2.0],
+            color: 0.25,
+        };
+        let u = PalFxUniform::from_palfx(&fx);
+        assert_eq!(u.add, [0.1, -0.2, 0.3, 0.0]);
+        assert_eq!(u.mul, [0.5, 1.5, 2.0, 0.0]);
+        assert_eq!(u.color, [0.25, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn palfx_uniform_is_48_bytes() {
+        // Three vec4s = 48 bytes, 16-byte aligned — the WGSL `PalFx` struct
+        // layout the shader expects.
+        assert_eq!(std::mem::size_of::<PalFxUniform>(), 48);
     }
 
     #[test]
