@@ -197,8 +197,15 @@ MUGEN community content is messy. Parsers and the evaluator must:
   ASCII strings in any tracked `.sff`/`.snd`/`.fnt` are the required `ElecbyteSpr\0`/`ElecbyteSnd\0`/
   `ElecbyteFnt` format magic (and, for the `.fnt`, original engine config), not copyrighted data.
   `*.sff`/`*.snd`/`*.fnt` stay gitignored globally except the `assets/trainingdummy/*.sff`/`*.snd`,
-  `assets/data/*.sff`, and `assets/data/*.fnt` paths.
-  Beyond these originals, `git ls-files` shows zero `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act` files.
+  `assets/data/*.sff`, and `assets/data/*.fnt` paths. Two **original text** motif files also ship under
+  `assets/data/`: `assets/data/system.def` + `assets/data/select.def` (MIT — the default clean-room motif:
+  an original `[Title Info]` text menu, `[Select Info]` grid geometry, and a `[Characters]` roster pointing
+  at the shipped `assets/trainingdummy`; no Elecbyte motif art or text, parsed by `fp-ui`'s
+  `system_def`/`select_def`). `.def` files are not globally gitignored, so these two are tracked directly.
+  Beyond these originals, `git ls-files` shows zero third-party `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
+  files — the only tracked such files are the originals named above (the `assets/trainingdummy/*` character
+  set incl. `trainingdummy.def`, the `assets/data/` effects/font, and `assets/data/system.def` +
+  `assets/data/select.def`).
   Real KFM content (CC BY-NC 3.0, Elecbyte) is **local-only** behind the gitignored `test-assets`
   symlink. Never commit or ship it.
 - Fighters Paradise is an independent project; MUGEN is a trademark of Elecbyte. Code is MIT

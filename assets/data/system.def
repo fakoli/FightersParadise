@@ -1,0 +1,67 @@
+; Fighters Paradise — default motif system definition
+; (c) 2025 Sekou Doumbouya, MIT. ORIGINAL clean-room content.
+;
+; No Elecbyte / MUGEN assets are referenced. This is a minimal text-only motif:
+; the engine renders a plain text menu and a simple character-select grid from
+; the geometry below. No binary motif art is required.
+
+[Info]
+name   = "Fighters Paradise"
+author = "Fighters Paradise"
+
+[Files]
+; The default motif ships no system sprite/sound sheet yet (text menu only).
+spr    =
+snd    =
+; Character + stage selection list (next to this file).
+select = select.def
+; In-fight HUD screenpack (the shipped fight.def, when present).
+fight  = fight.def
+; The single shipped bitmap font.
+font1  = font.fnt
+
+[Title Info]
+; Main-menu placement (320x240 local coords, origin top-left).
+menu.pos              = 159, 100
+menu.item.font        = 1, 0, 0
+menu.item.active.font = 1, 5, 0
+menu.item.spacing     = 0, 13
+menu.window.visibleitems = 5
+; Enabled menu items. A "" value disables an item; only these three ship.
+menu.itemname.arcade     = ""
+menu.itemname.versus     = "VS MODE"
+menu.itemname.teamarcade = ""
+menu.itemname.teamversus = ""
+menu.itemname.teamcoop   = ""
+menu.itemname.survival   = ""
+menu.itemname.survivalcoop = ""
+menu.itemname.training   = "TRAINING"
+menu.itemname.watch      = ""
+menu.itemname.options    = ""
+menu.itemname.exit       = "EXIT"
+; Cursor movement sounds (unused by the text menu, kept for parity).
+cursor.move.snd = 0, 0
+cursor.done.snd = 0, 1
+
+[Select Info]
+; A small 1x4 character-select grid.
+rows         = 1
+columns      = 4
+pos          = 90, 140
+cell.size    = 27, 27
+cell.spacing = 2
+p1.cursor.startcell = 0, 0
+p1.cursor.move.snd  = 0, 0
+p1.cursor.done.snd  = 0, 1
+p2.cursor.startcell = 0, 3
+p2.cursor.move.snd  = 0, 0
+p2.cursor.done.snd  = 0, 1
+portrait.offset = 0, 0
+
+[VS Screen]
+p1.pos       = 20, 31
+p1.name.pos  = 78, 190
+p1.name.font = 1, 0, 0
+p2.pos       = 299, 31
+p2.name.pos  = 241, 190
+p2.name.font = 1, 0, 0
