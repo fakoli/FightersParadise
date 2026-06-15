@@ -51,14 +51,34 @@ are still stubs, and several content-rendering paths are unwired.
   (`Hud`, [fp-app/src/main.rs:627](../crates/fp-app/src/main.rs#L627)).
 - **Workaround:** Read the round/KO state from the colored marker.
 
-### No real lifebars / fight.def screenpack (#31) — Stub
+### Real lifebars / fight.def screenpack (#31) — Partial
 
-- **What's missing:** `fp-ui` is a 7-line doc-only stub. There is no
-  `fight.def`/`fight.sff` screenpack loader.
-  ([crates/fp-ui/src/lib.rs](../crates/fp-ui/src/lib.rs))
-- **Impact:** Life bars are the hand-rolled quads in `fp-app`, not a real motif.
-  You cannot drop in a custom screenpack.
-- **Workaround:** The built-in quad HUD shows proportional P1/P2 life.
+- **What works:** `fp-ui` now parses a `fight.def` into a typed
+  [`ScreenpackLayout`](../crates/fp-ui/src/screenpack.rs) and renders the life
+  bars, power bars, names, round announcer, and timer from `fight.sff` + fonts
+  via [`ScreenpackHud`](../crates/fp-ui/src/renderer.rs). `fp-app` loads a
+  screenpack when a `fight.def` is found next to the P1 character (or via
+  `FP_SCREENPACK`) and falls back to the hand-rolled quad HUD otherwise (no
+  regression for the default match).
+- **Remaining fidelity gaps** (acceptable first cut, called out so they aren't
+  mistaken for full MUGEN fidelity):
+  - **Only one background layer per bar.** `parse_lifebar_side` /
+    `parse_powerbar_side` read just `p1.bg0` — MUGEN allows layered `p1.bg1`,
+    `p1.bg2`, …, which are silently dropped.
+  - **Font slots stop at the first gap.** `parse_fonts` collects `font0,
+    font1, …` only while contiguous. A malformed `[Files]` with `font0,
+    font1, font3` (no `font2`) drops `font3`, and any later `font = 3`
+    reference then resolves to no font and its text is silently skipped (a
+    `warn!` is logged, but there is no on-screen cue).
+  - **Bar fill ignores the authored `range.x` pixel magnitude.** `bar_fill_uv`
+    uses only the *sign* of `(x0, x1)` to pick left/right anchoring and scales
+    the whole front-sprite width by the fraction; a screenpack whose front
+    sprite width differs from its authored `range` span will mis-size the
+    fill. Coordinate-accurate scaling is deferred until a real `fight.sff`
+    fixture exists to tune against (clean-room / asset-blocked).
+- **Asset note:** no `fight.def`/`fight.sff` ships (clean-room), so the parser
+  and fill math are covered by synthetic-fixture unit tests; the GPU draw path
+  is exercised only with a real screenpack linked locally.
 
 ### SFF v1 art renders with no colors (#25) — Missing
 

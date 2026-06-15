@@ -445,6 +445,7 @@ dependencies = [
  "fp-physics",
  "fp-render",
  "fp-stage",
+ "fp-ui",
  "fp-vm",
  "pollster",
  "sdl2",
@@ -567,7 +568,8 @@ dependencies = [
 name = "fp-ui"
 version = "0.1.0"
 dependencies = [
- "fp-core",
+ "fp-formats",
+ "fp-render",
  "tracing",
 ]
 
