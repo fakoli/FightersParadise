@@ -50,6 +50,10 @@ pub struct MatchHudState {
     /// Text drawn by the round announcer (e.g. `"Round 1"`, `"KO"`, `"Fight"`);
     /// empty hides it.
     pub round_text: String,
+    /// Number of hits in the current active combo. The combo counter is drawn
+    /// only while this is `>= 2` (MUGEN shows the counter from the 2nd hit on);
+    /// `0`/`1` hide it. See [`combo_text`].
+    pub combo_count: i32,
 }
 
 /// A GPU-resident screenpack: the parsed layout, every referenced `fight.sff`
@@ -118,9 +122,10 @@ impl ScreenpackHud {
 
     /// Draws the whole screenpack HUD for the current frame.
     ///
-    /// Order: P1 then P2 life bars (background → front fill), power bars, fighter
-    /// names, the timer, and the round announcer. Missing sprites/fonts are
-    /// silently skipped (logged once at build), so a partial screenpack still
+    /// Order: P1 then P2 life bars (every `bg0..bgN` background layer → mid →
+    /// front fill), power bars, fighter names, the timer, the round announcer,
+    /// and — while a combo is active — the combo counter. Missing sprites/fonts
+    /// are silently skipped (logged once at build), so a partial screenpack still
     /// renders whatever it does define.
     pub fn draw(&self, frame: &mut RenderFrame<'_>, state: &MatchHudState) {
         // Life bars.
@@ -164,15 +169,28 @@ impl ScreenpackHud {
                 &state.round_text,
             );
         }
+        // Combo counter — only while a combo is active (>= 2 hits).
+        if let Some(text) = combo_text(state.combo_count) {
+            self.draw_text_slot(
+                frame,
+                self.layout.combo.font,
+                self.layout.combo.pos.x as f32,
+                self.layout.combo.pos.y as f32,
+                &text,
+            );
+        }
     }
 
-    /// Draws one life bar: its background layer at full size, then the front
-    /// layer clipped horizontally to `frac` of the bar's `range` span.
+    /// Draws one life bar: every `bg0..bgN` background layer in z-order at full
+    /// size, then the mid layer, then the front layer clipped horizontally to
+    /// `frac` of the bar's `range` span.
     fn draw_lifebar(&self, frame: &mut RenderFrame<'_>, bar: &LifebarSide, frac: f32) {
         let base_x = bar.pos.x as f32;
         let base_y = bar.pos.y as f32;
-        // Background + mid draw whole.
-        self.draw_sprite_ref(frame, bar.bg, base_x, base_y);
+        // Every background layer, then mid, all drawn whole.
+        for &bg in &bar.bg_layers {
+            self.draw_sprite_ref(frame, Some(bg), base_x, base_y);
+        }
         self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
         // Front fill clips to the life fraction over the bar's range.
         self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
@@ -182,7 +200,9 @@ impl ScreenpackHud {
     fn draw_powerbar(&self, frame: &mut RenderFrame<'_>, bar: &PowerbarSide, frac: f32) {
         let base_x = bar.pos.x as f32;
         let base_y = bar.pos.y as f32;
-        self.draw_sprite_ref(frame, bar.bg, base_x, base_y);
+        for &bg in &bar.bg_layers {
+            self.draw_sprite_ref(frame, Some(bg), base_x, base_y);
+        }
         self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
         self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
     }
@@ -292,14 +312,14 @@ fn upload_sprite(renderer: &Renderer, sff: &SffFile, group: u16, image: u16) -> 
 fn layout_sprite_refs(layout: &ScreenpackLayout) -> Vec<SpriteRef> {
     let mut refs = Vec::new();
     let mut push_lifebar = |b: &LifebarSide| {
-        refs.extend(b.bg);
+        refs.extend(b.bg_layers.iter().copied());
         refs.extend(b.mid);
         refs.extend(b.front);
     };
     push_lifebar(&layout.p1_lifebar);
     push_lifebar(&layout.p2_lifebar);
     let mut push_powerbar = |b: &PowerbarSide| {
-        refs.extend(b.bg);
+        refs.extend(b.bg_layers.iter().copied());
         refs.extend(b.mid);
         refs.extend(b.front);
     };
@@ -308,6 +328,25 @@ fn layout_sprite_refs(layout: &ScreenpackLayout) -> Vec<SpriteRef> {
     refs.extend(layout.p1_face.spr);
     refs.extend(layout.p2_face.spr);
     refs
+}
+
+/// The combo-counter text for a hit count, or `None` when no counter should
+/// show.
+///
+/// MUGEN displays the combo counter only once a combo is *active* — from the
+/// second connected hit onward — so a count of `0` or `1` (and any negative,
+/// defensive against bad inputs) returns `None` and draws nothing. A count of
+/// `2+` formats as `"<n> Hits"` (e.g. `"5 Hits"`).
+///
+/// Pure and unit-tested — no GPU. The renderer calls this each frame from
+/// [`MatchHudState::combo_count`] and draws the result at the parsed
+/// [`crate::screenpack::ComboLayout`] position.
+pub fn combo_text(count: i32) -> Option<String> {
+    if count >= 2 {
+        Some(format!("{count} Hits"))
+    } else {
+        None
+    }
 }
 
 /// Clamps a bar fraction into `[0, 1]`, mapping NaN to `0`.
@@ -416,21 +455,74 @@ mod tests {
         use crate::screenpack::{LifebarSide, Pos};
         let layout = ScreenpackLayout {
             p1_lifebar: LifebarSide {
-                bg: Some(SpriteRef { group: 0, image: 0, offset: Pos::default() }),
+                bg_layers: vec![
+                    SpriteRef { group: 0, image: 0, offset: Pos::default() },
+                    SpriteRef { group: 0, image: 3, offset: Pos::default() },
+                ],
                 front: Some(SpriteRef { group: 2, image: 0, offset: Pos::default() }),
                 ..Default::default()
             },
             p2_lifebar: LifebarSide {
-                bg: Some(SpriteRef { group: 0, image: 1, offset: Pos::default() }),
+                bg_layers: vec![SpriteRef { group: 0, image: 1, offset: Pos::default() }],
                 ..Default::default()
             },
             ..Default::default()
         };
         let refs = layout_sprite_refs(&layout);
-        // bg0, front0, bg1 -> 3 refs collected.
-        assert_eq!(refs.len(), 3);
+        // p1 bg0, p1 bg1, p1 front, p2 bg0 -> 4 refs collected (all bg layers).
+        assert_eq!(refs.len(), 4);
         assert!(refs.iter().any(|r| (r.group, r.image) == (0, 0)));
+        assert!(refs.iter().any(|r| (r.group, r.image) == (0, 3)));
         assert!(refs.iter().any(|r| (r.group, r.image) == (2, 0)));
         assert!(refs.iter().any(|r| (r.group, r.image) == (0, 1)));
+    }
+
+    #[test]
+    fn lifebar_bg_layers_are_collected_in_z_order() {
+        use crate::screenpack::{LifebarSide, Pos};
+        // bg0 must precede bg1 in the collected refs (z-order: bg0 at the back).
+        let layout = ScreenpackLayout {
+            p1_lifebar: LifebarSide {
+                bg_layers: vec![
+                    SpriteRef { group: 5, image: 0, offset: Pos::default() },
+                    SpriteRef { group: 5, image: 1, offset: Pos::default() },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let refs = layout_sprite_refs(&layout);
+        assert_eq!((refs[0].group, refs[0].image), (5, 0), "bg0 first (drawn at the back)");
+        assert_eq!((refs[1].group, refs[1].image), (5, 1), "bg1 second (drawn on top)");
+    }
+
+    #[test]
+    fn combo_text_hidden_below_two_hits() {
+        // No active combo: 0 or 1 hit draws nothing (negatives are defensive).
+        assert_eq!(combo_text(0), None);
+        assert_eq!(combo_text(1), None);
+        assert_eq!(combo_text(-3), None);
+    }
+
+    #[test]
+    fn combo_text_formats_active_combo() {
+        assert_eq!(combo_text(2).as_deref(), Some("2 Hits"));
+        assert_eq!(combo_text(5).as_deref(), Some("5 Hits"));
+        assert_eq!(combo_text(99).as_deref(), Some("99 Hits"));
+    }
+
+    #[test]
+    fn combo_layout_position_and_font_drive_the_draw() {
+        // The combo element is placed at its parsed position with its parsed
+        // font slot; this asserts the layout fields the renderer reads.
+        use crate::screenpack::{ComboLayout, Pos};
+        let layout = ScreenpackLayout {
+            combo: ComboLayout { pos: Pos::new(30, 80), font: 3 },
+            ..Default::default()
+        };
+        assert_eq!(layout.combo.pos, Pos::new(30, 80));
+        assert_eq!(layout.combo.font, 3);
+        // And the count gate the draw uses agrees with combo_text.
+        assert!(combo_text(layout.combo.pos.x).is_some()); // 30 >= 2 -> shows
     }
 }

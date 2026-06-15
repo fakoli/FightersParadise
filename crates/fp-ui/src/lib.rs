@@ -27,7 +27,7 @@ pub mod screenpack;
 pub mod select_def;
 pub mod system_def;
 
-pub use renderer::{bar_fill_uv, clamp_fraction, MatchHudState, ScreenpackHud};
+pub use renderer::{bar_fill_uv, clamp_fraction, combo_text, MatchHudState, ScreenpackHud};
 pub use screenpack::{
     ComboLayout, FaceSide, LifebarSide, NameSide, Pos, PowerbarSide, RoundLayout, ScreenpackLayout,
     SpriteRef, TextElem, TimeLayout,
