@@ -77,7 +77,8 @@ pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{
-    FreezeKind, FreezeRequest, HelperPosType, HelperSpawn, SoundRequest, TargetOp, TickReport,
+    FreezeKind, FreezeRequest, HelperPosType, HelperSpawn, ProjectileSpawn, SoundRequest, TargetOp,
+    TickReport,
 };
 pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
@@ -3314,9 +3315,11 @@ impl<'a> AnimSet<'a> {
 ///   distances (`FrontEdgeDist`/`BackEdgeDist`/`FrontEdgeBodyDist`/
 ///   `BackEdgeBodyDist`/`ScreenPos`).
 /// - **`redirect` resolves the opponent targets** (`p2`/`enemy`/`enemynear(_)`)
-///   to the opponent context and `root` to self; the remaining targets
-///   (`parent`/`target`/`helper`/`partner`/`playerid`) are `None` for now (this
-///   crate models a flat 1-v-1 with no helpers — documented, never a panic).
+///   to the opponent context and `root` to self; the entity-graph targets
+///   (`parent`/`helper(id)` — T012; `target`/`partner`/`playerid(n)` — T014)
+///   resolve against the installed [`EntityGraph`], falling back to `None` (the
+///   sub-expression → `0`) when the owner wired no such relation (documented,
+///   never a panic).
 ///
 /// ## Borrow / lifetime shape
 ///
@@ -3339,32 +3342,36 @@ pub struct EvalCtx<'a> {
     /// `me`'s loaded animation action set, for `SelfAnimExist(n)`. Empty (the
     /// [`AnimSet::default`]) when no `.air` is in view.
     anim: AnimSet<'a>,
-    /// The helper-entity graph this context resolves `parent`/`root`/`helper(id)`
-    /// redirects against (T012). Empty (the [`EntityGraph::default`]) for a
-    /// root player with no spawning chain, in which case `root` falls back to
-    /// `me` and `parent`/`helper(id)` resolve to `None`.
+    /// The multi-entity graph this context resolves `parent`/`root`/`helper(id)`
+    /// (T012) and `target`/`partner`/`playerid(n)` (T014) redirects against.
+    /// Empty (the [`EntityGraph::default`]) for a root player with no spawning
+    /// chain / relations, in which case `root` falls back to `me` and the rest
+    /// resolve to `None`.
     graph: EntityGraph<'a>,
 }
 
-/// The slice of the live helper-entity graph one [`EvalCtx`] can see, for
-/// resolving the entity-relationship redirects `parent`, `root`, and
-/// `helper(id)` (T012).
+/// The slice of the live multi-entity graph one [`EvalCtx`] can see, for
+/// resolving the entity-relationship redirects `parent`, `root`, `helper(id)`
+/// (T012) and `target`, `partner`, `playerid(n)` (T014).
 ///
 /// MUGEN entities form a tree: a root player spawns helpers (each addressable by
 /// a `helper(id)`), and every helper knows its immediate `parent` (its creator)
-/// and the `root` at the top of the chain. The entity owner (`fp-engine`'s
-/// `Player`, which holds the slot-map of live helpers) populates this graph for
-/// the duration of one tick so the executor's redirect resolution
-/// ([`EvalCtx::redirect`]) can hop to a related entity instead of bottoming out
-/// at `0`.
+/// and the `root` at the top of the chain. Beyond that spawning chain, an entity
+/// can address the opponent it most recently *hit* (`target`), a teammate
+/// (`partner`), and any player/entity by its global id (`playerid(n)`). The
+/// entity owner (`fp-engine`'s `Player` / `Match`, which holds the slot-map of
+/// live entities) populates this graph for the duration of one tick so the
+/// executor's redirect resolution ([`EvalCtx::redirect`]) can hop to a related
+/// entity instead of bottoming out at `0`.
 ///
-/// The graph is a tiny `Copy` bundle of immutable references (two optional
-/// `&Character`s plus a borrowed slice), so it threads through the `Copy`
+/// The graph is a tiny `Copy` bundle of immutable references (a few optional
+/// `&Character`s plus two borrowed slices), so it threads through the `Copy`
 /// [`EvalCtx`] / executor env with no allocation. A redirected related entity is
 /// surfaced as a **self-only** context (a bare `&Character`), so a single hop —
-/// `parent, life`, `root, stateno`, `helper(1), pos x` — resolves while that
-/// related entity's own nested redirects bottom out, exactly mirroring how the
-/// opponent (`p2, …`) redirect is depth-limited.
+/// `parent, life`, `root, stateno`, `helper(1), pos x`, `target, life`,
+/// `playerid(2), stateno` — resolves while that related entity's own nested
+/// redirects bottom out, exactly mirroring how the opponent (`p2, …`) redirect is
+/// depth-limited.
 #[derive(Clone, Copy, Default)]
 pub struct EntityGraph<'a> {
     /// The immediate creator of `me` (the `parent` redirect), or `None` when `me`
@@ -3379,16 +3386,35 @@ pub struct EntityGraph<'a> {
     /// most-recently-spawned matching helper, but a single match is enough for
     /// the common one-helper-per-id case). Empty when `me` owns no helpers.
     helpers: &'a [(i32, &'a Character)],
+    /// The entity `me` most recently hit — the `target` redirect (T014). `None`
+    /// when `me` has no established target (it has not connected a hit, or the
+    /// owner did not wire one this tick). In MUGEN `target` can address multiple
+    /// victims by `target(id)`; this flat model carries the single most-recently
+    /// hit opponent, which is the common case the `Target*` throw controllers act
+    /// on.
+    target: Option<&'a Character>,
+    /// `me`'s teammate — the `partner` redirect (T014). `None` when `me` has no
+    /// teammate (the common 1-v-1 case), in which case `partner, …` collapses to
+    /// `0`.
+    partner: Option<&'a Character>,
+    /// Every entity addressable by its global id via `playerid(n)`, as
+    /// `(id, entity)` pairs (T014). The first pair whose id matches wins. Empty
+    /// when the owner wired no id table, in which case `playerid(n), …` collapses
+    /// to `0`.
+    players: &'a [(i32, &'a Character)],
 }
 
 impl<'a> EntityGraph<'a> {
     /// Builds an entity graph from the optional `parent`/`root` chain and the
-    /// borrowed `(id, &Character)` helper lookup.
+    /// borrowed `(id, &Character)` helper lookup, with the `target`/`partner`/
+    /// `playerid` slots empty.
     ///
     /// Pass `None` for `parent`/`root` and an empty slice for a root player that
     /// owns no helpers (equivalent to [`EntityGraph::default`]). The references
     /// must outlive the [`EvalCtx`] the graph is installed on; the owner
-    /// (`fp-engine`) builds this for the span of one tick.
+    /// (`fp-engine`) builds this for the span of one tick. Layer on the T014
+    /// relations with [`EntityGraph::with_target`], [`EntityGraph::with_partner`],
+    /// and [`EntityGraph::with_players`].
     #[must_use]
     pub fn new(
         parent: Option<&'a Character>,
@@ -3399,7 +3425,36 @@ impl<'a> EntityGraph<'a> {
             parent,
             root,
             helpers,
+            target: None,
+            partner: None,
+            players: &[],
         }
+    }
+
+    /// Installs the `target` redirect — the entity `me` most recently hit (T014),
+    /// returning the updated graph. A builder method so the existing
+    /// [`EntityGraph::new`] call sites keep working unchanged.
+    #[must_use]
+    pub fn with_target(mut self, target: Option<&'a Character>) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Installs the `partner` redirect — `me`'s teammate, if any (T014),
+    /// returning the updated graph.
+    #[must_use]
+    pub fn with_partner(mut self, partner: Option<&'a Character>) -> Self {
+        self.partner = partner;
+        self
+    }
+
+    /// Installs the `playerid(n)` lookup table — the `(id, entity)` pairs every
+    /// `playerid(n)` redirect resolves against (T014), returning the updated
+    /// graph. The slice must outlive the [`EvalCtx`] the graph is installed on.
+    #[must_use]
+    pub fn with_players(mut self, players: &'a [(i32, &'a Character)]) -> Self {
+        self.players = players;
+        self
     }
 
     /// The immediate parent entity (`parent` redirect), if any.
@@ -3422,6 +3477,29 @@ impl<'a> EntityGraph<'a> {
         self.helpers
             .iter()
             .find(|(hid, _)| *hid == id)
+            .map(|(_, ent)| *ent)
+    }
+
+    /// The entity `me` most recently hit (`target` redirect, T014), or `None`
+    /// when `me` has no established target.
+    #[must_use]
+    pub fn target(&self) -> Option<&'a Character> {
+        self.target
+    }
+
+    /// `me`'s teammate (`partner` redirect, T014), or `None` in a 1-v-1.
+    #[must_use]
+    pub fn partner(&self) -> Option<&'a Character> {
+        self.partner
+    }
+
+    /// Looks up the entity addressable by global `id` (`playerid(id)` redirect,
+    /// T014), returning the first matching entity or `None` when none carries it.
+    #[must_use]
+    pub fn player(&self, id: i32) -> Option<&'a Character> {
+        self.players
+            .iter()
+            .find(|(pid, _)| *pid == id)
             .map(|(_, ent)| *ent)
     }
 }
@@ -3715,10 +3793,20 @@ impl EvalContext for EvalCtx<'_> {
             // `helper(id)` — a helper owned by this entity, looked up by id in the
             // graph (T012). `None` (→ `0`) when no helper carries that id.
             Redirect::Helper(id) => self.graph.helper(id).map(|h| h as &dyn EvalContext),
-            // Targeting / teams are not modeled in this flat 1-v-1, so these
-            // resolve to `None` (the redirected sub-expression → 0). A documented
-            // deferral, not a silent error.
-            Redirect::Target(_) | Redirect::Partner | Redirect::PlayerId(_) => None,
+            // `target` / `target(id)` — the entity `me` most recently hit (T014).
+            // This flat model tracks a single target (the last opponent hit), so
+            // both the bare `target` and an explicit `target(id)` resolve to it;
+            // `None` (→ `0`) when `me` has no established target. The id form's
+            // per-target selection (MUGEN matches `target` whose `HitDef.id == id`)
+            // is not distinguished here — a single hit target is the common case
+            // the `Target*` throw controllers act on.
+            Redirect::Target(_) => self.graph.target().map(|t| t as &dyn EvalContext),
+            // `partner` — `me`'s teammate (T014). `None` (→ `0`) in a 1-v-1 with no
+            // teammate, resolving gracefully rather than erroring.
+            Redirect::Partner => self.graph.partner().map(|p| p as &dyn EvalContext),
+            // `playerid(n)` — the entity with global id `n` (T014). `None` (→ `0`)
+            // when no entity carries that id.
+            Redirect::PlayerId(id) => self.graph.player(id).map(|p| p as &dyn EvalContext),
         }
     }
 }
@@ -6296,8 +6384,11 @@ mod tests {
     fn unsupported_redirects_are_none_through_evalctx() {
         let (me, opp) = two_chars();
         let stage = StageView::default();
-        // parent / partner / helper / target / playerid are not modeled in this
-        // flat 1-v-1: the redirected sub-expression collapses to 0 (never panics).
+        // With NO entity graph installed (a bare `EvalCtx::new`, the default
+        // empty `EntityGraph`), the graph-resolved redirects — parent / helper(id)
+        // (T012) and target / partner / playerid(n) (T014) — have nothing to point
+        // at, so the redirected sub-expression collapses to 0 (never panics). The
+        // T012/T014 tests below exercise the populated-graph case.
         for expr in [
             "parent, Life",
             "partner, Life",
@@ -6308,7 +6399,7 @@ mod tests {
             assert_eq!(
                 ev_cross(expr, &me, Some(&opp), stage),
                 Value::Int(0),
-                "`{expr}` should resolve to 0 (unsupported redirect)"
+                "`{expr}` should resolve to 0 with no entity graph installed"
             );
         }
     }
@@ -6417,6 +6508,113 @@ mod tests {
         assert!(empty.parent().is_none());
         assert!(empty.root().is_none());
         assert!(empty.helper(0).is_none());
+        // T014 relations are also empty on the default graph.
+        assert!(empty.target().is_none());
+        assert!(empty.partner().is_none());
+        assert!(empty.player(0).is_none());
+    }
+
+    // =====================================================================
+    // T014 — target / partner / playerid(n) redirects resolve through EvalCtx
+    // against an installed EntityGraph, exercised end-to-end through the same VM
+    // eval path the executor uses.
+    // =====================================================================
+
+    /// AC: `target` resolves to the entity `me` most recently hit — with the
+    /// `target` relation installed, `target, life` reads the target's life (not
+    /// `me`'s, not 0), and a graph with no target leaves it at the safe default 0.
+    #[test]
+    fn target_redirect_resolves_to_hit_entity() {
+        let mut me = Character::new();
+        me.life = 800;
+
+        let mut victim = Character::new();
+        victim.life = 123;
+        victim.state_no = 5050;
+
+        // With the target wired, `target, …` hops to the victim.
+        let graph = EntityGraph::default().with_target(Some(&victim));
+        assert_eq!(ev_graph("target, Life", &me, graph), Value::Int(123));
+        assert_eq!(ev_graph("target, StateNo", &me, graph), Value::Int(5050));
+        // `target(id)` (the optional-id form) resolves to the same single target.
+        assert_eq!(ev_graph("target(0), Life", &me, graph), Value::Int(123));
+        // A bare self read still reports `me`'s own life.
+        assert_eq!(ev_graph("Life", &me, graph), Value::Int(800));
+
+        // With NO target wired the redirect collapses to 0 (graceful default).
+        let no_target = EntityGraph::default();
+        assert_eq!(ev_graph("target, Life", &me, no_target), Value::Int(0));
+    }
+
+    /// AC: `partner` resolves to a teammate when present, and gracefully to 0 when
+    /// there is no teammate (the 1-v-1 case).
+    #[test]
+    fn partner_redirect_resolves_to_teammate_or_zero() {
+        let me = Character::new();
+
+        let mut mate = Character::new();
+        mate.life = 654;
+
+        // Teammate present → `partner, life` reads the mate's life.
+        let graph = EntityGraph::default().with_partner(Some(&mate));
+        assert_eq!(ev_graph("partner, Life", &me, graph), Value::Int(654));
+
+        // No teammate (1-v-1) → `partner, …` is the safe default 0, not a panic.
+        let solo = EntityGraph::default();
+        assert_eq!(ev_graph("partner, Life", &me, solo), Value::Int(0));
+    }
+
+    /// AC: `playerid(n)` resolves to the entity carrying global id `n` in the
+    /// populated lookup table, and a non-matching id is the safe default 0.
+    #[test]
+    fn playerid_redirect_resolves_by_id() {
+        let me = Character::new();
+
+        let mut p2 = Character::new();
+        p2.life = 222;
+        let mut p7 = Character::new();
+        p7.life = 777;
+
+        let players: [(i32, &Character); 2] = [(2, &p2), (7, &p7)];
+        let graph = EntityGraph::default().with_players(&players);
+
+        // Each id resolves to its entity.
+        assert_eq!(ev_graph("playerid(2), Life", &me, graph), Value::Int(222));
+        assert_eq!(ev_graph("playerid(7), Life", &me, graph), Value::Int(777));
+        // An id no entity carries → None → the sub-expression is 0.
+        assert_eq!(ev_graph("playerid(3), Life", &me, graph), Value::Int(0));
+    }
+
+    /// The T014 [`EntityGraph`] accessors return exactly the wired references, and
+    /// the `playerid` lookup returns the first id match / `None`. Confirms the
+    /// T012 relations remain intact when the T014 builders layer on top.
+    #[test]
+    fn entity_graph_t014_accessors_round_trip() {
+        let parent = Character::new();
+        let root = Character::new();
+        let helper = Character::new();
+        let target = Character::new();
+        let partner = Character::new();
+        let pa = Character::new();
+        let pb = Character::new();
+        let helpers: [(i32, &Character); 1] = [(1, &helper)];
+        let players: [(i32, &Character); 2] = [(2, &pa), (5, &pb)];
+
+        let graph = EntityGraph::new(Some(&parent), Some(&root), &helpers)
+            .with_target(Some(&target))
+            .with_partner(Some(&partner))
+            .with_players(&players);
+
+        // T012 relations still resolve after the T014 builders run.
+        assert!(graph.parent().is_some());
+        assert!(graph.root().is_some());
+        assert!(graph.helper(1).is_some());
+        // T014 relations resolve.
+        assert!(graph.target().is_some());
+        assert!(graph.partner().is_some());
+        assert!(graph.player(2).is_some(), "matching playerid resolves");
+        assert!(graph.player(5).is_some());
+        assert!(graph.player(99).is_none(), "missing playerid is None");
     }
 
     #[test]

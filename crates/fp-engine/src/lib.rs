@@ -57,8 +57,8 @@
 
 use fp_character::{
     combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, Facing,
-    HelperPosType, HelperSpawn, LoadedCharacter, MoveType, RoundView, StageView, StateType,
-    TickReport,
+    HelperPosType, HelperSpawn, LoadedCharacter, MoveType, ProjectileSpawn, RoundView, StageView,
+    StateType, TickReport,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -462,6 +462,91 @@ impl Helper {
     }
 }
 
+/// A hard cap on the number of live projectiles a single player may own at once
+/// (T013). MUGEN bounds the global projectile/explod count; this keeps the
+/// projectile slot-map bounded so a runaway `Projectile`-spawning loop can never
+/// grow the simulation without limit.
+const MAX_PROJECTILES_PER_PLAYER: usize = 64;
+
+/// The MUGEN player id of P1 (the convention the `playerid(n)` redirect resolves
+/// against, T014). Player 1 is id `1`; player 2 is [`MUGEN_PLAYER_ID_P2`].
+const MUGEN_PLAYER_ID_P1: i32 = 1;
+/// The MUGEN player id of P2 (T014); see [`MUGEN_PLAYER_ID_P1`].
+const MUGEN_PLAYER_ID_P2: i32 = 2;
+
+/// One live **projectile** entity owned by a [`Player`] (T013).
+///
+/// A `Projectile` is a moving attack entity spawned by its owner's `Projectile`
+/// controller. Unlike a [`Helper`] it does **not** run a CNS state machine: it
+/// carries its own [`fp_combat::HitDef`] (the spawned attack), travels in a
+/// straight line at a fixed [`velocity`](Projectile::velocity) each tick, and
+/// connects when its current AIR-frame `Clsn1` overlaps the opponent's `Clsn2`.
+/// It draws from the **owner's** [`LoadedCharacter`] animation set (its `anim` is
+/// one of the owner's `projanim` actions). It self-removes when it connects (a
+/// projectile is single-hit by default), when its [`remove_time`](Projectile::remove_time)
+/// lifetime elapses, or when it leaves the stage bounds.
+///
+/// The live entity is modeled as a [`Character`] so the same pure
+/// [`fp_character::combat::resolve_attack`] hit pipeline a melee attack uses
+/// resolves a projectile hit unchanged — the projectile's `pos`/`facing`/`anim`/
+/// `active_hitdef` are exactly the attacker fields `resolve_attack` reads.
+pub struct Projectile {
+    /// The live projectile entity. Its `active_hitdef` is the spawned attack; its
+    /// `pos`/`facing`/`anim`/`anim_elem` position it and source its `Clsn1` boxes.
+    pub character: Character,
+    /// The projectile's id (`projid`), from the spawning controller (T013).
+    pub proj_id: i32,
+    /// The per-tick world velocity (already mirrored by the owner's facing at
+    /// spawn time, so it points the way the projectile travels).
+    pub velocity: Vec2<f32>,
+    /// Remaining lifetime in ticks, or `-1` for "no time limit" (it then lives
+    /// until it connects or leaves the stage). A non-negative value counts down to
+    /// `0`, at which point the projectile is removed.
+    pub remaining: i32,
+}
+
+impl Projectile {
+    /// The projectile's world position in pixels.
+    #[must_use]
+    pub fn pos(&self) -> Vec2<f32> {
+        self.character.pos
+    }
+
+    /// The projectile's current animation (action) id.
+    #[must_use]
+    pub fn anim(&self) -> i32 {
+        self.character.anim
+    }
+
+    /// The projectile's id (`projid`).
+    #[must_use]
+    pub fn proj_id(&self) -> i32 {
+        self.proj_id
+    }
+}
+
+/// The cross-player redirect relations the match coordinator hands a [`Player`]
+/// for one root tick (T014): the entity it most recently hit (`target`), its
+/// teammate (`partner`), and the `playerid(n)` lookup table.
+///
+/// The match coordinator is the only place that owns both players, so it is the
+/// only place that can build these inter-player references. They borrow *other*
+/// `Player`s' characters (never the ticking player's own `self.character`), so
+/// they coexist with the `&mut self` tick without aliasing.
+#[derive(Clone, Copy, Default)]
+struct RedirectRelations<'a> {
+    /// The opponent this player most recently hit (`target` redirect), or `None`
+    /// when it has no established target this tick.
+    target: Option<&'a Character>,
+    /// This player's teammate (`partner` redirect), or `None` in a 1-v-1.
+    partner: Option<&'a Character>,
+    /// The cross-player `(id, &Character)` table `playerid(n)` resolves against
+    /// (the *other* players by their MUGEN player id; the ticking player's own id
+    /// is intentionally omitted to avoid aliasing its `&mut` tick — its own state
+    /// is already reachable through self-triggers).
+    players: &'a [(i32, &'a Character)],
+}
+
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
 /// and the input/command source feeding its state machine.
 ///
@@ -479,6 +564,11 @@ pub struct Player {
     /// every frame after the root character. Bounded by
     /// [`MAX_HELPERS_PER_PLAYER`].
     helpers: Vec<Helper>,
+    /// The slot-map of live projectile entities this player owns (T013). Populated
+    /// from each tick's [`fp_character::TickReport::projectile_spawns`], advanced
+    /// every frame, and reaped on connect / lifetime / out-of-bounds. Bounded by
+    /// [`MAX_PROJECTILES_PER_PLAYER`].
+    projectiles: Vec<Projectile>,
     /// Rolling raw-input history (absolute directions + buttons) this player's
     /// command recognizer scans each tick.
     input_buffer: InputBuffer,
@@ -517,6 +607,7 @@ impl Player {
             character,
             loaded,
             helpers: Vec::new(),
+            projectiles: Vec::new(),
             input_buffer: InputBuffer::new(),
             matcher,
             command_defs,
@@ -528,6 +619,14 @@ impl Player {
     #[must_use]
     pub fn helpers(&self) -> &[Helper] {
         &self.helpers
+    }
+
+    /// The live projectile entities this player currently owns (T013), in spawn
+    /// order. Empty until a `Projectile` controller fires and the spawn is applied
+    /// (and after each one is reaped on connect / expiry / out-of-bounds).
+    #[must_use]
+    pub fn projectiles(&self) -> &[Projectile] {
+        &self.projectiles
     }
 
     /// Spawns the helpers requested by this tick's
@@ -587,22 +686,119 @@ impl Player {
         }
     }
 
+    /// Spawns the projectiles requested by this tick's
+    /// [`fp_character::TickReport::projectile_spawns`] into the projectile
+    /// slot-map (T013), resolving each [`ProjectileSpawn`]'s offset into a world
+    /// position relative to the owner and mirroring the offset / velocity X by the
+    /// owner's facing (so the projectile travels the way the owner faces).
+    ///
+    /// The new projectile carries the spawn's [`HitDef`](fp_combat::HitDef) as its
+    /// `active_hitdef`, takes the owner's facing, and begins on the spawn's
+    /// `projanim` action (frame 0). Bounded by [`MAX_PROJECTILES_PER_PLAYER`]: once
+    /// the slot-map is full, further spawns this tick are dropped (warn-logged)
+    /// rather than growing without limit. Never panics.
+    fn spawn_projectiles(&mut self, spawns: &[ProjectileSpawn]) {
+        for spawn in spawns {
+            if self.projectiles.len() >= MAX_PROJECTILES_PER_PLAYER {
+                tracing::warn!(
+                    "projectile slot-map full ({MAX_PROJECTILES_PER_PLAYER}); dropping spawn id={}",
+                    spawn.id
+                );
+                break;
+            }
+            let owner = &self.character;
+            let sign = owner.facing.sign() as f32;
+            let (off_x, off_y) = spawn.pos;
+            let (vel_x, vel_y) = spawn.velocity;
+
+            let mut proj = Character::with_constants(owner.constants);
+            proj.pos = Vec2::new(owner.pos.x + off_x * sign, owner.pos.y + off_y);
+            proj.facing = owner.facing;
+            proj.anim = spawn.anim;
+            proj.anim_elem = 0;
+            proj.anim_elem_time = 0;
+            // The projectile carries its own attack. It is its own (single) move,
+            // so its `move_connect` starts clear: `resolve_attack` will connect it
+            // exactly once before it is reaped.
+            proj.active_hitdef = Some(spawn.hitdef);
+
+            // Velocity is facing-relative on X; mirror it so it points the way the
+            // owner faces, matching how the offset and `Target*` ops mirror X.
+            let velocity = Vec2::new(vel_x * sign, vel_y);
+
+            self.projectiles.push(Projectile {
+                character: proj,
+                proj_id: spawn.id,
+                velocity,
+                remaining: spawn.remove_time,
+            });
+        }
+    }
+
+    /// Advances every live projectile this player owns by one tick (T013): move it
+    /// by its velocity, step its animation cursor (for the next frame's `Clsn1`
+    /// boxes), decrement its lifetime, and reap it when its `removetime` elapses or
+    /// it leaves the stage bounds (with a generous off-screen margin).
+    ///
+    /// Hit resolution against the opponent is **not** done here (it needs the
+    /// opponent mutably, which only the match coordinator owns); see
+    /// [`Match::resolve_projectile_hits`]. Pure field writes over a bounded list;
+    /// never panics.
+    fn tick_projectiles(&mut self, stage: StageView) {
+        let air = &self.loaded.air;
+        // A projectile is reaped once it travels this far past a stage edge, so an
+        // un-timed (`removetime = -1`) projectile that misses still gets reclaimed
+        // rather than flying forever.
+        const OFFSCREEN_MARGIN: f32 = 80.0;
+        let left_bound = stage.left - OFFSCREEN_MARGIN;
+        let right_bound = stage.right + OFFSCREEN_MARGIN;
+        self.projectiles.retain_mut(|proj| {
+            // Lifetime: a non-negative `remaining` counts down; reaching 0 reaps it.
+            // `-1` means "no time limit" and is left untouched.
+            if proj.remaining >= 0 {
+                proj.remaining -= 1;
+                if proj.remaining < 0 {
+                    return false;
+                }
+            }
+            proj.character.pos.x += proj.velocity.x;
+            proj.character.pos.y += proj.velocity.y;
+            // Step the displayed animation so the next frame's Clsn1 is current.
+            advance_projectile_frame(&mut proj.character, air);
+            // Reap once it has flown off the stage (either horizontal edge).
+            proj.character.pos.x >= left_bound && proj.character.pos.x <= right_bound
+        });
+    }
+
     /// Ticks this player's **root** character against `opponent`, with its own
-    /// helper slot-map wired into the redirect graph so the root's `helper(id)`
-    /// redirects resolve to its live helpers (T012).
+    /// helper slot-map plus the cross-player relations (`target`/`partner`/
+    /// `playerid(n)`) wired into the redirect graph (T012/T014).
     ///
     /// The root is itself the top of the chain, so `parent`/`root` are `None`
     /// (the empty entries make `root` resolve to self and `parent` to `0`). The
-    /// helper lookup is built from an immutable borrow of `self.helpers` while
-    /// `self.character` is mutated — distinct fields, so the split borrow is
-    /// sound.
-    fn tick_root(&mut self, opponent: Option<&Character>, stage: StageView) -> TickReport {
+    /// `target`/`partner`/`players` relations come from the match coordinator (the
+    /// only place that owns both players); `target` is the opponent this player
+    /// most recently hit, `partner` is its teammate (`None` in a 1-v-1), and
+    /// `players` is the cross-player `(id, &Character)` lookup `playerid(n)`
+    /// resolves against. The helper lookup is built from an immutable borrow of
+    /// `self.helpers` while `self.character` is mutated — distinct fields, so the
+    /// split borrow is sound; the passed-in relations likewise borrow other
+    /// `Player`s' characters (distinct from `self.character`), never `self`.
+    fn tick_root(
+        &mut self,
+        opponent: Option<&Character>,
+        stage: StageView,
+        relations: RedirectRelations<'_>,
+    ) -> TickReport {
         let lookup: Vec<(i32, &Character)> = self
             .helpers
             .iter()
             .map(|h| (h.helper_id, &h.character))
             .collect();
-        let graph = EntityGraph::new(None, None, &lookup);
+        let graph = EntityGraph::new(None, None, &lookup)
+            .with_target(relations.target)
+            .with_partner(relations.partner)
+            .with_players(relations.players);
         self.character
             .tick_as_helper(&self.loaded, opponent, stage, graph)
     }
@@ -1421,13 +1617,27 @@ impl Match {
         // can resolve their anchor without re-borrowing the opponent later (T012).
         let p2_x = self.p2.character.pos.x;
         let p1_x = self.p1.character.pos.x;
-        let mut p1_report = self.p1.tick_root(Some(&self.p2.character), stage);
+        // (T014) P1's cross-player redirects: `target` is P2 once P1 has hit it,
+        // `partner` is None (1-v-1), and `playerid(2)` resolves to P2. The lookup
+        // intentionally omits P1's own id (1) — it would alias the `&mut self.p1`
+        // tick, and a player's own state is reachable through self-triggers. The
+        // opponent borrow is immutable and distinct from the ticking `self.p1`.
+        let p1_target = self.p1.character.has_target.then_some(&self.p2.character);
+        let p1_players: [(i32, &Character); 1] = [(MUGEN_PLAYER_ID_P2, &self.p2.character)];
+        let p1_relations = RedirectRelations {
+            target: p1_target,
+            partner: None,
+            players: &p1_players,
+        };
+        let mut p1_report = self.p1.tick_root(Some(&self.p2.character), stage, p1_relations);
         // Capture any `Pause`/`SuperPause` P1 requested this tick (audit #24); the
         // freeze is armed after BOTH players tick so the later request wins.
         let p1_freeze = p1_report.freeze_request;
         // Helper spawns P1 requested this tick (T012); applied to P1's slot-map
         // below, after the opponent borrow is released.
         let p1_helper_spawns = std::mem::take(&mut p1_report.helper_spawns);
+        // Projectile spawns P1 requested this tick (T013).
+        let p1_projectile_spawns = std::mem::take(&mut p1_report.projectile_spawns);
         self.p1_sound_requests = p1_report.sound_requests;
         // (2a) Apply P1's deferred `Target*` ops to P1's target, the OPPONENT (P2).
         //      `self.p1`/`self.p2` are distinct fields, so the split borrow of the
@@ -1448,9 +1658,19 @@ impl Match {
             );
         }
 
-        let mut p2_report = self.p2.tick_root(Some(&self.p1.character), stage);
+        // (T014) P2's cross-player redirects, mirroring P1's: `target` is P1 once
+        // P2 has hit it, and `playerid(1)` resolves to P1 (P2's own id 2 omitted).
+        let p2_target = self.p2.character.has_target.then_some(&self.p1.character);
+        let p2_players: [(i32, &Character); 1] = [(MUGEN_PLAYER_ID_P1, &self.p1.character)];
+        let p2_relations = RedirectRelations {
+            target: p2_target,
+            partner: None,
+            players: &p2_players,
+        };
+        let mut p2_report = self.p2.tick_root(Some(&self.p1.character), stage, p2_relations);
         let p2_freeze = p2_report.freeze_request;
         let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
+        let p2_projectile_spawns = std::mem::take(&mut p2_report.projectile_spawns);
         self.p2_sound_requests = p2_report.sound_requests;
         // (2b) Apply P2's deferred `Target*` ops to its target, the OPPONENT (P1).
         if fighting {
@@ -1486,6 +1706,19 @@ impl Match {
         self.p2.spawn_helpers(&p2_helper_spawns, p1_x, stage);
         self.p1.tick_helpers(Some(&self.p2.character), stage);
         self.p2.tick_helpers(Some(&self.p1.character), stage);
+
+        // (2e) Spawn each player's requested projectiles into its slot-map, then
+        //      advance every live projectile (T013). Like helpers, projectiles are
+        //      entities (not combat effects), so they spawn and move across phases;
+        //      their HIT resolution against the opponent below is gated on the live
+        //      fight phase, exactly like melee combat. Spawning is done after both
+        //      roots ticked (so a projectile appears the frame its `Projectile`
+        //      controller fired); the advance moves each by its velocity and steps
+        //      its animation so this frame's `Clsn1` is current for hit detection.
+        self.p1.spawn_projectiles(&p1_projectile_spawns);
+        self.p2.spawn_projectiles(&p2_projectile_spawns);
+        self.p1.tick_projectiles(stage);
+        self.p2.tick_projectiles(stage);
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
         //     Each direction reads the attacker's Clsn1 and the defender's Clsn2
@@ -1590,6 +1823,17 @@ impl Match {
                     self.p2.character.change_state(states, state);
                 }
             }
+
+            // (3b') Projectile combat (T013): each player's live projectiles attack
+            //       the opponent, mirroring the melee passes. A projectile that
+            //       overlaps the opponent's `Clsn2` connects via the SAME pure
+            //       `resolve_attack` pipeline (its `active_hitdef`/anim/pos/facing
+            //       are the attacker fields), applying damage / knockback / get-hit
+            //       state to the opponent. A connecting projectile is reaped (a
+            //       projectile is single-hit). P1's projectiles hit P2, then P2's
+            //       hit P1.
+            resolve_projectile_hits(&mut self.p1, &mut self.p2);
+            resolve_projectile_hits(&mut self.p2, &mut self.p1);
         }
 
         // (3c) Advance the live hit-spark effects (audit #17): step each spark's
@@ -2000,6 +2244,9 @@ impl Match {
 
         // Stale hit-sparks must not linger into the new round (audit #17).
         self.effects.clear();
+        // Live projectiles likewise do not survive a round boundary (T013).
+        self.p1.projectiles.clear();
+        self.p2.projectiles.clear();
 
         tracing::info!(
             round = self.round_number,
@@ -2186,6 +2433,95 @@ fn effect_lifetime(action: &AnimAction) -> i32 {
         .map(|f| f.ticks.max(0))
         .fold(0i32, |acc, t| acc.saturating_add(t));
     total.clamp(1, EFFECT_MAX_LIFETIME)
+}
+
+/// Advances a projectile's animation cursor (`anim_elem`/`anim_elem_time`) by one
+/// tick against its owner's AIR `air` (T013), so the next frame's `Clsn1` attack
+/// boxes are current for hit detection.
+///
+/// Unlike a one-shot hit-spark, a projectile animation **loops** (a fireball
+/// spins continuously while it flies): once the cursor passes the last frame it
+/// wraps to frame `0`. A frame with `ticks <= 0` (an infinite hold) parks the
+/// cursor there. A missing / empty action leaves the cursor untouched (the
+/// projectile still moves and connects on its current frame). A loop guard bounds
+/// the advance against a run of zero-duration frames; never panics.
+fn advance_projectile_frame(proj: &mut Character, air: &AirFile) {
+    let Some(action) = air.action(proj.anim) else {
+        return;
+    };
+    if action.frames.is_empty() {
+        return;
+    }
+    proj.anim_elem_time += 1;
+    let mut guard = action.frames.len() + 1;
+    while guard > 0 {
+        guard -= 1;
+        let idx = proj.anim_elem.max(0) as usize;
+        let Some(frame) = action.frames.get(idx) else {
+            // Cursor ran past the end (e.g. the action shrank): wrap to the start.
+            proj.anim_elem = 0;
+            proj.anim_elem_time = 0;
+            break;
+        };
+        if frame.ticks <= 0 || proj.anim_elem_time < frame.ticks {
+            break;
+        }
+        proj.anim_elem_time = 0;
+        proj.anim_elem += 1;
+        // Loop back to the first frame once we step past the last.
+        if proj.anim_elem as usize >= action.frames.len() {
+            proj.anim_elem = 0;
+        }
+    }
+}
+
+/// Resolves every live projectile of `attacker` against `defender`'s character
+/// (T013), applying any connecting hit and reaping the projectiles that landed.
+///
+/// Each projectile is run through the SAME pure
+/// [`fp_character::combat::resolve_attack`] pipeline a melee attack uses: the
+/// projectile's [`Character`] (carrying its `active_hitdef`/`anim`/`pos`/`facing`)
+/// is the attacker, the opponent is the defender, and both source their collision
+/// boxes from their respective AIR sets (the projectile from its **owner's** AIR,
+/// since its `projanim` is one of the owner's actions). A projectile that connects
+/// is **removed** from the slot-map — a projectile is single-hit. A projectile
+/// that does not connect is retained to fly on. Damage / knockback / get-hit state
+/// are applied to the defender inside `resolve_attack`. `attacker` and `defender`
+/// are distinct [`Player`] fields, so the split borrow is sound; never panics.
+fn resolve_projectile_hits(attacker: &mut Player, defender: &mut Player) {
+    let owner_air = &attacker.loaded.air;
+    let defender_air = &defender.loaded.air;
+    let defender_states = &defender.loaded.states;
+    // Whether any of this player's projectiles connected this pass: a connecting
+    // projectile establishes the OWNER's `target` (T014), so the owner's
+    // `target, …` redirects resolve to the hit defender — exactly as a melee hit
+    // does. `resolve_attack` sets `has_target` on the *projectile* entity (the
+    // attacker it is given), but the projectile is reaped, so the flag is lifted
+    // onto the owning player here.
+    let mut owner_connected = false;
+    attacker.projectiles.retain_mut(|proj| {
+        // `resolve_attack` returns `Some(..)` only on an effective hit/guard; on a
+        // connection the projectile is consumed (single-hit), else it lives on.
+        let connected = resolve_attack(
+            &mut proj.character,
+            owner_air,
+            &mut defender.character,
+            defender_air,
+            defender_states,
+        )
+        .is_some();
+        if connected {
+            owner_connected = true;
+            tracing::debug!(
+                "projectile id={} connected; reaping (single-hit)",
+                proj.proj_id
+            );
+        }
+        !connected
+    });
+    if owner_connected {
+        attacker.character.has_target = true;
+    }
 }
 
 impl Player {
@@ -7991,5 +8327,373 @@ time = 1
         }
         assert!(m.p1().helpers().is_empty(), "no P1 helpers");
         assert!(m.p2().helpers().is_empty(), "no P2 helpers");
+    }
+
+    // =====================================================================
+    // T013 — Projectile entity slot-map: a `Projectile` controller spawns a
+    // moving attack entity into the player's slot-map, the projectile advances
+    // each tick, and a projectile overlapping the opponent's Clsn2 connects a hit.
+    // =====================================================================
+
+    /// The projectile action id used by the T013 tests: action 2000 carries a wide
+    /// `Clsn1` attack box (the projectile's hit geometry), and action 0 carries a
+    /// hurt box (so the owner is still hittable / the AIR is well-formed).
+    const PROJ_ANIM: i32 = 2000;
+
+    /// A loaded character whose state 0 fires ONE `Projectile` the first FIGHT
+    /// tick — gated on `RoundState = 1` (the fight phase) AND a self-var latch
+    /// (`var(30) = 0`) so it fires exactly once, NOT during the intro (where a
+    /// projectile would simply fly off before combat is live). It travels forward
+    /// at velocity `(8, 0)`, carrying a damaging HitDef on `projanim = 2000`. The
+    /// owner's AIR has action 2000 with a wide `Clsn1` and action 0 with a hurt box.
+    fn projectile_owner_loaded() -> LoadedCharacter {
+        // RoundState 1 = the live fight phase; `var(30)` is the once-only latch.
+        let spawn = ctrl_gated(
+            0,
+            "Projectile",
+            "RoundState = 1 && var(30) = 0",
+            &[
+                ("projid", "9001"),
+                ("projanim", "2000"),
+                ("offset", "20, -40"),
+                ("velocity", "8, 0"),
+                // No removetime -> -1 (no time limit); it lives until it hits / flies off.
+                ("attr", "S, NP"),
+                ("damage", "30, 5"),
+                ("hitflag", "MAF"),
+                ("ground.velocity", "4, -3"),
+                ("air.velocity", "4, -6"),
+                ("pausetime", "8, 8"),
+                ("p2stateno", "5000"),
+            ],
+        );
+        // Latch: once fighting, mark `var(30) = 1` so the spawn never re-fires.
+        let latch = ctrl_gated(0, "VarSet", "RoundState = 1", &[("v", "30"), ("value", "1")]);
+        let st0 = stand_state(0, vec![spawn, latch]);
+
+        // AIR: action 2000 = the projectile's wide attack box; action 0 = a hurt
+        // box (about the axis) so the owner is well-formed / hittable.
+        let mut air = air_with(PROJ_ANIM, vec![Rect::new(-30.0, -70.0, 60.0, 70.0)], Vec::new());
+        air.actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![AnimFrame {
+                    sprite: SpriteId::new(0, 0),
+                    offset: Vec2::new(0, 0),
+                    ticks: 1,
+                    flip_h: false,
+                    flip_v: false,
+                    blend: BlendMode::Normal,
+                    clsn1: Vec::new(),
+                    clsn2: vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+                    ..Default::default()
+                }],
+                loopstart: 0,
+            },
+        );
+        let mut loaded = loaded_with(air);
+        loaded.states.insert(0, st0);
+        loaded
+    }
+
+    /// AC: a `Projectile` controller spawns a moving projectile entity with its
+    /// own HitDef into the player's slot-map, positioned by its offset and facing.
+    #[test]
+    fn projectile_controller_spawns_moving_entity() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-100.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        // Place P2 far away so the projectile does NOT connect this test (we are
+        // only checking spawn + the carried HitDef here).
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(280.0, 0.0);
+        let p1 = Player::new(p1c, projectile_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+
+        assert!(m.p1().projectiles().is_empty(), "none before any tick");
+        into_fight(&mut m);
+
+        let projs = m.p1().projectiles();
+        assert_eq!(projs.len(), 1, "exactly one projectile spawned");
+        let proj = &projs[0];
+        assert_eq!(proj.proj_id(), 9001, "addressable by its projid");
+        assert_eq!(proj.anim(), PROJ_ANIM, "displays its projanim");
+        // It carries its own HitDef (the attack), distinct from the owner's.
+        let hd = proj
+            .character
+            .active_hitdef
+            .expect("projectile carries its own HitDef");
+        assert_eq!(hd.damage.hit, 30);
+        assert_eq!(hd.p2stateno, Some(5000));
+        // The owner did NOT keep the HitDef itself.
+        assert!(
+            m.p1().character.active_hitdef.is_none(),
+            "the owner does not carry the projectile's attack"
+        );
+        // The spawn is gated Time = 0, so no second projectile appears next frame.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.p1().projectiles().len(), 1, "Projectile fired once");
+    }
+
+    /// AC: the projectile MOVES each tick by its velocity (mirrored by the owner's
+    /// facing). Spawned facing right, its X strictly increases frame over frame.
+    #[test]
+    fn projectile_advances_each_tick() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-100.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(280.0, 0.0);
+        let p1 = Player::new(p1c, projectile_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-400.0, 400.0));
+        into_fight(&mut m);
+
+        // The frame the projectile spawned it has already advanced once (spawn +
+        // tick happen the same frame). Capture its X, then confirm it keeps moving.
+        let x0 = m.p1().projectiles()[0].pos().x;
+        m.tick(MatchInput::none(), MatchInput::none());
+        let x1 = m.p1().projectiles()[0].pos().x;
+        m.tick(MatchInput::none(), MatchInput::none());
+        let x2 = m.p1().projectiles()[0].pos().x;
+        assert!(x1 > x0, "projectile moved right (x1={x1} > x0={x0})");
+        assert!(x2 > x1, "projectile kept moving right (x2={x2} > x1={x1})");
+        // Velocity 8/tick: each step advances ~8px (mirrored by the right facing).
+        assert!((x1 - x0 - 8.0).abs() < 1e-3, "advanced 8px/tick, got {}", x1 - x0);
+    }
+
+    /// AC: a projectile that overlaps the opponent's `Clsn2` resolves a hit —
+    /// damaging the defender, sending it to the HitDef's `p2stateno`, and reaping
+    /// the (single-hit) projectile.
+    #[test]
+    fn projectile_connects_and_damages_opponent() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        // Opponent placed far enough that the forward-travelling projectile takes
+        // several FIGHT ticks to reach it — so the connection happens inside the
+        // measured loop below, not during the single fight tick `into_fight` runs.
+        // P2's hurt box is about its axis (-18..18 -> world 182..218 at x=200).
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(200.0, 0.0);
+        p2c.facing = Facing::Left;
+        let p1 = Player::new(p1c, projectile_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-400.0, 400.0));
+        into_fight(&mut m);
+
+        let life_before = m.p2().life();
+        // Run several fight ticks so the projectile flies into the opponent. It
+        // spawns ~20px in front of P1 (x≈20) and advances 8px/tick, reaching the
+        // opponent's hurt box (centred at 200) after ~20 ticks.
+        let mut connected = false;
+        for _ in 0..40 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p2().life() < life_before {
+                connected = true;
+                break;
+            }
+        }
+        assert!(connected, "projectile connected and reduced the opponent's life");
+        // Damage applied (30 hit damage; defence_mul defaults to 1.0).
+        assert!(
+            m.p2().life() <= life_before - 30,
+            "applied at least the HitDef hit damage"
+        );
+        // The defender was sent into the HitDef's p2stateno (5000).
+        assert_eq!(
+            m.p2().character.state_no,
+            5000,
+            "defender entered the projectile's p2stateno"
+        );
+        // The projectile is single-hit: it was reaped on the connection.
+        assert!(
+            m.p1().projectiles().is_empty(),
+            "the connecting projectile was reaped (single-hit)"
+        );
+    }
+
+    /// A projectile that never reaches the opponent is eventually reaped when it
+    /// flies off the stage (an un-timed projectile is still bounded).
+    #[test]
+    fn projectile_is_reaped_after_flying_offscreen() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        // Opponent placed BEHIND the projectile's travel (to the left), so the
+        // forward-flying projectile never connects and instead flies off the right.
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(-200.0, 0.0);
+        p2c.facing = Facing::Right;
+        let p1 = Player::new(p1c, projectile_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-150.0, 150.0));
+        into_fight(&mut m);
+        assert_eq!(m.p1().projectiles().len(), 1, "projectile present after spawn");
+
+        // Fly it well past the right edge (150 + 80 margin) at 8px/tick.
+        for _ in 0..40 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert!(
+            m.p1().projectiles().is_empty(),
+            "projectile reaped after flying off the stage"
+        );
+    }
+
+    /// A match whose players never spawn projectiles keeps empty projectile
+    /// slot-maps and ticks without panicking.
+    #[test]
+    fn match_without_projectiles_keeps_empty_slot_maps() {
+        let mut m = basic_match();
+        for _ in 0..30 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert!(m.p1().projectiles().is_empty(), "no P1 projectiles");
+        assert!(m.p2().projectiles().is_empty(), "no P2 projectiles");
+    }
+
+    // =====================================================================
+    // T014 — cross-player redirects through the Match: `target` resolves to the
+    // entity a player most recently hit; `playerid(n)` resolves to that player.
+    // =====================================================================
+
+    /// A loaded character whose state 0 records, into its own vars each tick,
+    /// whether its `target` / `playerid(2)` redirects resolve to a defender whose
+    /// life the test sets to a distinctive 444. Reads go through trigger
+    /// CONDITIONS (single compiled expressions) so the redirect comma is preserved.
+    fn redirect_reader_loaded() -> LoadedCharacter {
+        // var(0) = 1 iff `target, Life == 444`; var(1) = 1 iff `playerid(2), Life == 444`.
+        let read_target =
+            ctrl_gated(0, "VarSet", "target, Life = 444", &[("v", "0"), ("value", "1")]);
+        let read_playerid =
+            ctrl_gated(0, "VarSet", "playerid(2), Life = 444", &[("v", "1"), ("value", "1")]);
+        let st0 = stand_state(0, vec![read_target, read_playerid]);
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(0, st0);
+        loaded
+    }
+
+    /// AC: `playerid(2)` (P2's MUGEN player id) resolves to the opponent through a
+    /// live `Match::tick`, reading the opponent's life (not 0).
+    #[test]
+    fn playerid_redirect_resolves_opponent_through_match() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        p2c.life = 444; // the distinctive opponent life the redirect should read
+        let p1 = Player::new(p1c, redirect_reader_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+        into_fight(&mut m);
+
+        // P1 has not hit P2 yet, so `target` is None (var(0) stays 0); but
+        // `playerid(2)` always resolves to P2 (var(1) becomes 1).
+        assert_eq!(
+            m.p1().character.vars[1], 1,
+            "`playerid(2)` resolved to the opponent (life 444), not 0"
+        );
+    }
+
+    /// AC: `target` resolves to the entity a player most recently hit. Drive P1's
+    /// projectile into P2 to ESTABLISH a target, then confirm P1's `target, Life`
+    /// redirect reads the opponent (it was 0 before the hit).
+    #[test]
+    fn target_redirect_resolves_after_a_hit_through_match() {
+        // P1 fires a projectile (state 0) AND reads its `target` redirect each
+        // tick. We compose: state 0 fires the projectile once and records whether
+        // `target, life` resolves. Use a fresh loaded char combining both.
+        // Fire the projectile the first FIGHT tick (latched once via var(30)) so it
+        // does not fly off during the intro.
+        let spawn = ctrl_gated(
+            0,
+            "Projectile",
+            "RoundState = 1 && var(30) = 0",
+            &[
+                ("projid", "1"),
+                ("projanim", "2000"),
+                ("offset", "20, -40"),
+                ("velocity", "8, 0"),
+                ("attr", "S, NP"),
+                ("damage", "10, 0"),
+                ("hitflag", "MAF"),
+                ("pausetime", "1, 1"),
+            ],
+        );
+        let latch = ctrl_gated(0, "VarSet", "RoundState = 1", &[("v", "30"), ("value", "1")]);
+        // var(0) = 1 whenever `target` resolves to a live opponent (life > 0).
+        let read_target =
+            ctrl_gated(0, "VarSet", "target, Life > 0", &[("v", "0"), ("value", "1")]);
+        let st0 = stand_state(0, vec![spawn, latch, read_target]);
+        let mut air = air_with(PROJ_ANIM, vec![Rect::new(-30.0, -70.0, 60.0, 70.0)], Vec::new());
+        air.actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![AnimFrame {
+                    sprite: SpriteId::new(0, 0),
+                    offset: Vec2::new(0, 0),
+                    ticks: 1,
+                    flip_h: false,
+                    flip_v: false,
+                    blend: BlendMode::Normal,
+                    clsn1: Vec::new(),
+                    clsn2: vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+                    ..Default::default()
+                }],
+                loopstart: 0,
+            },
+        );
+        let mut loaded = loaded_with(air);
+        loaded.states.insert(0, st0);
+
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        // Far enough that the projectile connects several fight ticks in, not on
+        // the single fight tick `into_fight` runs.
+        p2c.pos = Vec2::new(200.0, 0.0);
+        p2c.facing = Facing::Left;
+        let p1 = Player::new(p1c, loaded);
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-400.0, 400.0));
+        into_fight(&mut m);
+
+        // Before the projectile connects, P1 has no target: the first fight tick
+        // records var(0) = 0 (no target established yet).
+        assert_eq!(m.p1().character.vars[0], 0, "no target before the hit");
+        assert!(!m.p1().character.has_target, "no target before the hit");
+
+        // Run until the projectile connects and P1 establishes a target.
+        let mut hit = false;
+        for _ in 0..40 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p1().character.has_target {
+                hit = true;
+                break;
+            }
+        }
+        assert!(hit, "P1's projectile connected and established a target");
+        // One more tick so the `target` read runs WITH the target now wired.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.vars[0], 1,
+            "`target` redirect resolved to the hit opponent (life > 0), not 0"
+        );
     }
 }

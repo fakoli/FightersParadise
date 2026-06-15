@@ -81,13 +81,15 @@
 //! A controller type that is **not** handled is split two ways so no documented
 //! controller silently no-ops without a tracked reason:
 //!
-//! - A **documented MUGEN controller blocked on an unbuilt subsystem** (helpers /
-//!   explods / projectiles, multi-entity redirects, the stage/background owner, or
-//!   the full global PalFX modulation — see [`is_tracked_deferred_controller`] and
-//!   T007-T014) routes to a named, `tracing::warn!`-logged no-op. The
-//!   target/projectile-graph controllers `HitAdd`, `AttackDist`, and `TargetDrop`
-//!   are tracked here too: they act on a target / active-HitDef / projectile that
-//!   the multi-entity graph (T013/T014) does not yet exist to address.
+//! - A **documented MUGEN controller blocked on an unbuilt subsystem** (explod
+//!   entities, the stage/background owner, the full global PalFX modulation, or the
+//!   bind / hit-count entity lifecycle — see [`is_tracked_deferred_controller`] and
+//!   T007-T014) routes to a named, `tracing::warn!`-logged no-op. The `Helper`
+//!   (T012) and `Projectile` (T013) entity-spawn controllers, and the
+//!   `parent`/`root`/`helper`/`target`/`partner`/`playerid` redirects (T012/T014),
+//!   are now handled. The `HitAdd`, `AttackDist`, and `TargetDrop` controllers are
+//!   still tracked here: they need the hit-count / guard-distance / bind-release
+//!   lifecycle the slot-map does not drive yet.
 //! - A **genuinely unrecognized** token (a typo / non-MUGEN extension) routes to a
 //!   `tracing::debug!`-logged no-op.
 //!
@@ -499,6 +501,56 @@ pub struct HelperSpawn {
     pub facing: i32,
 }
 
+/// A deferred request, emitted by a `Projectile` controller, to spawn a
+/// projectile entity owned by this character (T013).
+///
+/// `fp-character` ticks one entity at a time and cannot create — or own — a live
+/// projectile from inside a single character's tick, so the `Projectile`
+/// controller does not spawn inline. Instead it records the request on
+/// [`TickReport::projectile_spawns`], and the entity owner (`fp-engine`'s
+/// `Player`, which holds the projectile slot-map) reads it after the tick and
+/// inserts the new projectile. This mirrors how `Helper` defers a [`HelperSpawn`]
+/// and `Target*` defers a [`TargetOp`], keeping the executor a single-entity,
+/// deterministic, panic-free simulation.
+///
+/// The fields are the subset of MUGEN's `Projectile` parameters this engine
+/// models: the projectile's [`hitdef`](Self::hitdef) (its own attack — parsed by
+/// the same [`build_hitdef`](Character::build_hitdef) path the `HitDef`
+/// controller uses), the [`anim`](Self::anim) it displays (MUGEN `projanim`), the
+/// [`pos`](Self::pos) spawn offset relative to the owner, the [`velocity`](Self::velocity)
+/// it travels at, and the [`id`](Self::id) it is addressable by. Velocity / position
+/// are in the owner's facing-relative convention on X; the spawner (`fp-engine`)
+/// applies the facing mirroring, exactly as it does for `Target*` ops and
+/// [`HelperSpawn`]. Unmodeled MUGEN parameters (`projremove`/`projremovetime`/
+/// `projscale`/`projsprpriority`/`projedgebound`/…) take their MUGEN defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectileSpawn {
+    /// The projectile's id, used to address its triggers (MUGEN `ID`/`projid`).
+    /// Defaults to `0` when absent (MUGEN's default).
+    pub id: i32,
+    /// The animation (action) id the projectile displays (MUGEN `projanim`); also
+    /// the action whose `Clsn1` attack boxes drive its hit detection. Defaults to
+    /// `0` when absent.
+    pub anim: i32,
+    /// The projectile's own attack, parsed from the controller's HitDef-style
+    /// parameters (`attr`/`damage`/`hitflag`/…) via
+    /// [`Character::build_hitdef`]. The projectile carries this as its
+    /// `active_hitdef` so its overlap with the opponent resolves a hit.
+    pub hitdef: fp_combat::HitDef,
+    /// The `(x, y)` spawn offset relative to the owner's axis, in the owner's
+    /// facing-relative convention on X (MUGEN `offset`/`projoffset`'s `pos`). The
+    /// spawner (`fp-engine`) applies the facing mirroring.
+    pub pos: (f32, f32),
+    /// The `(x, y)` velocity the projectile travels at each tick, facing-relative
+    /// on X (MUGEN `velocity`). The spawner mirrors X by the owner's facing.
+    pub velocity: (f32, f32),
+    /// How many ticks the projectile lives before self-removing (MUGEN
+    /// `removetime`). `-1` (the MUGEN default) means "no time limit" — the
+    /// projectile lives until it leaves the stage bounds or connects. A
+    /// non-negative value caps the lifetime in ticks.
+    pub remove_time: i32,
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
@@ -550,6 +602,13 @@ pub struct TickReport {
     /// owner (`fp-engine`'s `Player`, which holds the slot-map of live helpers)
     /// reads them after the tick and inserts each new helper into the slot-map.
     pub helper_spawns: Vec<HelperSpawn>,
+    /// Projectile-spawn requests emitted by `Projectile` controllers this tick, in
+    /// fire order (T013). Empty on a tick with no firing `Projectile`, and (like
+    /// the other request fields) never carried across ticks because a fresh
+    /// [`TickReport`] is built per tick. `fp-character` only *describes* each
+    /// spawn; the entity owner (`fp-engine`'s `Player`, which holds the projectile
+    /// slot-map) reads them after the tick and inserts each new projectile.
+    pub projectile_spawns: Vec<ProjectileSpawn>,
 }
 
 impl Character {
@@ -1367,6 +1426,8 @@ impl Character {
             // Null intentionally does nothing.
         } else if kind.eq_ignore_ascii_case("Helper") {
             self.ctrl_helper(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("Projectile") {
+            self.ctrl_projectile(ctrl, env, report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
             // run because it depends on an unbuilt subsystem (helpers, explods,
@@ -1934,6 +1995,88 @@ impl Character {
         );
     }
 
+    /// `Projectile`: emit a [`ProjectileSpawn`] request to bring a projectile
+    /// entity to life, owned by this character (T013).
+    ///
+    /// `fp-character` ticks a single entity and cannot create — or own — a live
+    /// projectile inside one tick, so (exactly like `Helper`, `PlaySnd`, and the
+    /// `Target*` controllers) this defers: it pushes a [`ProjectileSpawn`] onto
+    /// [`TickReport::projectile_spawns`] and the entity owner (`fp-engine`'s
+    /// `Player`, which holds the projectile slot-map) inserts, advances, and
+    /// resolves hits for the projectile after the tick.
+    ///
+    /// The projectile's own attack is built from the controller's HitDef-style
+    /// parameters (`attr`/`damage`/`hitflag`/`pausetime`/…) via the shared
+    /// [`build_hitdef`](Self::build_hitdef) path, so a projectile carries a full
+    /// `HitDef` and connects exactly like a melee attack. The remaining modeled
+    /// parameters are: `id`/`projid` (the projectile id; default `0`), `projanim`
+    /// (the displayed animation, whose `Clsn1` boxes drive hit detection; default
+    /// `0`), `offset` (the `(x, y)` spawn offset relative to the owner; each axis
+    /// defaults to `0`), `velocity` (the `(x, y)` travel velocity; each axis
+    /// defaults to `0`), and `removetime` (the lifetime cap in ticks; MUGEN
+    /// default `-1` = no limit). A missing parameter takes its MUGEN default;
+    /// nothing here panics.
+    fn ctrl_projectile(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        let hitdef = self.build_hitdef(ctrl, env);
+        // `ID` / `projid` — the projectile's addressable id (MUGEN accepts either
+        // spelling; prefer the explicit `projid` when present).
+        let id = ctrl
+            .params
+            .get("projid")
+            .or_else(|| ctrl.params.get("id"))
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let anim = ctrl
+            .params
+            .get("projanim")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        // `offset = x, y` (MUGEN also accepts `projoffset`/`pos` in some authoring;
+        // the documented key is `offset`). Each axis defaults to 0.
+        let off_param = ctrl
+            .params
+            .get("offset")
+            .or_else(|| ctrl.params.get("projoffset"))
+            .or_else(|| ctrl.params.get("pos"));
+        let off_x = off_param
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(0.0, |v| v.to_float());
+        let off_y = off_param
+            .and_then(|p| self.eval_param_component(p, 1, env))
+            .map_or(0.0, |v| v.to_float());
+        // `velocity = x, y` — the per-tick travel velocity (facing-relative on X).
+        let vel_param = ctrl.params.get("velocity");
+        let vel_x = vel_param
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(0.0, |v| v.to_float());
+        let vel_y = vel_param
+            .and_then(|p| self.eval_param_component(p, 1, env))
+            .map_or(0.0, |v| v.to_float());
+        // `removetime` — lifetime cap in ticks; MUGEN default -1 (no limit).
+        let remove_time = ctrl
+            .params
+            .get("removetime")
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(-1, |v| v.to_int());
+
+        report.projectile_spawns.push(ProjectileSpawn {
+            id,
+            anim,
+            hitdef,
+            pos: (off_x, off_y),
+            velocity: (vel_x, vel_y),
+            remove_time,
+        });
+        tracing::debug!(
+            "tick: Projectile id={id} anim={anim} offset=({off_x},{off_y}) \
+             velocity=({vel_x},{vel_y}) removetime={remove_time} attr={:?} damage={:?} \
+             spawned from state {}",
+            hitdef.attr,
+            hitdef.damage,
+            ctrl.state_number
+        );
+    }
+
     // ---- Target controllers (deferred ops) --------------------------------
     //
     // Each `Target*` controller mutates this character's *target* (the opponent
@@ -2183,6 +2326,41 @@ impl Character {
     /// MUGEN-faithful value. This never panics: a malformed string parses to its
     /// documented safe default and a malformed expression evaluates to `0`.
     fn ctrl_hit_def(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let hd = self.build_hitdef(ctrl, env);
+        tracing::debug!(
+            "tick: HitDef in state {} -> attr {:?}, damage {:?}, getpower {:?}, givepower {:?}",
+            ctrl.state_number,
+            hd.attr,
+            hd.damage,
+            hd.getpower,
+            hd.givepower
+        );
+        self.active_hitdef = Some(hd);
+        // Mark that a HitDef was established this tick so a later same-tick
+        // `ChangeState` does not clear it before this frame's hit detection (#16).
+        self.hitdef_set_this_tick = true;
+    }
+
+    /// Builds a [`fp_combat::HitDef`] from a controller's parameters, the shared
+    /// HitDef-parameter parsing used by both the [`HitDef`](Self::ctrl_hit_def)
+    /// controller (which stores it as [`active_hitdef`](Character::active_hitdef))
+    /// and the [`Projectile`](Self::ctrl_projectile) controller (which carries it
+    /// on the spawned projectile entity, T013).
+    ///
+    /// MUGEN's `HitDef` carries two *kinds* of parameter:
+    ///
+    /// - **string / enum** params (`attr`, `hitflag`, `guardflag`, `animtype`,
+    ///   `sparkno`, `hit`/`guardsound`, …) read from the raw source and parsed by
+    ///   the matching `fp_combat` parser; and
+    /// - **numeric** params (`damage`, `*.velocity`, `pausetime`, `*.hittime`,
+    ///   `p1`/`p2stateno`, `priority`, `getpower`/`givepower`, …) evaluated as VM
+    ///   expressions against `me` (the attacker), component by component.
+    ///
+    /// MUGEN defaults a HitDef's `air.type`/`air.animtype` to its ground value
+    /// when absent. Any unspecified parameter falls back to
+    /// [`fp_combat::HitDef::default`]'s MUGEN-faithful default. Never panics: a
+    /// missing or unparseable parameter keeps the default for that field.
+    fn build_hitdef(&self, ctrl: &CompiledController, env: EvalEnv) -> fp_combat::HitDef {
         let mut hd = fp_combat::HitDef::default();
 
         // ---- String / enum params (read from raw source) ------------------
@@ -2379,18 +2557,7 @@ impl Character {
             }
         }
 
-        tracing::debug!(
-            "tick: HitDef in state {} -> attr {:?}, damage {:?}, getpower {:?}, givepower {:?}",
-            ctrl.state_number,
-            hd.attr,
-            hd.damage,
-            hd.getpower,
-            hd.givepower
-        );
-        self.active_hitdef = Some(hd);
-        // Mark that a HitDef was established this tick so a later same-tick
-        // `ChangeState` does not clear it before this frame's hit detection (#16).
-        self.hitdef_set_this_tick = true;
+        hd
     }
 
     /// `NotHitBy` / `HitBy`: install an attack-attribute invulnerability window
@@ -3957,14 +4124,18 @@ fn strip_quotes(raw: &str) -> &str {
 ///
 /// The blocking subsystems (and their tasks):
 ///
-/// - **Helper lifecycle / explods / projectiles** (`DestroySelf`, `Explod`,
-///   `ModifyExplod`, `RemoveExplod`, `Projectile`, `BindToParent`,
-///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — these need helper *lifecycle*
-///   management (self-destruction, binding, cross-entity var writes) and the
-///   explod/projectile entity kinds, which the slot-map does not own yet (T013).
-///   (`Helper` itself is now handled — it emits a [`HelperSpawn`] request the
-///   entity owner inserts into the slot-map; T012.)
-/// - **Target/partner redirects beyond the flat 1-v-1** (`BindToTarget`) — T014.
+/// - **Helper lifecycle / explods** (`DestroySelf`, `Explod`, `ModifyExplod`,
+///   `RemoveExplod`, `BindToParent`, `BindToRoot`, `ParentVarSet`/`ParentVarAdd`)
+///   — these need helper *lifecycle* management (self-destruction, binding,
+///   cross-entity var writes) and the explod entity kind, which the slot-map does
+///   not own yet. (`Helper` is handled — it emits a [`HelperSpawn`] request the
+///   entity owner inserts into the slot-map; T012. `Projectile` is now handled
+///   too — it emits a [`ProjectileSpawn`] the entity owner advances and resolves
+///   hits for; T013.)
+/// - **Target binding lifecycle** (`BindToTarget`) — the `target`/`partner`/
+///   `playerid(n)` *redirects* now resolve (T014), but binding a player to its
+///   target each tick needs the per-tick bind/release lifecycle the slot-map does
+///   not drive yet.
 /// - **Stage/background ownership** (`BGPalFX`) — the background lives in
 ///   `fp-stage`/`fp-app`, not on a `Character`, so a per-character tick cannot
 ///   tint it.
@@ -3996,7 +4167,6 @@ fn is_tracked_deferred_controller(kind: &str) -> bool {
         "ModifyExplod",
         "RemoveExplod",
         "ExplodBindTime",
-        "Projectile",
         "BindToParent",
         "BindToRoot",
         "BindToTarget",
@@ -9423,6 +9593,137 @@ mod tests {
         assert_eq!(hd.priority.kind, fp_combat::PriorityType::Hit);
     }
 
+    // ---- T013: Projectile controller ----------------------------------------
+
+    /// A synthetic `Projectile` controller emits a [`ProjectileSpawn`] on the
+    /// `TickReport` carrying its own HitDef (built from the same HitDef-style
+    /// params as the `HitDef` controller), plus the projectile's id, anim,
+    /// offset, velocity, and removetime. It does NOT touch the spawner's own
+    /// `active_hitdef` (the projectile owns the attack, not the owner).
+    #[test]
+    fn projectile_emits_spawn_request_with_hitdef() {
+        let proj = ctrl(
+            1000,
+            "Projectile",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[
+                ("projid", "1234"),
+                ("projanim", "2000"),
+                ("offset", "30, -50"),
+                ("velocity", "8, 0"),
+                ("removetime", "90"),
+                // HitDef-style attack params, parsed by the shared build_hitdef.
+                ("attr", "S, NP"),
+                ("damage", "40, 10"),
+                ("hitflag", "MAF"),
+                ("pausetime", "8, 8"),
+                ("p2stateno", "5000"),
+            ],
+        );
+        let st = stand_n(1000, vec![proj]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 1000;
+        ch.physics = Physics::None;
+
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "Projectile dispatched");
+        assert_eq!(report.projectile_spawns.len(), 1, "one projectile spawned");
+        // The spawner did NOT gain the attack itself — the projectile owns it.
+        assert!(
+            ch.active_hitdef.is_none(),
+            "Projectile must not populate the owner's active_hitdef"
+        );
+
+        let spawn = &report.projectile_spawns[0];
+        assert_eq!(spawn.id, 1234);
+        assert_eq!(spawn.anim, 2000);
+        assert!((spawn.pos.0 - 30.0).abs() < 1e-4);
+        assert!((spawn.pos.1 - (-50.0)).abs() < 1e-4);
+        assert!((spawn.velocity.0 - 8.0).abs() < 1e-4);
+        assert!((spawn.velocity.1).abs() < 1e-4);
+        assert_eq!(spawn.remove_time, 90);
+        // The carried HitDef reflects the controller's attack params.
+        assert_eq!(spawn.hitdef.attr, fp_combat::AttackAttr::parse("S, NP"));
+        assert_eq!(spawn.hitdef.damage.hit, 40);
+        assert_eq!(spawn.hitdef.damage.guard, 10);
+        assert_eq!(spawn.hitdef.p2stateno, Some(5000));
+    }
+
+    /// Unspecified `Projectile` params take their MUGEN defaults: id/anim 0,
+    /// zero offset/velocity, and `removetime = -1` (no time limit). The HitDef
+    /// still defaults faithfully (e.g. `hitflag = MAF`).
+    #[test]
+    fn projectile_unspecified_params_use_defaults() {
+        let proj = ctrl(
+            0,
+            "Projectile",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("attr", "S, NP")],
+        );
+        let st = stand_n(0, vec![proj]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        let report = lc.tick(&mut ch);
+        let spawn = report
+            .projectile_spawns
+            .first()
+            .expect("one projectile spawned");
+        assert_eq!(spawn.id, 0, "default projid");
+        assert_eq!(spawn.anim, 0, "default projanim");
+        assert!(spawn.pos.0.abs() < 1e-4 && spawn.pos.1.abs() < 1e-4, "zero offset");
+        assert!(
+            spawn.velocity.0.abs() < 1e-4 && spawn.velocity.1.abs() < 1e-4,
+            "zero velocity"
+        );
+        assert_eq!(spawn.remove_time, -1, "removetime defaults to no-limit");
+        assert_eq!(
+            spawn.hitdef.hitflag,
+            fp_combat::HitFlags::parse("MAF"),
+            "HitDef defaults still apply"
+        );
+    }
+
+    /// The Projectile controller never panics on malformed params: a bad attr
+    /// falls back to the default, a non-numeric velocity evaluates to 0, and the
+    /// spawn request is still emitted.
+    #[test]
+    fn projectile_malformed_params_never_panic() {
+        let proj = ctrl(
+            0,
+            "Projectile",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[
+                ("attr", "totally bogus"),
+                ("velocity", ","), // empty components -> 0, 0
+                ("projanim", "not a number"),
+            ],
+        );
+        let st = stand_n(0, vec![proj]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+
+        let report = lc.tick(&mut ch);
+        let spawn = report
+            .projectile_spawns
+            .first()
+            .expect("spawn emitted even on bad input");
+        assert_eq!(spawn.hitdef.attr, fp_combat::AttackAttr::default(), "bad attr -> default");
+        assert!(spawn.velocity.0.abs() < 1e-4, "empty velocity component -> 0");
+        assert_eq!(spawn.anim, 0, "non-numeric projanim -> 0");
+    }
+
     // ---- AC4: gated real-KFM HitDef test (skips when test-assets absent) ----
 
     /// Ticks real KFM into a state that contains a `HitDef` controller and
@@ -12920,14 +13221,14 @@ mod tests {
     #[test]
     fn deferred_controllers_are_tracked() {
         for kind in [
-            "Explod", "ModifyExplod", "RemoveExplod", "Projectile",
+            "Explod", "ModifyExplod", "RemoveExplod",
             "BGPalFX", "AllPalFX", "BindToParent", "BindToRoot", "BindToTarget",
             "DestroySelf", "MakeDust", "ForceFeedback",
             // T015 follow-up review: documented controllers that depend on an
             // unbuilt subsystem must be tracked, not silently no-op'd.
             "ReversalDef", "ScreenBound", "FallEnvShake",
-            // Target / active-HitDef / projectile controllers — blocked on the
-            // T013/T014 entity graph; must be tracked, not silent no-ops.
+            // Target / active-HitDef controllers — blocked on the bind/hit-count
+            // entity lifecycle; must be tracked, not silent no-ops.
             "HitAdd", "AttackDist", "TargetDrop",
         ] {
             assert!(
@@ -12938,11 +13239,12 @@ mod tests {
             assert!(is_tracked_deferred_controller(&kind.to_lowercase()));
         }
         // Newly-handled controllers are NOT in the deferred set (including the
-        // reasonably-implementable self-field writes implemented in T015 and the
-        // `Helper` spawn-request emitter added in T012).
+        // reasonably-implementable self-field writes implemented in T015, the
+        // `Helper` spawn-request emitter added in T012, and the `Projectile`
+        // spawn-request emitter added in T013).
         for handled in [
             "EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw",
-            "Gravity", "VarRandom", "MoveHitReset", "Helper",
+            "Gravity", "VarRandom", "MoveHitReset", "Helper", "Projectile",
         ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
