@@ -366,6 +366,66 @@ impl SffFile {
         }
     }
 
+    /// Decodes the sprite at `index` to RGBA using a caller-supplied external
+    /// palette instead of the sprite's own SFF palette.
+    ///
+    /// This is the format-layer hook for MUGEN's **alternate-color** mechanism:
+    /// a character's `pal1`..`pal12` `.act` files (see [`crate::act::ActPalette`])
+    /// supply a replacement 256-colour table that re-tints the same indexed
+    /// pixels — that is how palette-swapped player 2 colours are produced. Pass
+    /// the chosen palette's 1024-byte RGBA buffer (e.g. `ActPalette::rgba`) and
+    /// the indexed sprite is remapped through it.
+    ///
+    /// Applies only to **indexed** sprites (Raw/RLE8/RLE5/LZ5, SFF v1 PCX, and
+    /// indexed PNG8) — those are the formats an external palette can re-tint.
+    /// Truecolor PNG24/PNG32 sprites carry their own colour and ignore the
+    /// palette entirely, decoding exactly as [`Self::decode_sprite_rgba`] would.
+    ///
+    /// `palette` should be 1024 bytes (256 × RGBA); a shorter buffer simply
+    /// renders the out-of-range indices transparent (it never panics). Index 0
+    /// remains transparent per the MUGEN convention encoded in the palette's
+    /// own alpha byte.
+    pub fn decode_sprite_rgba_with_palette(
+        &self,
+        index: usize,
+        palette: &[u8],
+    ) -> FpResult<Vec<u8>> {
+        let sprite = self.sprites.get(index).ok_or_else(|| {
+            FpError::not_found("sprite", format!("index {index}"))
+        })?;
+
+        // SFF v1: inline PCX indices remapped through the external palette.
+        if self.version == SffVersion::V1 {
+            let indices = self.decode_sprite_v1(index, sprite)?;
+            return Ok(indices_to_rgba(&indices, palette));
+        }
+
+        let (data_sprite, compressed) = self.sprite_compressed_bytes(index, sprite)?;
+
+        match data_sprite.format {
+            // Indexed PNG8 keeps its decoded indices but re-tints through the
+            // external palette; truecolor PNGs carry their own colour and so are
+            // returned unchanged (an external palette cannot re-tint them).
+            SpriteFormat::Png8 | SpriteFormat::Png24 | SpriteFormat::Png32 => {
+                match compression::decode_png(compressed)? {
+                    compression::DecodedPng::Indexed { pixels, .. } => {
+                        Ok(indices_to_rgba(&pixels, palette))
+                    }
+                    compression::DecodedPng::TrueColor { rgba, .. } => Ok(rgba),
+                }
+            }
+            SpriteFormat::Invalid => Err(FpError::parse(
+                "SFF",
+                format!("sprite {index} has invalid format byte (1)"),
+            )),
+            // Raw/RLE8/RLE5/LZ5: decode indices, then apply the external palette.
+            _ => {
+                let indices = self.decode_sprite(index)?;
+                Ok(indices_to_rgba(&indices, palette))
+            }
+        }
+    }
+
     /// Decodes a single SFF v1 sprite (inline 8-bit PCX image).
     ///
     /// Linked sprites (zero data length) resolve through `linked_index` to the
@@ -685,5 +745,92 @@ mod tests {
 
         // Spot-check the exact bytes for color index 1 (red, opaque).
         assert_eq!(&pal[4..8], &[255, 0, 0, 255]);
+    }
+
+    /// Compat-matrix gap #1: SFF **v2.00** vs **v2.01** decode parity. The two
+    /// minor revisions share an identical container/decode layout — only the
+    /// minor-version byte differs — so a file decoded as v2.00 and the same file
+    /// decoded as v2.01 must yield byte-identical sprites and palettes. This
+    /// locks the "v2.01 = v2.00 for our purposes" claim into the test suite.
+    #[test]
+    fn sff_v2_minor_versions_decode_identically() {
+        // The fixture is version 2.1.0.0 (minor1 byte at offset 14 = 1).
+        let mut v200 = make_test_sff();
+        v200[14] = 0; // minor1 = 0  -> "SFF v2.00"
+        let mut v201 = make_test_sff();
+        v201[14] = 1; // minor1 = 1  -> "SFF v2.01"
+
+        let a = SffFile::from_bytes(&v200).expect("v2.00 must load");
+        let b = SffFile::from_bytes(&v201).expect("v2.01 must load");
+
+        // The detected major version is the same; the minor byte is the only
+        // difference and it must not change decoding.
+        assert_eq!(a.version, SffVersion::V2);
+        assert_eq!(b.version, SffVersion::V2);
+        assert_eq!(a.header.version_minor1, 0);
+        assert_eq!(b.header.version_minor1, 1);
+
+        // Decoded pixels and resolved palette are byte-for-byte identical.
+        assert_eq!(
+            a.decode_sprite(0).unwrap(),
+            b.decode_sprite(0).unwrap(),
+            "v2.00 and v2.01 must decode the same sprite pixels"
+        );
+        assert_eq!(
+            a.decode_sprite_rgba(0).unwrap(),
+            b.decode_sprite_rgba(0).unwrap(),
+            "v2.00 and v2.01 must resolve the same RGBA sprite"
+        );
+        assert_eq!(
+            a.palette(0).unwrap(),
+            b.palette(0).unwrap(),
+            "v2.00 and v2.01 must resolve the same palette"
+        );
+    }
+
+    /// Compat-matrix gap #6: external-palette (alt-color / `.act`) decode. An
+    /// indexed sprite must re-tint through a caller-supplied palette via
+    /// [`SffFile::decode_sprite_rgba_with_palette`] without touching the SFF's
+    /// own palette — the format-layer hook for `pal1`..`pal12` palette swaps.
+    #[test]
+    fn decode_indexed_sprite_with_external_palette() {
+        let data = make_test_sff();
+        let sff = SffFile::from_bytes(&data).unwrap();
+
+        // Build an external 256-color RGBA palette where index 1 is green
+        // (the in-SFF palette has index 1 = red). The 2x2 sprite is all index 1.
+        let mut ext = vec![0u8; PALETTE_RGBA_SIZE];
+        ext[4] = 0; // R
+        ext[5] = 255; // G
+        ext[6] = 0; // B
+        ext[7] = 255; // A (opaque)
+
+        let rgba = sff.decode_sprite_rgba_with_palette(0, &ext).unwrap();
+        assert_eq!(rgba.len(), 2 * 2 * 4);
+        // Every pixel must take the EXTERNAL palette's green, not the SFF's red.
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, &[0, 255, 0, 255], "pixel must use the external palette");
+        }
+
+        // Sanity: the default (in-SFF) path still yields the SFF's red, proving
+        // the external palette did not mutate or shadow the file's own table.
+        let default_rgba = sff.decode_sprite_rgba(0).unwrap();
+        assert_eq!(&default_rgba[0..4], &[255, 0, 0, 255]);
+    }
+
+    /// A short external palette must not panic: out-of-range indices fall back
+    /// to transparent black rather than indexing past the buffer.
+    #[test]
+    fn external_palette_too_short_is_safe() {
+        let data = make_test_sff();
+        let sff = SffFile::from_bytes(&data).unwrap();
+
+        // Only index 0's worth of colour; index 1 (the sprite's pixel) is missing.
+        let short = vec![0u8; 4];
+        let rgba = sff.decode_sprite_rgba_with_palette(0, &short).unwrap();
+        assert_eq!(rgba.len(), 2 * 2 * 4);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, &[0, 0, 0, 0], "missing color falls back to transparent");
+        }
     }
 }

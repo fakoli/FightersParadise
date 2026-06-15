@@ -52,7 +52,7 @@ malformed lines; only an unrecoverable condition returns an error).
 | **AIR** (`.air`) | **Partial** | `[Begin Action N]`, frame lines `group,image,x,y,ticks[,flip[,blend]]`, `Loopstart`, `Clsn1`/`Clsn2` default + per-frame boxes, blend modes `A`/`A1`/`S`/`AS###D###`. Extended per-frame `scale`, `angle`, and `Interpolate Offset/Scale/Angle/Blend` lines now **parse** into the typed `Frame` (`scale`/`angle`/`interpolate` fields) — but the renderer does **not yet apply** them (audit #39a, parser-side only; KFM uses none). Both plain `A` and `A1` map to Additive and the `D` (destination) alpha is ignored. `air.rs`. |
 | **CMD** (`.cmd`) | **Done** | `[Defaults]` (`command.time`, `command.buffer.time`), `[Command]` blocks with default inheritance. `[Statedef -1]` / `[State -1]` AI sections are deliberately skipped here and handled by the CNS layer + the command→state bridge. `cmd.rs`. |
 | **CNS** (`.cns`, `.cns`-in-`.def`) | **Done** | `[Statedef N]` with 13 dedicated header fields + an extras map; `[State N,label]` controllers with `triggerall` + numbered trigger groups; `ignorehitpause`/`persistent` routing. Raw expression strings are preserved (split only on the first `=`), so comparisons inside triggers survive intact. `cns.rs`. See [§4](#4-known-semantic-deviations) for the trigger-group-gap deviation and dropped Statedef headers. |
-| **SND** (`.snd`) | **Done** | Elecbyte SND header + sound-directory walk; `(group,sample)` lookup returns the raw RIFF/WAVE payload. PCM decoding is `fp-audio`'s job, not the parser's. `snd.rs`. |
+| **SND** (`.snd`) | **Done** | Elecbyte SND header + sound-directory walk; `(group,sample)` lookup returns the raw payload. The container is codec-agnostic; `SndEntry::format()` / `sniff_sound_format` now sniff the payload codec (WAV vs ADX vs unknown) so a consumer can skip an undecodable blob. **Only WAV/PCM decodes** (in `fp-audio`); **ADX is recognised-but-unsupported**. `snd.rs`. |
 | **SFF** (container) | **Done** | Auto-detects v1 vs v2 from the major-version byte at offset 15. `sff/mod.rs`. |
 | &nbsp;&nbsp;↳ SFF **v2** header + directory | **Done** | Real MUGEN 1.0 layout: 512-byte header, 28-byte sprite sub-headers, 16-byte palette sub-headers, LData/TData blocks, on-demand decode with link-following. `sff/header.rs`, `sff/mod.rs`. |
 | &nbsp;&nbsp;↳ SFF v2 **Uncompressed (Raw)** | **Done** | Passthrough. |
@@ -63,11 +63,49 @@ malformed lines; only an unrecoverable condition returns an error).
 | &nbsp;&nbsp;↳ SFF **v1** (inline PCX) pixels | **Partial** | Container + linked-list walk + 8-bit RLE PCX index decode work. Only the common single-plane 8-bit PCX variant is supported. `sff/v1.rs`. |
 | &nbsp;&nbsp;↳ SFF **v1** palette | **Done** | Each 8-bit sprite's trailing 768-byte VGA palette (`0x0C` marker + 256 RGB triplets) is now extracted into the `SffPalette` table; every data-owning sprite contributes its own palette (linked/short sprites reuse the most recent real one). v1 intro/ending/motif art renders with color. Audit **#25**. `sff/v1.rs`, `sff/palette.rs`. |
 | **FNT** (`.fnt` fonts) | **Partial** | An FNT v1 parser now exists (`fnt.rs`) and `fp-render` has a `draw_text`/glyph path consumed by the screenpack HUD. **Caveats:** asset-blocked (no real `.fnt` fixture — synthetic-tested), and the *legacy quad HUD* is not yet wired to it. Audit **#30**. |
-| **ACT** (`.act` palettes) | **Partial** | A parser now exists (`act.rs`, `ActPalette::load`/`from_bytes`), but the result is **not yet consumed at runtime** — only in-SFF palettes drive rendering. Audit **#39a** (parser-side only). |
+| **ACT** (`.act` palettes) | **Partial** | A parser exists (`act.rs`, `ActPalette::load`/`from_bytes`) and `SffFile::decode_sprite_rgba_with_palette` now re-tints indexed sprites through an external (ACT/alt-color) palette at the format layer. Runtime *selection* of `pal1`..`pal12` is still the consumer's job — only in-SFF palettes drive the default render path. Audit **#39a**. |
 
 > **SFF format-tag caveat:** SFF v1 sprites are internally tagged `SpriteFormat::Png8` even
 > though the data is RLE PCX. This is cosmetic — the v1 decode path is selected by version before
 > the format tag is consulted, and no consumer outside `fp-formats` branches on `.format`.
+
+### 1a. Asset-type × engine-variant compatibility matrix
+
+The table above is the *parser*-level view. This matrix is the **per-variant** view that answers
+"my content was made for engine X / codec Y — does it work?" It surfaces the variant axis the
+file-format table folds away (WinMUGEN vs MUGEN 1.0 vs 1.1 vs IKEMEN GO; the specific SFF/SND/FNT
+codecs). It was assembled from a survey of the MUGEN asset taxonomy (community Characters dominate,
+plus Stages, Screenpacks/Lifebars, add-on fonts/effects, and Full Games) and grounded against the
+`fp-formats` source + tests. Clean-room note: only the *taxonomy* was referenced; every test uses
+synthetic fixtures authored from scratch.
+
+> **Variant legend:** **Supported** = decodes/parses and is exercised by tests. **Partial** = the
+> common case works, listed sub-features are simplified or parsed-not-applied. **Unsupported** =
+> recognised (detected, then skipped/flagged) but not decoded — never a crash, always a safe default.
+> **Out of scope** = explicitly not a goal of this engine.
+
+| Asset / variant | Status | Notes |
+|-----------------|--------|-------|
+| **SFF v1.01** (WinMUGEN, inline PCX) | **Partial** | Container + linked-list walk + 8-bit RLE PCX decode + trailing-palette extraction. Only the common single-plane 8-bit PCX variant; renders in color. `sff/v1.rs`. |
+| **SFF v2.00** (MUGEN 1.0) | **Supported** | Full RLE8/RLE5/LZ5/Raw + PNG8/24/32 + RGBA palette path. |
+| **SFF v2.01** (MUGEN 1.1) | **Supported** | **Decode parity with v2.00** — the two minor revisions share an identical container/decode layout; only the minor-version byte differs (`parse_header` validates the *major* byte only). Locked by `sff_v2_minor_versions_decode_identically`. |
+| SFF v2 codecs: **Raw / RLE8 / RLE5 / LZ5** | **Supported** | RLE8/LZ5 verified against real KFM; RLE5 against a synthetic fixture. `sff/compression.rs`. |
+| SFF v2 codecs: **PNG8 / PNG24 / PNG32** | **Supported** | PNG8 → indices + embedded PLTE; PNG24/32 → flat RGBA, with a decompression-bomb guard. |
+| SFF **per-sprite / shared palettes** | **Supported** | v1 trailing-PCX palettes and v2 RGBA palette sub-headers (incl. sub-256-color palettes) both resolve; linked palettes follow their link. |
+| SFF **external / alt-color palette** (`pal1..pal12` `.act`) | **Partial** | `decode_sprite_rgba_with_palette` re-tints any **indexed** sprite (Raw/RLE8/RLE5/LZ5, v1 PCX, PNG8) through a caller-supplied RGBA palette — the format-layer hook for palette swaps. Truecolor PNG24/32 ignore it (they carry their own color). Runtime *selection* of which `.act` to apply is the consumer's job (audit #39a). |
+| **AIR** base (WinMUGEN) | **Supported** | Frames, loop, flip, default + per-frame Clsn, blend `A`/`A1`/`S`/`AS###D###`. |
+| **AIR 1.1** extensions (`scale`, `angle`, `Interpolate`) | **Partial** | Per-frame `xscale,yscale,angle` columns and `Interpolate Offset/Scale/Angle/Blend` lines **parse** into the typed `AnimFrame`; the renderer does not yet *apply* them. `air.rs`. |
+| **CNS / CMD** state + command files | **Supported** (with deviations) | Statedef/controller/command parsing is complete; see [§2](#2-state-controllers) for unhandled controllers and [§4](#4-known-semantic-deviations) for trigger-group/semantic deviations. Version-specific controllers fall to a safe no-op. |
+| **DEF** config | **Supported** | INI sections + case-insensitive `key=value` + DEF-relative paths. |
+| **SND** payload: **WAV / PCM** | **Supported** | Decoded + played by `fp-audio`. `SndEntry::format()` reports `Wav`. |
+| **SND** payload: **ADX** (CRI, classic-MUGEN ports) | **Unsupported** | Detected via the `0x80` sync byte (`sniff_sound_format` → `SoundFormat::Adx`); a consumer can warn-and-skip. Not decoded. |
+| **ACT** palette (768 / 772-byte) | **Supported** (parse) | Reverse-ordered VGA palette → RGBA, index-0 transparent; both the bare 768-byte and the 772-byte-trailer variants parse. Runtime multi-palette *selection* is the consumer's job. `act.rs`. |
+| **FNT v1** bitmap font (WinMUGEN) | **Partial** | Embedded PCX glyph strip + `[Def]`/`[Map]` parse; fed to `fp-render`'s `draw_text`. Asset-blocked (synthetic-tested). `fnt.rs`. |
+| **FNT v2** sprite/TTF font (MUGEN 1.0+) | **Unsupported** | **Detected** by its version byte and skipped with a warning (`FntFont::from_bytes` returns `FpError::Unsupported`) — never a crash. `fnt.rs`. |
+| **MUGEN 1.1 high-res `localcoord`** | **Partial** | The `localcoord`-width ratio drives `Const720p`/`Const1280p` (see [§3](#cross-entity-triggers-done-the-keystone)); full HD-coordinate stage/sprite scaling is not modeled end-to-end. |
+| **Stage** `.def` (`[BGdef]`/`[BG]`/`[Camera]`) | **Partial** | Parsed + horizontal parallax; `tile`/`velocity`/`mask`/`type=anim`/vertical-follow parsed-not-rendered. `fp-stage`. |
+| **Screenpack / Lifebar** (`system.def`/`fight.def`) | **Partial** | Typed model + HUD render; `[Combo]`/`[Face]` parsed-not-drawn, single bg layer. `fp-ui`. |
+| **IKEMEN GO** extensions (Lua/zss, engine-specific `.cns`) | **Out of scope** | Not a goal of this engine; IKEMEN-only scripting is neither parsed nor executed. |
 
 ---
 
