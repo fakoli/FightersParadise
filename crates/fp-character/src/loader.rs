@@ -2498,6 +2498,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Builds a representative SFF-embedded RGBA palette (256 × RGBA, index 0
+    /// transparent) using colors distinct from [`make_act_bytes`], so an `.act`
+    /// override is observably *replacing* it rather than matching by accident.
+    fn embedded_rgba() -> [u8; 1024] {
+        let mut rgba = [0u8; 1024];
+        for i in 0..256usize {
+            let dst = i * 4;
+            rgba[dst] = i as u8; // R: a ramp
+            rgba[dst + 1] = 200; // G: distinct from the .act's index-1 green
+            rgba[dst + 2] = 5; // B
+            rgba[dst + 3] = if i == 0 { 0 } else { 255 }; // index 0 transparent
+        }
+        rgba
+    }
+
+    /// AC: loading a character's `.act` palette uses the `.act` RGBA as the active
+    /// palette (overriding the SFF-embedded palette), and index-0 transparency is
+    /// preserved. Fully synthetic + non-gated: it loads a real `.act` off disk
+    /// through `load_act_palettes`, resolves the runtime selection with
+    /// `resolve_override_palette` (the seam `LoadedCharacter::override_palette`
+    /// uses), and asserts the result against a representative SFF-embedded palette.
+    #[test]
+    fn act_palette_overrides_embedded_and_preserves_index0_transparency() {
+        let dir = scratch_dir("pal_overrides_embedded");
+        let def = write_file(&dir, "c.def", "[Files]\npal1 = costume.act\n");
+        // `make_act_bytes(50)` paints palette index 1 = (50, 51, 52); the rest is
+        // black. Index 0 is forced transparent by the ACT parser.
+        write_bytes(&dir, "costume.act", &make_act_bytes(50));
+        let parsed = DefFile::load(&def).unwrap();
+        let palettes = load_act_palettes(&parsed, &def);
+        assert_eq!(palettes.len(), 1, "the single pal1 .act must load");
+
+        // Selecting the .act (index 0) yields a concrete override...
+        let over = resolve_override_palette(&palettes, Some(0)).expect("pal1 override");
+
+        // ...which OVERRIDES a representative SFF-embedded palette: the active
+        // palette is the .act's RGBA, not the embedded bytes.
+        let embedded = embedded_rgba();
+        assert_ne!(
+            over, &embedded,
+            ".act override must differ from the SFF-embedded palette"
+        );
+        // The active color at index 1 came from the .act (50,51,52), not the
+        // embedded ramp (whose green is 200) — the costume actually replaced it.
+        assert_eq!(&over[4..7], &[50, 51, 52], "index 1 RGB must come from the .act");
+        assert_ne!(over[5], embedded[5], ".act green must replace the embedded green");
+
+        // Index-0 transparency is preserved through the override (alpha == 0),
+        // and a color index stays opaque (alpha == 255) — the MUGEN convention
+        // survives the swap.
+        assert_eq!(over[3], 0, "palette index 0 must stay transparent");
+        assert_eq!(over[4 + 3], 255, "index 1 must be opaque after override");
+
+        // The no-override (None) path falls back to the SFF-embedded palette
+        // (resolves to None here), so a costumeless character is unchanged.
+        assert!(resolve_override_palette(&palettes, None).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Gated real-content check: evilken ships 12 `.act` palettes referenced by
     /// `pal1`..`pal12`. The loader must read them all and they must not all be
     /// identical. Skips cleanly when test-assets/ is absent.

@@ -295,4 +295,64 @@ mod tests {
         assert_ne!(chosen, &embedded);
         assert_eq!(chosen[4], 200);
     }
+
+    /// Builds a representative SFF-embedded RGBA palette (256 × RGBA, index 0
+    /// transparent) where every entry differs from the `.act` fixture below, so
+    /// the override is observably *replacing* the embedded palette, not matching
+    /// it by accident.
+    fn embedded_palette() -> [u8; 1024] {
+        let mut rgba = [0u8; 1024];
+        for i in 0..256usize {
+            let dst = i * 4;
+            // A simple ramp distinct from the .act fixture's constant grey.
+            rgba[dst] = i as u8; // R
+            rgba[dst + 1] = 1; // G
+            rgba[dst + 2] = 2; // B
+            rgba[dst + 3] = if i == 0 { 0 } else { 255 }; // index 0 transparent
+        }
+        rgba
+    }
+
+    /// End-to-end runtime selection: a real `.act` palette (parsed by
+    /// `fp_formats::act::ActPalette`) overrides the SFF-embedded palette, and the
+    /// MUGEN index-0-transparency rule survives the swap. This is the non-gated,
+    /// fully-synthetic assertion for the `.act`-overrides-embedded acceptance
+    /// criterion — it exercises the same `select_palette_bytes` seam that
+    /// `PaletteTexture::from_override` (the GPU upload) uses.
+    #[test]
+    fn act_palette_overrides_embedded_and_keeps_index0_transparent() {
+        // A 768-byte .act: a constant opaque grey for every on-disk triple. The
+        // ActPalette parser de-reverses it and forces index 0 transparent.
+        let act_bytes = vec![90u8; 768];
+        let act = fp_formats::act::ActPalette::from_bytes(&act_bytes)
+            .expect("synthetic .act parses");
+
+        let embedded = embedded_palette();
+
+        // With the .act selected, the chosen bytes are the override, NOT the
+        // embedded palette: the costume swap actually replaced the active palette.
+        let chosen = select_palette_bytes(&embedded, Some(&act.rgba));
+        assert!(std::ptr::eq(chosen, &act.rgba));
+        assert_ne!(
+            chosen, &embedded,
+            ".act override must differ from the SFF-embedded palette"
+        );
+
+        // Index 0 transparency is preserved through the swap (alpha == 0), while
+        // an opaque color index keeps alpha == 255 — the MUGEN convention holds
+        // for the .act exactly as for the embedded palette.
+        assert_eq!(chosen[3], 0, "palette index 0 must stay transparent");
+        assert_eq!(chosen[4 + 3], 255, "index 1 must be opaque");
+        // The override's color came from the .act, not the embedded ramp.
+        assert_eq!(chosen[4], 90, "index 1 RGB must come from the .act");
+        assert_ne!(
+            chosen[4], embedded[4],
+            ".act color must replace the embedded color at index 1"
+        );
+
+        // And the no-override path still falls back to the embedded palette,
+        // byte-identical — costumeless characters render exactly as before.
+        let fallback = select_palette_bytes(&embedded, None);
+        assert!(std::ptr::eq(fallback, &embedded));
+    }
 }
