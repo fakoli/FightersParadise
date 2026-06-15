@@ -679,17 +679,30 @@ impl<'a> Parser<'a> {
     /// Parses an expression whose operators all bind at least as tightly as
     /// `min_bp` (precedence climbing).
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
-        // Redirection (`redirect, expr`) binds looser than every operator, so it
-        // is only recognized at the start of a full expression (`min_bp == 0`):
-        // the top level and each call argument / range bound, which all recurse
-        // through `parse_expr(0)`. This lets a redirect target itself redirect
-        // (`enemy, helper(1), x`) and keeps a comma inside a higher-precedence
-        // context (e.g. `cond(a, b, c)`'s arg separators) from being mistaken
-        // for a redirect.
-        if min_bp == 0 {
-            if let Some(redirected) = self.try_parse_redirect()? {
-                return Ok(redirected);
-            }
+        // Redirection (`redirect, expr`) binds looser than every operator, so a
+        // redirect at the *operand* position grabs the whole sub-expression to
+        // its right. It is recognized whenever an operand is expected — both at
+        // the start of a full expression (top level / call arg / range bound)
+        // **and** as the right-hand side of a boolean / relational / arithmetic
+        // operator. The latter is essential for real content such as
+        // `target, command = "a" || target, command = "b"`: after `||`, the
+        // RHS `target, command = "b"` is itself a redirect, parsed here with
+        // `min_bp > 0`.
+        //
+        // `try_parse_redirect` only commits when it sees a redirection keyword
+        // followed (after an optional `(id)`) by a top-level `,`; otherwise it
+        // consumes nothing and returns `Ok(None)`, so a redirection keyword used
+        // as a bare value (`helper(1) + 1`) or a comma that merely separates
+        // call arguments (`cond(a, b, c)`) is never mistaken for a redirect.
+        //
+        // The redirect's body is parsed (inside `try_parse_redirect`) via
+        // `parse_expr(0)`, so it binds looser than every operator and a nested
+        // redirect can itself redirect (`enemy, helper(1), x`). We then resume
+        // `fold_binary_ops` at `min_bp`, but the body already consumed every
+        // operator to its right, so this only continues an *outer* fold (e.g.
+        // closing a parenthesized group), never re-binds inside the body.
+        if let Some(redirected) = self.try_parse_redirect()? {
+            return self.fold_binary_ops(redirected, min_bp);
         }
 
         let lhs = self.parse_prefix()?;
@@ -1731,6 +1744,143 @@ mod tests {
                     int(0),
                 ],
             )
+        );
+    }
+
+    #[test]
+    fn redirect_as_rhs_of_logical_and_parses() {
+        // The core BUG 2 case: a redirect on the RHS of `&&` must parse. Real
+        // content (CVTW2RYU R.cmd) relies on this. The redirect binds looser than
+        // every operator, so `target, vel y > 0` (the RHS) redirects the whole
+        // `vel y > 0`.
+        assert_eq!(
+            parse_str("ctrl && target, life > 0").unwrap(),
+            bin(
+                BinaryOp::And,
+                ident("ctrl"),
+                redirected(
+                    Redirect::Target(None),
+                    bin(BinaryOp::Gt, ident("life"), int(0)),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn redirect_as_rhs_of_logical_or_parses() {
+        // `a || target, x` — redirect on the RHS of `||`.
+        assert_eq!(
+            parse_str("a || target, stateno").unwrap(),
+            bin(
+                BinaryOp::Or,
+                ident("a"),
+                redirected(Redirect::Target(None), ident("stateno")),
+            )
+        );
+    }
+
+    #[test]
+    fn two_redirects_around_logical_or_parse() {
+        // `target, command = "a" || target, command = "b"` — both sides are
+        // redirects. The leading `target,` redirects everything after it (binds
+        // loosest), so the whole expression is one redirect whose body is the
+        // `||`, with the RHS itself a redirect.
+        assert_eq!(
+            parse_str("target, command = \"a\" || target, command = \"b\"").unwrap(),
+            redirected(
+                Redirect::Target(None),
+                bin(
+                    BinaryOp::Or,
+                    bin(BinaryOp::Eq, ident("command"), Expr::Str("a".into())),
+                    redirected(
+                        Redirect::Target(None),
+                        bin(BinaryOp::Eq, ident("command"), Expr::Str("b".into())),
+                    ),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn bug2_holdfwd_holdback_command_expression_parses() {
+        // The EXACT expression the loader logged as failing (unexpected token `,`
+        // at column 71). Requirement: it must PARSE (Ok), not fall back to const
+        // 0. It may evaluate to 0 since the target graph is unimplemented — that
+        // is fine; parse success is what is asserted here.
+        let src = "(target, command = \"holdfwd\" || target, command = \"holdback\") \
+&& target, command != \"holdup\" && target, command != \"holddown\"";
+        let parsed = parse_str(src);
+        assert!(
+            parsed.is_ok(),
+            "BUG2 holdfwd/holdback expression must parse, got: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn bug2_target_pos_vel_axis_expression_parses() {
+        // The second EXACT expression the loader logged as failing (unexpected
+        // token `,` at column 30): a redirect-prefixed axis-component trigger on
+        // both sides of `&&`. Must parse (Ok).
+        let src = "Target, pos y >= -48 && Target, vel y > 0";
+        let parsed = parse_str(src);
+        assert!(
+            parsed.is_ok(),
+            "BUG2 Target pos/vel expression must parse, got: {:?}",
+            parsed.err()
+        );
+        // Spot-check the structure: a top-level redirect whose body is the `&&`.
+        assert_eq!(
+            parsed.unwrap(),
+            redirected(
+                Redirect::Target(None),
+                bin(
+                    BinaryOp::And,
+                    bin(
+                        BinaryOp::Ge,
+                        call("pos", vec![Expr::Str("Y".into())]),
+                        un(UnaryOp::Neg, int(48)),
+                    ),
+                    redirected(
+                        Redirect::Target(None),
+                        bin(
+                            BinaryOp::Gt,
+                            call("vel", vec![Expr::Str("Y".into())]),
+                            int(0),
+                        ),
+                    ),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn redirect_as_rhs_of_relational_parses() {
+        // A redirect on the RHS of a relational operator also parses. `1 = enemy,
+        // life` reads as `1 = (enemy redirect of `life`)` because the redirect
+        // body binds looser than `=`.
+        assert_eq!(
+            parse_str("1 = enemy, life").unwrap(),
+            bin(
+                BinaryOp::Eq,
+                int(1),
+                redirected(Redirect::Enemy, ident("life")),
+            )
+        );
+    }
+
+    #[test]
+    fn redirect_rhs_does_not_disturb_plain_keyword_operand() {
+        // Regression guard: a redirection keyword used as a *bare value* on the
+        // RHS of an operator (no trailing comma) must still parse as an ordinary
+        // call/ident, not be mistaken for a redirect.
+        assert_eq!(
+            parse_str("1 + helper(2)").unwrap(),
+            bin(BinaryOp::Add, int(1), call("helper", vec![int(2)]))
+        );
+        assert_eq!(
+            parse_str("a && root").unwrap(),
+            bin(BinaryOp::And, ident("a"), ident("root"))
         );
     }
 

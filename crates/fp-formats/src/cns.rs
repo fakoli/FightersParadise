@@ -401,7 +401,17 @@ impl SectionKind {
             if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
                 return Some(SectionKind::Other);
             }
-            let num = rest.trim();
+            // Real MUGEN content allows a trailing free-text label/comment after
+            // the number: `[Statedef <number>[, <ignored label>]]` (e.g.
+            // `[StateDef 9889, INTRO 1]`). Only the number is meaningful; the
+            // label after the first comma is ignored. (Unlike a `[State N, label]`
+            // *controller* header, where the post-comma text is the controller's
+            // label, a Statedef's label carries no parser-relevant meaning.)
+            let after = rest.trim();
+            let num = match after.split_once(',') {
+                Some((n, _label)) => n.trim(),
+                None => after,
+            };
             return match num.parse::<i32>() {
                 Ok(n) => Some(SectionKind::Statedef(n)),
                 Err(_) => None,
@@ -891,20 +901,122 @@ trigger1 = 1
     }
 
     #[test]
-    fn statedef_header_with_trailing_junk_is_dropped() {
-        // `[Statedef 200, foo]` is not valid MUGEN: the number token fails to
-        // parse, so the header is rejected (logged + skipped) and no statedef
-        // is produced. The parser must not panic.
+    fn statedef_header_with_trailing_label_is_accepted() {
+        // Real MUGEN content writes `[Statedef <number>, <free-text label>]`
+        // (e.g. `[StateDef 9889, INTRO 1]`). The number is what matters; the
+        // post-comma label is ignored. The statedef must NOT be dropped.
         let text = "\
 [Statedef 200, foo]
 type = S
 anim = 200
 ";
         let cns = CnsFile::from_str(text).unwrap();
+        assert_eq!(cns.statedefs.len(), 1, "labeled Statedef should be kept");
+        let def = &cns.statedefs[0];
+        assert_eq!(def.number, 200, "number parsed, label ignored");
+        assert_eq!(def.state_type.as_deref(), Some("S"));
+        assert_eq!(def.anim.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn statedef_labels_from_real_content_are_accepted() {
+        // The exact header forms the CVTW2RYU validator flagged as dropped:
+        // `[StateDef 9889, INTRO 1]`, `[StateDef 181, WIN 1]`, `[StateDef 195,
+        // TAUNT]`. All must parse to their number with the label ignored.
+        let text = "\
+[StateDef 9889, INTRO 1]
+type = S
+anim = 190
+
+[StateDef 181, WIN 1]
+type = S
+anim = 181
+
+[StateDef 195, TAUNT]
+type = S
+anim = 195
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        let nums: Vec<i32> = cns.statedefs.iter().map(|s| s.number).collect();
+        assert_eq!(nums, vec![9889, 181, 195]);
+        assert_eq!(cns.statedef(9889).unwrap().anim.as_deref(), Some("190"));
+        assert_eq!(cns.statedef(181).unwrap().anim.as_deref(), Some("181"));
+        assert_eq!(cns.statedef(195).unwrap().anim.as_deref(), Some("195"));
+    }
+
+    #[test]
+    fn negative_statedef_with_label_is_accepted() {
+        // A negative statedef number with a trailing label must still parse: the
+        // sign is part of the number token, the label after the comma is ignored.
+        let text = "\
+[Statedef -2, common gethit overrides]
+type = S
+anim = 5000
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        assert_eq!(cns.statedefs.len(), 1);
+        assert_eq!(cns.statedefs[0].number, -2);
+        assert_eq!(cns.statedefs[0].anim.as_deref(), Some("5000"));
+    }
+
+    #[test]
+    fn statedef_label_may_contain_commas_and_is_ignored() {
+        // `[STATEDEF 1200, TATSUMAKI, START]` (real CVTW2RYU): only the first
+        // comma separates the number from the label; the rest of the label
+        // (further commas included) is ignored, and the number still parses.
+        let text = "\
+[StateDef 1200, TATSUMAKI, START]
+type = A
+anim = 1200
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        assert_eq!(cns.statedefs.len(), 1);
+        assert_eq!(cns.statedefs[0].number, 1200);
+        assert_eq!(cns.statedefs[0].state_type.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn non_numeric_state_controller_header_still_skipped() {
+        // A genuinely non-numeric controller header like `[State 2OS]` is NOT a
+        // valid state number and must still be safely skipped (warn + skip), with
+        // its body dropped — the Statedef-label fix must not loosen this.
+        let text = "\
+[Statedef 1]
+type = S
+
+[State 2OS]
+type = Null
+trigger1 = 1
+value = 99
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        // The statedef survives; the malformed controller header is dropped, so
+        // no controller is attached.
+        assert_eq!(cns.statedefs.len(), 1);
         assert!(
-            cns.statedefs.is_empty(),
-            "malformed Statedef header should yield no statedef"
+            cns.statedefs[0].controllers.is_empty(),
+            "[State 2OS] is non-numeric and must be skipped"
         );
+    }
+
+    #[test]
+    fn non_numeric_statedef_with_label_is_skipped() {
+        // The label fix only ignores the post-comma text — the number itself must
+        // still be a valid integer. `[Statedef foo, bar]` has a non-numeric number
+        // and is rejected (warn + skip), never panicking.
+        let text = "\
+[Statedef foo, bar]
+type = S
+anim = 1
+
+[Statedef 5, ok]
+type = C
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        // Only the well-formed labeled statedef survives.
+        assert_eq!(cns.statedefs.len(), 1);
+        assert_eq!(cns.statedefs[0].number, 5);
+        assert_eq!(cns.statedefs[0].state_type.as_deref(), Some("C"));
     }
 
     #[test]
@@ -1328,5 +1440,39 @@ hitcountpersist = 1
                 );
             }
         }
+    }
+
+    #[test]
+    fn real_fixture_cvtw2ryu_labeled_statedefs() {
+        // CVTW2RYU's SYSTEM.st uses `[StateDef <number>, <label>]` headers that
+        // were previously rejected as malformed and dropped (validator logged
+        // "CNS: malformed section header [StateDef 9889, INTRO 1]; skipped").
+        // With the Statedef-label fix those statedefs must now be present.
+        let path = test_asset("CVTW2RYU/SYSTEM.st");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let cns = CnsFile::load(&path).expect("SYSTEM.st should parse");
+        assert!(
+            !cns.statedefs.is_empty(),
+            "SYSTEM.st should yield statedefs"
+        );
+        // The specific statedefs the validator reported as dropped are now found.
+        for n in [9889, 181, 195] {
+            assert!(
+                cns.statedef(n).is_some(),
+                "[StateDef {n}, <label>] should now be present (was dropped)"
+            );
+        }
+        // The recovered statedefs carry real bodies (controllers), proving the
+        // whole block — not just the header — survived.
+        let intro = cns
+            .statedef(9889)
+            .expect("[StateDef 9889, INTRO 1] should be present");
+        assert!(
+            !intro.controllers.is_empty(),
+            "[StateDef 9889] should keep its controllers"
+        );
     }
 }
