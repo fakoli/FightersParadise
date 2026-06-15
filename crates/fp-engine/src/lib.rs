@@ -7194,6 +7194,62 @@ time = 1
         );
     }
 
+    /// T019 acceptance test: the full `Match` state serializes to bytes and
+    /// deserializes back to an identical state (round-trip equality) on a
+    /// non-trivial mid-match state, and the byte output is deterministic
+    /// (re-serializing the same captured state yields identical bytes).
+    #[test]
+    fn match_state_serialize_round_trip_is_bit_for_bit_stable() {
+        // Build a non-trivial mid-match state: seed, run the intro, then drive a
+        // varied input script so positions, RNG streams, the round clock, and the
+        // game time have all advanced away from their construction defaults.
+        let mut m = rng_probe_match();
+        m.seed_players(DEFAULT_MATCH_SEED);
+        into_fight(&mut m);
+        for (p1, p2) in scripted_inputs(73) {
+            m.tick(p1, p2);
+        }
+
+        // Sanity: the state really is mid-match, not a trivial fresh build.
+        let baseline = rng_probe_match().snapshot_state();
+        let captured = m.snapshot_state();
+        assert_ne!(
+            captured, baseline,
+            "the captured state must be a non-trivial mid-match state"
+        );
+
+        // (a) Deterministic byte output: serializing the same captured state twice
+        // must produce identical bytes (no HashMap-iteration-order or pointer churn
+        // leaking into the blob). serialize -> "to_bytes".
+        let bytes_a = m.snapshot().expect("serialize must succeed");
+        let bytes_b = m.snapshot().expect("serialize must succeed");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "serialization must be deterministic (stable bytes across runs)"
+        );
+
+        // (b) Round-trip equality: deserialize the bytes into a fresh match built
+        // from the same characters; the restored runtime state must equal the
+        // original. deserialize -> "from_bytes".
+        let mut restored = rng_probe_match();
+        restored
+            .restore_snapshot(&bytes_a)
+            .expect("deserialize must succeed");
+        assert_eq!(
+            restored.snapshot_state(),
+            captured,
+            "the deserialized state must equal the original (round-trip equality)"
+        );
+
+        // And the freshly-serialized restored blob is byte-identical to the source
+        // blob, closing the loop: serialize -> deserialize -> serialize is stable.
+        assert_eq!(
+            restored.snapshot().expect("re-serialize must succeed"),
+            bytes_a,
+            "serialize -> deserialize -> serialize must be byte-for-byte stable"
+        );
+    }
+
     #[test]
     fn restore_then_tick_matches_continuing_from_the_original() {
         // A save-state must be a perfect resume point: restoring at frame N and
