@@ -69,9 +69,14 @@
 //! palette swap `RemapPal`, the debug clipboard (`DisplayToClipboard` /
 //! `AppendToClipboard` / `ClearClipboard`), `VictoryQuote`, `PosFreeze`, the
 //! sprite-blend `Trans`, the draw-rotation family (`AngleSet` / `AngleAdd` /
-//! `AngleMul` / `AngleDraw`), and the self-life writes `LifeAdd` / `LifeSet` are
-//! now handled. Every effect is stored on the [`Character`] (mirroring
-//! `cur_palfx` / `afterimage`) for a downstream renderer / engine to consume.
+//! `AngleMul` / `AngleDraw`), the self-life writes `LifeAdd` / `LifeSet`, the
+//! self-velocity `Gravity` (adds `yaccel` to `vel.y`), the bounded-random
+//! `VarRandom`, and the move-connection reset `MoveHitReset` are now handled.
+//! Effects with a render/engine side (e.g. `EnvShake`, `EnvColor`, `Trans`, the
+//! angle family) are stored on the [`Character`] (mirroring `cur_palfx` /
+//! `afterimage`) for a downstream renderer / engine to consume; the pure
+//! self-field writes (`Gravity`, `VarRandom`, `MoveHitReset`) take effect
+//! immediately.
 //!
 //! A controller type that is **not** handled is split two ways so no documented
 //! controller silently no-ops without a tracked reason:
@@ -1187,6 +1192,12 @@ impl Character {
             self.ctrl_life_add(ctrl, env);
         } else if kind.eq_ignore_ascii_case("LifeSet") {
             self.ctrl_life_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("Gravity") {
+            self.ctrl_gravity();
+        } else if kind.eq_ignore_ascii_case("VarRandom") {
+            self.ctrl_var_random(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("MoveHitReset") {
+            self.ctrl_move_hit_reset();
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else if is_tracked_deferred_controller(kind) {
@@ -2505,9 +2516,11 @@ impl Character {
     ///
     /// MUGEN's `EnvColor` fills the screen with a solid color for `time` ticks
     /// (the super-flash white-out). Parameters: `value = r,g,b` (default white
-    /// `255,255,255`), `time` (default `1`; `-1` = "until cleared", modeled as a
-    /// long finite window so it always expires), and `under` (0/1, draw under the
-    /// characters; default `0`). A `time = 0` clears any active fill. We arm
+    /// `255,255,255`), `time` (default `1`; `-1` = "persist until cleared",
+    /// represented faithfully by the [`EnvColor::PERSISTENT`] sentinel — it never
+    /// counts down and only an explicit `time = 0` ends it), and `under` (0/1,
+    /// draw under the characters; default `0`). A `time = 0` clears any active
+    /// fill. We arm
     /// [`Character::env_color`] for the renderer to fill the screen; the executor
     /// only counts the window down. Never panics.
     fn ctrl_env_color(&mut self, ctrl: &CompiledController, env: EvalEnv) {
@@ -2520,8 +2533,14 @@ impl Character {
             self.env_color = EnvColor::INACTIVE;
             return;
         }
-        // `-1` = "until cleared"; model as a long but finite window so it expires.
-        let remaining = if time < 0 { i32::MAX / 2 } else { time };
+        // MUGEN `time = -1` means "persist until explicitly cleared". Represent
+        // it faithfully with the PERSISTENT sentinel (it never counts down; only a
+        // `time = 0` EnvColor clears it), rather than a long-but-finite window.
+        let remaining = if time < 0 {
+            EnvColor::PERSISTENT
+        } else {
+            time
+        };
         // `value = r,g,b` on a 0..255 scale; default white. Each channel clamps.
         let rgb = self.read_rgb_triple(ctrl, "value", env, 255.0, 1.0);
         let col = [
@@ -2723,7 +2742,13 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .is_none_or(|v| v.as_bool());
         let floor = if kill { 0 } else { 1 };
-        self.life = (self.life + value.to_int()).clamp(floor, self.life_max);
+        // Saturating add: an authored oversized `life`/`life_max` plus a large
+        // `value` must never overflow i32 and panic — the engine never panics on
+        // bad content. Mirrors `fp-engine`'s `TargetLifeAdd` apply.
+        self.life = self
+            .life
+            .saturating_add(value.to_int())
+            .clamp(floor, self.life_max);
     }
 
     /// `LifeSet`: set this character's own life directly (T015).
@@ -2739,6 +2764,70 @@ impl Character {
             return;
         };
         self.life = value.to_int().clamp(0, self.life_max);
+    }
+
+    /// `Gravity`: apply this character's gravity acceleration to `vel.y` for one
+    /// tick (T015).
+    ///
+    /// MUGEN's `Gravity` adds the character's `[Movement] yaccel` constant to the
+    /// downward velocity, independent of the statedef `physics`. Authors use it
+    /// inside custom (e.g. thrown / get-hit) states where `physics = N` so the
+    /// engine's automatic air gravity is off but they still want the body to fall.
+    /// This is a pure self-velocity write requiring no other subsystem. Since `Y`
+    /// increases downward, gravity is a positive addition. Never panics.
+    fn ctrl_gravity(&mut self) {
+        self.vel.y += self.constants.movement.yaccel;
+    }
+
+    /// `MoveHitReset`: clear this character's own move-connection flags (T015).
+    ///
+    /// MUGEN's `MoveHitReset` resets `MoveContact`/`MoveHit`/`MoveGuarded` to `0`
+    /// (and re-arms a `hitonce` move to connect again), without starting a new
+    /// `HitDef`. Routes through [`MoveConnect::reset`](crate::MoveConnect::reset),
+    /// the same path a fresh `HitDef` uses. Self-contained; never panics.
+    fn ctrl_move_hit_reset(&mut self) {
+        self.move_connect.reset();
+    }
+
+    /// `VarRandom`: set an integer variable to a bounded random value (T015).
+    ///
+    /// MUGEN's `VarRandom v = i, range = a, b` sets `var(i)` to a uniformly random
+    /// integer in the inclusive `[a, b]` range (a single `range = n` means
+    /// `[0, n]`; an absent `range` defaults to MUGEN's `[0, 1000]`). `VarRandom`
+    /// only targets the **integer** `var(...)` bank (never `fvar`). The draw uses
+    /// this character's own deterministic RNG seam (`draw_random` →
+    /// [`fp_vm::Rng`]), so it stays replay-deterministic and matches the `random`
+    /// trigger. A missing `v` index or out-of-range index is a safe no-op. Never
+    /// panics.
+    fn ctrl_var_random(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: VarRandom in state {} has no `v` index; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        // `range` is one or two components. One → [0, n]; two → [lo, hi]. Absent →
+        // MUGEN's default [0, 1000].
+        let range = ctrl.params.get("range");
+        let (lo, hi) = match range {
+            Some(p) => {
+                let first = self.eval_param_component(p, 0, env).map(|v| v.to_int());
+                let second = self.eval_param_component(p, 1, env).map(|v| v.to_int());
+                match (first, second) {
+                    (Some(lo), Some(hi)) => (lo, hi),
+                    (Some(n), None) => (0, n),
+                    _ => (0, 1000),
+                }
+            }
+            None => (0, 1000),
+        };
+        // Inclusive [lo, hi] (swap if reversed), mirroring `fp_vm::Rng::next_range`.
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        let span = (hi as i64) - (lo as i64) + 1; // >= 1, never zero
+        let raw = self.draw_random() as i64; // 1..=2^31-2, non-negative
+        let drawn = (lo as i64 + raw.rem_euclid(span)) as i32;
+        self.assign_var(VarBank::Int, index.to_int(), Value::Int(drawn));
     }
 
     /// Reads an `r,g,b` triple parameter for a color effect, normalizing each
@@ -3467,9 +3556,9 @@ fn strip_quotes(raw: &str) -> &str {
 ///
 /// - **Helpers / explods / projectiles** (`Helper`, `DestroySelf`, `Explod`,
 ///   `ModifyExplod`, `RemoveExplod`, `Projectile`, `BindToParent`,
-///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`, `VarRandom` on a child) —
-///   the multi-entity slot-map (T012/T013) does not exist yet, so there is no
-///   child entity to spawn or address.
+///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — the multi-entity slot-map
+///   (T012/T013) does not exist yet, so there is no child entity to spawn or
+///   address.
 /// - **Target/partner redirects beyond the flat 1-v-1** (`BindToTarget`) — T014.
 /// - **Stage/background ownership** (`BGPalFX`) — the background lives in
 ///   `fp-stage`/`fp-app`, not on a `Character`, so a per-character tick cannot
@@ -3479,6 +3568,16 @@ fn strip_quotes(raw: &str) -> &str {
 /// - **Cosmetic engine effects with no model yet** (`ForceFeedback`, `MakeDust`,
 ///   `GameMakeAnim`, `SndPan`, `StopSnd`, `Offset`, `PlayerPush`) — these need a
 ///   render/audio/engine seam that is out of `fp-character`'s scope.
+/// - **Reversal / camera-bound / fall screen-shake** (`ReversalDef`,
+///   `ScreenBound`, `FallEnvShake`) — `ReversalDef` needs the reversal/hit
+///   primitive, `ScreenBound` needs the camera/stage-bounds subsystem, and
+///   `FallEnvShake` needs the get-hit fall-state env-shake wiring (the EnvShake
+///   render path is itself a renderer follow-up).
+///
+/// Conversely, controllers that are a pure self-field write requiring no missing
+/// subsystem are **implemented**, not deferred (T015): `Gravity` (adds `yaccel`
+/// to `vel.y`), `VarRandom` (writes a bounded random into the int var bank), and
+/// `MoveHitReset` (clears the move-connection flags).
 fn is_tracked_deferred_controller(kind: &str) -> bool {
     const DEFERRED: &[&str] = &[
         // Multi-entity (helpers / explods / projectiles) — T012/T013.
@@ -3506,6 +3605,16 @@ fn is_tracked_deferred_controller(kind: &str) -> bool {
         "StopSnd",
         "Offset",
         "PlayerPush",
+        // Reversal detection (a HitDef-like primitive for catching the opponent's
+        // attack) — blocked on the reversal/hit subsystem.
+        "ReversalDef",
+        // Camera-bound clamping (whether the player may leave the screen and how
+        // the camera follows) — blocked on the camera/stage-bounds subsystem.
+        "ScreenBound",
+        // Fires the get-hit `fall.envshake` screen shake — blocked on the
+        // fall-state env-shake wiring (the EnvShake render path is itself a
+        // renderer follow-up).
+        "FallEnvShake",
     ];
     DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(kind))
 }
@@ -11585,7 +11694,8 @@ mod tests {
     }
 
     /// `EnvColor` defaults to opaque white drawn over everything, and `time = -1`
-    /// arms a long (finite) window while `time = 0` clears.
+    /// is a faithful "persist until cleared" fill (it does NOT count down) while
+    /// `time = 0` clears.
     #[test]
     fn envcolor_defaults_and_until_cleared() {
         let lc = one_ctrl_synth("EnvColor", &[("time", "1")]);
@@ -11594,17 +11704,49 @@ mod tests {
         assert_eq!(ch.env_color.col, [255, 255, 255], "default white");
         assert!(!ch.env_color.under, "default draws over");
 
+        // `time = -1` arms a PERSISTENT fill: active, held at the sentinel, and
+        // unchanged by further ticks (only an explicit clear ends it). This is the
+        // faithful MUGEN semantics — no long-but-finite window that silently expires.
         let lc_forever = one_ctrl_synth("EnvColor", &[("time", "-1")]);
         let mut ch2 = Character::new();
         lc_forever.tick(&mut ch2);
         assert!(ch2.env_color.is_active(), "time=-1 armed an active fill");
-        assert!(ch2.env_color.time > 1000, "time=-1 modeled as a long window");
+        assert_eq!(
+            ch2.env_color.time,
+            crate::EnvColor::PERSISTENT,
+            "time=-1 stored as the PERSISTENT sentinel"
+        );
+        // Many idle ticks (an empty-ctrl statedef) must NOT decrement a persistent
+        // fill — it stays active forever until cleared.
+        let idle = one_ctrl_synth("Null", &[]);
+        for _ in 0..1000 {
+            idle.tick(&mut ch2);
+        }
+        assert!(
+            ch2.env_color.is_active(),
+            "persistent fill survives 1000 ticks"
+        );
+        assert_eq!(ch2.env_color.time, crate::EnvColor::PERSISTENT);
 
         let lc_clear = one_ctrl_synth("EnvColor", &[("time", "0")]);
         let mut ch3 = Character::new();
         ch3.env_color = crate::EnvColor { time: 5, col: [1, 2, 3], under: true };
         lc_clear.tick(&mut ch3);
         assert!(!ch3.env_color.is_active(), "time=0 cleared the fill");
+
+        // A persistent fill is likewise cleared by an explicit `time = 0`.
+        let mut ch4 = Character::new();
+        ch4.env_color = crate::EnvColor {
+            time: crate::EnvColor::PERSISTENT,
+            col: [9, 9, 9],
+            under: false,
+        };
+        assert!(ch4.env_color.is_active(), "persistent fill is active");
+        lc_clear.tick(&mut ch4);
+        assert!(
+            !ch4.env_color.is_active(),
+            "time=0 clears even a persistent fill"
+        );
     }
 
     /// `RemapPal` selects a `(group,item)` palette swap; a `(-1,-1)` dest restores
@@ -11768,6 +11910,106 @@ mod tests {
         assert_eq!(ch3.life, 1, "kill = 0 floors life at 1");
     }
 
+    /// `LifeAdd` must never overflow on adversarial content: an authored oversized
+    /// `life`/`life_max` plus a large positive (or negative) `value` saturates
+    /// instead of panicking (`attempt to add with overflow` in debug builds). This
+    /// is the never-panic-on-bad-content invariant — the same saturating policy
+    /// `fp-engine`'s `TargetLifeAdd` uses.
+    #[test]
+    fn lifeadd_saturates_and_never_overflows() {
+        // Oversized life_max + a near-i32::MAX value: plain `i32 + i32` would
+        // overflow and panic. Saturating add caps at i32::MAX, then the clamp to
+        // life_max settles it. (This is the reviewer's reproduced case.)
+        let lc = one_ctrl_synth("LifeAdd", &[("value", "2000000000")]);
+        let mut ch = Character::new();
+        ch.life_max = 2_000_000_000;
+        ch.life = 2_000_000_000;
+        lc.tick(&mut ch); // must not panic
+        assert_eq!(ch.life, 2_000_000_000, "saturated then clamped to life_max");
+
+        // Symmetric underflow guard: a hugely negative add saturates at i32::MIN,
+        // then clamps to the [0/1, life_max] floor.
+        let lc_neg = one_ctrl_synth("LifeAdd", &[("value", "-2000000000")]);
+        let mut ch2 = Character::new();
+        ch2.life_max = 2_000_000_000;
+        ch2.life = -2_000_000_000; // adversarial pre-state
+        lc_neg.tick(&mut ch2); // must not panic
+        assert_eq!(ch2.life, 0, "saturated then floored to 0 (default kill)");
+    }
+
+    /// `Gravity` adds the character's `yaccel` constant to `vel.y` (a self-velocity
+    /// write that works even when `physics = N` disables automatic air gravity).
+    #[test]
+    fn gravity_adds_yaccel_to_y_velocity() {
+        let lc = one_ctrl_synth("Gravity", &[]);
+        let mut ch = Character::new();
+        // physics = None so the per-tick air gravity does NOT also fire — isolate
+        // the controller's effect.
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 0.0);
+        let yaccel = ch.constants.movement.yaccel;
+        lc.tick(&mut ch);
+        assert!(
+            (ch.vel.y - yaccel).abs() < 1e-6,
+            "Gravity added one yaccel ({yaccel}) to vel.y, got {}",
+            ch.vel.y
+        );
+    }
+
+    /// `MoveHitReset` clears the move-connection flags so a `hitonce` move can
+    /// connect again, without starting a new `HitDef`.
+    #[test]
+    fn move_hit_reset_clears_connection_flags() {
+        let lc = one_ctrl_synth("MoveHitReset", &[]);
+        let mut ch = Character::new();
+        ch.move_connect.hit = true;
+        ch.move_connect.guarded = true;
+        assert!(ch.move_connect.contact(), "precondition: move had connected");
+        lc.tick(&mut ch);
+        assert!(!ch.move_connect.hit, "MoveHit cleared");
+        assert!(!ch.move_connect.guarded, "MoveGuarded cleared");
+        assert!(!ch.move_connect.contact(), "MoveContact cleared");
+    }
+
+    /// `VarRandom` writes a bounded random integer into the int var bank. With a
+    /// two-value `range` the result is inside `[lo, hi]`; deterministic for a fixed
+    /// seed; only touches the requested index.
+    #[test]
+    fn var_random_writes_bounded_value() {
+        // range = 10, 20 → var(3) lands in [10, 20].
+        let lc = one_ctrl_synth("VarRandom", &[("v", "3"), ("range", "10,20")]);
+        let mut ch = Character::new();
+        ch.seed_rng(12345);
+        ch.vars[0] = 7; // an untouched neighbour
+        lc.tick(&mut ch);
+        let v = ch.vars[3];
+        assert!((10..=20).contains(&v), "VarRandom result {v} out of [10,20]");
+        assert_eq!(ch.vars[0], 7, "VarRandom only touched the requested index");
+
+        // Deterministic for a fixed seed (replay safety).
+        let mut a = Character::new();
+        let mut b = Character::new();
+        a.seed_rng(999);
+        b.seed_rng(999);
+        lc.tick(&mut a);
+        lc.tick(&mut b);
+        assert_eq!(a.vars[3], b.vars[3], "same seed → same VarRandom draw");
+
+        // Single-value `range = n` means [0, n]; absent index is a no-op.
+        let lc_single = one_ctrl_synth("VarRandom", &[("v", "1"), ("range", "5")]);
+        let mut ch2 = Character::new();
+        ch2.seed_rng(42);
+        lc_single.tick(&mut ch2);
+        assert!((0..=5).contains(&ch2.vars[1]), "single-range VarRandom in [0,5]");
+
+        // No `v` index → safe no-op (no var changes, no panic).
+        let lc_noidx = one_ctrl_synth("VarRandom", &[("range", "0,10")]);
+        let mut ch3 = Character::new();
+        ch3.vars[0] = 123;
+        lc_noidx.tick(&mut ch3);
+        assert_eq!(ch3.vars[0], 123, "VarRandom with no `v` index is a no-op");
+    }
+
     /// `LifeSet` writes life directly, clamped to `[0, life_max]`.
     #[test]
     fn lifeset_sets_life_clamped() {
@@ -11796,6 +12038,9 @@ mod tests {
             "Helper", "Explod", "ModifyExplod", "RemoveExplod", "Projectile",
             "BGPalFX", "AllPalFX", "BindToParent", "BindToRoot", "BindToTarget",
             "DestroySelf", "MakeDust", "ForceFeedback",
+            // T015 follow-up review: documented controllers that depend on an
+            // unbuilt subsystem must be tracked, not silently no-op'd.
+            "ReversalDef", "ScreenBound", "FallEnvShake",
         ] {
             assert!(
                 is_tracked_deferred_controller(kind),
@@ -11804,8 +12049,12 @@ mod tests {
             // Case-insensitive, like the dispatch chain.
             assert!(is_tracked_deferred_controller(&kind.to_lowercase()));
         }
-        // Newly-handled controllers are NOT in the deferred set.
-        for handled in ["EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw"] {
+        // Newly-handled controllers are NOT in the deferred set (including the
+        // reasonably-implementable self-field writes implemented in T015).
+        for handled in [
+            "EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw",
+            "Gravity", "VarRandom", "MoveHitReset",
+        ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
                 "{handled} is handled, not deferred"

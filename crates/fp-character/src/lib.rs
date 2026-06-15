@@ -974,13 +974,18 @@ impl Default for EnvShake {
 /// selects whether the fill is drawn *under* the characters (`true`) or over
 /// everything (`false`, the default). This is a screen-level effect owned by the
 /// renderer (`fp-app`); this models the parameters and counts the duration down.
-/// Inactive ([`time`](Self::time) `<= 0`) by default.
+/// Inactive ([`time`](Self::time) `== 0`) by default.
 ///
-/// MUGEN's `EnvColor time = -1` ("until cleared") is modeled as a long but
-/// finite window so it always expires.
+/// MUGEN's `EnvColor time = -1` ("persist until cleared") is represented
+/// **faithfully**: [`time`](Self::time) is held at the sentinel
+/// [`PERSISTENT`](Self::PERSISTENT) (`-1`) and never counts down — only an
+/// explicit clear (a `time = 0` `EnvColor`, written by the controller as
+/// [`INACTIVE`](Self::INACTIVE)) ends it, exactly as in MUGEN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvColor {
-    /// Remaining fill duration in ticks. `0` (or less) = inactive.
+    /// Remaining fill duration in ticks. `0` = inactive; a positive value counts
+    /// down each tick; [`PERSISTENT`](Self::PERSISTENT) (`-1`) means "fill until
+    /// explicitly cleared" and never decrements (MUGEN's `time = -1`).
     pub time: i32,
     /// The fill color as a `[r, g, b]` triple in `0..=255` (MUGEN default white).
     pub col: [u8; 3],
@@ -997,14 +1002,20 @@ impl EnvColor {
         under: false,
     };
 
-    /// Returns `true` while the fill is still running ([`time`](Self::time) `> 0`).
+    /// The [`time`](Self::time) sentinel for MUGEN's `time = -1`: the fill
+    /// persists until explicitly cleared and never counts down.
+    pub const PERSISTENT: i32 = -1;
+
+    /// Returns `true` while the fill is showing — either still counting down
+    /// ([`time`](Self::time) `> 0`) or persistent ([`PERSISTENT`](Self::PERSISTENT)).
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.time > 0
+        self.time > 0 || self.time == Self::PERSISTENT
     }
 
     /// Counts the fill down by one tick, clearing it when it expires. Called once
-    /// per non-hit-paused tick.
+    /// per non-hit-paused tick. A [`PERSISTENT`](Self::PERSISTENT) fill is left
+    /// untouched — only an explicit clear ends it (MUGEN's `time = -1`).
     pub fn tick(&mut self) {
         if self.time > 0 {
             self.time -= 1;
