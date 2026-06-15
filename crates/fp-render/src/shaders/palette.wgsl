@@ -15,10 +15,13 @@ struct Uniforms {
 @group(1) @binding(2) var palette_texture: texture_2d<f32>;
 @group(1) @binding(3) var palette_sampler: sampler;
 
-// MUGEN PalFX / AfterImage color tint (audit #33). `add.xyz` is a signed
-// per-channel add, `mul.xyz` a per-channel multiply, `color.x` the grayscale-
-// retention fraction (1.0 = full color, 0.0 = luminance). The identity value
-// {add=0, mul=1, color=1} leaves the looked-up color exactly unchanged.
+// MUGEN PalFX / AfterImage color tint (audit #33; full modulation set T008).
+// `add.xyz` is a signed per-channel add (the caller has already folded the
+// current tick's `sinadd` sine contribution into it), `mul.xyz` a per-channel
+// multiply, `color.x` the grayscale-retention fraction (1.0 = full color, 0.0 =
+// luminance), and `color.y` the `invertall` flag (1.0 = invert each channel,
+// 0.0 = leave). The identity value {add=0, mul=1, color=(1,0,..)} leaves the
+// looked-up color exactly unchanged.
 struct PalFx {
     add: vec4<f32>,
     mul: vec4<f32>,
@@ -32,11 +35,15 @@ struct PalFx {
 const LUMA_WEIGHTS = vec3<f32>(0.299, 0.587, 0.114);
 
 // Applies the PalFX tint to a linear RGB color: grayscale blend (color) →
-// multiply (mul) → signed add (add), clamped to 0..1. Mirrors `apply_palfx`.
+// optional channel inversion (invertall) → multiply (mul) → signed add (add),
+// clamped to 0..1. Mirrors `apply_palfx` in params.rs.
 fn apply_palfx(rgb: vec3<f32>) -> vec3<f32> {
     let luma = dot(rgb, LUMA_WEIGHTS);
     let blended = mix(vec3<f32>(luma), rgb, palfx.color.x);
-    return clamp(blended * palfx.mul.xyz + palfx.add.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+    // invertall (color.y == 1.0): flip each channel to (1 - c). mix selects the
+    // inverted color when the flag is 1, the blended color when 0.
+    let inverted = mix(blended, vec3<f32>(1.0) - blended, palfx.color.y);
+    return clamp(inverted * palfx.mul.xyz + palfx.add.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 struct VertexInput {

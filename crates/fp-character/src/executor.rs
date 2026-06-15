@@ -2564,23 +2564,28 @@ impl Character {
         }
     }
 
-    /// `PalFX`: arm a timed color tint on this character (faithfulness audit #33).
+    /// `PalFX`: arm a timed color tint on this character, with the full
+    /// modulation set (faithfulness audit #33; `sinadd`/`invertall`, T008).
     ///
     /// MUGEN's `PalFX` recolors the player for `time` ticks. The parameters are
-    /// 0–255-scale integer triples:
+    /// 0–255-scale integer triples plus two extras:
     ///
     /// - `add = r,g,b` — signed per-channel add (`±255` = ±full).
     /// - `mul = r,g,b` — per-channel multiply on a 0–256 scale (`256` = ×1).
+    /// - `sinadd = r,g,b,period` — a sinusoidal per-channel add (same `±255`
+    ///   scale) that oscillates with the given `period` (ticks); added on top of
+    ///   the static `add` each tick.
     /// - `color = c` — grayscale blend `0..256` (`256` = full color, `0` = gray).
+    /// - `invertall = 0|1` — invert every channel (`1 - c`) before mul/add.
     ///
-    /// We normalize these to the renderer's float scale ([`CurPalFx`]): `add`
-    /// becomes `±1.0`, `mul` becomes a plain `0..` multiplier, and `color` a
-    /// `0.0..=1.0` retention fraction. `time` is the duration in ticks (MUGEN's
-    /// `time = -1` "until overridden" is modeled as a long but finite window so it
-    /// always expires; a non-positive `time` arms nothing and clears any current
-    /// tint). The `sinadd` oscillation is **not** modeled (only the static
-    /// add/mul/color); this is a documented approximation. Missing components
-    /// default to the identity for that channel. Never panics.
+    /// We normalize the color scales to the renderer's float scale ([`CurPalFx`]):
+    /// `add`/`sinadd` amplitudes become `±1.0`, `mul` a plain `0..` multiplier,
+    /// and `color` a `0.0..=1.0` retention fraction; `period` stays in ticks.
+    /// `time` is the duration in ticks (MUGEN's `time = -1` "until overridden" is
+    /// modeled as a long but finite window so it always expires; a non-positive
+    /// `time` arms nothing and clears any current tint). The arming resets the
+    /// `sinadd` phase to tick `0` ([`CurPalFx::elapsed`] `= 0`). Missing
+    /// components default to the identity for that channel. Never panics.
     fn ctrl_palfx(&mut self, ctrl: &CompiledController, env: EvalEnv) {
         // `time` (ticks). Default 1 per MUGEN; <=0 (other than -1) clears the tint.
         let time = ctrl
@@ -2613,11 +2618,32 @@ impl Character {
             .and_then(|p| self.eval_param_component(p, 0, env))
             .map_or(1.0, |v| (v.to_float() / COLOR_SCALE).clamp(0.0, 1.0));
 
+        // `sinadd = r,g,b,period`: the first three components are the oscillation
+        // amplitude (same ±255 add scale), the fourth is the period in ticks
+        // (NOT scaled). A wholly-missing `sinadd` (or a zero period) is a no-op.
+        let sinadd = self.read_rgb_triple(ctrl, "sinadd", env, 0.0, ADD_SCALE);
+        let sinadd_period = ctrl
+            .params
+            .get("sinadd")
+            .and_then(|p| self.eval_param_component(p, 3, env))
+            .map_or(0, |v| v.to_int());
+
+        // `invertall = 0|1`: any non-zero value inverts every channel.
+        let invertall = ctrl
+            .params
+            .get("invertall")
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .is_some_and(|v| v.as_bool());
+
         self.cur_palfx = CurPalFx {
             add,
             mul,
             color,
+            sinadd,
+            sinadd_period,
+            invertall,
             remaining,
+            elapsed: 0,
         };
     }
 
@@ -2726,6 +2752,8 @@ impl Character {
                 color: 1.0,
                 // The trail's own per-ghost lifetime is the whole-trail `time`.
                 remaining: time,
+                // AfterImage's base tint has no sinadd/invertall modulation.
+                ..CurPalFx::IDENTITY
             },
             palbright,
             palcontrast,
@@ -3846,8 +3874,11 @@ fn strip_quotes(raw: &str) -> &str {
 /// - **Stage/background ownership** (`BGPalFX`) — the background lives in
 ///   `fp-stage`/`fp-app`, not on a `Character`, so a per-character tick cannot
 ///   tint it.
-/// - **The full afterimage/PalFX modulation engine** (`AllPalFX`) — T008 owns
-///   the global PalFX path; a per-character no-op here is the safe placeholder.
+/// - **The global, all-players PalFX broadcast** (`AllPalFX`) — the per-character
+///   `PalFX` modulation set (add/mul/sinadd/invertall/color) is fully implemented
+///   (`ctrl_palfx`, T008), but `AllPalFX` tints *every* entity at once, which
+///   needs a match-level fan-out seam this per-character tick does not own; a
+///   per-character no-op here is the safe placeholder.
 /// - **Cosmetic engine effects with no model yet** (`ForceFeedback`, `MakeDust`,
 ///   `GameMakeAnim`, `SndPan`, `StopSnd`, `Offset`, `PlayerPush`) — these need a
 ///   render/audio/engine seam that is out of `fp-character`'s scope.
@@ -11858,9 +11889,156 @@ mod tests {
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
         // Pre-seed an active tint; the zero-time PalFX must clear it.
-        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5 };
+        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5, ..crate::CurPalFx::IDENTITY };
         lc.tick(&mut ch);
         assert!(!ch.palfx().is_active(), "zero-time PalFX cleared the tint");
+    }
+
+    /// `PalFX invertall = 1` records the inversion flag on the armed tint, and a
+    /// missing `invertall` defaults to `false` (no inversion).
+    #[test]
+    fn palfx_invertall_flag_is_recorded() {
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "10"), ("invertall", "1")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert!(ch.palfx().invertall, "invertall = 1 sets the flag");
+
+        // A PalFX with no invertall leaves it false.
+        let pal2 = ctrl(0, "PalFX", &[], &[(1, &["Time = 0"])], None, &[("time", "10")]);
+        let st0b = stand_n(0, vec![pal2]);
+        let lcb = loaded(vec![st0b], tiny_air(0, &[30]));
+        let mut chb = Character::new();
+        lcb.tick(&mut chb);
+        assert!(!chb.palfx().invertall, "missing invertall defaults to false");
+    }
+
+    /// `PalFX sinadd = r,g,b,period` records the oscillation amplitude (0–255
+    /// scaled to ±1.0) and the period (ticks, unscaled).
+    #[test]
+    fn palfx_sinadd_params_are_recorded() {
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "40"), ("sinadd", "255, 0, -255, 8")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        // The stored (unresolved) effect carries the amplitude + period.
+        assert!((ch.cur_palfx.sinadd[0] - 1.0).abs() < 1e-4, "R amplitude 255 → 1.0");
+        assert!((ch.cur_palfx.sinadd[1] - 0.0).abs() < 1e-4);
+        assert!((ch.cur_palfx.sinadd[2] + 1.0).abs() < 1e-4, "B amplitude -255 → -1.0");
+        assert_eq!(ch.cur_palfx.sinadd_period, 8, "4th component is the period");
+        assert_eq!(ch.cur_palfx.elapsed, 0, "phase starts at tick 0");
+    }
+
+    /// The headline T008 assertion: the per-tick **effective** PalFX add evolves
+    /// over the effect lifetime as the `sinadd` oscillation sweeps its phase,
+    /// while the static `add`/`mul`/`color` stay constant. The first tick is the
+    /// trough of `sin(0) = 0` (= static add), then the add rises to the static
+    /// add + amplitude at the quarter-period and back through zero at the half.
+    #[test]
+    fn palfx_sinadd_coefficients_evolve_over_lifetime() {
+        // static add = 0 (so the effective add IS the sine), amplitude R = 255
+        // (→ 1.0), period = 8 ticks, time long enough to sweep a full period.
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "40"), ("sinadd", "255, 0, 0, 8")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+
+        // Tick 1 fires the controller (elapsed = 0): sin(0) = 0 → add = 0.
+        lc.tick(&mut ch);
+        assert_eq!(ch.cur_palfx.elapsed, 0);
+        assert!(ch.palfx().add[0].abs() < 1e-4, "tick 0: sin(0)=0 → static add 0");
+
+        // Period 8 → quarter-period at elapsed = 2: sin(π/2) = 1 → add = 1.0.
+        // The countdown/phase advances one per tick BEFORE the (already-spent)
+        // controller, so two more ticks bring elapsed to 2.
+        lc.tick(&mut ch); // elapsed 1
+        lc.tick(&mut ch); // elapsed 2
+        assert_eq!(ch.cur_palfx.elapsed, 2);
+        assert!((ch.palfx().add[0] - 1.0).abs() < 1e-4, "quarter-period: sin(π/2)=1 → 1.0");
+
+        // Half-period at elapsed = 4: sin(π) ≈ 0 → back to the static add.
+        lc.tick(&mut ch); // elapsed 3
+        lc.tick(&mut ch); // elapsed 4
+        assert_eq!(ch.cur_palfx.elapsed, 4);
+        assert!(ch.palfx().add[0].abs() < 1e-4, "half-period: sin(π)≈0 → static add 0");
+
+        // Three-quarter-period at elapsed = 6: sin(3π/2) = -1 → add = -1.0.
+        lc.tick(&mut ch); // elapsed 5
+        lc.tick(&mut ch); // elapsed 6
+        assert_eq!(ch.cur_palfx.elapsed, 6);
+        assert!((ch.palfx().add[0] + 1.0).abs() < 1e-4, "3/4-period: sin(3π/2)=-1 → -1.0");
+
+        // The G/B channels (amplitude 0) never move, and `mul`/`color` are static.
+        assert!(ch.palfx().add[1].abs() < 1e-4, "G amplitude 0 stays put");
+        assert!(ch.palfx().add[2].abs() < 1e-4, "B amplitude 0 stays put");
+        assert_eq!(ch.palfx().mul, [1.0; 3], "mul is constant over the lifetime");
+        assert!((ch.palfx().color - 1.0).abs() < 1e-4, "color is constant");
+    }
+
+    /// `sinadd` on top of a non-zero static `add`: the effective add is the
+    /// static add plus the sine contribution, and `palfx()` clears the phase
+    /// fields (the renderer never sees an unresolved oscillation).
+    #[test]
+    fn palfx_sinadd_adds_on_top_of_static_add_and_resolves() {
+        // static add = 51 (→ 0.2), amplitude = 51 (→ 0.2), period = 8.
+        let pal = ctrl(
+            0,
+            "PalFX",
+            &[],
+            &[(1, &["Time = 0"])],
+            None,
+            &[("time", "40"), ("add", "51, 0, 0"), ("sinadd", "51, 0, 0, 8")],
+        );
+        let st0 = stand_n(0, vec![pal]);
+        let lc = loaded(vec![st0], tiny_air(0, &[30]));
+        let mut ch = Character::new();
+        lc.tick(&mut ch); // elapsed 0: sin(0)=0 → effective add = static 0.2
+        let fx0 = ch.palfx();
+        assert!((fx0.add[0] - 0.2).abs() < 1e-4, "elapsed 0: static add only");
+        // The resolved effect handed out has the oscillation folded away.
+        assert_eq!(fx0.sinadd, [0.0; 3], "palfx() clears sinadd amplitude");
+        assert_eq!(fx0.sinadd_period, 0, "palfx() clears sinadd period");
+
+        lc.tick(&mut ch); // elapsed 1
+        lc.tick(&mut ch); // elapsed 2: sin(π/2)=1 → 0.2 + 0.2 = 0.4
+        assert!((ch.palfx().add[0] - 0.4).abs() < 1e-4, "static 0.2 + amplitude 0.2");
+    }
+
+    /// `effective_add` with a zero `sinadd_period` is a no-op: it returns the
+    /// static add verbatim (no division-by-zero, never panics).
+    #[test]
+    fn palfx_effective_add_no_oscillation_when_period_zero() {
+        let fx = crate::CurPalFx {
+            add: [0.3, -0.2, 0.5],
+            sinadd: [1.0, 1.0, 1.0],
+            sinadd_period: 0,
+            remaining: 5,
+            ..crate::CurPalFx::IDENTITY
+        };
+        assert_eq!(fx.effective_add(), [0.3, -0.2, 0.5], "period 0 → static add");
     }
 
     /// `AfterImage` arms the trail with a duration, length, and ghost tint.
@@ -12091,7 +12269,7 @@ mod tests {
         let st0 = stand_n(0, vec![]);
         let lc = loaded(vec![st0], tiny_air(0, &[30]));
         let mut ch = Character::new();
-        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5 };
+        ch.cur_palfx = crate::CurPalFx { add: [1.0, 0.0, 0.0], mul: [1.0; 3], color: 1.0, remaining: 5, ..crate::CurPalFx::IDENTITY };
         ch.afterimage = crate::AfterImageState {
             time: 8,
             length: 4,

@@ -122,6 +122,7 @@ pub fn ghost_palfx(modulation: &AfterImageModulation, ghost_index: usize) -> Pal
         add,
         mul,
         color: modulation.base.color,
+        invertall: modulation.base.invertall,
     }
 }
 
@@ -197,6 +198,7 @@ mod tests {
             add: [0.2, 0.0, 0.0],
             mul: [0.9, 0.9, 0.9],
             color: 0.5,
+            invertall: false,
         };
         let m = AfterImageModulation {
             base,

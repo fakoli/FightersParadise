@@ -1668,20 +1668,24 @@ fn draw_effects(
 }
 
 /// Converts the character-side [`fp_character::CurPalFx`] into the renderer's
-/// [`fp_render::PalFx`] color tint (audit #33).
+/// [`fp_render::PalFx`] color tint (audit #33; full modulation set T008).
 ///
-/// The `add`/`mul`/`color` fields pass straight through (both sides use the same
-/// normalized float scale). No `is_active` gate is needed here: callers obtain the
-/// effect from [`fp_character::Character::palfx`] /
-/// [`fp_character::AfterImageState::palfx`], which already collapse an inactive
-/// effect to [`fp_character::CurPalFx::IDENTITY`] — and that value's
-/// `add`/`mul`/`color` are exactly [`fp_render::PalFx::IDENTITY`], so an inactive
-/// effect still maps to the guaranteed no-op draw.
+/// The `add`/`mul`/`color`/`invertall` fields pass straight through (both sides
+/// use the same normalized float scale). The character-side accessors
+/// ([`fp_character::Character::palfx`]) already resolve the `sinadd` oscillation
+/// into `add` for the current tick, so there is no phase to carry. No `is_active`
+/// gate is needed here: callers obtain the effect from
+/// [`fp_character::Character::palfx`] / [`fp_character::AfterImageState::palfx`],
+/// which already collapse an inactive effect to
+/// [`fp_character::CurPalFx::IDENTITY`] — and that value's fields are exactly
+/// [`fp_render::PalFx::IDENTITY`], so an inactive effect still maps to the
+/// guaranteed no-op draw.
 fn char_palfx_to_render(fx: fp_character::CurPalFx) -> fp_render::PalFx {
     fp_render::PalFx {
         add: fx.add,
         mul: fx.mul,
         color: fx.color,
+        invertall: fx.invertall,
     }
 }
 
@@ -6254,17 +6258,21 @@ mod tests {
 
     #[test]
     fn char_palfx_to_render_passes_active_fields_through() {
-        // An active tint's add/mul/color cross the crate boundary unchanged.
+        // An active tint's add/mul/color/invertall cross the crate boundary
+        // unchanged.
         let fx = fp_character::CurPalFx {
             add: [0.5, -0.25, 0.0],
             mul: [0.5, 1.0, 2.0],
             color: 0.25,
+            invertall: true,
             remaining: 12,
+            ..fp_character::CurPalFx::IDENTITY
         };
         let out = char_palfx_to_render(fx);
         assert_eq!(out.add, [0.5, -0.25, 0.0]);
         assert_eq!(out.mul, [0.5, 1.0, 2.0]);
         assert!((out.color - 0.25).abs() < 1e-6);
+        assert!(out.invertall, "invertall crosses the boundary");
         assert!(!out.is_identity(), "an active tint is not the no-op");
     }
 
