@@ -11,19 +11,29 @@
 //! cargo run -p fp-app -- <p1.def> <p2.def>     # P1 and P2 from two .def files
 //! cargo run -p fp-app -- <file.sff> <file.air> # legacy SFF+AIR animation viewer (demo mode)
 //! cargo run -p fp-app -- <file.sff>            # legacy single-sprite viewer
-//! cargo run -p fp-app -- validate <file.def>   # headless: load a character + print an
-//!                                              #   actionable validation report (no window)
+//! cargo run -p fp-app -- validate <file.def>   # headless: load a character/stage/scene +
+//!                                              #   print an actionable lint report (no window)
 //! ```
 //!
-//! ## The `validate` subcommand (headless character linter)
+//! ## The `validate` subcommand (headless content linter)
 //!
-//! `validate <file.def>` loads a character through the same loader the live match
-//! uses and prints an actionable report — missing referenced sprites, unresolved
-//! `ChangeState`/`ChangeAnim` targets, expressions that failed to compile (silent
-//! const-`0` fallbacks), and unsupported controllers — then exits 0 (the report
-//! body carries the findings; a non-zero exit is reserved for a missing argument
-//! or a character that cannot be loaded at all). It opens no window, GPU, or
-//! audio device, so it runs anywhere. See [`validate`] for the analysis.
+//! `validate <file.def>` detects what the `.def` describes — a **character**, a
+//! **stage**, or a **scene** (storyboard / `fight.def` screenpack) — and prints
+//! an actionable lint report for it, then exits 0 (the report body carries the
+//! findings; a non-zero exit is reserved for a missing argument or a `.def` that
+//! cannot be loaded/classified at all). It opens no window, GPU, or audio device,
+//! so it runs anywhere.
+//!
+//! - **Characters** report missing referenced sprites, unresolved
+//!   `ChangeState`/`ChangeAnim` targets, expressions that failed to compile
+//!   (silent const-`0` fallbacks), and unsupported controllers.
+//! - **Stages** report missing/invalid `[Camera]`/`[PlayerInfo]`/`[StageInfo]`
+//!   fields, a missing or unloadable `[BGdef] spr`, and per-`[BG]` issues.
+//! - **Scenes** report missing sprite containers, scenes referencing an
+//!   undefined background group, layers with no drawable, and out-of-range font
+//!   slots.
+//!
+//! See [`validate::validate_path`] for the dispatch and the per-kind analyzers.
 //!
 //! ## The two-player match (task 7.2 — the playable milestone)
 //!
@@ -177,11 +187,16 @@ fn run_validate(args: &[String]) -> i32 {
         return 2;
     };
     let def_path = Path::new(def_arg);
-    match validate::validate(def_path) {
+    match validate::validate_path(def_path) {
         Ok(report) => {
+            if report.is_clean() {
+                tracing::info!("validate: {} is clean", def_path.display());
+            } else {
+                tracing::warn!("validate: {} has authoring problems", def_path.display());
+            }
             // stdout: this IS the program's output (a user-facing report), so a
             // direct print is correct here — not logging.
-            print!("{}", validate::render_report(&report));
+            print!("{}", validate::render_any(&report));
             0
         }
         Err(e) => {
