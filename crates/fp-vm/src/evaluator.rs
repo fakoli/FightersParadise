@@ -633,12 +633,28 @@ fn eval_binary_values(op: BinaryOp, l: Eval, r: Eval) -> Eval {
 ///
 /// Both int → native **wrapping** `i32` (per §4) via `int_op`; any float operand
 /// → `f32` via `float_op` (rounded to f32 after the op, §11). Bottom propagates.
+///
+/// A **non-finite float result** (`NaN` or `±inf`) funnels to [`Eval::Bottom`],
+/// matching the `**` / `ln` / transcendental paths so a public
+/// [`Value::Float`](crate::eval::Value::Float)`(NaN)` can never escape [`eval`]
+/// from ordinary float `+ - *` (e.g. `0 * <inf-producing expr>`, audit #19).
+/// `Bottom` collapses to the safe default `0` at the public boundary, preserving
+/// the never-panic + "an erroring expression never fires a trigger" contract.
+/// The integer path is unaffected — native wrapping `i32` is always finite, so
+/// the saturating-overflow numeric contract on `+ - *` is unchanged.
 fn arith(l: Eval, r: Eval, int_op: fn(i32, i32) -> i32, float_op: fn(f32, f32) -> f32) -> Eval {
     if Eval::either_bottom(l, r) {
         return Eval::Bottom;
     }
     if l.is_float() || r.is_float() {
-        Eval::Float(float_op(l.to_float(), r.to_float()))
+        let result = float_op(l.to_float(), r.to_float());
+        if result.is_finite() {
+            Eval::Float(result)
+        } else {
+            // NaN (e.g. `0 * inf`) or ±inf (e.g. a huge literal overflowing f32):
+            // an invalid / non-representable float result → bottom (§1, §11).
+            Eval::Bottom
+        }
     } else {
         Eval::Int(int_op(l.to_int(), r.to_int()))
     }
@@ -1807,6 +1823,55 @@ mod tests {
         assert_eq!(evb("(1 / 0) * 100"), Value::Int(0));
         // A float-side bottom likewise poisons.
         assert_eq!(evb("(1.0 / 0.0) + 2.5"), Value::Int(0));
+    }
+
+    #[test]
+    fn float_arith_nan_funnels_to_bottom_zero() {
+        // Audit #19: `+ - *` funnel a NaN float result to bottom → 0, matching
+        // `**`/`ln`/transcendentals. `0 * (huge literal that overflows f32 to
+        // -inf)` is `0 * -inf == NaN`; previously this leaked a public
+        // Value::Float(NaN), now it is the safe default 0.
+        let v = evb("0 * -5.8751624776690396e128");
+        assert_eq!(v, Value::Int(0));
+        assert!(!matches!(v, Value::Float(f) if f.is_nan()), "no public NaN may escape");
+        // The mirror case via the trigger seam (unknown trigger → Int(0)).
+        let ctx = MockContext::new();
+        assert_eq!(ev("A * -5.8751624776690396e128", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn float_arith_infinity_funnels_to_bottom_zero() {
+        // An overflowing float `*`/`+`/`-` result is non-finite (±inf) and funnels
+        // to bottom → 0, so no public infinity escapes ordinary `+ - *`.
+        // 1e38 is finite in f32 (f32::MAX ≈ 3.4e38) but 1e38 * 1e38 == +inf.
+        assert_eq!(evb("1e38 * 1e38"), Value::Int(0));
+        // A literal beyond f32::MAX already overflows to +inf at the Float node;
+        // adding to it keeps it non-finite → 0. (`+` only overflows once a sum
+        // exceeds f32::MAX, so use an already-infinite operand.)
+        assert_eq!(evb("1e40 + 1.0"), Value::Int(0));
+        // The literal itself overflowing to -inf, summed, stays non-finite → 0.
+        assert_eq!(evb("-1e40 - 1.0"), Value::Int(0));
+        // Sanity: an in-range float `+` stays finite and unaffected.
+        assert_eq!(evb("1e38 + 1e38"), Value::Float(2e38));
+        // Sanity: an in-range float `*` is unaffected and stays Float.
+        assert_eq!(evb("2.5 * 4.0"), Value::Float(10.0));
+    }
+
+    #[test]
+    fn eval_never_returns_public_nan_from_arith() {
+        // The public-boundary guarantee: a NaN-producing arithmetic expression
+        // collapses to a finite Int, never a public Value::Float(NaN).
+        for src in [
+            "0 * -5.8751624776690396e128",
+            "(0.0) * 5e128",
+            "1e38 * 1e38 - 1e38 * 1e38", // (+inf) - (+inf) chain, every step non-finite
+        ] {
+            let v = evb(src);
+            assert!(
+                !matches!(v, Value::Float(f) if !f.is_finite()),
+                "{src} must not yield a public non-finite float, got {v:?}"
+            );
+        }
     }
 
     #[test]
