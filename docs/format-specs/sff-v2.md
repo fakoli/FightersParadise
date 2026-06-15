@@ -92,7 +92,17 @@ SFF (Sprite File Format) v2 is a binary container for 256-color indexed sprites.
 | 8 | 4 | u32 | Data offset in LData |
 | 12 | 4 | u32 | Data length |
 
-Palette data is stored as 256 RGB triplets (768 bytes) in the LData block.
+Palette data is stored in the LData block as `num_colors` **RGBA** quadruplets — 4
+bytes per color, so a full 256-color palette is 1024 bytes (and `data_length`
+sizes it: e.g. KFM's 32-color per-sprite palettes are 128 bytes). The 4th byte
+is reserved/padding (typically `0`), **not** a usable per-color alpha: the
+decoder forces index 0 transparent and every other color opaque.
+
+> **Correction (task T001):** the format is **RGBA**, not the RGB triplets (768
+> bytes) an earlier note claimed — that is the SFF **v1** trailing-PCX layout.
+> Reading v2 palettes through the v1 RGB path mis-strided the colors and rendered
+> v2 characters (e.g. KFM) as black silhouettes. `SffFile::palette()` is now
+> version-aware: v1 = RGB→RGBA, v2 = `num_colors` RGBA quadruplets.
 
 ## RLE8 Decompression
 
