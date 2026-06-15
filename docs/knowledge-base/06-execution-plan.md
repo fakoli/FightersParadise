@@ -328,4 +328,64 @@ closes CB25** (locomotion built-ins) and the input-pipeline half of the old debt
 
 ---
 
+## ⭐⭐ Ledger update — the 23-PR audit-P run (2026-06-14)
+
+This run drove the [08 faithfulness audit](08-faithfulness-audit.md) 39-item roadmap top-down via the
+build loop, landing the bulk of it across **23 PRs (`#5`–`#23`+ the keystone/follow-ups)** merged to
+`main` on top of `7e5021d`. The audit-`PXX` task ids map 1:1 onto the audit's item numbers (`P25` =
+audit #25, etc.). **Result: the audit is effectively done except #38, #39, and the net-new M5 moat.**
+
+### What landed (by PR / audit item)
+
+| Task | PR | Status | What merged |
+|------|----|--------|-------------|
+| **P25 / P35** | #5 | DONE | SFF v1 trailing-palette extraction + SFF v2 PNG decode (`png` crate; Png8 indices+PLTE, Png24/32 RGBA via `decode_sprite_rgba`). |
+| **P28** | #6 | DONE | RNG-in-state: `Character` Park-Miller seed *in state*; the `random` trigger returns a real `[0,999]`. |
+| **P26 / P27** | #7 | DONE | Power-bar HUD (`Player::power()`/`power_max()` + blue bar) + keyboard sampled once per real frame. |
+| **P13 / P10 / P23 / P9b / P18** | #8 | DONE | Executor dispatch arms: `AssertSpecial` (NoWalk/NoAutoTurn/Intro per-tick flags), `Width` (per-state push override), `HitVelSet`/`HitFallSet`/`HitFallVel`/`HitFallDamage` (+ HitDef `fall.damage`/`fall.xvelocity`), `HitOverride` (8-slot), and `getpower`/`givepower` on-hit power. |
+| **P34** | #9 | DONE | Clsn debug overlay (F1 toggle; `fp-render` debug-box primitive). |
+| **P37** | #10 | DONE | `fp-vm` proptest property/fuzz harness (lexer/parser/evaluator). |
+| **P21** | #11 | DONE | `RoundState`/`GameTime`/`MatchOver` triggers threaded via `RoundView` (previously pinned 0). |
+| **P30** | #12 | PARTIAL | FNT v1 parser + `fp-render` `draw_text`/glyph path. *Asset-blocked* (no real `.fnt` fixture); consumed by the screenpack, not the legacy quad HUD. |
+| **P29** | #13 | PARTIAL | Stage `.def` parser + parallax background render — **`fp-stage` graduates from stub**. *Caveat:* tile/velocity/mask/`type=anim` + camera vertical-follow parsed-not-rendered; no real stage fixture. |
+| **P20** | #14 | DONE | Priority/trade clash resolution (`fp-combat resolve_clash` + an `fp-engine` reconciled pass) for simultaneous hits. |
+| **P16** | #15 | DONE | Dropped Statedef headers (sprpriority/juggle/facep2/hitdefpersist/movehitpersist) + `SprPriority` controller + sprite draw-order + air-juggle. |
+| **P39a** | #16 | PARTIAL | `.act` palette **parser** + extended AIR `scale`/`angle`/`Interpolate` parsing. *Parser only* — `.act` runtime + team/turns/tag modes (#39) remain open. |
+| **P24** | #17 | DONE | `Pause`/`SuperPause` global match freeze (`fp-engine` freeze timer; trigger clock keeps ticking, `GameTime` held). |
+| **P36** | #18 | DONE | Character validator CLI (`fp-app -- validate`, found 23 real KFM problems) + a real CI gate + a SHIPPED ORIGINAL clean-room `assets/trainingdummy/` character (CI loads + matches + validates it). **Closes the #36 CI no-op gap.** |
+| **#19** | #19 | DONE | `fp-vm` arith funnels NaN/non-finite to `Bottom` (no public NaN) + proptest doc fixes. **The open fp-vm-NaN follow-ups are now closed.** |
+| **P33** | #20 | PARTIAL | `PalFX`/`AfterImage`/`AfterImageTime` controllers + a PalFX color-tint render uniform (`palette.wgsl`) + `fp-app` draw wiring. *Caveat:* the afterimage trail is a motion-smear approximation (no true frame-history ghost ring); `sinadd`/`TimeGap`/`FrameGap`/`Trans`/`PalBright`/`PalContrast` not modeled. |
+| **P31** | #21 | PARTIAL | `fight.def` screenpack: typed model+parser + `ScreenpackHud` renderer + `fp-app` load/fallback — **`fp-ui` graduates from stub**. *Caveat:* `[Combo]`/`[Face]` parsed-not-drawn; single `bg0` layer; no `fight.def`/`fight.sff` fixture; falls back to the quad HUD when absent. |
+| **P17** | #22 | PARTIAL | Hit-spark **effect-entity infrastructure** (`fp-engine` effect list: spawn-on-hit / tick / expire; `fp-app` render; own-spark path works + tested). *Caveat:* KFM renders NO visible spark — it authors common-`fightfx` `sparkno` and **no `fightfx.sff` loader exists yet**; the `S`-prefix own-spark form is flattened upstream (`parse_resource_id` strips `S`→positive id). |
+| **P32** | #23 | PARTIAL | Intro/ending storyboard playback: `fp-storyboard` graduates from parser-only (adds a `StoryboardPlayer`) + `fp-app` overlay during Intro/ending. *Caveat:* scene fadein/fadeout + per-scene clearcolor + BGM not applied; the intro fixed-60-frame timer is not tied to storyboard length. |
+
+(The cross-entity-eval keystone + redirects/P2Dist — audit #1/#2 — and the earlier ✅DONE items #3–#8,
+#11, #12, #14, #15, #19(damage-mult), #22 landed in prior runs; see the audit-driven section above and
+[08](08-faithfulness-audit.md) for the per-item status column.)
+
+### Structural facts now true
+- **`fp-stage` and `fp-ui` are NO LONGER stubs**; **`fp-storyboard` is no longer parser-only** (it has
+  a `StoryboardPlayer`).
+- The executor dispatch chain now handles **~40 controllers** (was ~30): added `AssertSpecial`,
+  `Width`, `HitVelSet`/`HitFallSet`/`HitFallVel`/`HitFallDamage`, `HitOverride`, `SprPriority`,
+  `Pause`, `SuperPause`, `PalFX`, `AfterImage`, `AfterImageTime`.
+- Workspace tests now **~2,045** (was ~1,769).
+- **CI loads + matches + validates the shipped original `assets/trainingdummy` character** — the #36
+  green-no-op gap is fixed; the clean-room contract was updated (in `CLAUDE.md`) to permit this
+  original content.
+
+### Remaining forward-looking work (NOT done)
+- **#38** — replay / determinism / rollback + whole-`Match` state serialization (no `serde`/`bincode`
+  whole-state path yet). The next big lever; **unblocked** now that #28 RNG-in-state is in.
+- **#39** — team / turns / tag modes + `.act` palette *runtime* consumption (the #39a parser side is
+  done).
+- **M5 moat** (not in the 39-item audit) — hot-reload, authoring tooling, packaging, and rounding out
+  the original default content into a visually complete out-of-box experience.
+- The honest render-fidelity **Partials** above (stage tile/velocity/anim layers + camera v-follow;
+  screenpack `[Combo]`/`[Face]` + multi-layer bg; true AfterImage ghost ring; common-`fightfx` spark
+  loader; storyboard fades/clearcolor/BGM; FNT/screenpack/stage real fixtures) — scheduled
+  opportunistically as content and fixtures demand.
+
+---
+
 _Ledger initialized 2026-06-13. Update statuses in place as the loop runs._

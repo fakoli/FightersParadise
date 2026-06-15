@@ -10,7 +10,9 @@ conventions see the root [CONTRIBUTING](../CONTRIBUTING.md).
 > **Project state (not early stubs):** this is a **playable two-character
 > fighter** driven by real Kung Fu Man data — KFM's throw, supers (meter),
 > hitpause, i-frames, hit reactions, jump/airjump/land, and damage multipliers
-> all work end to end. Only `fp-stage` and `fp-ui` are true stubs. The root
+> all work end to end. **No crate is a true stub anymore** — `fp-stage`,
+> `fp-ui`, and `fp-storyboard` have all graduated (several presentation features
+> are wired but partial or asset-blocked). The root
 > [CHANGELOG.md](../CHANGELOG.md) and `docs/knowledge-base/04-codebase-review.md`
 > are **stale** — trust the source, [CLAUDE.md](../CLAUDE.md), and this doc.
 
@@ -52,6 +54,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p fp-app                        # default two-KFM match (test pattern if assets absent)
 cargo run -p fp-app -- p1.def [p2.def]     # explicit character(s)
 cargo run -p fp-app -- file.sff [file.air] # static SFF sprite / AIR viewer
+cargo run -p fp-app -- validate char.def   # character validator / linter (lints a .def's assets/states)
 ```
 
 The two wrappers below (Makefile + `scripts/fp.sh`) are thin conveniences over
@@ -154,9 +157,12 @@ scripts/fp.sh start                         # launch detached, then `status` / `
   dummy** (`MatchInput::none()`, `main.rs:1133`) — no second-player input map or
   AI yet.
 - **What you'll see:** two fighters drawn from their current AIR frame, two life
-  bars + a KO/winner marker (a hand-rolled solid-quad HUD, **not** a `fight.def`
-  screenpack — `fp-ui` is a stub), over a flat clear color (no stage background
-  — `fp-stage` is a stub).
+  bars + a blue power bar + a KO/winner marker. By default this is the
+  hand-rolled solid-quad HUD over a flat clear color (the default KFM match ships
+  no `fight.def` screenpack and no stage `.def`). Supply a `fight.def` (or
+  `FP_SCREENPACK`) and `fp-ui` renders a real `ScreenpackHud`; supply a stage
+  `.def` and `fp-stage` renders parallax backgrounds — both crates have graduated
+  from stubs.
 
 `test-assets` is a **local-only, gitignored** symlink into the shared checkout —
 KFM content (Elecbyte, CC BY-NC 3.0) is never tracked or shipped. If `make run`
@@ -166,25 +172,26 @@ fixtures. See the [clean-room constraints](#worktree-discipline--clean-room).
 ## Testing
 
 ```sh
-make test                       # full workspace suite (~1769 pass incl. doc-tests)
+make test                       # full workspace suite (~2045 pass incl. doc-tests)
 cargo test --workspace          # the same, by hand
 make test-fast CRATE=fp-vm      # one crate, fast iteration
 make test-fast                  # all crates' lib/bin unit tests only (skips integration + doc tests)
 ```
 
-The suite is large and green: ~1769 tests pass (~1724 `#[test]` attributes plus
+The suite is large and green: ~2,045 tests pass (~2,000 `#[test]` attributes plus
 doc-tests). Rough per-crate share:
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `fp-character` | 620 | `fp-input` | 102 |
-| `fp-vm` | 463 | `fp-engine` | 96 |
-| `fp-formats` | 142 | `fp-physics` | 79 |
-| `fp-combat` | 60 | `fp-app` | 49 |
-| `fp-storyboard` | 44 | `fp-audio` | 32 |
-| `fp-render` | 22 | `fp-core` | 15 |
+| `fp-character` | 692 | `fp-input` | 103 |
+| `fp-vm` | 491 | `fp-engine` | 121 |
+| `fp-formats` | 182 | `fp-physics` | 90 |
+| `fp-combat` | 84 | `fp-app` | 89 |
+| `fp-storyboard` | 63 | `fp-audio` | 34 |
+| `fp-render` | 46 | `fp-core` | 20 |
+| `fp-stage` | 13 | `fp-ui` | 17 |
 
-(`fp-stage` and `fp-ui` are stubs: 0 tests each.)
+(Every crate now has tests — `fp-stage` and `fp-ui` graduated from stubs.)
 
 ### Real-content tests are gated
 
@@ -267,9 +274,11 @@ worktree  →  task  →  review  →  fix  →  verify   (repeat if verify fail
 > under it — it's deliberately external tooling, not part of the shipped
 > project. Don't look for it in-repo and don't add it.
 
-The audit's inline ✅ markers can **lag the actual code** — verify done-status
-against source, not the markers (e.g. keystone items #1/#2 are implemented but
-unmarked; #9 over-claims `HitOverride`, which is still missing).
+The audit's inline ✅ markers can **lag the actual code** in either direction —
+verify done-status against source, not the markers. The audit run since then has
+closed most items (including the `HitOverride` half of #9, now done); the
+forward-looking exceptions are #38 (replay/determinism) and #39 (team/turns/tag
+modes), which remain genuinely unstarted.
 
 ## Worktree discipline & clean-room
 
@@ -306,20 +315,20 @@ depends on `fp-core`. Full design overview: [Architecture](architecture.md).
 
 | Crate | Status | Start here | One-line role |
 | --- | --- | --- | --- |
-| `fp-character` | Implemented (largest) | `crates/fp-character/src/loader.rs` · `executor.rs` · `lib.rs` · `combat.rs` | `.def`→`LoadedCharacter` loader, live `Character` entity, per-tick MUGEN-order executor (~30 controllers), cross-entity `EvalCtx` keystone, and the `resolve_attack` hit-application bridge. |
+| `fp-character` | Implemented (largest) | `crates/fp-character/src/loader.rs` · `executor.rs` · `lib.rs` · `combat.rs` | `.def`→`LoadedCharacter` loader, live `Character` entity, per-tick MUGEN-order executor (~40 controllers), cross-entity `EvalCtx` keystone, and the `resolve_attack` hit-application bridge. |
 | `fp-vm` | Implemented | `crates/fp-vm/src/lexer.rs` · `parser.rs` · `evaluator.rs` · `eval.rs` | CNS trigger-expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). `Value` model + `EvalContext` trait seam. |
-| `fp-formats` | Implemented | `crates/fp-formats/src/sff/mod.rs` · `cns.rs` | Parsers: SFF v1 (PCX) + v2 (RLE8/RLE5/LZ5/raw), AIR, CMD, DEF, CNS, SND. PNG decode, SFF v1 palette, FNT/ACT are gaps. |
+| `fp-formats` | Implemented | `crates/fp-formats/src/sff/mod.rs` · `cns.rs` | Parsers: SFF v1 (PCX **+ trailing-palette extraction**) + v2 (RLE8/RLE5/LZ5/raw **+ PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, SND, **FNT v1, ACT palette**. |
 | `fp-input` | Implemented | `crates/fp-input/src/command.rs` · `buffer.rs` | 60-frame ring buffer + backward-scan command matcher (`~` `/` `$` `>` `+`). |
 | `fp-engine` | Implemented | `crates/fp-engine/src/lib.rs` | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op (`Target*`) application. |
 | `fp-physics` | Implemented | `crates/fp-physics/src/lib.rs` · `collision.rs` · `push.rs` | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. (No friction — that's `fp-character`.) |
 | `fp-combat` | Implemented | `crates/fp-combat/src/lib.rs` | Pure leaf: `HitDef` data model, `Clsn1`×`Clsn2` `detect_hit`, pure `resolve_hit` → `HitOutcome`. No mutation. |
 | `fp-app` | Implemented | `crates/fp-app/src/main.rs` | SDL2 window, 60Hz accumulator loop, CLI modes, hand-rolled HUD, two-player wiring, audio routing. |
-| `fp-storyboard` | Parser only | `crates/fp-storyboard/src/storyboard.rs` | Storyboard `.def` parser + typed scene model. No tick/render; no in-engine consumer. |
+| `fp-storyboard` | Implemented | `crates/fp-storyboard/src/storyboard.rs` · `player.rs` | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. (Per-scene fade/clearcolor/BGM not yet applied.) |
 | `fp-audio` | Implemented | `crates/fp-audio/src/system.rs` · `sound.rs` | rodio WAV decode + channel cut-off mixer; `NullBackend` headless fallback (never panics). |
 | `fp-render` | Implemented | `crates/fp-render/src/renderer.rs` · `shaders/palette.wgsl` | wgpu sprite renderer; WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent); 3 blend pipelines. |
 | `fp-core` | Implemented | `crates/fp-core/src/lib.rs` · `error.rs` | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |
-| `fp-stage` | **Stub** | `crates/fp-stage/src/lib.rs` | Empty (7-line doc) — no `[BGDef]`/`[BG]`/`[Camera]` parser; matches render over a flat color. |
-| `fp-ui` | **Stub** | `crates/fp-ui/src/lib.rs` | Empty (7-line doc) — HUD is hand-rolled quads in `fp-app`, not a `fight.def`/`fight.sff` screenpack. |
+| `fp-stage` | Implemented | `crates/fp-stage/src/lib.rs` | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax-camera render in `fp-app`. (Tile/velocity/mask/`type=anim` and vertical-follow parsed-not-rendered; no real stage fixture.) |
+| `fp-ui` | Implemented | `crates/fp-ui/src/{screenpack,renderer}.rs` | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it and falls back to the quad HUD when absent. (`[Combo]`/`[Face]` parsed-not-drawn; single bg layer; no real fixture.) |
 
 ### Two keystones to internalize first
 

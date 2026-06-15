@@ -7,49 +7,74 @@ plan, this is the current honest state.
 
 Fighters Paradise is a **playable two-character fighter** today — real Kung Fu
 Man data drives a keyboard-controlled P1 vs. a dummy P2 with life bars, KO/round
-flow, throws, supers, hitpause, and i-frames. The items below are the rough
-edges that remain. None of them crash the engine (the
+flow, throws, supers, hitpause, and i-frames. A large batch of audit fixes has
+since landed: the **stage, screenpack, and storyboard crates have all graduated
+from stubs**, SFF v1 palettes + SFF v2 PNG decode, the power-bar HUD, the RNG
+seam, ~10 new state controllers (AssertSpecial, Width, the get-hit-vel family,
+HitOverride, SprPriority, Pause/SuperPause, PalFX/AfterImage), RoundState/
+GameTime/MatchOver triggers, priority/trade clash, a Clsn debug overlay, a
+character-validator CLI + real CI gate, and the FNT/ACT parsers all merged. The
+items below are the rough edges that **remain**. None of them crash the engine
+(the
 [never-crash discipline](../CLAUDE.md#error-philosophy-never-crash-on-bad-content)
-holds throughout); they show up as missing visuals, unmodeled mechanics, or
-infra gaps.
+holds throughout); they show up as the last presentation gaps, a few
+deliberately-simplified mechanics, and the forward-looking scope (replay,
+team/tag modes) that is genuinely not started.
 
 Each issue carries the matching number from the ranked
 [Faithfulness Audit](knowledge-base/08-faithfulness-audit.md), which has the full
 priority context. Where the audit's inline ✅ markers disagreed with the code,
 this document follows the **code**.
 
-> **Status legend:** **Stub** = crate/module exists but is empty or doc-only ·
-> **Missing** = no implementation, falls through to a safe default · **Partial**
-> = works for the common case but mechanically incomplete.
+> **Status legend:** **Resolved** = the gap is closed (implemented + tested) ·
+> **Partial** = works for the common case but mechanically incomplete (the caveat
+> is spelled out) · **Missing** = no implementation, falls through to a safe
+> default. (No crate is a **Stub** anymore — `fp-stage`, `fp-ui`, and
+> `fp-storyboard` have all graduated.)
 
 ---
 
 ## Rendering & visuals
 
-What the player sees is the area with the most visible gaps. Two whole crates
-are still stubs, and several content-rendering paths are unwired.
+This used to be the area with the most visible gaps; most of it is now wired.
+The stage, screenpack, and storyboard crates have graduated from stubs and SFF
+v1/PNG sprites decode. What remains here is a short list of **Partials** —
+content paths that render in the common case but defer specific sub-features
+until a real Elecbyte fixture exists to tune against.
 
-### Stage backgrounds are not rendered (#29) — Stub
+### Stage backgrounds: parallax renders, tile/anim deferred (#29) — Partial
 
-- **What's missing:** `fp-stage` is a 7-line doc-only stub. There is no
-  `[BGDef]`/`[BG]`/`[Camera]` parser and no background draw path.
-  ([crates/fp-stage/src/lib.rs](../crates/fp-stage/src/lib.rs))
-- **Impact:** Matches render over a flat clear color
-  (`frame.clear(0.1, 0.1, 0.15)`, [fp-app/src/main.rs:1167](../crates/fp-app/src/main.rs#L1167)).
-  No scrolling stage, no parallax, no camera follow.
-- **Workaround:** None — the fight is fully playable on the flat background.
+- **What works:** `fp-stage` has graduated from a stub into an ~850-line crate
+  with typed `[StageInfo]`/`[BGDef]`/`[BG]`/`[Camera]` parsing
+  ([crates/fp-stage/src/lib.rs](../crates/fp-stage/src/lib.rs)), and `fp-app`
+  renders the parallax background layers with a horizontal camera that follows
+  the fighters (`world_to_screen_x` offsets by `camera_x`,
+  [fp-app/src/main.rs:895](../crates/fp-app/src/main.rs#L895)).
+- **Remaining fidelity gaps:** `tile = x,y`, per-layer scroll `velocity`,
+  `mask`, and `type = anim` (animated AIR-driven elements) are **parsed into the
+  typed model but not yet rendered**, and the camera's **vertical follow** /
+  floor-tension fields are parsed but the camera only scrolls horizontally.
+- **Asset note:** no real Elecbyte stage `.def` fixture ships (clean-room), so
+  the parser + camera math are covered by synthetic-fixture tests; the default
+  match still falls back to a flat clear color when no stage is supplied.
 
-### HUD text is colored quads, no font rendering (#30) — Missing
+### HUD font rendering: FNT parser + glyph path done; legacy quad HUD still markerless (#30) — Partial
 
-- **What's missing:** No FNT (MUGEN font) parser exists — only a doc-comment
-  placeholder in [fp-formats/src/lib.rs](../crates/fp-formats/src/lib.rs) and the
-  word "FNT" in that crate's `Cargo.toml` description. No ACT palette parser
-  either.
-- **Impact:** The KO / round-state readout is a centered solid-color marker
-  (yellow KO, green/red winner), not text. There is no on-screen timer, combo
-  counter, or any glyph rendering. The HUD is hand-rolled 1×1 indexed quads
-  (`Hud`, [fp-app/src/main.rs:627](../crates/fp-app/src/main.rs#L627)).
-- **Workaround:** Read the round/KO state from the colored marker.
+- **What works:** A MUGEN bitmap-font FNT v1 parser now exists
+  ([fp-formats/src/fnt.rs](../crates/fp-formats/src/fnt.rs)), and `fp-render`
+  has a `draw_text` / glyph draw path. The new **screenpack** HUD ([#31](#real-lifebars--fightdef-screenpack-31--partial))
+  consumes it to render names, the round announcer, and the timer as real glyphs.
+  The `.act` external-palette parser also landed
+  ([fp-formats/src/act.rs](../crates/fp-formats/src/act.rs)).
+- **Remaining gaps:** The **legacy hand-rolled quad HUD** (used when no
+  `fight.def` is found) is *not* wired to `draw_text` — its KO / round-state
+  readout is still a centered solid-color marker (yellow KO, green/red winner),
+  with no timer or combo glyphs (`Hud`,
+  [fp-app/src/main.rs](../crates/fp-app/src/main.rs)). FNT is also
+  **asset-blocked**: no real `.fnt` fixture ships, so the parser is synthetic-
+  tested only.
+- **Workaround:** Supply a `fight.def` screenpack to get glyph text; otherwise
+  read the round/KO state from the colored marker.
 
 ### Real lifebars / fight.def screenpack (#31) — Partial
 
@@ -80,31 +105,32 @@ are still stubs, and several content-rendering paths are unwired.
   and fill math are covered by synthetic-fixture unit tests; the GPU draw path
   is exercised only with a real screenpack linked locally.
 
-### SFF v1 art renders with no colors (#25) — Missing
+### SFF v1 art now decodes with its inline palette (#25) — Resolved
 
-- **What's wrong:** SFF v1 stores each sprite's 256-color palette inline (the
-  768-byte trailing PCX palette), but the v1 loader only decodes pixel
-  *indices* — it never reads the palette. `palettes` is left empty for v1
-  ([fp-formats/src/sff/mod.rs:128](../crates/fp-formats/src/sff/mod.rs#L128); the
-  index-only decode is in
-  [fp-formats/src/sff/v1.rs](../crates/fp-formats/src/sff/v1.rs)).
-- **Impact:** WinMUGEN-era (SFF v1) sprites — typically intro/ending/motif art —
-  have no colors to look up and render invisible. SFF v2 (modern, e.g. KFM's
-  `kfm.sff`) is unaffected and fully colored.
-- **Workaround:** Use SFF v2 content. Note also that SFF v1 sprites are
-  cosmetically mislabeled `SpriteFormat::Png8`; this is harmless because the v1
-  decode path short-circuits before the format match
-  ([fp-formats/src/sff/v1.rs:144](../crates/fp-formats/src/sff/v1.rs#L144)).
+- **What was wrong:** SFF v1 stores each sprite's 256-color palette inline (the
+  768-byte trailing PCX VGA block), but the v1 loader used to decode pixel
+  *indices* only and left `palettes` empty, so v1 art rendered invisible.
+- **What's done now:** [fp-formats/src/sff/v1.rs](../crates/fp-formats/src/sff/v1.rs)
+  extracts each 8-bit sprite's trailing 768-byte VGA palette (`0x0C` marker +
+  256 RGB triplets) into the [`SffPalette`](../crates/fp-formats/src/sff/palette.rs)
+  table; every data-owning sprite contributes its own palette (a linked/data-less
+  sprite reuses the most recent real one), so WinMUGEN-era intro/ending/motif art
+  now has colors to look up.
+- **Note:** SFF v1 sprites are still cosmetically tagged `SpriteFormat::Png8`;
+  this stays harmless because the v1 decode path short-circuits before the format
+  match.
 
-### PNG sprites are not decoded (#35) — Missing
+### SFF v2 PNG sprites now decode (#35) — Resolved
 
-- **What's missing:** SFF v2 `Png8`/`Png24`/`Png32` sprite payloads hit an
-  explicit `FpError::Unsupported` stub
-  ([fp-formats/src/sff/compression.rs:341](../crates/fp-formats/src/sff/compression.rs#L341)).
-  Only uncompressed/RLE8/RLE5/LZ5 indexed sprites decode.
-- **Impact:** Modern HD characters that store sprites as PNG inside SFF v2 fail to
-  load those sprites (true-color 24/32-bit also routes through this stub).
-- **Workaround:** Use indexed (RLE/LZ5) SFF v2 content such as KFM.
+- **What was missing:** SFF v2 `Png8`/`Png24`/`Png32` payloads hit an explicit
+  `FpError::Unsupported` stub; only uncompressed/RLE8/RLE5/LZ5 sprites decoded.
+- **What's done now:** `decode_png`
+  ([fp-formats/src/sff/compression.rs](../crates/fp-formats/src/sff/compression.rs))
+  decodes embedded PNG datastreams via the `png` crate. Indexed PNG8 yields
+  palette indices + a PLTE palette that flow through the 256-color indexed render
+  path; truecolor PNG24/PNG32 yield flat RGBA (via the `decode_sprite_rgba`
+  path), with a `MAX_PNG_PIXELS` guard against decompression bombs. Modern HD
+  PNG-packed characters now load their sprites.
 
 ### Hit sparks: own-spark infrastructure only; KFM still shows none (#17) — Partial
 
@@ -139,114 +165,101 @@ are still stubs, and several content-rendering paths are unwired.
 - **Workaround:** None for the visual; the hit sound and life-bar drop confirm the
   hit landed.
 
-### AfterImage / PalFX color effects do nothing (#33) — Missing
+### AfterImage / PalFX color effects: tint works, trail is approximated (#33) — Partial
 
-- **What's missing:** The `AfterImage`, `AfterImageTime`, and `PalFX` controllers
-  have no dispatch arm; they fall to the debug-logged no-op branch
-  ([fp-character/src/executor.rs:974](../crates/fp-character/src/executor.rs#L974)).
-  There is no color-tint render uniform.
-- **Impact:** Moves that should trail an afterimage or flash a palette effect
-  (common on supers) render with no visual effect.
-- **Workaround:** None — purely cosmetic.
+- **What works:** The `PalFX`, `AfterImage`, and `AfterImageTime` controllers now
+  have real dispatch arms
+  ([fp-character/src/executor.rs](../crates/fp-character/src/executor.rs)). PalFX
+  drives a **color-tint render uniform** in the palette shader
+  ([palette.wgsl](../crates/fp-render/src/shaders/palette.wgsl)), so a flashing
+  super tints correctly, and `fp-app` draws a fading AfterImage trail behind the
+  fighter (`draw_afterimage_trail`,
+  [fp-app/src/main.rs:931](../crates/fp-app/src/main.rs#L931)).
+- **Remaining fidelity gaps:** the trail is a **motion-smear approximation** — it
+  re-uses the *current* frame stepped back along the character's facing with
+  decaying alpha, **not** a true frame-history ghost ring. PalFX's
+  `sinadd`/`PalBright`/`PalContrast`/`Trans` and AfterImage's `TimeGap`/`FrameGap`
+  are not modeled.
+- **Workaround:** None needed — the visible tint and smear read correctly for the
+  common super-flash case.
 
 ---
 
 ## Gameplay fidelity
 
-The fight engine is faithful for the KFM feature set, but several MUGEN
-mechanics are still unmodeled. These affect more advanced characters more than
-KFM.
+The fight engine is faithful for the KFM feature set, and a large batch of the
+mechanics that used to be unmodeled have landed. The items in this section are
+now **Resolved** — they are kept here (briefly) as a record of what was closed,
+with the remaining honest caveats called out where they exist.
 
-### No global Pause / SuperPause freeze (#24) — Missing
+### Global Pause / SuperPause freeze (#24) — Resolved
 
-- **What's missing:** Neither a `Pause` nor a `SuperPause` controller exists in
-  `fp-character` or `fp-engine` (grep returns nothing). Hitpause is **per
-  character only**, not a whole-match freeze.
-- **Impact:** Super flashes and dramatic-freeze moments that rely on a global
-  game-time freeze do not pause the opponent or the timer. Supers still fire
-  (meter, damage, p1stateno) — they just don't freeze the screen.
-- **Workaround:** None; gameplay continues without the freeze.
+- **What's done:** `fp-engine` now owns a whole-match `Freeze` timer
+  ([fp-engine/src/lib.rs:590](../crates/fp-engine/src/lib.rs#L590)) driven by the
+  `Pause` / `SuperPause` controllers. While a freeze is active the frozen
+  players' simulation **and** the round timer / `GameTime` are held; only the
+  `SuperPause` triggerer (tracked via `FreezeExempt`) keeps ticking. A `Pause`
+  freezes everyone. Super flashes and dramatic-freeze moments now stop the screen.
 
-### RoundState / GameTime / MatchOver not exposed to triggers (#21) — Missing
+### RoundState / GameTime / MatchOver exposed to triggers (#21) — Resolved
 
-- **What's wrong:** The `Match` tracks `round_state`/`timer`/`round_number`, but
-  those values are not threaded into the trigger context. `RoundState`,
-  `GameTime`, and `MatchOver` triggers return the safe default `0` (pinned by a
-  test at [fp-character/src/lib.rs:2285](../crates/fp-character/src/lib.rs#L2285)).
-- **Impact:** Character logic that gates on round phase (intro poses, win poses,
-  round-based behavior) won't react.
-- **Workaround:** None; affected branches simply never fire.
+- **What's done:** the coordinator now pushes a
+  [`RoundView`](../crates/fp-character/src/lib.rs) (`round_state` / `game_time` /
+  `match_over`) onto each character every tick via `set_round_view`, and the
+  `RoundState`, `GameTime`, and `MatchOver` triggers read it
+  ([fp-character/src/lib.rs:2332](../crates/fp-character/src/lib.rs#L2332)).
+  Character logic that gates on round phase (intro/win poses) now reacts. A bare
+  self-only `Character` with no coordinator still falls back to safe defaults.
 
-### Width controller is ignored (#10) — Missing
+### Width controller (#10) — Resolved
 
-- **What's missing:** No `Width` dispatch arm; per-state push/collision width
-  falls to the no-op branch. Only the static `[Size]` widths apply.
-  ([fp-character/src/executor.rs:974](../crates/fp-character/src/executor.rs#L974))
-- **Impact:** Moves that should temporarily change push width (e.g. crouching or
-  a lunging attack) keep the default width.
-- **Workaround:** None.
+- **What's done:** the `Width` controller has a dispatch arm that applies a
+  per-state push/collision width override on top of the static `[Size]` widths.
 
-### AssertSpecial flags are not applied (#13) — Missing
+### AssertSpecial flags (#13) — Resolved
 
-- **What's missing:** `AssertSpecial` (NoWalk / NoAutoTurn / Intro and friends)
-  has no dispatch arm and no asserted-flag set.
-  ([fp-character/src/executor.rs:974](../crates/fp-character/src/executor.rs#L974))
-- **Impact:** Per-tick behavior toggles a character asserts (disable walking,
-  suppress auto-turn during a move, intro lockout) have no effect.
-- **Workaround:** None.
+- **What's done:** `AssertSpecial` has a dispatch arm that sets the per-tick
+  asserted flags (`NoWalk`, `NoAutoTurn`, `Intro`, …); they are consulted for the
+  tick and cleared each frame, as MUGEN expects.
 
-### Dropped Statedef headers: SprPriority, juggle, facep2, persist flags (#16) — Missing
+### Dropped Statedef headers: SprPriority, juggle, facep2, persist flags (#16) — Resolved
 
-- **What's wrong:** `fp-formats` parses the `sprpriority`, `juggle`, `facep2`,
-  `hitdefpersist`, and `movehitpersist` statedef headers, but
-  `CompiledState::from_parsed` drops them at compile time
-  ([fp-character/src/loader.rs:363](../crates/fp-character/src/loader.rs#L363)).
-  There is also no `SprPriority` controller arm.
-- **Impact:** No sprite-draw-priority ordering, no juggle limits, no per-state
-  face-opponent override, no HitDef/MoveHit persistence across state changes.
-- **Workaround:** None; characters relying on these headers behave subtly wrong.
+- **What's done:** `CompiledState::from_parsed` now keeps the `sprpriority`,
+  `juggle`, `facep2`, `hitdefpersist`, and `movehitpersist` headers instead of
+  dropping them. A `SprPriority` controller arm + sprite draw-order ordering and
+  air-juggle limits are wired through.
 
-### No on-hit power gain / transfer (#18) — Missing
+### On-hit power gain / transfer (#18) — Resolved
 
-- **What's wrong:** `resolve_attack` never adds power to attacker or defender on
-  a connecting hit (no power writes in
-  [fp-character/src/combat.rs](../crates/fp-character/src/combat.rs)). MUGEN's
-  HitDef `getpower`/`givepower` are unmodeled.
-- **Impact:** The super meter does **not** build from landing or taking hits. It
-  only changes via explicit `PowerAdd`/`PowerSet` controllers and
-  `TargetPowerAdd`.
-- **Workaround:** Characters that script `PowerAdd` on hit still build meter; the
-  automatic HitDef power gain does not.
+- **What's done:** `resolve_attack` now applies the HitDef `getpower` /
+  `givepower` on a connecting hit, so the super meter builds from landing **and**
+  taking hits (in addition to explicit `PowerAdd`/`PowerSet`/`TargetPowerAdd`).
 
-### No priority / trade clash resolution (#20) — Missing
+### Priority / trade clash resolution (#20) — Resolved
 
-- **What's wrong:** `PriorityType` and `Priority{value, kind}` are **data only**
-  in `fp-combat`; nothing compares two simultaneous HitDefs. Combat runs strictly
-  sequentially — P1→P2 then P2→P1 — with no trade arbitration
-  ([fp-engine/src/lib.rs:749](../crates/fp-engine/src/lib.rs#L749)).
-- **Impact:** Two attacks that should clash/trade based on priority will instead
-  both resolve in order; there are no proper trades or move cancels on clash.
-- **Workaround:** None.
+- **What's done:** `fp-combat` gained a pure `resolve_clash`, and `fp-engine`
+  runs a reconciled pass over two simultaneous HitDefs so attacks that should
+  clash/trade by priority do so instead of both landing blindly in sequence.
 
-### Get-hit velocity controllers missing (#23) — Missing
+### Get-hit velocity controllers (#23) — Resolved
 
-- **What's missing:** `HitVelSet`, `HitFallSet`, `HitFallVel`, and
-  `HitFallDamage` have no dispatch arms
-  ([fp-character/src/executor.rs:974](../crates/fp-character/src/executor.rs#L974)).
-- **Impact:** Get-hit common states cannot fine-tune knockback/fall via these
-  controllers. Note: **basic knockback is already applied** in `resolve_attack`,
-  so hits still launch and push correctly — only the controller-level tuning is
-  absent.
-- **Workaround:** Rely on the built-in knockback from the HitDef velocities.
+- **What's done:** `HitVelSet`, `HitFallSet`, `HitFallVel`, and `HitFallDamage`
+  all have dispatch arms, and the HitDef now carries `fall.damage` /
+  `fall.xvelocity`. Get-hit common states can fine-tune knockback/fall (basic
+  knockback was already applied in `resolve_attack`).
 
-### No power bar in the HUD (#26) — Missing
+### Power bar in the HUD (#26) — Resolved
 
-- **What's wrong:** The engine `Player` exposes no `power()`/`power_max()`
-  accessor and the HUD draws life bars only
-  ([fp-app/src/main.rs:627](../crates/fp-app/src/main.rs#L627)).
-- **Impact:** The super meter exists and works in the simulation (power is
-  tracked and carried across rounds), but you cannot **see** it.
-- **Workaround:** None visually; supers still trigger when meter is available.
+- **What's done:** the engine `Player` exposes `power()` / `power_max()` and the
+  HUD draws a **blue power bar** under each life bar (`draw_power_bar`,
+  [fp-app/src/main.rs:813](../crates/fp-app/src/main.rs#L813)). The super meter is
+  now visible.
+
+### HitOverride controller (#9b) — Resolved
+
+- **What's done:** an 8-slot `HitOverride` controller now exists alongside the
+  already-working `NotHitBy` / `HitBy` i-frame windows (#9). (The audit's #9 ✅
+  marker that once over-claimed this is now accurate.)
 
 ---
 
@@ -255,55 +268,43 @@ KFM.
 These don't affect the visible fight much today but matter for correctness,
 testing, and the long-term customizable-engine vision.
 
-### Input is sampled inside the catch-up loop (#27) — Partial
+### Input is sampled once per frame (#27) — Resolved
 
-- **What's wrong:** The keyboard is read **inside** the fixed-timestep catch-up
-  loop (`event_pump.keyboard_state()` at
-  [fp-app/src/main.rs:1131](../crates/fp-app/src/main.rs#L1131), inside
-  `while accumulator >= TICK_DURATION` at
-  [fp-app/src/main.rs:1127](../crates/fp-app/src/main.rs#L1127)).
-- **Impact:** On a frame that drains multiple ticks (e.g. after a hitch), every
-  catch-up tick re-reads the same live keyboard, so a single press can be
-  over-counted and timing isn't snapshot-once-per-frame. Mostly invisible at a
-  steady 60 FPS.
-- **Workaround:** Run on hardware that holds 60 FPS so each frame drains exactly
-  one tick.
+- **What's done:** the keyboard is now snapshotted **once per frame**, outside
+  the fixed-timestep catch-up loop, and the snapshot is reused for every catch-up
+  tick. A multi-tick frame after a hitch no longer over-counts a single press.
 
-### RNG-in-state is non-functional (#28) — Missing
+### RNG-in-state (#28) — Resolved
 
-- **What's wrong:** Neither `Character` nor `EvalCtx` overrides the VM's
-  `random()` seam, so it uses the trait default that returns a fixed `0`
-  ([fp-vm/src/eval.rs:525](../crates/fp-vm/src/eval.rs#L525)). There is no
-  per-entity seed/RNG field. (The VM does ship a deterministic Park-Miller `Rng`
-  ready to be wired in — it's just not connected to the entity yet.)
-- **Impact:** The `Random` trigger and any state logic gated on RNG always read
-  `0`, so randomized AI/move selection is effectively disabled.
-- **Workaround:** None; randomized branches are deterministic-zero.
+- **What's done:** `Character` now owns a Park–Miller RNG state (seeded from
+  `DEFAULT_RNG_SEED`, re-seedable via `seed_rng`) and overrides the VM's
+  `random()` seam ([fp-character/src/lib.rs:2414](../crates/fp-character/src/lib.rs#L2414)),
+  so the `random` trigger returns a real value in `[0, 999]`. The state lives on
+  the entity as a plain `i32` so it serializes for future replay/rollback (#38).
+  Randomized AI/move selection now works and is deterministic for a fixed seed.
 
-### CI's real-content tests run as green no-ops (#36) — Infra gap
+### fp-vm arithmetic NaN handling (#19) — Resolved
 
-- **What's wrong:** Real-KFM tests are **asset-gated** — they early-return when
-  `test-assets/` is absent. `test-assets` is a gitignored local-only symlink and
-  the [CI workflow](../.github/workflows/ci.yml) has **no fetch/restore step**,
-  so the entire real-content regression net executes as green no-ops on CI. Only
-  synthetic tests truly run there.
-- **Impact:** **A green CI badge does not mean real-content behavior is
-  verified.** Regressions in any KFM-driven path can pass CI silently. This is a
-  meta-multiplier — it can hide regressions in every other fix listed here.
-- **Workaround:** Run `cargo test --workspace` **locally** with `test-assets`
-  present to exercise the real-content suite before trusting a change.
+- **What's done:** `arith()` now funnels any NaN / non-finite result to `Bottom`
+  ([fp-vm/src/eval.rs](../crates/fp-vm/src/eval.rs)), so no NaN can escape the
+  evaluator into a public `Value`. The previously-open NaN follow-ups are closed.
 
-### No VM fuzz / property tests (#37) — Missing
+### CI now exercises real content via the shipped training dummy (#36) — Resolved
 
-- **What's missing:** `fp-vm` has no `proptest`/`quickcheck` dependency and no
-  `cargo-fuzz` target — only hardcoded adversarial-string smoke tests
-  (e.g. [fp-vm/src/parser.rs](../crates/fp-vm/src/parser.rs)). The evaluator's
-  never-panic contract is well covered by ~474 unit/integration tests but not by
-  generative testing.
-- **Impact:** Lower confidence that exotic/malformed expressions can't surface an
-  unhandled edge. (No known panic — the never-panic contract is upheld in
-  practice.)
-- **Workaround:** None needed for normal content; relevant only for hardening.
+- **What was wrong:** real-KFM tests were asset-gated and `test-assets/` is a
+  gitignored local-only symlink with no CI fetch step, so the real-content
+  regression net ran as green no-ops on CI.
+- **What's done:** the repo now ships an **original, clean-room training-dummy
+  character** (`assets/trainingdummy/`) and CI **loads, matches, and validates**
+  it, so the loader → match → validator path is exercised on every CI run. (The
+  real-KFM suite is still local-only by design; run `cargo test --workspace` with
+  `test-assets` linked to exercise genuine KFM content too.)
+
+### VM fuzz / property tests (#37) — Resolved
+
+- **What's done:** `fp-vm` now has `proptest`-based property/fuzz tests across the
+  lexer, parser, and evaluator, hardening the never-panic contract beyond the
+  hardcoded adversarial smoke tests.
 
 ### No replay / determinism / rollback (#38) — Missing
 
@@ -311,28 +312,30 @@ testing, and the long-term customizable-engine vision.
   capture, and no rollback netcode. The fixed-timestep, deterministic design is a
   prerequisite the engine already meets, but the save/restore machinery isn't
   built.
-- **Impact:** No replays, no rollback-based netplay, no save states. Note this
-  interacts with the RNG gap (#28) — true determinism also needs a seeded,
-  serializable RNG.
+- **Impact:** No replays, no rollback-based netplay, no save states. The RNG
+  groundwork is already in place — `Character`'s Park–Miller state is a plain,
+  serializable `i32` carried on the entity (#28, Resolved) — so what's left is the
+  save/restore + capture machinery itself.
 - **Workaround:** None.
 
 ---
 
-## Scope: single-match only (#39)
+## Scope: team / turns / tag modes (#39)
 
 Today Fighters Paradise is a **1v1 local match** built around the KFM feature
-set. The following broader scope is **not yet implemented**:
+set. The multi-fighter **modes** are still forward-looking; some of their
+*plumbing* (the `.act` and extended-AIR parsers) has landed parser-side.
 
-| Out of scope today | Notes |
-|---|---|
-| Team / Simul / Turns / Tag modes | Only one fighter per side; `Match` is strictly two-player. |
-| Real second player or AI | P2 receives `MatchInput::none()` every tick — an idle dummy ([fp-app/src/main.rs:1133](../crates/fp-app/src/main.rs#L1133)). |
-| `.act` external palette files | No parser; only in-SFF palettes are read. |
-| Extended AIR features | Per-frame `scale`/`angle`/`Interpolate` blocks are not parsed — only `group, image, x, y, ticks, [flip], [blend]` ([fp-formats/src/air.rs](../crates/fp-formats/src/air.rs)). |
-| Intro / ending storyboard playback (#32) | `fp-storyboard` parses storyboard `.def` into a typed scene model but never ticks or renders it — it has no consumer crate ([crates/fp-storyboard/src/storyboard.rs](../crates/fp-storyboard/src/storyboard.rs)). |
+| Status | Item | Notes |
+|---|---|---|
+| **Missing** | Team / Simul / Turns / Tag modes | Only one fighter per side; `Match` is strictly two-player. The big unimplemented chunk of #39. |
+| **Missing** | Real second player or AI | P2 receives `MatchInput::none()` every tick — an idle dummy ([fp-app/src/main.rs](../crates/fp-app/src/main.rs)). |
+| **Partial** | `.act` external palette files (#39a) | A parser now exists ([fp-formats/src/act.rs](../crates/fp-formats/src/act.rs)), but the result is **not yet consumed at runtime** — only in-SFF palettes drive rendering. |
+| **Partial** | Extended AIR `scale`/`angle`/`Interpolate` (#39a) | Now **parsed** into the typed `Frame` model (`scale`, `angle`, `interpolate` fields, [fp-formats/src/air.rs](../crates/fp-formats/src/air.rs)); the renderer does **not yet apply** per-frame scale/rotation/interpolation. KFM uses none. |
+| **Partial** | Intro / ending storyboard playback (#32) | `fp-storyboard` has graduated from parser-only to a real [`StoryboardPlayer`](../crates/fp-storyboard/src/player.rs) that ticks scenes, and `fp-app` overlays it during Intro/ending. **Not yet applied:** per-scene fadein/fadeout, per-scene `clearcolor`, and BGM; the intro's fixed-60-frame timer is not tied to storyboard length. |
 
-Also unimplemented for debugging convenience: a Clsn hitbox/hurtbox debug overlay
-(#34).
+The Clsn hitbox/hurtbox debug overlay (#34) is **done** — toggle it with **F1**
+(it draws `fp-render` debug-box primitives over the active boxes).
 
 ---
 
@@ -344,9 +347,6 @@ A few details that are easy to trip over but lower-impact:
   GetHitVars; `GetHitVar(type)` (`hit_type`), `hitcount`, and `isbound` are
   **not** populated even though the HitDef carries the source data
   ([fp-character/src/combat.rs](../crates/fp-character/src/combat.rs)).
-- **`HitOverride` is missing.** `NotHitBy`/`HitBy` i-frames work (#9), but the
-  related `HitOverride` controller has no dispatch arm anywhere. (The audit's #9
-  ✅ marker over-claims this — i-frames are done, `HitOverride` is not.)
 - **Friction has no explicit snap-to-zero line (#12).** The `friction.threshold`
   key is loaded and exposed via the `const()` seam, so KFM's own
   `abs(vel x) < Const(threshold)` check fires correctly, but there's no

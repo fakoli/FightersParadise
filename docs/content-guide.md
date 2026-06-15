@@ -12,9 +12,11 @@ one with `cargo run`, what works versus what is still missing, and how to debug 
 character that loads wrong.
 
 > **Status (2026-06-14):** Fighters Paradise is a playable two-character fighter
-> driven by real Kung Fu Man (KFM) data. It is **not** a stub. Some content does
-> not yet render (SFF v1 art, stage backgrounds, real screenpacks) — those limits
-> are called out plainly below and tracked in [Known Issues](known-issues.md).
+> driven by real Kung Fu Man (KFM) data. **No crate is a stub anymore** — stages,
+> screenpacks, and storyboards all render now, and SFF v1 + PNG sprites decode.
+> What's left is mostly *fidelity sub-features* on those newly-landed paths
+> (called out plainly below) and the forward-looking modes — all tracked in
+> [Known Issues](known-issues.md).
 
 See also: [Architecture](architecture.md) · [MUGEN Compatibility Matrix](mugen-compatibility.md) · [Roadmap](roadmap.md) · [Known Issues](known-issues.md) · [Development](development.md) · root [README](../README.md)
 
@@ -46,7 +48,7 @@ ai       = kfm.ai           ; AI hints (not used by this engine)
 ### The six core formats and how they map to our parsers
 
 Every format below is parsed by the [`fp-formats`](../crates/fp-formats) crate.
-All six core formats parse **real KFM content end to end** (142 parser tests).
+All six core formats parse **real KFM content end to end** (182 parser tests).
 The text formats share one discipline: case-insensitive keys, BOM/CRLF tolerant,
 `;` comments stripped, **never crash** — malformed lines are warn-logged and
 skipped, not fatal.
@@ -54,8 +56,8 @@ skipped, not fatal.
 | File   | What it holds                                    | Parser module                          | Status |
 | ------ | ------------------------------------------------ | -------------------------------------- | ------ |
 | `.def` | The manifest: `[Info]`, `[Files]`, sections      | `fp-formats/src/def.rs`                | Full — INI sections + `key=value`, quote stripping, `resolve_path` for `.def`-relative refs |
-| `.sff` | Sprite archive (indexed-color images)            | `fp-formats/src/sff/`                  | **v2 full** (RLE8/RLE5/LZ5 + uncompressed); **v1 (PCX) decodes pixels but not its palette**; PNG-embedded sprites unsupported |
-| `.air` | Animations: frame timing, flip/blend, Clsn boxes | `fp-formats/src/air.rs`                | Full for `group,image,x,y,ticks[,flip[,blend]]`, Loopstart, Clsn1/Clsn2; **scale/angle/Interpolate not parsed** |
+| `.sff` | Sprite archive (indexed-color images)            | `fp-formats/src/sff/`                  | **v2 full** (RLE8/RLE5/LZ5 + uncompressed **+ PNG8/24/32 decode**); **v1 (PCX) now decodes pixels *and* its trailing inline palette** — both eras render in color |
+| `.air` | Animations: frame timing, flip/blend, Clsn boxes | `fp-formats/src/air.rs`                | Full for `group,image,x,y,ticks[,flip[,blend]]`, Loopstart, Clsn1/Clsn2; extended `scale`/`angle`/`Interpolate` now **parse** into the typed `Frame` (renderer doesn't apply them yet) |
 | `.cmd` | Commands: motions (`~D, DF, F, x`) -> names      | `fp-formats/src/cmd.rs`                | Full — `[Command]` blocks + `[Defaults]`; the `[Statedef -1]` AI section is intentionally read by the CNS path instead |
 | `.cns` | Constants (`[Data]`, `[Size]`, …) + state logic  | `fp-formats/src/cns.rs`                | Full — `[Statedef N]` headers + `[State N,…]` controllers, raw trigger expressions preserved |
 | `.snd` | Sound archive (RIFF/WAVE payloads)               | `fp-formats/src/snd.rs`                | Full — directory walk, `(group,sample)` lookup; PCM decode happens in `fp-audio` |
@@ -167,6 +169,7 @@ a real match; a bare `.sff`/`.air` opens a legacy viewer.**
 | `cargo run -p fp-app -- p1.def p2.def`             | Two-player match, **two different** characters.        |
 | `cargo run -p fp-app -- char.sff char.air`         | **Legacy animation viewer** — plays the `.sff` sprites through the `.air` timeline. No states, no combat. |
 | `cargo run -p fp-app -- char.sff`                  | **Legacy static viewer** — shows the first sprite.    |
+| `cargo run -p fp-app -- validate char.def`         | **Headless validator / linter** — loads the `.def` and prints actionable author problems (missing sprites/animations, unresolved state refs, expressions that failed to compile, no-op controllers). No window. |
 
 What each combo *enables*:
 
@@ -177,6 +180,9 @@ What each combo *enables*:
 - **`.sff` + `.air` (viewer)** is a quick visual sanity check for your sprites and
   animations *before* wiring up states — no `.cns`/`.cmd` needed.
 - **`.sff` (static)** verifies the sprite archive decodes at all.
+- **`validate` (linter)** is the fastest way to find why a character loads wrong —
+  run it before filing a bug; it surfaces exactly what the loader skipped or
+  could not resolve.
 
 > **There is no `sff + air + cmd` mode.** A third non-`.def` argument is ignored —
 > `select_mode` runs the 2-argument viewer and never reads a standalone `.cmd`.
@@ -229,21 +235,31 @@ controller-by-controller breakdown, see the
 - `.snd` playback: `PlaySnd` and `HitDef` impact sounds.
 - Animation: per-element timing, flip, and the three blend modes
   (normal/additive/subtractive).
+- **Sprites of any era render in color:** SFF v1 inline palettes and SFF v2
+  PNG8/24/32 sprites both decode now (so WinMUGEN-era and modern HD art show).
+- **Presentation layer:** a parallax **stage** (from a stage `.def`), a real
+  **`fight.def` screenpack** (life + power bars, names, round announcer, timer as
+  glyphs, with a quad-HUD fallback), a drawn **power/meter bar**, and
+  **intro/ending storyboard** playback.
+- **~40 state controllers** dispatched, including `AssertSpecial`, `Width`,
+  `SprPriority`, `Pause`/`SuperPause`, `PalFX`/`AfterImage`, `HitOverride`, and
+  the get-hit-velocity set; plus priority/trade **clash** resolution and a
+  **real `random`** trigger (`[0, 999]`).
 
 ### Current limits — call these out before you file a bug
 
 | Limit | Effect on your character | Tracking |
 | ----- | ------------------------ | -------- |
-| **SFF v1 palettes not extracted** | WinMUGEN-era (`.sff` v1) sprites decode their pixels but have **no colors to look up**, so they render **invisible/transparent**. Modern SFF v2 characters (like KFM) are fine. | [#25](known-issues.md) |
-| **PNG-embedded sprites unsupported** | SFF v2 sprites stored as PNG (Png8/24/32 — common in HD characters) fail to decode. RLE8/RLE5/LZ5/uncompressed all work. | [#35](known-issues.md) |
-| **No stage backgrounds** | `fp-stage` is a stub; matches render over a flat clear color, not a `[BGDef]`/`[BG]` stage. | [#29](known-issues.md) |
-| **HUD is not a real screenpack** | Life bars + KO/win marker are hand-drawn colored quads, not a `fight.def`/`fight.sff`. No power/meter bar drawn, no font text. | [#26](known-issues.md), [#30](known-issues.md), [#31](known-issues.md) |
-| **No hit sparks** | The spark anchor is computed but no spark sprite is spawned/rendered. | [#17](known-issues.md) |
-| **Some CNS controllers are no-ops** | `Width`, `AssertSpecial`, `SprPriority`, `Pause`/`SuperPause`, `AfterImage`/`PalFX`, and the get-hit velocity controllers are not yet dispatched — they log a debug message and do nothing. ~30 common controllers *are* implemented. | [#10/#13/#16/#23/#24/#33](known-issues.md) |
-| **No helpers/projectiles/teams** | `Helper`, `Projectile`, and the `parent/helper/target/partner/playerid` redirects resolve to nothing yet. | [#39](known-issues.md) |
-| **No RNG** | `random` returns a fixed `0`, so `Random`-driven behavior is deterministic-but-constant. | [#28](known-issues.md) |
-| **Storyboards parse but don't play** | `intro.def`/`ending.def` are parsed into a typed model but not ticked or rendered. | [#32](known-issues.md) |
-| **No FNT/ACT support** | Font and external-palette files have no parser. | [#30](known-issues.md) |
+| **Stage tiling / animation / vertical camera — *Partial*** | The parallax stage renders, but `tile`/`velocity`/`mask`/`type=anim` layers and the camera's vertical-follow are *parsed but not yet drawn* — the camera only scrolls horizontally. | [#29](known-issues.md) |
+| **Screenpack combo/face + layered bars — *Partial*** | The `fight.def` screenpack renders life/power bars, names, round announcer, and timer, but `[Combo]`/`[Face]` are parsed-not-drawn and only one `bg0` layer per bar renders. | [#31](known-issues.md) |
+| **FNT text on the legacy quad HUD — *Partial*** | The FNT v1 parser + `draw_text` glyph path feed the *screenpack*; the fallback quad HUD (used when no `fight.def`) still shows only a solid-color KO/win marker, no glyph text. FNT is also asset-blocked (no real `.fnt` fixture ships). | [#30](known-issues.md) |
+| **Hit sparks — infrastructure only — *Partial*** | The effect-entity path exists (own-spark spawn/tick/expire), but KFM (and conventional content) authors *common*-`fightfx` sparks and **no `fightfx.sff` loader exists yet**, so KFM shows **no visible spark**. The hit still lands. | [#17](known-issues.md) |
+| **AfterImage trail is approximate — *Partial*** | `PalFX`/`AfterImage` dispatch and the color-tint render uniform work, but the trail is a motion-smear approximation (no true frame-history ghost ring); `sinadd`/`TimeGap`/`Trans` etc. aren't modeled. | [#33](known-issues.md) |
+| **Storyboard fade/clearcolor/BGM — *Partial*** | `intro.def`/`ending.def` now play (a `StoryboardPlayer` ticks scenes; `fp-app` overlays them), but per-scene fadein/fadeout, `clearcolor`, and BGM are not yet applied. | [#32](known-issues.md) |
+| **`.act` palette + extended AIR are parser-only — *Partial*** | `.act` external palettes and AIR `scale`/`angle`/`Interpolate` parse into the typed model but are **not yet consumed at runtime** (no `.act` palette swaps, no per-frame scale/rotation). | [#39](known-issues.md) |
+| **A few CNS controllers are still no-ops — *Missing*** | `LifeAdd`, `Helper`, `Projectile`, `Explod`, `EnvShake` are still not dispatched — they debug-log and do nothing. (~40 controllers *are* dispatched now, including the formerly-missing `Width`/`AssertSpecial`/`SprPriority`/`Pause`/`SuperPause`/`PalFX`/`AfterImage`/`HitOverride`/get-hit-vel set.) | [#39](known-issues.md) |
+| **No helpers / projectiles / teams — *Missing*** | `Helper`, `Projectile`, and the `parent/helper/target/partner/playerid` redirects resolve to nothing; team/turns/tag *modes* are forward-looking. | [#39](known-issues.md) |
+| **No replay / save-state — *Missing*** | No state serialization, replay capture, or rollback yet (the deterministic-design groundwork and in-state RNG are in place). | [#38](known-issues.md) |
 
 A character that uses an unimplemented controller still **loads and fights** — the
 unsupported controller is simply skipped, so you get a degraded-but-playable
@@ -275,17 +291,19 @@ The match failed to *load* and the app degraded. Look for a
 
 ### My character loads but is invisible
 
-The sprites decoded but produced no visible pixels. Most likely:
+The sprites decoded but produced no visible pixels. SFF v1 inline palettes and
+SFF v2 PNG sprites both decode now, so the most common cause is the palette
+convention rather than a missing decoder:
 
-- **SFF v1 character** — its inline palette isn't extracted yet, so every pixel
-  maps to transparent ([#25](known-issues.md)). This is expected for WinMUGEN-era
-  art; there is currently no workaround short of the palette fix.
-- **PNG-embedded SFF v2 sprites** — unsupported decode ([#35](known-issues.md)).
 - Remember palette **index 0 is always transparent** by MUGEN convention — sprites
-  authored against index 0 as a visible color will show holes.
+  authored against index 0 as a visible color will show holes (or render
+  fully transparent if index 0 is their only color).
+- A truly empty/zero-size sprite, or one that linked to a missing data sprite,
+  renders as nothing.
 
 Sanity-check the sprites in isolation with the viewer:
-`cargo run -p fp-app -- my-fighter.sff my-fighter.air`.
+`cargo run -p fp-app -- my-fighter.sff my-fighter.air`. If they show there, the
+issue is in the character's states/positions, not the sprite decode.
 
 ### Parse warnings in the log
 
@@ -297,12 +315,14 @@ to see whether it was skipped or compiled to `0`.
 
 ### My character loads but a move does nothing
 
-- The move may rely on a **not-yet-implemented controller** (see the limits table
-  and the [compatibility matrix](mugen-compatibility.md)). Unimplemented
-  controllers debug-log and no-op.
-- The move may need a `random`/RNG branch — `random` currently returns `0`
-  ([#28](known-issues.md)), so RNG-gated branches never fire.
+- The move may rely on a **still-unimplemented controller** (`LifeAdd`, `Helper`,
+  `Projectile`, `Explod`, `EnvShake` — see the limits table and the
+  [compatibility matrix](mugen-compatibility.md)). Unimplemented controllers
+  debug-log and no-op. (~40 controllers *are* dispatched now, so most moves work.)
 - Helper/projectile-based moves won't spawn anything yet ([#39](known-issues.md)).
+- The `random` trigger now returns a real value in `[0, 999]`
+  ([#28](known-issues.md)), so RNG-gated branches *do* fire — if one misbehaves,
+  it's a logic issue, not the old fixed-`0` stub.
 
 ### Sound doesn't play
 
@@ -355,11 +375,14 @@ licensed under [MIT](../LICENSE).
 ## 7. The vision — full customization
 
 The headline goal is simple: **bring your own characters, in real MUGEN format,
-and have them just work.** Today that means SFF v2 characters with implemented
-controllers run as a full fight; the roadmap fills in the rest — SFF v1 palettes
-and PNG sprites so *any* era of character renders, stages and real screenpacks so
-fights look complete, fonts/text, helpers/projectiles/teams, and the remaining
-controllers. Track that progress in the **[Roadmap](roadmap.md)** and
-**[Known Issues](known-issues.md)**, and check the
+and have them just work.** Today that's largely true: characters of *any* era
+render in color (SFF v1 palettes + PNG sprites both decode), ~40 controllers run,
+and fights show with a parallax stage, a `fight.def` screenpack, glyph text, a
+power bar, and intro/ending storyboards. What the roadmap still fills in is the
+*forward-looking* scope — helpers/projectiles, team/turns/tag modes,
+`.act`/extended-AIR *runtime* consumption, replay/determinism, and the
+render-fidelity polish on the newly-landed presentation paths (stage tiling,
+screenpack combo/face, true afterimage ghosts). Track that progress in the
+**[Roadmap](roadmap.md)** and **[Known Issues](known-issues.md)**, and check the
 **[Compatibility Matrix](mugen-compatibility.md)** before porting a specific
 character.
