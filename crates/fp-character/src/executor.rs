@@ -62,9 +62,36 @@
 //! emitter: it pushes a [`SoundRequest`] onto [`TickReport::sound_requests`] for
 //! a downstream audio player to consume — `fp-character` stays a pure simulation
 //! crate and produces no audio itself. Task 6.2 adds the `HitDef` controller
-//! (builds a [`fp_combat::HitDef`] into [`Character::active_hitdef`]). Any other controller
-//! type is a safe no-op (debug-logged) and is deferred to a later task. The
-//! dispatch never panics; a malformed parameter resolves to its safe default.
+//! (builds a [`fp_combat::HitDef`] into [`Character::active_hitdef`]).
+//!
+//! **T015 (state-controller coverage)** closed the remaining
+//! reasonably-implementable gaps: the screen effects `EnvShake` / `EnvColor`, the
+//! palette swap `RemapPal`, the debug clipboard (`DisplayToClipboard` /
+//! `AppendToClipboard` / `ClearClipboard`), `VictoryQuote`, `PosFreeze`, the
+//! sprite-blend `Trans`, the draw-rotation family (`AngleSet` / `AngleAdd` /
+//! `AngleMul` / `AngleDraw`), the self-life writes `LifeAdd` / `LifeSet`, the
+//! self-velocity `Gravity` (adds `yaccel` to `vel.y`), the bounded-random
+//! `VarRandom`, and the move-connection reset `MoveHitReset` are now handled.
+//! Effects with a render/engine side (e.g. `EnvShake`, `EnvColor`, `Trans`, the
+//! angle family) are stored on the [`Character`] (mirroring `cur_palfx` /
+//! `afterimage`) for a downstream renderer / engine to consume; the pure
+//! self-field writes (`Gravity`, `VarRandom`, `MoveHitReset`) take effect
+//! immediately.
+//!
+//! A controller type that is **not** handled is split two ways so no documented
+//! controller silently no-ops without a tracked reason:
+//!
+//! - A **documented MUGEN controller blocked on an unbuilt subsystem** (helpers /
+//!   explods / projectiles, multi-entity redirects, the stage/background owner, or
+//!   the full global PalFX modulation — see [`is_tracked_deferred_controller`] and
+//!   T007-T014) routes to a named, `tracing::warn!`-logged no-op. The
+//!   target/projectile-graph controllers `HitAdd`, `AttackDist`, and `TargetDrop`
+//!   are tracked here too: they act on a target / active-HitDef / projectile that
+//!   the multi-entity graph (T013/T014) does not yet exist to address.
+//! - A **genuinely unrecognized** token (a typo / non-MUGEN extension) routes to a
+//!   `tracing::debug!`-logged no-op.
+//!
+//! The dispatch never panics; a malformed parameter resolves to its safe default.
 //!
 //! ## Get-hit state readiness (task 6.2, part C)
 //!
@@ -74,17 +101,16 @@
 //! previously deferred to a hard `0`). Their `ChangeState` / `ChangeAnim` /
 //! `VelSet` / `PosSet` / `VarSet` controllers are all handled by the dispatch.
 //!
-//! Two **documented gaps** remain — neither silently mis-runs:
+//! One **documented gap** remains — it does not silently mis-run:
 //!
-//! 1. The get-hit-specific controllers (`HitVelSet`, `HitFallSet`, `HitFallVel`,
-//!    `HitFallDamage`, `HitAdd`, `LifeAdd`, …) are not yet
-//!    implemented; the dispatch routes them to its safe, **debug-logged** no-op
-//!    branch (visible, not silent) and they are deferred to task 6.3+.
-//!    (`SelfState` and `VelMul`, formerly in this list, are now handled —
-//!    audit P3+P11.)
-//! 2. [`Character::get_hit_vars`] stays at its default until hit *resolution*
-//!    (task 6.3) populates it, so a get-hit state run *before* 6.3 sees zeroed
-//!    hit effects. This is expected: 6.2 only wires the read path.
+//! - [`Character::get_hit_vars`] stays at its default until hit *resolution*
+//!   (task 6.3) populates it, so a get-hit state run *before* 6.3 sees zeroed
+//!   hit effects. This is expected: 6.2 only wires the read path.
+//!
+//! (The get-hit velocity/fall controllers `HitVelSet` / `HitFallSet` /
+//! `HitFallVel` / `HitFallDamage` — and, since T015, the self-life writes
+//! `LifeAdd` / `LifeSet` — are now handled; `SelfState` and `VelMul` were handled
+//! earlier in audit P3+P11.)
 //!
 //! [03 §3]: ../../../docs/knowledge-base/03-engine-architecture.md
 
@@ -98,8 +124,8 @@ use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
 };
 use crate::{
-    AfterImageState, AnimSet, Character, CurPalFx, EvalCtx, Facing, LoadedCharacter, MoveType,
-    Physics, StageView, StateType, NUM_FVARS, NUM_VARS,
+    AfterImageState, AnimSet, Character, CurPalFx, EnvColor, EnvShake, EvalCtx, Facing,
+    LoadedCharacter, MoveType, Physics, StageView, StateType, TransMode, NUM_FVARS, NUM_VARS,
 };
 
 /// The per-tick **cross-entity evaluation environment**: the opponent's context
@@ -461,6 +487,13 @@ impl Character {
         // character asserts nothing.)
         self.asserted.clear();
         self.cur_width.clear();
+        // T015 per-tick draw overrides — `AngleDraw` arm, `PosFreeze`, and `Trans`
+        // all hold for only the tick that fires them, mirroring `AssertSpecial` /
+        // `Width`. The persistent `draw_angle.angle` itself is left untouched (only
+        // the per-tick arm flag is cleared).
+        self.draw_angle.active = false;
+        self.pos_frozen = false;
+        self.cur_trans = None;
         // Per-tick `HitDef`-fired flag (#16): cleared here, set by `ctrl_hit_def`.
         // A same-tick `ChangeState` consults it so a freshly-set HitDef survives
         // the move for this frame's detection (see `apply_state_entry`).
@@ -542,6 +575,9 @@ impl Character {
         // frozen sprite keeps its current tint.)
         self.cur_palfx.tick();
         self.afterimage.tick();
+        // T015 screen effects (EnvShake / EnvColor) count down the same way.
+        self.env_shake.tick();
+        self.env_color.tick();
 
         // Process the special states first, in MUGEN order, then the current
         // state. The current state number is re-read after each special state in
@@ -1020,8 +1056,17 @@ impl Character {
     /// (per-tick push-width override, [`ctrl_width`](Self::ctrl_width)); #23 adds
     /// the get-hit velocity/fall controllers `HitVelSet` / `HitFallSet` /
     /// `HitFallVel` / `HitFallDamage`; and #9b adds `HitOverride`
-    /// ([`ctrl_hit_override`](Self::ctrl_hit_override)).
-    /// Every other type is a safe no-op, debug-logged and deferred to a later task.
+    /// ([`ctrl_hit_override`](Self::ctrl_hit_override)). **T015** adds the screen
+    /// effects `EnvShake` / `EnvColor`, `RemapPal`, the clipboard trio
+    /// (`DisplayToClipboard` / `AppendToClipboard` / `ClearClipboard`),
+    /// `VictoryQuote`, `PosFreeze`, `Trans`, the draw-angle family (`AngleSet` /
+    /// `AngleAdd` / `AngleMul` / `AngleDraw`), and the self-life writes `LifeAdd` /
+    /// `LifeSet`.
+    ///
+    /// An unhandled type is split: a documented MUGEN controller blocked on an
+    /// unbuilt subsystem (see [`is_tracked_deferred_controller`]) is a
+    /// **`warn!`-logged** tracked no-op; a genuinely unrecognized token is a
+    /// **`debug!`-logged** safe no-op. Either way the dispatch never panics.
     fn dispatch(
         &mut self,
         states: &HashMap<i32, CompiledState>,
@@ -1120,10 +1165,59 @@ impl Character {
             self.ctrl_afterimage(ctrl, env);
         } else if kind.eq_ignore_ascii_case("AfterImageTime") {
             self.ctrl_afterimage_time(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("EnvShake") {
+            self.ctrl_env_shake(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("EnvColor") {
+            self.ctrl_env_color(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("RemapPal") {
+            self.ctrl_remap_pal(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("DisplayToClipboard") {
+            self.ctrl_clipboard(ctrl, ClipboardMode::Display);
+        } else if kind.eq_ignore_ascii_case("AppendToClipboard") {
+            self.ctrl_clipboard(ctrl, ClipboardMode::Append);
+        } else if kind.eq_ignore_ascii_case("ClearClipboard") {
+            self.clipboard.clear();
+        } else if kind.eq_ignore_ascii_case("VictoryQuote") {
+            self.ctrl_victory_quote(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("PosFreeze") {
+            self.ctrl_pos_freeze(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("Trans") {
+            self.ctrl_trans(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AngleSet") {
+            self.ctrl_angle_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AngleAdd") {
+            self.ctrl_angle_add(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AngleMul") {
+            self.ctrl_angle_mul(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("AngleDraw") {
+            self.ctrl_angle_draw(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("LifeAdd") {
+            self.ctrl_life_add(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("LifeSet") {
+            self.ctrl_life_set(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("Gravity") {
+            self.ctrl_gravity();
+        } else if kind.eq_ignore_ascii_case("VarRandom") {
+            self.ctrl_var_random(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("MoveHitReset") {
+            self.ctrl_move_hit_reset();
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
+        } else if is_tracked_deferred_controller(kind) {
+            // A documented MUGEN controller that this engine cannot yet faithfully
+            // run because it depends on an unbuilt subsystem (helpers, explods,
+            // projectiles, multi-entity redirects, the background/stage owner, or
+            // the full PalFX modulation). Tracked to a named, WARN-logged no-op
+            // (NOT the silent debug fall-through below) so the gap is visible and
+            // attributable to its blocking task. See `is_tracked_deferred_controller`.
+            tracing::warn!(
+                "tick: controller {kind:?} in state {} is recognized but deferred \
+                 (blocked on an unbuilt subsystem; see T007-T014)",
+                ctrl.state_number
+            );
         } else {
-            // Unrecognized in this task → safe no-op, deferred to a later task.
+            // Genuinely unrecognized type (a typo or a non-MUGEN extension) → safe
+            // no-op, debug-logged.
             tracing::debug!(
                 "tick: unhandled controller type {kind:?} in state {} (deferred)",
                 ctrl.state_number
@@ -2379,6 +2473,366 @@ impl Character {
         // No active trail → nothing to re-arm (matches MUGEN).
     }
 
+    /// `EnvShake`: arm the camera shake (T015).
+    ///
+    /// MUGEN's `EnvShake` shakes the whole screen for `time` ticks. Parameters:
+    /// `time` (duration, required — a non-positive `time` disarms), `freq`
+    /// (`0..180`, default `60`), `ampl` (vertical amplitude in pixels, default
+    /// `-4`), and `phase` (degrees, default `0`). We arm [`Character::env_shake`]
+    /// for the renderer to consume (the camera offset is a presentation concern
+    /// owned by `fp-app`); the executor only counts the window down. Missing
+    /// optional params fall back to the MUGEN defaults. Never panics.
+    fn ctrl_env_shake(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        if time <= 0 {
+            self.env_shake = EnvShake::INACTIVE;
+            return;
+        }
+        let freq = ctrl
+            .params
+            .get("freq")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(60.0, |v| v.to_float().clamp(0.0, 180.0));
+        let ampl = ctrl
+            .params
+            .get("ampl")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(-4.0, |v| v.to_float());
+        let phase = ctrl
+            .params
+            .get("phase")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0.0, |v| v.to_float());
+        self.env_shake = EnvShake {
+            time,
+            freq,
+            ampl,
+            phase,
+        };
+    }
+
+    /// `EnvColor`: arm the full-screen color flash (T015).
+    ///
+    /// MUGEN's `EnvColor` fills the screen with a solid color for `time` ticks
+    /// (the super-flash white-out). Parameters: `value = r,g,b` (default white
+    /// `255,255,255`), `time` (default `1`; `-1` = "persist until cleared",
+    /// represented faithfully by the [`EnvColor::PERSISTENT`] sentinel — it never
+    /// counts down and only an explicit `time = 0` ends it), and `under` (0/1,
+    /// draw under the characters; default `0`). A `time = 0` clears any active
+    /// fill. We arm
+    /// [`Character::env_color`] for the renderer to fill the screen; the executor
+    /// only counts the window down. Never panics.
+    fn ctrl_env_color(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(1, |v| v.to_int());
+        if time == 0 {
+            self.env_color = EnvColor::INACTIVE;
+            return;
+        }
+        // MUGEN `time = -1` means "persist until explicitly cleared". Represent
+        // it faithfully with the PERSISTENT sentinel (it never counts down; only a
+        // `time = 0` EnvColor clears it), rather than a long-but-finite window.
+        let remaining = if time < 0 {
+            EnvColor::PERSISTENT
+        } else {
+            time
+        };
+        // `value = r,g,b` on a 0..255 scale; default white. Each channel clamps.
+        let rgb = self.read_rgb_triple(ctrl, "value", env, 255.0, 1.0);
+        let col = [
+            rgb[0].round().clamp(0.0, 255.0) as u8,
+            rgb[1].round().clamp(0.0, 255.0) as u8,
+            rgb[2].round().clamp(0.0, 255.0) as u8,
+        ];
+        let under = ctrl
+            .params
+            .get("under")
+            .and_then(|p| self.eval_param(p, env))
+            .is_some_and(|v| v.as_bool());
+        self.env_color = EnvColor {
+            time: remaining,
+            col,
+            under,
+        };
+    }
+
+    /// `RemapPal`: select an alternate `(group, item)` palette (T015).
+    ///
+    /// MUGEN's `RemapPal source = sg, si` `dest = dg, di` swaps the character's
+    /// palette to a different table entry mid-match (alternate costume colors). A
+    /// `dest` of `(-1, -1)` restores the default palette. We store the selection on
+    /// [`Character::remap_pal`] for the renderer to resolve against the loaded
+    /// palettes; the pixels themselves live on the static `LoadedCharacter`. A
+    /// missing `dest` is treated as "restore default". Never panics.
+    fn ctrl_remap_pal(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let read_pair = |me: &Self, key: &str| -> Option<(i32, i32)> {
+            let param = ctrl.params.get(key)?;
+            let g = me.eval_param_component(param, 0, env)?.to_int();
+            let i = me.eval_param_component(param, 1, env)?.to_int();
+            Some((g, i))
+        };
+        let source = read_pair(self, "source");
+        let dest = match read_pair(self, "dest") {
+            // MUGEN's `(-1, -1)` dest means "restore the default palette".
+            Some((-1, -1)) | None => None,
+            other => other,
+        };
+        self.remap_pal = crate::RemapPal { source, dest };
+    }
+
+    /// `DisplayToClipboard` / `AppendToClipboard`: set or extend the debug
+    /// clipboard text (T015).
+    ///
+    /// MUGEN's clipboard is a debug-overlay string. The `text` parameter is a
+    /// printf-style format string (`"foo %d"`) plus `params = ...` arguments; we do
+    /// not run the format engine, so we store the raw format text (stripped of its
+    /// surrounding quotes) verbatim. `Display` replaces the clipboard, `Append`
+    /// concatenates. A missing `text` is a safe no-op for `Append` and clears for
+    /// `Display` (matching MUGEN's empty-format behaviour). Never panics.
+    fn ctrl_clipboard(&mut self, ctrl: &CompiledController, mode: ClipboardMode) {
+        let text = raw_param(ctrl, "text")
+            .map(strip_quotes)
+            .unwrap_or_default()
+            .to_string();
+        match mode {
+            ClipboardMode::Display => self.clipboard = text,
+            ClipboardMode::Append => self.clipboard.push_str(&text),
+        }
+    }
+
+    /// `VictoryQuote`: select which win quote to show (T015).
+    ///
+    /// MUGEN's `VictoryQuote value = n` selects victory quote `n` (`-1` = random).
+    /// We store the selection on [`Character::victory_quote`] for the win-screen
+    /// presenter to read. A missing `value` is a safe no-op (leaves the previous
+    /// selection). Never panics.
+    fn ctrl_victory_quote(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            self.victory_quote = Some(v.to_int());
+        }
+    }
+
+    /// `PosFreeze`: hold the character's position for this tick (T015).
+    ///
+    /// MUGEN's `PosFreeze` (optional `value`, default `1`/true) skips the position
+    /// integration for the tick it fires — used by charge / hit-flash effects.
+    /// Sets the per-tick [`Character::pos_frozen`] flag (cleared at the top of each
+    /// tick); the executor skips `integrate_position` while it is set. A `value`
+    /// evaluating to false leaves the position free. Never panics.
+    fn ctrl_pos_freeze(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let on = ctrl
+            .params
+            .get("value")
+            .and_then(|p| self.eval_param(p, env))
+            .is_none_or(|v| v.as_bool());
+        self.pos_frozen = on;
+    }
+
+    /// `Trans`: select the sprite blend mode for this tick (T015).
+    ///
+    /// MUGEN's `Trans trans = none|add|add1|sub|addalpha` sets how the sprite is
+    /// composited for the tick it fires (cleared each tick like `AssertSpecial`).
+    /// `addalpha` also reads `alpha = src, dst` (0..256). We store the selection on
+    /// [`Character::cur_trans`] for the renderer to pick a blend pipeline. A
+    /// missing / unknown `trans` is a safe no-op (opaque default). Never panics.
+    fn ctrl_trans(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(mode) = raw_param(ctrl, "trans") else {
+            tracing::debug!(
+                "tick: Trans in state {} had no `trans`; no-op",
+                ctrl.state_number
+            );
+            return;
+        };
+        let mode = mode.trim();
+        let trans = if mode.eq_ignore_ascii_case("none") {
+            TransMode::None
+        } else if mode.eq_ignore_ascii_case("add") {
+            TransMode::Add
+        } else if mode.eq_ignore_ascii_case("add1") {
+            TransMode::Add1
+        } else if mode.eq_ignore_ascii_case("sub") {
+            TransMode::Sub
+        } else if mode.eq_ignore_ascii_case("addalpha") || mode.eq_ignore_ascii_case("alpha") {
+            // `alpha = src, dst` on a 0..256 scale; default fully opaque source.
+            let alpha = ctrl.params.get("alpha");
+            let src = alpha
+                .and_then(|p| self.eval_param_component(p, 0, env))
+                .map_or(256, |v| v.to_int())
+                .clamp(0, 256);
+            let dst = alpha
+                .and_then(|p| self.eval_param_component(p, 1, env))
+                .map_or(0, |v| v.to_int())
+                .clamp(0, 256);
+            TransMode::AddAlpha { src, dst }
+        } else {
+            tracing::debug!(
+                "tick: Trans in state {} had unknown trans {mode:?}; no-op",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.cur_trans = Some(trans);
+    }
+
+    /// `AngleSet`: set the sprite draw angle (T015).
+    ///
+    /// MUGEN's `AngleSet value = deg` sets the draw angle (degrees) used by a
+    /// following `AngleDraw`. Stores onto [`Character::draw_angle`]`.angle`
+    /// (persistent — survives the tick); a missing `value` is a safe no-op. Never
+    /// panics.
+    fn ctrl_angle_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            self.draw_angle.angle = v.to_float();
+        }
+    }
+
+    /// `AngleAdd`: add to the sprite draw angle (T015). See [`ctrl_angle_set`](Self::ctrl_angle_set).
+    fn ctrl_angle_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            self.draw_angle.angle += v.to_float();
+        }
+    }
+
+    /// `AngleMul`: multiply the sprite draw angle (T015). See [`ctrl_angle_set`](Self::ctrl_angle_set).
+    fn ctrl_angle_mul(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            self.draw_angle.angle *= v.to_float();
+        }
+    }
+
+    /// `AngleDraw`: arm a rotated sprite draw for this tick (T015).
+    ///
+    /// MUGEN's `AngleDraw` draws the current frame rotated by the angle set with
+    /// `AngleSet`/`AngleAdd` (or by its own optional `value`, which overrides for
+    /// this tick). Sets the per-tick [`Character::draw_angle`]`.active` arm flag
+    /// (cleared at the top of each tick) so the renderer rotates the sprite this
+    /// frame only. (The optional `scale = x, y` is a render concern not modeled
+    /// here.) Never panics.
+    fn ctrl_angle_draw(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        if let Some(v) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) {
+            self.draw_angle.angle = v.to_float();
+        }
+        self.draw_angle.active = true;
+    }
+
+    /// `LifeAdd`: add `value` to this character's own life (T015).
+    ///
+    /// MUGEN's `LifeAdd value = n` adds `n` to the player's own life (negative =
+    /// self-damage; positive = heal), clamped to `[0, life_max]`. The `kill = 0`
+    /// flag forbids a fatal result (life floors at `1` instead of `0`); `kill`
+    /// defaults to `1` (a `LifeAdd` *may* kill). The `absolute` flag (ignore the
+    /// defence multiplier) is accepted but the multiplier is not re-applied here —
+    /// `LifeAdd` is a direct life write, distinct from hit damage. A missing
+    /// `value` is a safe no-op. Never panics.
+    fn ctrl_life_add(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: LifeAdd in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        let kill = ctrl
+            .params
+            .get("kill")
+            .and_then(|p| self.eval_param(p, env))
+            .is_none_or(|v| v.as_bool());
+        let floor = if kill { 0 } else { 1 };
+        // Saturating add: an authored oversized `life`/`life_max` plus a large
+        // `value` must never overflow i32 and panic — the engine never panics on
+        // bad content. Mirrors `fp-engine`'s `TargetLifeAdd` apply.
+        self.life = self
+            .life
+            .saturating_add(value.to_int())
+            .clamp(floor, self.life_max);
+    }
+
+    /// `LifeSet`: set this character's own life directly (T015).
+    ///
+    /// MUGEN's `LifeSet value = n` sets the player's life to `n`, clamped to
+    /// `[0, life_max]`. A missing `value` is a safe no-op. Never panics.
+    fn ctrl_life_set(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(value) = ctrl.params.get("value").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: LifeSet in state {} has no `value`; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        self.life = value.to_int().clamp(0, self.life_max);
+    }
+
+    /// `Gravity`: apply this character's gravity acceleration to `vel.y` for one
+    /// tick (T015).
+    ///
+    /// MUGEN's `Gravity` adds the character's `[Movement] yaccel` constant to the
+    /// downward velocity, independent of the statedef `physics`. Authors use it
+    /// inside custom (e.g. thrown / get-hit) states where `physics = N` so the
+    /// engine's automatic air gravity is off but they still want the body to fall.
+    /// This is a pure self-velocity write requiring no other subsystem. Since `Y`
+    /// increases downward, gravity is a positive addition. Never panics.
+    fn ctrl_gravity(&mut self) {
+        self.vel.y += self.constants.movement.yaccel;
+    }
+
+    /// `MoveHitReset`: clear this character's own move-connection flags (T015).
+    ///
+    /// MUGEN's `MoveHitReset` resets `MoveContact`/`MoveHit`/`MoveGuarded` to `0`
+    /// (and re-arms a `hitonce` move to connect again), without starting a new
+    /// `HitDef`. Routes through [`MoveConnect::reset`](crate::MoveConnect::reset),
+    /// the same path a fresh `HitDef` uses. Self-contained; never panics.
+    fn ctrl_move_hit_reset(&mut self) {
+        self.move_connect.reset();
+    }
+
+    /// `VarRandom`: set an integer variable to a bounded random value (T015).
+    ///
+    /// MUGEN's `VarRandom v = i, range = a, b` sets `var(i)` to a uniformly random
+    /// integer in the inclusive `[a, b]` range (a single `range = n` means
+    /// `[0, n]`; an absent `range` defaults to MUGEN's `[0, 1000]`). `VarRandom`
+    /// only targets the **integer** `var(...)` bank (never `fvar`). The draw uses
+    /// this character's own deterministic RNG seam (`draw_random` →
+    /// [`fp_vm::Rng`]), so it stays replay-deterministic and matches the `random`
+    /// trigger. A missing `v` index or out-of-range index is a safe no-op. Never
+    /// panics.
+    fn ctrl_var_random(&mut self, ctrl: &CompiledController, env: EvalEnv) {
+        let Some(index) = ctrl.params.get("v").and_then(|p| self.eval_param(p, env)) else {
+            tracing::debug!(
+                "tick: VarRandom in state {} has no `v` index; ignored",
+                ctrl.state_number
+            );
+            return;
+        };
+        // `range` is one or two components. One → [0, n]; two → [lo, hi]. Absent →
+        // MUGEN's default [0, 1000].
+        let range = ctrl.params.get("range");
+        let (lo, hi) = match range {
+            Some(p) => {
+                let first = self.eval_param_component(p, 0, env).map(|v| v.to_int());
+                let second = self.eval_param_component(p, 1, env).map(|v| v.to_int());
+                match (first, second) {
+                    (Some(lo), Some(hi)) => (lo, hi),
+                    (Some(n), None) => (0, n),
+                    _ => (0, 1000),
+                }
+            }
+            None => (0, 1000),
+        };
+        // Inclusive [lo, hi] (swap if reversed), mirroring `fp_vm::Rng::next_range`.
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        let span = (hi as i64) - (lo as i64) + 1; // >= 1, never zero
+        let raw = self.draw_random() as i64; // 1..=2^31-2, non-negative
+        let drawn = (lo as i64 + raw.rem_euclid(span)) as i32;
+        self.assign_var(VarBank::Int, index.to_int(), Value::Int(drawn));
+    }
+
     /// Reads an `r,g,b` triple parameter for a color effect, normalizing each
     /// **present** component by `scale` and defaulting a missing component to
     /// `default`.
@@ -2854,6 +3308,13 @@ impl Character {
     /// `VelSet`/`PosSet` to settle. Upward motion (negative Y) is unaffected by
     /// `min(_, 0)`, and a grounded character already at `GROUND_Y` is unchanged.
     fn integrate_position(&mut self) {
+        // `PosFreeze` (T015) holds the position for this tick: MUGEN skips the
+        // position update entirely while frozen (velocity and the ground clamp are
+        // left for the next, unfrozen, tick), so the sprite stays put for charge /
+        // hit-flash effects.
+        if self.pos_frozen {
+            return;
+        }
         self.pos.x += self.vel.x * self.facing.sign() as f32;
         self.pos.y += self.vel.y;
         // Hold at the floor: clamp position only, never velocity, so the
@@ -3064,6 +3525,111 @@ fn raw_param<'a>(ctrl: &'a CompiledController, key: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.raw())
+}
+
+/// Which clipboard write a `*ToClipboard` controller performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardMode {
+    /// `DisplayToClipboard`: replace the clipboard text.
+    Display,
+    /// `AppendToClipboard`: concatenate onto the clipboard text.
+    Append,
+}
+
+/// Strips a single pair of surrounding double quotes from a raw parameter value,
+/// trimming surrounding whitespace first. Used for the `*ToClipboard` `text`
+/// format string, which CNS authors as a quoted literal. A value without
+/// surrounding quotes is returned trimmed but otherwise unchanged.
+fn strip_quotes(raw: &str) -> &str {
+    let t = raw.trim();
+    t.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(t)
+}
+
+/// Returns `true` for a **documented MUGEN controller** that this engine
+/// recognizes but cannot yet faithfully run because it depends on a subsystem
+/// that has not been built (and is tracked by an open task). Such a controller is
+/// routed to a named, `WARN`-logged no-op in [`Character::dispatch`] rather than
+/// the silent `debug!` fall-through, so the coverage gap is **visible and
+/// attributable** — satisfying T015's "no documented controller silently no-ops
+/// without a tracked reason".
+///
+/// The blocking subsystems (and their tasks):
+///
+/// - **Helpers / explods / projectiles** (`Helper`, `DestroySelf`, `Explod`,
+///   `ModifyExplod`, `RemoveExplod`, `Projectile`, `BindToParent`,
+///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — the multi-entity slot-map
+///   (T012/T013) does not exist yet, so there is no child entity to spawn or
+///   address.
+/// - **Target/partner redirects beyond the flat 1-v-1** (`BindToTarget`) — T014.
+/// - **Stage/background ownership** (`BGPalFX`) — the background lives in
+///   `fp-stage`/`fp-app`, not on a `Character`, so a per-character tick cannot
+///   tint it.
+/// - **The full afterimage/PalFX modulation engine** (`AllPalFX`) — T008 owns
+///   the global PalFX path; a per-character no-op here is the safe placeholder.
+/// - **Cosmetic engine effects with no model yet** (`ForceFeedback`, `MakeDust`,
+///   `GameMakeAnim`, `SndPan`, `StopSnd`, `Offset`, `PlayerPush`) — these need a
+///   render/audio/engine seam that is out of `fp-character`'s scope.
+/// - **Reversal / camera-bound / fall screen-shake** (`ReversalDef`,
+///   `ScreenBound`, `FallEnvShake`) — `ReversalDef` needs the reversal/hit
+///   primitive, `ScreenBound` needs the camera/stage-bounds subsystem, and
+///   `FallEnvShake` needs the get-hit fall-state env-shake wiring (the EnvShake
+///   render path is itself a renderer follow-up).
+///
+/// Conversely, controllers that are a pure self-field write requiring no missing
+/// subsystem are **implemented**, not deferred (T015): `Gravity` (adds `yaccel`
+/// to `vel.y`), `VarRandom` (writes a bounded random into the int var bank), and
+/// `MoveHitReset` (clears the move-connection flags).
+fn is_tracked_deferred_controller(kind: &str) -> bool {
+    const DEFERRED: &[&str] = &[
+        // Multi-entity (helpers / explods / projectiles) — T012/T013.
+        "Helper",
+        "DestroySelf",
+        "Explod",
+        "ModifyExplod",
+        "RemoveExplod",
+        "ExplodBindTime",
+        "Projectile",
+        "BindToParent",
+        "BindToRoot",
+        "BindToTarget",
+        "ParentVarSet",
+        "ParentVarAdd",
+        // Stage/background owner — not on a Character.
+        "BGPalFX",
+        // Global PalFX modulation engine — T008.
+        "AllPalFX",
+        // Cosmetic engine effects with no model in fp-character yet.
+        "ForceFeedback",
+        "MakeDust",
+        "GameMakeAnim",
+        "SndPan",
+        "StopSnd",
+        "Offset",
+        "PlayerPush",
+        // Reversal detection (a HitDef-like primitive for catching the opponent's
+        // attack) — blocked on the reversal/hit subsystem.
+        "ReversalDef",
+        // Camera-bound clamping (whether the player may leave the screen and how
+        // the camera follows) — blocked on the camera/stage-bounds subsystem.
+        "ScreenBound",
+        // Fires the get-hit `fall.envshake` screen shake — blocked on the
+        // fall-state env-shake wiring (the EnvShake render path is itself a
+        // renderer follow-up).
+        "FallEnvShake",
+        // Operate on the target / projectile / helper entity graph — blocked on
+        // the multi-entity slot-map + Target/Projectile/helper redirect
+        // resolution (T013/T014). `HitAdd` adds to the combo/hit counter the
+        // current move has scored on the *target*; `AttackDist` overrides the
+        // guard distance of an *active HitDef / projectile*; `TargetDrop`
+        // releases entities currently bound as this player's *targets*. None can
+        // be implemented faithfully until that entity graph exists.
+        "HitAdd",
+        "AttackDist",
+        "TargetDrop",
+    ];
+    DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(kind))
 }
 
 /// Returns `true` if `label` is one of the engine-built-in stand↔walk locomotion
@@ -11060,6 +11626,472 @@ mod tests {
         // Hit-paused tick: the color-effect timers must be unchanged.
         assert_eq!(ch.cur_palfx.remaining, 5, "PalFX held during hitpause");
         assert_eq!(ch.afterimage.time, 8, "AfterImage held during hitpause");
+    }
+
+    // ---- T015: state-controller coverage gaps -----------------------------
+    //
+    // Each test below fires exactly one newly-handled controller (gated to fire
+    // only on the first tick via `Time = 0`) and asserts its observable effect on
+    // the `Character`. The countdown for the timed effects (`EnvShake`,
+    // `EnvColor`) runs *before* the controllers, so the firing tick sets the
+    // duration without decrementing it.
+
+    /// Convenience: a one-state Synth whose state 0 runs a single controller of
+    /// `kind` (gated to `Time = 0`, so it fires only the first tick) with `params`.
+    fn one_ctrl_synth(kind: &str, params: &[(&str, &str)]) -> Synth {
+        let c = ctrl(0, kind, &[], &[(1, &["Time = 0"])], None, params);
+        loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[30]))
+    }
+
+    /// `EnvShake` arms the camera shake with the given duration / freq / ampl /
+    /// phase, and the effect counts down each tick to expiry.
+    #[test]
+    fn envshake_arms_and_counts_down() {
+        let lc = one_ctrl_synth(
+            "EnvShake",
+            &[("time", "2"), ("freq", "90"), ("ampl", "8"), ("phase", "45")],
+        );
+        let mut ch = Character::new();
+        assert!(!ch.env_shake.is_active(), "no shake initially");
+        lc.tick(&mut ch); // fires; time = 2 (no decrement this tick)
+        assert!(ch.env_shake.is_active(), "EnvShake armed");
+        assert_eq!(ch.env_shake.time, 2);
+        assert_eq!(ch.env_shake.freq, 90.0);
+        assert_eq!(ch.env_shake.ampl, 8.0);
+        assert_eq!(ch.env_shake.phase, 45.0);
+        lc.tick(&mut ch); // 2 → 1 (controller no longer fires, Time != 0)
+        assert_eq!(ch.env_shake.time, 1);
+        lc.tick(&mut ch); // 1 → 0, expires
+        assert!(!ch.env_shake.is_active(), "EnvShake expired");
+    }
+
+    /// `EnvShake` with a non-positive `time` disarms (and uses MUGEN defaults for
+    /// the missing optional params when it would arm).
+    #[test]
+    fn envshake_zero_time_disarms_and_defaults() {
+        let lc = one_ctrl_synth("EnvShake", &[("time", "0")]);
+        let mut ch = Character::new();
+        ch.env_shake = crate::EnvShake { time: 9, freq: 1.0, ampl: 1.0, phase: 1.0 };
+        lc.tick(&mut ch);
+        assert!(!ch.env_shake.is_active(), "zero-time EnvShake disarmed");
+
+        // A bare `time` arms with the documented MUGEN defaults.
+        let lc2 = one_ctrl_synth("EnvShake", &[("time", "4")]);
+        let mut ch2 = Character::new();
+        lc2.tick(&mut ch2);
+        assert_eq!(ch2.env_shake.time, 4);
+        assert_eq!(ch2.env_shake.freq, 60.0, "default freq");
+        assert_eq!(ch2.env_shake.ampl, -4.0, "default ampl");
+        assert_eq!(ch2.env_shake.phase, 0.0, "default phase");
+    }
+
+    /// `EnvColor` arms a full-screen fill with the given color / under flag, and
+    /// counts down to expiry.
+    #[test]
+    fn envcolor_arms_color_and_under() {
+        let lc = one_ctrl_synth(
+            "EnvColor",
+            &[("value", "10,20,30"), ("time", "2"), ("under", "1")],
+        );
+        let mut ch = Character::new();
+        assert!(!ch.env_color.is_active(), "no fill initially");
+        lc.tick(&mut ch);
+        assert!(ch.env_color.is_active(), "EnvColor armed");
+        assert_eq!(ch.env_color.col, [10, 20, 30]);
+        assert!(ch.env_color.under, "under flag honored");
+        assert_eq!(ch.env_color.time, 2);
+        lc.tick(&mut ch);
+        assert_eq!(ch.env_color.time, 1);
+        lc.tick(&mut ch);
+        assert!(!ch.env_color.is_active(), "EnvColor expired");
+    }
+
+    /// `EnvColor` defaults to opaque white drawn over everything, and `time = -1`
+    /// is a faithful "persist until cleared" fill (it does NOT count down) while
+    /// `time = 0` clears.
+    #[test]
+    fn envcolor_defaults_and_until_cleared() {
+        let lc = one_ctrl_synth("EnvColor", &[("time", "1")]);
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert_eq!(ch.env_color.col, [255, 255, 255], "default white");
+        assert!(!ch.env_color.under, "default draws over");
+
+        // `time = -1` arms a PERSISTENT fill: active, held at the sentinel, and
+        // unchanged by further ticks (only an explicit clear ends it). This is the
+        // faithful MUGEN semantics — no long-but-finite window that silently expires.
+        let lc_forever = one_ctrl_synth("EnvColor", &[("time", "-1")]);
+        let mut ch2 = Character::new();
+        lc_forever.tick(&mut ch2);
+        assert!(ch2.env_color.is_active(), "time=-1 armed an active fill");
+        assert_eq!(
+            ch2.env_color.time,
+            crate::EnvColor::PERSISTENT,
+            "time=-1 stored as the PERSISTENT sentinel"
+        );
+        // Many idle ticks (an empty-ctrl statedef) must NOT decrement a persistent
+        // fill — it stays active forever until cleared.
+        let idle = one_ctrl_synth("Null", &[]);
+        for _ in 0..1000 {
+            idle.tick(&mut ch2);
+        }
+        assert!(
+            ch2.env_color.is_active(),
+            "persistent fill survives 1000 ticks"
+        );
+        assert_eq!(ch2.env_color.time, crate::EnvColor::PERSISTENT);
+
+        let lc_clear = one_ctrl_synth("EnvColor", &[("time", "0")]);
+        let mut ch3 = Character::new();
+        ch3.env_color = crate::EnvColor { time: 5, col: [1, 2, 3], under: true };
+        lc_clear.tick(&mut ch3);
+        assert!(!ch3.env_color.is_active(), "time=0 cleared the fill");
+
+        // A persistent fill is likewise cleared by an explicit `time = 0`.
+        let mut ch4 = Character::new();
+        ch4.env_color = crate::EnvColor {
+            time: crate::EnvColor::PERSISTENT,
+            col: [9, 9, 9],
+            under: false,
+        };
+        assert!(ch4.env_color.is_active(), "persistent fill is active");
+        lc_clear.tick(&mut ch4);
+        assert!(
+            !ch4.env_color.is_active(),
+            "time=0 clears even a persistent fill"
+        );
+    }
+
+    /// `RemapPal` selects a `(group,item)` palette swap; a `(-1,-1)` dest restores
+    /// the default.
+    #[test]
+    fn remappal_selects_and_restores() {
+        let lc = one_ctrl_synth("RemapPal", &[("source", "1,0"), ("dest", "1,3")]);
+        let mut ch = Character::new();
+        assert!(!ch.remap_pal.is_active(), "no remap initially");
+        lc.tick(&mut ch);
+        assert_eq!(ch.remap_pal.source, Some((1, 0)));
+        assert_eq!(ch.remap_pal.dest, Some((1, 3)));
+        assert!(ch.remap_pal.is_active());
+
+        let lc_restore = one_ctrl_synth("RemapPal", &[("source", "1,0"), ("dest", "-1,-1")]);
+        let mut ch2 = Character::new();
+        ch2.remap_pal = crate::RemapPal { source: Some((1, 0)), dest: Some((1, 3)) };
+        lc_restore.tick(&mut ch2);
+        assert_eq!(ch2.remap_pal.dest, None, "(-1,-1) restores the default");
+        assert!(!ch2.remap_pal.is_active());
+    }
+
+    /// `DisplayToClipboard` sets the debug clipboard (stripping the format quotes);
+    /// `AppendToClipboard` concatenates; `ClearClipboard` empties it.
+    #[test]
+    fn clipboard_display_append_clear() {
+        let lc = one_ctrl_synth("DisplayToClipboard", &[("text", "\"hello\"")]);
+        let mut ch = Character::new();
+        lc.tick(&mut ch);
+        assert_eq!(ch.clipboard, "hello", "Display set the clipboard, quotes stripped");
+
+        let lc_app = one_ctrl_synth("AppendToClipboard", &[("text", "\" world\"")]);
+        // Reuse `ch`'s clipboard by seeding a fresh character.
+        let mut ch2 = Character::new();
+        ch2.clipboard = "hello".to_string();
+        lc_app.tick(&mut ch2);
+        assert_eq!(ch2.clipboard, "hello world", "Append concatenated");
+
+        let lc_clear = one_ctrl_synth("ClearClipboard", &[]);
+        let mut ch3 = Character::new();
+        ch3.clipboard = "stale".to_string();
+        lc_clear.tick(&mut ch3);
+        assert!(ch3.clipboard.is_empty(), "ClearClipboard emptied it");
+    }
+
+    /// `VictoryQuote` records the selected quote index.
+    #[test]
+    fn victoryquote_records_selection() {
+        let lc = one_ctrl_synth("VictoryQuote", &[("value", "3")]);
+        let mut ch = Character::new();
+        assert_eq!(ch.victory_quote, None, "no quote selected initially");
+        lc.tick(&mut ch);
+        assert_eq!(ch.victory_quote, Some(3));
+
+        // `-1` (random) is stored verbatim for a host to interpret.
+        let lc_rand = one_ctrl_synth("VictoryQuote", &[("value", "-1")]);
+        let mut ch2 = Character::new();
+        lc_rand.tick(&mut ch2);
+        assert_eq!(ch2.victory_quote, Some(-1));
+    }
+
+    /// `PosFreeze` holds the character's position for the tick it fires (skips
+    /// integration), and is a per-tick flag (clears the following tick).
+    #[test]
+    fn posfreeze_holds_position_for_one_tick() {
+        // A char with rightward velocity. With PosFreeze on tick 1 the position
+        // must not advance; on tick 2 (controller no longer fires) it advances.
+        let lc = one_ctrl_synth("PosFreeze", &[]);
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.vel = Vec2::new(5.0, 0.0);
+        ch.facing = Facing::Right;
+        let x0 = ch.pos.x;
+        lc.tick(&mut ch); // PosFreeze fires (Time = 0) → position held
+        assert_eq!(ch.pos.x, x0, "PosFreeze held the position this tick");
+        assert!(ch.pos_frozen, "pos_frozen set by the firing tick");
+        lc.tick(&mut ch); // top-of-tick clears the flag; Time != 0 → no re-fire
+        assert!(!ch.pos_frozen, "pos_frozen cleared at the top of the next tick");
+        assert!(ch.pos.x > x0, "position advanced once unfrozen");
+    }
+
+    /// `Trans` selects the sprite blend mode for the tick it fires, and is a
+    /// per-tick override (cleared the next tick).
+    #[test]
+    fn trans_selects_blend_for_one_tick() {
+        let lc = one_ctrl_synth("Trans", &[("trans", "add")]);
+        let mut ch = Character::new();
+        assert_eq!(ch.cur_trans, None, "no blend override initially");
+        lc.tick(&mut ch);
+        assert_eq!(ch.cur_trans, Some(crate::TransMode::Add), "set by the firing tick");
+        lc.tick(&mut ch); // top-of-tick clears it; Time != 0 → no re-fire
+        assert_eq!(ch.cur_trans, None, "Trans override cleared at the top of the next tick");
+
+        // `addalpha` reads the `alpha = src, dst` pair.
+        let lc_alpha = one_ctrl_synth("Trans", &[("trans", "addalpha"), ("alpha", "200,56")]);
+        let mut ch2 = Character::new();
+        lc_alpha.tick(&mut ch2);
+        assert_eq!(ch2.cur_trans, Some(crate::TransMode::AddAlpha { src: 200, dst: 56 }));
+    }
+
+    /// `AngleSet` / `AngleAdd` / `AngleMul` mutate the persistent draw angle;
+    /// `AngleDraw` arms a rotated draw for the tick (and may override the angle).
+    #[test]
+    fn angle_controllers_set_and_draw() {
+        let lc_set = one_ctrl_synth("AngleSet", &[("value", "30")]);
+        let mut ch = Character::new();
+        lc_set.tick(&mut ch);
+        assert_eq!(ch.draw_angle.angle, 30.0, "AngleSet set the angle");
+        assert!(!ch.draw_angle.active, "AngleSet does not arm a draw");
+
+        let lc_add = one_ctrl_synth("AngleAdd", &[("value", "15")]);
+        let mut ch2 = Character::new();
+        ch2.draw_angle.angle = 30.0;
+        lc_add.tick(&mut ch2);
+        assert_eq!(ch2.draw_angle.angle, 45.0, "AngleAdd added");
+
+        let lc_mul = one_ctrl_synth("AngleMul", &[("value", "2")]);
+        let mut ch3 = Character::new();
+        ch3.draw_angle.angle = 20.0;
+        lc_mul.tick(&mut ch3);
+        assert_eq!(ch3.draw_angle.angle, 40.0, "AngleMul multiplied");
+
+        // AngleDraw with an explicit value overrides the angle and arms the draw
+        // for this tick only.
+        let lc_draw = one_ctrl_synth("AngleDraw", &[("value", "90")]);
+        let mut ch4 = Character::new();
+        lc_draw.tick(&mut ch4);
+        assert_eq!(ch4.draw_angle.angle, 90.0);
+        assert!(ch4.draw_angle.active, "AngleDraw armed a rotated draw this tick");
+        lc_draw.tick(&mut ch4); // top-of-tick clears the arm; Time != 0 → no re-fire
+        assert!(!ch4.draw_angle.active, "AngleDraw arm cleared at the top of the next tick");
+        assert_eq!(ch4.draw_angle.angle, 90.0, "the angle itself persists");
+    }
+
+    /// `LifeAdd` adds (heals / self-damages) within `[0, life_max]`; `kill = 0`
+    /// floors at 1 instead of 0.
+    #[test]
+    fn lifeadd_heals_damages_and_respects_kill() {
+        // Heal, clamped to life_max.
+        let lc_heal = one_ctrl_synth("LifeAdd", &[("value", "50")]);
+        let mut ch = Character::new();
+        ch.life_max = 100;
+        ch.life = 80;
+        lc_heal.tick(&mut ch);
+        assert_eq!(ch.life, 100, "heal clamped to life_max");
+
+        // Lethal self-damage with default kill (kill = 1) reaches 0.
+        let lc_kill = one_ctrl_synth("LifeAdd", &[("value", "-200")]);
+        let mut ch2 = Character::new();
+        ch2.life_max = 100;
+        ch2.life = 80;
+        lc_kill.tick(&mut ch2);
+        assert_eq!(ch2.life, 0, "default LifeAdd may kill");
+
+        // Same damage with kill = 0 floors at 1.
+        let lc_nokill = one_ctrl_synth("LifeAdd", &[("value", "-200"), ("kill", "0")]);
+        let mut ch3 = Character::new();
+        ch3.life_max = 100;
+        ch3.life = 80;
+        lc_nokill.tick(&mut ch3);
+        assert_eq!(ch3.life, 1, "kill = 0 floors life at 1");
+    }
+
+    /// `LifeAdd` must never overflow on adversarial content: an authored oversized
+    /// `life`/`life_max` plus a large positive (or negative) `value` saturates
+    /// instead of panicking (`attempt to add with overflow` in debug builds). This
+    /// is the never-panic-on-bad-content invariant — the same saturating policy
+    /// `fp-engine`'s `TargetLifeAdd` uses.
+    #[test]
+    fn lifeadd_saturates_and_never_overflows() {
+        // Oversized life_max + a near-i32::MAX value: plain `i32 + i32` would
+        // overflow and panic. Saturating add caps at i32::MAX, then the clamp to
+        // life_max settles it. (This is the reviewer's reproduced case.)
+        let lc = one_ctrl_synth("LifeAdd", &[("value", "2000000000")]);
+        let mut ch = Character::new();
+        ch.life_max = 2_000_000_000;
+        ch.life = 2_000_000_000;
+        lc.tick(&mut ch); // must not panic
+        assert_eq!(ch.life, 2_000_000_000, "saturated then clamped to life_max");
+
+        // Symmetric underflow guard: a hugely negative add saturates at i32::MIN,
+        // then clamps to the [0/1, life_max] floor.
+        let lc_neg = one_ctrl_synth("LifeAdd", &[("value", "-2000000000")]);
+        let mut ch2 = Character::new();
+        ch2.life_max = 2_000_000_000;
+        ch2.life = -2_000_000_000; // adversarial pre-state
+        lc_neg.tick(&mut ch2); // must not panic
+        assert_eq!(ch2.life, 0, "saturated then floored to 0 (default kill)");
+    }
+
+    /// `Gravity` adds the character's `yaccel` constant to `vel.y` (a self-velocity
+    /// write that works even when `physics = N` disables automatic air gravity).
+    #[test]
+    fn gravity_adds_yaccel_to_y_velocity() {
+        let lc = one_ctrl_synth("Gravity", &[]);
+        let mut ch = Character::new();
+        // physics = None so the per-tick air gravity does NOT also fire — isolate
+        // the controller's effect.
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 0.0);
+        let yaccel = ch.constants.movement.yaccel;
+        lc.tick(&mut ch);
+        assert!(
+            (ch.vel.y - yaccel).abs() < 1e-6,
+            "Gravity added one yaccel ({yaccel}) to vel.y, got {}",
+            ch.vel.y
+        );
+    }
+
+    /// `MoveHitReset` clears the move-connection flags so a `hitonce` move can
+    /// connect again, without starting a new `HitDef`.
+    #[test]
+    fn move_hit_reset_clears_connection_flags() {
+        let lc = one_ctrl_synth("MoveHitReset", &[]);
+        let mut ch = Character::new();
+        ch.move_connect.hit = true;
+        ch.move_connect.guarded = true;
+        assert!(ch.move_connect.contact(), "precondition: move had connected");
+        lc.tick(&mut ch);
+        assert!(!ch.move_connect.hit, "MoveHit cleared");
+        assert!(!ch.move_connect.guarded, "MoveGuarded cleared");
+        assert!(!ch.move_connect.contact(), "MoveContact cleared");
+    }
+
+    /// `VarRandom` writes a bounded random integer into the int var bank. With a
+    /// two-value `range` the result is inside `[lo, hi]`; deterministic for a fixed
+    /// seed; only touches the requested index.
+    #[test]
+    fn var_random_writes_bounded_value() {
+        // range = 10, 20 → var(3) lands in [10, 20].
+        let lc = one_ctrl_synth("VarRandom", &[("v", "3"), ("range", "10,20")]);
+        let mut ch = Character::new();
+        ch.seed_rng(12345);
+        ch.vars[0] = 7; // an untouched neighbour
+        lc.tick(&mut ch);
+        let v = ch.vars[3];
+        assert!((10..=20).contains(&v), "VarRandom result {v} out of [10,20]");
+        assert_eq!(ch.vars[0], 7, "VarRandom only touched the requested index");
+
+        // Deterministic for a fixed seed (replay safety).
+        let mut a = Character::new();
+        let mut b = Character::new();
+        a.seed_rng(999);
+        b.seed_rng(999);
+        lc.tick(&mut a);
+        lc.tick(&mut b);
+        assert_eq!(a.vars[3], b.vars[3], "same seed → same VarRandom draw");
+
+        // Single-value `range = n` means [0, n]; absent index is a no-op.
+        let lc_single = one_ctrl_synth("VarRandom", &[("v", "1"), ("range", "5")]);
+        let mut ch2 = Character::new();
+        ch2.seed_rng(42);
+        lc_single.tick(&mut ch2);
+        assert!((0..=5).contains(&ch2.vars[1]), "single-range VarRandom in [0,5]");
+
+        // No `v` index → safe no-op (no var changes, no panic).
+        let lc_noidx = one_ctrl_synth("VarRandom", &[("range", "0,10")]);
+        let mut ch3 = Character::new();
+        ch3.vars[0] = 123;
+        lc_noidx.tick(&mut ch3);
+        assert_eq!(ch3.vars[0], 123, "VarRandom with no `v` index is a no-op");
+    }
+
+    /// `LifeSet` writes life directly, clamped to `[0, life_max]`.
+    #[test]
+    fn lifeset_sets_life_clamped() {
+        let lc = one_ctrl_synth("LifeSet", &[("value", "42")]);
+        let mut ch = Character::new();
+        ch.life_max = 100;
+        ch.life = 10;
+        lc.tick(&mut ch);
+        assert_eq!(ch.life, 42);
+
+        // Over-cap clamps to life_max; negative clamps to 0.
+        let lc_over = one_ctrl_synth("LifeSet", &[("value", "9999")]);
+        let mut ch2 = Character::new();
+        ch2.life_max = 100;
+        lc_over.tick(&mut ch2);
+        assert_eq!(ch2.life, 100);
+    }
+
+    /// A documented-but-deferred controller (e.g. `Explod`, `Helper`, `BGPalFX`)
+    /// is recognized by [`is_tracked_deferred_controller`] — it routes to the
+    /// tracked WARN no-op, not the silent fall-through — while a genuine
+    /// non-controller string is not.
+    #[test]
+    fn deferred_controllers_are_tracked() {
+        for kind in [
+            "Helper", "Explod", "ModifyExplod", "RemoveExplod", "Projectile",
+            "BGPalFX", "AllPalFX", "BindToParent", "BindToRoot", "BindToTarget",
+            "DestroySelf", "MakeDust", "ForceFeedback",
+            // T015 follow-up review: documented controllers that depend on an
+            // unbuilt subsystem must be tracked, not silently no-op'd.
+            "ReversalDef", "ScreenBound", "FallEnvShake",
+            // Target / active-HitDef / projectile controllers — blocked on the
+            // T013/T014 entity graph; must be tracked, not silent no-ops.
+            "HitAdd", "AttackDist", "TargetDrop",
+        ] {
+            assert!(
+                is_tracked_deferred_controller(kind),
+                "{kind} should be a tracked deferred controller"
+            );
+            // Case-insensitive, like the dispatch chain.
+            assert!(is_tracked_deferred_controller(&kind.to_lowercase()));
+        }
+        // Newly-handled controllers are NOT in the deferred set (including the
+        // reasonably-implementable self-field writes implemented in T015).
+        for handled in [
+            "EnvShake", "EnvColor", "RemapPal", "LifeAdd", "Trans", "AngleDraw",
+            "Gravity", "VarRandom", "MoveHitReset",
+        ] {
+            assert!(
+                !is_tracked_deferred_controller(handled),
+                "{handled} is handled, not deferred"
+            );
+        }
+        // A pure typo / non-MUGEN token is not tracked (falls to debug no-op).
+        assert!(!is_tracked_deferred_controller("Frobnicate"));
+    }
+
+    /// A deferred controller dispatched through a real tick is a safe no-op (it
+    /// neither panics nor mutates state) — exercising the WARN branch end-to-end.
+    #[test]
+    fn deferred_controller_dispatch_is_safe_noop() {
+        let lc = one_ctrl_synth("Explod", &[("anim", "0"), ("id", "1")]);
+        let mut ch = Character::new();
+        let before = ch.life;
+        let report = lc.tick(&mut ch);
+        // The controller "fired" (gating passed) but had no effect on the entity.
+        assert_eq!(ch.life, before, "deferred Explod did not mutate state");
+        assert!(report.freeze_request.is_none());
+        assert!(report.target_ops.is_empty());
     }
 
     /// Entering a `facep2 = 1` state turns the character to face the opponent.
