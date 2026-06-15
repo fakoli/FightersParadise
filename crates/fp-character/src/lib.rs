@@ -1360,9 +1360,10 @@ impl HitOverrides {
     /// hit. Lower slot indices take priority (scanned in order).
     #[must_use]
     pub fn matching(&self, attr: &fp_combat::AttackAttr) -> Option<(usize, i32)> {
-        self.slots.iter().enumerate().find_map(|(i, s)| {
-            (s.is_active() && s.attrs.matches(attr)).then_some((i, s.stateno))
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| (s.is_active() && s.attrs.matches(attr)).then_some((i, s.stateno)))
     }
 
     /// Consumes (disarms) the slot at `index` after a successful override match —
@@ -3698,9 +3699,7 @@ impl<'a> EvalCtx<'a> {
         // in view — opponent context / out-of-tick seam / bare `Character`),
         // yields `0` (action absent). Never panics.
         if name.eq_ignore_ascii_case("SelfAnimExist") {
-            let exists = args
-                .first()
-                .is_some_and(|v| self.anim.contains(v.to_int()));
+            let exists = args.first().is_some_and(|v| self.anim.contains(v.to_int()));
             return Some(Value::from(exists));
         }
 
@@ -3929,7 +3928,13 @@ mod tests {
         // `round_clock_triggers_default_to_zero`; their non-default behavior is
         // pinned in `round_clock_triggers_read_round_view`.
         let ch = sample();
-        for t in ["HitOver", "HitFall", "CanRecover", "InGuardDist", "SelfAnimExist"] {
+        for t in [
+            "HitOver",
+            "HitFall",
+            "CanRecover",
+            "InGuardDist",
+            "SelfAnimExist",
+        ] {
             assert_eq!(
                 ch.trigger(t, &[]),
                 Value::DEFAULT,
@@ -4235,7 +4240,10 @@ mod tests {
         // (no-hit) get-hit record — the starting point before any HitDef fires or
         // any hit lands.
         let ch = Character::new();
-        assert!(ch.active_hitdef.is_none(), "no active HitDef on a fresh character");
+        assert!(
+            ch.active_hitdef.is_none(),
+            "no active HitDef on a fresh character"
+        );
         assert_eq!(ch.get_hit_vars, GetHitVars::default());
         // Every GetHitVar member reads its no-hit default through the seam.
         assert_eq!(ch.trigger_str("GetHitVar", "damage"), Value::Int(0));
@@ -4355,12 +4363,30 @@ mod tests {
     fn const_resolves_velocity_members() {
         let ch = const_sample();
         // Float members thread through the float path via direct equality.
-        assert_eq!(ch.trigger_str("const", "velocity.walk.fwd.x"), Value::Float(2.7));
-        assert_eq!(ch.trigger_str("const", "velocity.walk.back.x"), Value::Float(-2.1));
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+        assert_eq!(
+            ch.trigger_str("const", "velocity.walk.fwd.x"),
+            Value::Float(2.7)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.walk.back.x"),
+            Value::Float(-2.1)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.x"),
+            Value::Float(4.9)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.y"),
+            Value::Float(-1.5)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.neu.x"),
+            Value::Float(0.3)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.y"),
+            Value::Float(-8.6)
+        );
     }
 
     #[test]
@@ -4384,7 +4410,11 @@ mod tests {
             ("velocity.airjump.y", -7.9),
         ];
         for (m, want) in float_pairs {
-            assert_eq!(ch.trigger_str("const", m), Value::Float(want), "member `{m}`");
+            assert_eq!(
+                ch.trigger_str("const", m),
+                Value::Float(want),
+                "member `{m}`"
+            );
         }
     }
 
@@ -4393,10 +4423,22 @@ mod tests {
         // The full dotted name folds case for the new members exactly like the
         // existing ones (axis suffix included).
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "Velocity.Jump.Fwd.X"), Value::Float(2.6));
-        assert_eq!(ch.trigger_str("const", "VELOCITY.AIRJUMP.FWD.X"), Value::Float(2.45));
-        assert_eq!(ch.trigger_str("const", "velocity.RunJump.Fwd.Y"), Value::Float(-8.2));
-        assert_eq!(ch.trigger_str("const", "Velocity.AirJump.Y"), Value::Float(-7.9));
+        assert_eq!(
+            ch.trigger_str("const", "Velocity.Jump.Fwd.X"),
+            Value::Float(2.6)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "VELOCITY.AIRJUMP.FWD.X"),
+            Value::Float(2.45)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.RunJump.Fwd.Y"),
+            Value::Float(-8.2)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "Velocity.AirJump.Y"),
+            Value::Float(-7.9)
+        );
     }
 
     #[test]
@@ -4405,10 +4447,19 @@ mod tests {
         // these in a `velset` expression.
         let ch = const_sample();
         assert_eq!(ev("const(velocity.jump.fwd.x) = 2.6", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.jump.back.x) = -2.55", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.jump.back.x) = -2.55", &ch),
+            Value::Int(1)
+        );
         assert_eq!(ev("const(velocity.run.back.x) = -4.3", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.runjump.fwd.x) = 4.1", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.45", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.runjump.fwd.x) = 4.1", &ch),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev("const(velocity.airjump.fwd.x) = 2.45", &ch),
+            Value::Int(1)
+        );
         assert_eq!(ev("const(velocity.airjump.y) = -7.9", &ch), Value::Int(1));
     }
 
@@ -4418,10 +4469,16 @@ mod tests {
         // VelocityConstants defaults encode (kfm.cns [Velocity]).
         let ch = Character::new();
         assert_eq!(ev("const(velocity.jump.fwd.x) = 2.5", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.jump.back.x) = -2.55", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.jump.back.x) = -2.55", &ch),
+            Value::Int(1)
+        );
         assert_eq!(ev("const(velocity.run.back.x) = -4.5", &ch), Value::Int(1));
         assert_eq!(ev("const(velocity.runjump.fwd.x) = 4", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.5", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.airjump.fwd.x) = 2.5", &ch),
+            Value::Int(1)
+        );
         assert_eq!(ev("const(velocity.airjump.y) = -8.1", &ch), Value::Int(1));
     }
 
@@ -4445,7 +4502,10 @@ mod tests {
         assert_eq!(ev("const(velocity.airjump.fwd.x) != 0", &ch), Value::Int(1));
         // And they match KFM's authored 2.5 for both.
         assert_eq!(ev("const(velocity.jump.fwd.x) = 2.5", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.airjump.fwd.x) = 2.5", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.airjump.fwd.x) = 2.5", &ch),
+            Value::Int(1)
+        );
     }
 
     // ---- A.P4 (Proctor): edge cases, error paths, MUGEN semantics ----------
@@ -4486,12 +4546,24 @@ mod tests {
         // members; a mis-map that aliased the directional jump's stored `y` would
         // surface here. const_sample(): jump_fwd = (2.6, 0), jump_up = -8.6.
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "velocity.jump.fwd.x"), Value::Float(2.6));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.fwd.x"),
+            Value::Float(2.6)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.y"),
+            Value::Float(-8.6)
+        );
         // The bare-x jump's own `.y` is unmapped (defaults to 0), proving the
         // vertical speed never leaks through the directional member.
-        assert_eq!(ch.trigger_str("const", "velocity.jump.fwd.y"), Value::DEFAULT);
-        assert_eq!(ch.trigger_str("const", "velocity.airjump.fwd.y"), Value::DEFAULT);
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.fwd.y"),
+            Value::DEFAULT
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.airjump.fwd.y"),
+            Value::DEFAULT
+        );
     }
 
     #[test]
@@ -4510,7 +4582,10 @@ mod tests {
         let ch = const_sample();
         // Forward branch.
         assert_eq!(
-            ev("ifelse(0=1, const(velocity.jump.fwd.x), const(velocity.jump.fwd.x)) = 2.6", &ch),
+            ev(
+                "ifelse(0=1, const(velocity.jump.fwd.x), const(velocity.jump.fwd.x)) = 2.6",
+                &ch
+            ),
             Value::Int(1)
         );
         // The exact nested-ifelse shape common1 uses, forced down each arm.
@@ -4532,7 +4607,10 @@ mod tests {
         );
         // The vertical component and the running-jump horizontal component.
         assert_eq!(ev("const(velocity.jump.y) = -8.6", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.runjump.fwd.x) = 4.1", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.runjump.fwd.x) = 4.1", &ch),
+            Value::Int(1)
+        );
         // The load-bearing property: the forward/back arms are nonzero, so the
         // VelSet moves horizontally instead of straight up.
         assert_eq!(ev("const(velocity.jump.fwd.x) != 0", &ch), Value::Int(1));
@@ -4568,7 +4646,10 @@ mod tests {
         );
         assert_eq!(ev("const(velocity.airjump.y) = -7.9", &ch), Value::Int(1));
         assert_eq!(ev("const(velocity.airjump.fwd.x) != 0", &ch), Value::Int(1));
-        assert_eq!(ev("const(velocity.airjump.back.x) != 0", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(velocity.airjump.back.x) != 0", &ch),
+            Value::Int(1)
+        );
     }
 
     #[test]
@@ -4581,7 +4662,13 @@ mod tests {
         assert_eq!(ev("const(velocity.run.back.x) = -4.3", &ch), Value::Int(1));
         assert_eq!(ev("const(velocity.run.back.y) = -3.2", &ch), Value::Int(1));
         // x and y are distinct fields, not aliased.
-        assert_eq!(ev("const(velocity.run.back.x) = const(velocity.run.back.y)", &ch), Value::Int(0));
+        assert_eq!(
+            ev(
+                "const(velocity.run.back.x) = const(velocity.run.back.y)",
+                &ch
+            ),
+            Value::Int(0)
+        );
     }
 
     #[test]
@@ -4589,12 +4676,30 @@ mod tests {
         // Regression guard: the walk / run.fwd / jump.neu / jump.y members that
         // existed before A.P4 must keep resolving unchanged alongside the new ones.
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "velocity.walk.fwd.x"), Value::Float(2.7));
-        assert_eq!(ch.trigger_str("const", "velocity.walk.back.x"), Value::Float(-2.1));
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+        assert_eq!(
+            ch.trigger_str("const", "velocity.walk.fwd.x"),
+            Value::Float(2.7)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.walk.back.x"),
+            Value::Float(-2.1)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.x"),
+            Value::Float(4.9)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.y"),
+            Value::Float(-1.5)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.neu.x"),
+            Value::Float(0.3)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.y"),
+            Value::Float(-8.6)
+        );
     }
 
     #[test]
@@ -4634,9 +4739,18 @@ mod tests {
     #[test]
     fn const_resolves_movement_members() {
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "movement.yaccel"), Value::Float(0.5));
-        assert_eq!(ch.trigger_str("const", "movement.stand.friction"), Value::Float(0.83));
-        assert_eq!(ch.trigger_str("const", "movement.crouch.friction"), Value::Float(0.81));
+        assert_eq!(
+            ch.trigger_str("const", "movement.yaccel"),
+            Value::Float(0.5)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "movement.stand.friction"),
+            Value::Float(0.83)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "movement.crouch.friction"),
+            Value::Float(0.81)
+        );
     }
 
     #[test]
@@ -4652,9 +4766,15 @@ mod tests {
     fn const_member_match_is_case_insensitive() {
         let ch = const_sample();
         // Mixed/upper case on the full dotted name resolves the same value.
-        assert_eq!(ch.trigger_str("const", "Velocity.Walk.Fwd.X"), Value::Float(2.7));
+        assert_eq!(
+            ch.trigger_str("const", "Velocity.Walk.Fwd.X"),
+            Value::Float(2.7)
+        );
         assert_eq!(ch.trigger_str("const", "SIZE.GROUND.FRONT"), Value::Int(17));
-        assert_eq!(ch.trigger_str("const", "Movement.YAccel"), Value::Float(0.5));
+        assert_eq!(
+            ch.trigger_str("const", "Movement.YAccel"),
+            Value::Float(0.5)
+        );
         // The trigger name itself is also case-insensitive.
         assert_eq!(ch.trigger_str("CONST", "data.life"), Value::Int(1234));
     }
@@ -4753,7 +4873,11 @@ mod tests {
             ("movement.crouch.friction", 0.81),
         ];
         for (m, want) in float_pairs {
-            assert_eq!(ch.trigger_str("const", m), Value::Float(want), "member `{m}`");
+            assert_eq!(
+                ch.trigger_str("const", m),
+                Value::Float(want),
+                "member `{m}`"
+            );
         }
     }
 
@@ -4765,17 +4889,34 @@ mod tests {
         // int literal must not silently truncate the const).
         let ch = const_sample();
         for m in [
-            "data.life", "data.power", "data.attack", "data.defence",
-            "size.ground.front", "size.ground.back", "size.height",
+            "data.life",
+            "data.power",
+            "data.attack",
+            "data.defence",
+            "size.ground.front",
+            "size.ground.back",
+            "size.height",
         ] {
-            assert!(ch.trigger_str("const", m).is_int(), "`{m}` must be int-typed");
+            assert!(
+                ch.trigger_str("const", m).is_int(),
+                "`{m}` must be int-typed"
+            );
         }
         for m in [
-            "velocity.walk.fwd.x", "velocity.walk.back.x", "velocity.run.fwd.x",
-            "velocity.run.fwd.y", "velocity.jump.neu.x", "velocity.jump.y",
-            "movement.yaccel", "movement.stand.friction", "movement.crouch.friction",
+            "velocity.walk.fwd.x",
+            "velocity.walk.back.x",
+            "velocity.run.fwd.x",
+            "velocity.run.fwd.y",
+            "velocity.jump.neu.x",
+            "velocity.jump.y",
+            "movement.yaccel",
+            "movement.stand.friction",
+            "movement.crouch.friction",
         ] {
-            assert!(ch.trigger_str("const", m).is_float(), "`{m}` must be float-typed");
+            assert!(
+                ch.trigger_str("const", m).is_float(),
+                "`{m}` must be float-typed"
+            );
         }
     }
 
@@ -4785,8 +4926,14 @@ mod tests {
         // component read separately. Confirm they thread to the matching Vec2
         // axis (a bug returning x for both would pass a single-axis test).
         let ch = const_sample(); // run_fwd = (4.9, -1.5)
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.x"), Value::Float(4.9));
-        assert_eq!(ch.trigger_str("const", "velocity.run.fwd.y"), Value::Float(-1.5));
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.x"),
+            Value::Float(4.9)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.run.fwd.y"),
+            Value::Float(-1.5)
+        );
         assert_ne!(
             ch.trigger_str("const", "velocity.run.fwd.x"),
             ch.trigger_str("const", "velocity.run.fwd.y"),
@@ -4800,8 +4947,14 @@ mod tests {
         // separate jump_up field. const_sample() makes them distinct (0.3 vs
         // -8.6) so a mapping that confuses the two is caught.
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "velocity.jump.neu.x"), Value::Float(0.3));
-        assert_eq!(ch.trigger_str("const", "velocity.jump.y"), Value::Float(-8.6));
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.neu.x"),
+            Value::Float(0.3)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.jump.y"),
+            Value::Float(-8.6)
+        );
     }
 
     // ---- AC1: case-insensitive matching on the FULL dotted name --------------
@@ -4812,10 +4965,19 @@ mod tests {
         // const_sample() keeps every value unique so a case slip that lands on a
         // different member would surface.
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "VELOCITY.WALK.FWD.X"), Value::Float(2.7));
-        assert_eq!(ch.trigger_str("const", "velocity.WALK.fwd.X"), Value::Float(2.7));
+        assert_eq!(
+            ch.trigger_str("const", "VELOCITY.WALK.FWD.X"),
+            Value::Float(2.7)
+        );
+        assert_eq!(
+            ch.trigger_str("const", "velocity.WALK.fwd.X"),
+            Value::Float(2.7)
+        );
         assert_eq!(ch.trigger_str("const", "Size.Ground.Back"), Value::Int(19));
-        assert_eq!(ch.trigger_str("const", "Movement.Crouch.Friction"), Value::Float(0.81));
+        assert_eq!(
+            ch.trigger_str("const", "Movement.Crouch.Friction"),
+            Value::Float(0.81)
+        );
         assert_eq!(ch.trigger_str("const", "DATA.DEFENCE"), Value::Int(222));
     }
 
@@ -4825,7 +4987,10 @@ mod tests {
         // incidental surrounding whitespace still resolves rather than defaulting.
         // (Defends the never-panic / be-lenient posture on messy content.)
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "  velocity.walk.fwd.x  "), Value::Float(2.7));
+        assert_eq!(
+            ch.trigger_str("const", "  velocity.walk.fwd.x  "),
+            Value::Float(2.7)
+        );
         assert_eq!(ch.trigger_str("const", "\tsize.height\t"), Value::Int(63));
     }
 
@@ -4838,16 +5003,16 @@ mod tests {
         // name. They must default to 0 (debug-logged), never partially resolve.
         let ch = const_sample();
         for m in [
-            "data",                       // group only
-            "velocity",                   // group only
-            "velocity.walk",              // partial
-            "velocity.walk.fwd",          // missing axis
-            "size.ground",                // partial
-            "movement",                   // group only
-            "velocity.walk.fwd.x.extra",  // trailing junk
-            "size.ground.front.x",        // bogus axis on an int member
-            "velocity.walk.fwd.z",        // unmodeled z axis
-            "data.life.max",              // over-qualified
+            "data",                      // group only
+            "velocity",                  // group only
+            "velocity.walk",             // partial
+            "velocity.walk.fwd",         // missing axis
+            "size.ground",               // partial
+            "movement",                  // group only
+            "velocity.walk.fwd.x.extra", // trailing junk
+            "size.ground.front.x",       // bogus axis on an int member
+            "velocity.walk.fwd.z",       // unmodeled z axis
+            "data.life.max",             // over-qualified
         ] {
             assert_eq!(
                 ch.trigger_str("const", m),
@@ -4889,7 +5054,10 @@ mod tests {
         // valid one. (Pins that `trim()`, not a whitespace-stripping match, is the
         // semantics.)
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("const", "velocity. walk.fwd.x"), Value::DEFAULT);
+        assert_eq!(
+            ch.trigger_str("const", "velocity. walk.fwd.x"),
+            Value::DEFAULT
+        );
         assert_eq!(ch.trigger_str("const", "size .height"), Value::DEFAULT);
     }
 
@@ -4925,7 +5093,10 @@ mod tests {
         // falls through to the safe default rather than mis-routing to either
         // branch.
         let ch = const_sample();
-        assert_eq!(ch.trigger_str("NotARealStrTrigger", "velocity.walk.fwd.x"), Value::DEFAULT);
+        assert_eq!(
+            ch.trigger_str("NotARealStrTrigger", "velocity.walk.fwd.x"),
+            Value::DEFAULT
+        );
         assert_eq!(ch.trigger_str("", "data.life"), Value::DEFAULT);
     }
 
@@ -4991,8 +5162,14 @@ mod tests {
         assert_eq!(ev("const(size.ground.back) = 15", &ch), Value::Int(1));
         assert_eq!(ev("const(size.height) = 60", &ch), Value::Int(1));
         assert_eq!(ev("const(movement.yaccel) = 0.44", &ch), Value::Int(1));
-        assert_eq!(ev("const(movement.stand.friction) = 0.85", &ch), Value::Int(1));
-        assert_eq!(ev("const(movement.crouch.friction) = 0.82", &ch), Value::Int(1));
+        assert_eq!(
+            ev("const(movement.stand.friction) = 0.85", &ch),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev("const(movement.crouch.friction) = 0.82", &ch),
+            Value::Int(1)
+        );
         assert_eq!(ev("const(data.life) = 1000", &ch), Value::Int(1));
         assert_eq!(ev("const(data.power) = 3000", &ch), Value::Int(1));
         assert_eq!(ev("const(data.attack) = 100", &ch), Value::Int(1));
@@ -5114,10 +5291,19 @@ mod tests {
         // A zero localcoord width would make the scale 0 (degenerate but defined),
         // and is still finite — exercise it so the path is covered.
         let zero = char_with_localcoord(0, 0);
-        assert_eq!(zero.trigger("Const720p", &[Value::Int(-8)]), Value::Float(0.0));
+        assert_eq!(
+            zero.trigger("Const720p", &[Value::Int(-8)]),
+            Value::Float(0.0)
+        );
         // Case-insensitive dispatch through the trigger seam.
-        assert_eq!(ch.trigger("const720P", &[Value::Int(20)]), Value::Float(5.0));
-        assert_eq!(ch.trigger("CONST1280P", &[Value::Int(16)]), Value::Float(2.0));
+        assert_eq!(
+            ch.trigger("const720P", &[Value::Int(20)]),
+            Value::Float(5.0)
+        );
+        assert_eq!(
+            ch.trigger("CONST1280P", &[Value::Int(16)]),
+            Value::Float(2.0)
+        );
     }
 
     #[test]
@@ -5203,7 +5389,10 @@ mod tests {
         let ch = char_with_localcoord(1280, 720); // factor 1.0
         let v = ch.trigger("Const720p", &[Value::Int(7)]);
         assert_eq!(v, Value::Float(7.0));
-        assert!(matches!(v, Value::Float(_)), "Const720p must be float-typed, got {v:?}");
+        assert!(
+            matches!(v, Value::Float(_)),
+            "Const720p must be float-typed, got {v:?}"
+        );
     }
 
     #[test]
@@ -5226,11 +5415,22 @@ mod tests {
         // For KFM's (320,240) the factor is 0.25, so each must scale to a*0.25 and
         // none collapse to 0 — the whole point of the fix.
         let ch = char_with_localcoord(320, 240);
-        let cases = [(-8, -2.0), (-20, -5.0), (-80, -20.0), (4, 1.0), (20, 5.0), (56, 14.0)];
+        let cases = [
+            (-8, -2.0),
+            (-20, -5.0),
+            (-80, -20.0),
+            (4, 1.0),
+            (20, 5.0),
+            (56, 14.0),
+        ];
         for (arg, want) in cases {
             let got = ev(&format!("Const720p({arg})"), &ch);
             assert_eq!(got, Value::Float(want), "Const720p({arg})");
-            assert_ne!(got, Value::Float(0.0), "Const720p({arg}) must not collapse to 0");
+            assert_ne!(
+                got,
+                Value::Float(0.0),
+                "Const720p({arg}) must not collapse to 0"
+            );
         }
     }
 
@@ -5243,13 +5443,25 @@ mod tests {
         let me = char_with_localcoord(320, 240);
         let (_, opp) = two_chars();
         let stage = StageView::default();
-        assert_eq!(ev_cross("Const720p(-8)", &me, Some(&opp), stage), Value::Float(-2.0));
-        assert_eq!(ev_cross("Const720p(-8)", &me, None, stage), Value::Float(-2.0));
-        assert_eq!(ev_cross("Const1280p(16)", &me, Some(&opp), stage), Value::Float(2.0));
+        assert_eq!(
+            ev_cross("Const720p(-8)", &me, Some(&opp), stage),
+            Value::Float(-2.0)
+        );
+        assert_eq!(
+            ev_cross("Const720p(-8)", &me, None, stage),
+            Value::Float(-2.0)
+        );
+        assert_eq!(
+            ev_cross("Const1280p(16)", &me, Some(&opp), stage),
+            Value::Float(2.0)
+        );
         // The headline behavior gate, evaluated through the real executor seam.
         let mut moving = char_with_localcoord(320, 240);
         moving.vel = Vec2::new(0.0, -1.0);
-        assert_eq!(ev_cross("Vel y > Const720p(-8)", &moving, Some(&opp), stage), Value::Int(1));
+        assert_eq!(
+            ev_cross("Vel y > Const720p(-8)", &moving, Some(&opp), stage),
+            Value::Int(1)
+        );
     }
 
     #[test]
@@ -5270,8 +5482,16 @@ mod tests {
         let mut ch = Character::with_constants(loaded.constants);
         ch.vel = Vec2::new(0.0, -1.0);
         assert_eq!(ev("Const720p(-8)", &ch), Value::Float(-2.0));
-        assert_eq!(ev("Vel y > Const720p(-8)", &ch), Value::Int(1), "fixed: > -2.0");
-        assert_eq!(ev("Vel y > 0", &ch), Value::Int(0), "old collapsed gate would be false");
+        assert_eq!(
+            ev("Vel y > Const720p(-8)", &ch),
+            Value::Int(1),
+            "fixed: > -2.0"
+        );
+        assert_eq!(
+            ev("Vel y > 0", &ch),
+            Value::Int(0),
+            "old collapsed gate would be false"
+        );
     }
 
     #[test]
@@ -5374,7 +5594,11 @@ mod tests {
         for expr in [
             "Life", "LifeMax", "Power", "PowerMax", "StateNo", "Anim", "Time", "Facing",
         ] {
-            assert_eq!(ev(expr, &a), ev(expr, &b), "default vs new disagree on {expr}");
+            assert_eq!(
+                ev(expr, &a),
+                ev(expr, &b),
+                "default vs new disagree on {expr}"
+            );
         }
     }
 
@@ -5760,7 +5984,7 @@ mod tests {
     #[test]
     fn range_literal_triggers() {
         let ch = sample(); // life=100, var(1)=5, state_no=200
-        // Inclusive range: 100 is within [1,1000].
+                           // Inclusive range: 100 is within [1,1000].
         assert_eq!(ev("Life = [1,1000]", &ch), Value::Int(1));
         // Exclusive lower bound excludes the endpoint.
         assert_eq!(ev("var(1) = (5,10]", &ch), Value::Int(0));
@@ -6013,7 +6237,11 @@ mod tests {
             // Get-hit state (Phase 6). `HitShakeOver`/`MoveContact`/`MoveHit`/
             // `MoveGuarded` are no longer here: task 6.3b answers them from the
             // fields hit resolution populates (see `move_connect_triggers`).
-            "HitOver", "hitover", "HitFall", "CanRecover", "InGuardDist",
+            "HitOver",
+            "hitover",
+            "HitFall",
+            "CanRecover",
+            "InGuardDist",
             // Round / match state (engine) is no longer deferred:
             // `RoundState`/`GameTime`/`MatchOver` (audit #21) and
             // `RoundNo`/`RoundsExisted` (T016) are all answered from the
@@ -6021,22 +6249,36 @@ mod tests {
             // live values once a `Match` sets the view — see
             // `round_clock_triggers_read_round_view`).
             // Cross-entity geometry (Phase 7 redirection).
-            "P2BodyDist", "P2Dist", "FrontEdgeBodyDist", "BackEdgeBodyDist",
+            "P2BodyDist",
+            "P2Dist",
+            "FrontEdgeBodyDist",
+            "BackEdgeBodyDist",
             "BackEdgeDist",
             // Animation-table query (executor owns the .air set).
             "SelfAnimExist",
         ];
         for t in deferred {
             let v = ch.trigger(t, &[]);
-            assert_eq!(v, Value::DEFAULT, "deferred trigger `{t}` must default to 0");
+            assert_eq!(
+                v,
+                Value::DEFAULT,
+                "deferred trigger `{t}` must default to 0"
+            );
             // Value::DEFAULT is documented as Value::Int(0); pin that contract so
             // a comparison against literal 0 in stock content still holds.
-            assert_eq!(v, Value::Int(0), "deferred trigger `{t}` default must be int 0");
+            assert_eq!(
+                v,
+                Value::Int(0),
+                "deferred trigger `{t}` default must be int 0"
+            );
         }
         // With representative args (these are functions in real content, e.g.
         // SelfAnimExist(44), P2BodyDist), the deferred path must still default,
         // not panic.
-        assert_eq!(ch.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
+        assert_eq!(
+            ch.trigger("SelfAnimExist", &[Value::Int(44)]),
+            Value::Int(0)
+        );
         assert_eq!(ch.trigger("P2BodyDist", &[Value::Int(0)]), Value::Int(0));
     }
 
@@ -6137,7 +6379,10 @@ mod tests {
         // gate behave correctly: closed (0) for a full-life KFM, open (1) when KO.
         // SKIPS cleanly when the asset is absent so the suite stays green in a
         // checkout without test-assets.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-assets/kfm/common1.cns");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-assets/kfm/common1.cns"
+        );
         let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return, // asset absent → skip, not a failure
@@ -6193,7 +6438,10 @@ mod tests {
         // Stock common1.cns has both polarities; require we exercised the death
         // gate at minimum (the task's core scenario).
         assert!(saw_negated, "expected a `!alive` death gate in common1.cns");
-        assert!(saw_plain, "expected an `alive` recovery guard in common1.cns");
+        assert!(
+            saw_plain,
+            "expected an `alive` recovery guard in common1.cns"
+        );
     }
 
     // =====================================================================
@@ -6206,7 +6454,12 @@ mod tests {
     /// Evaluates a trigger expression string against `me` viewed with `opponent`
     /// (or `None`) and the given stage, through the same VM eval path the
     /// executor uses. Panics only in test code on a parse error.
-    fn ev_cross(expr: &str, me: &Character, opponent: Option<&Character>, stage: StageView) -> Value {
+    fn ev_cross(
+        expr: &str,
+        me: &Character,
+        opponent: Option<&Character>,
+        stage: StageView,
+    ) -> Value {
         let ast = parse_str(expr).expect("test expression should parse");
         // Build the opponent context one level deep (its own opponent is None),
         // mirroring `Character::tick_with`.
@@ -6294,7 +6547,10 @@ mod tests {
         // `enemy, life` reads the OPPONENT's life (450), not me's (700). `enemy`
         // is MUGEN's redirect keyword for the opposing player (the parser maps it
         // to `Redirect::Enemy`, which EvalCtx resolves to the opponent context).
-        assert_eq!(ev_cross("enemy, Life", &me, Some(&opp), stage), Value::Int(450));
+        assert_eq!(
+            ev_cross("enemy, Life", &me, Some(&opp), stage),
+            Value::Int(450)
+        );
         assert_eq!(ev_cross("Life", &me, Some(&opp), stage), Value::Int(700));
         // `enemy, stateno` reads the opponent's state number.
         assert_eq!(
@@ -6322,7 +6578,10 @@ mod tests {
         let (me, opp) = two_chars();
         let stage = StageView::default();
         // The single-token `P2<field>` aliases read the opponent's own fields.
-        assert_eq!(ev_cross("P2Life = 450", &me, Some(&opp), stage), Value::Int(1));
+        assert_eq!(
+            ev_cross("P2Life = 450", &me, Some(&opp), stage),
+            Value::Int(1)
+        );
         assert_eq!(
             ev_cross("P2LifeMax = 1000", &me, Some(&opp), stage),
             Value::Int(1)
@@ -6349,7 +6608,10 @@ mod tests {
         let (me, opp) = two_chars();
         let stage = StageView::default();
         // A non-helper's `root` is itself: `root, life` == own life.
-        assert_eq!(ev_cross("root, Life", &me, Some(&opp), stage), Value::Int(700));
+        assert_eq!(
+            ev_cross("root, Life", &me, Some(&opp), stage),
+            Value::Int(700)
+        );
         assert_eq!(
             ev_cross("root, StateNo = 200", &me, Some(&opp), stage),
             Value::Int(1)
@@ -6363,10 +6625,16 @@ mod tests {
         // With no opponent every opponent-dependent read is the safe default 0.
         assert_eq!(ev_cross("P2Dist X", &me, None, stage), Value::Float(0.0));
         assert_eq!(ev_cross("P2Dist Y", &me, None, stage), Value::Float(0.0));
-        assert_eq!(ev_cross("P2BodyDist X", &me, None, stage), Value::Float(0.0));
+        assert_eq!(
+            ev_cross("P2BodyDist X", &me, None, stage),
+            Value::Float(0.0)
+        );
         // An `enemy, ...` redirect resolves to None → the whole sub-expr is 0.
         assert_eq!(ev_cross("enemy, Life", &me, None, stage), Value::Int(0));
-        assert_eq!(ev_cross("enemy, StateNo = 1300", &me, None, stage), Value::Int(0));
+        assert_eq!(
+            ev_cross("enemy, StateNo = 1300", &me, None, stage),
+            Value::Int(0)
+        );
         // A compound gated on a cross-entity read collapses to false, not a panic.
         // (A redirect binds looser than every operator, so `enemy, EXPR` retargets
         // the whole trailing compound; with no opponent it is 0.)
@@ -6663,7 +6931,10 @@ mod tests {
             Value::Float(150.0 - gb)
         );
         // ScreenPos Y is raw world Y (no vertical camera modeled).
-        assert_eq!(ev_cross("ScreenPos Y", &me, None, stage), Value::Float(me.pos.y));
+        assert_eq!(
+            ev_cross("ScreenPos Y", &me, None, stage),
+            Value::Float(me.pos.y)
+        );
     }
 
     #[test]
@@ -6681,7 +6952,11 @@ mod tests {
             ("Facing = 1", Value::Int(1)),
         ] {
             assert_eq!(ev_cross(expr, &me, Some(&opp), stage), expected, "{expr}");
-            assert_eq!(ev_cross(expr, &me, None, stage), expected, "{expr} (no opp)");
+            assert_eq!(
+                ev_cross(expr, &me, None, stage),
+                expected,
+                "{expr} (no opp)"
+            );
         }
         // fvar reads through the typed seam too.
         assert_eq!(
@@ -6729,14 +7004,32 @@ mod tests {
         let ch = Character::new();
 
         // Present actions → 1; absent → 0; through the real trigger/eval path.
-        assert_eq!(ev_with_anim("SelfAnimExist(44)", &ch, &actions), Value::Int(1));
-        assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &actions), Value::Int(1));
-        assert_eq!(ev_with_anim("SelfAnimExist(41)", &ch, &actions), Value::Int(1));
-        assert_eq!(ev_with_anim("SelfAnimExist(99)", &ch, &actions), Value::Int(0));
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(44)", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(0)", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(41)", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(99)", &ch, &actions),
+            Value::Int(0)
+        );
 
         // Case-insensitive trigger name.
-        assert_eq!(ev_with_anim("selfanimexist(44)", &ch, &actions), Value::Int(1));
-        assert_eq!(ev_with_anim("SELFANIMEXIST(99)", &ch, &actions), Value::Int(0));
+        assert_eq!(
+            ev_with_anim("selfanimexist(44)", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SELFANIMEXIST(99)", &ch, &actions),
+            Value::Int(0)
+        );
 
         // Direct trigger call with a missing arg → 0, never panics.
         let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
@@ -6779,7 +7072,10 @@ mod tests {
             Value::Int(1)
         );
         // The AirJump idiom: action 44 exists, so the air-jump anim is chosen.
-        assert_eq!(ev_with_anim("SelfAnimExist(44)", &ch, &actions), Value::Int(1));
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(44)", &ch, &actions),
+            Value::Int(1)
+        );
     }
 
     #[test]
@@ -6792,11 +7088,20 @@ mod tests {
 
         // EvalCtx::new (no anim supplied) → empty default set.
         let ctx = EvalCtx::new(&ch, None, stage);
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
-        assert_eq!(ev_cross("SelfAnimExist(44)", &ch, None, stage), Value::Int(0));
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Int(44)]),
+            Value::Int(0)
+        );
+        assert_eq!(
+            ev_cross("SelfAnimExist(44)", &ch, None, stage),
+            Value::Int(0)
+        );
 
         // A bare `Character` (self-only context) also has no AIR → 0.
-        assert_eq!(ch.trigger("SelfAnimExist", &[Value::Int(44)]), Value::Int(0));
+        assert_eq!(
+            ch.trigger("SelfAnimExist", &[Value::Int(44)]),
+            Value::Int(0)
+        );
 
         // `enemy, SelfAnimExist(...)` degrades to 0: the opponent context is built
         // without an `.air` view (documented approximation for a flat 1-v-1).
@@ -6896,7 +7201,10 @@ mod tests {
         let empty: HashMap<i32, AnimAction> = HashMap::new();
         let ch = Character::new();
         assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &empty), Value::Int(0));
-        assert_eq!(ev_with_anim("SelfAnimExist(200)", &ch, &empty), Value::Int(0));
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(200)", &ch, &empty),
+            Value::Int(0)
+        );
     }
 
     #[test]
@@ -6905,16 +7213,31 @@ mod tests {
         // exactly and never panic on the i32 extremes.
         let actions = anim_actions(&[-1, 0, i32::MAX, i32::MIN]);
         let ch = Character::new();
-        assert_eq!(ev_with_anim("SelfAnimExist(-1)", &ch, &actions), Value::Int(1));
-        assert_eq!(ev_with_anim("SelfAnimExist(0)", &ch, &actions), Value::Int(1));
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(-1)", &ch, &actions),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(0)", &ch, &actions),
+            Value::Int(1)
+        );
         // Absent negative number → 0.
-        assert_eq!(ev_with_anim("SelfAnimExist(-2)", &ch, &actions), Value::Int(0));
+        assert_eq!(
+            ev_with_anim("SelfAnimExist(-2)", &ch, &actions),
+            Value::Int(0)
+        );
 
         // i32 boundaries through the direct trigger path (literal parsing of the
         // extremes is brittle, so drive them as explicit Value args).
         let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(i32::MAX)]), Value::Int(1));
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Int(i32::MIN)]), Value::Int(1));
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Int(i32::MAX)]),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Int(i32::MIN)]),
+            Value::Int(1)
+        );
     }
 
     #[test]
@@ -6925,10 +7248,19 @@ mod tests {
         let ch = Character::new();
         let ctx = EvalCtx::with_anim(&ch, None, StageView::default(), AnimSet::new(&actions));
         // 44.9 → 44 (present); 45.9 → 45 (absent). Truncation, not rounding.
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(44.9)]), Value::Int(1));
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(45.9)]), Value::Int(0));
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Float(44.9)]),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Float(45.9)]),
+            Value::Int(0)
+        );
         // Negative fractional truncates toward zero too: -0.9 → 0 (absent here).
-        assert_eq!(ctx.trigger("SelfAnimExist", &[Value::Float(-0.9)]), Value::Int(0));
+        assert_eq!(
+            ctx.trigger("SelfAnimExist", &[Value::Float(-0.9)]),
+            Value::Int(0)
+        );
     }
 
     #[test]
@@ -6956,7 +7288,7 @@ mod tests {
         let actions = anim_actions(&[41, 44]);
         let mut ch = Character::new();
         ch.anim = 41; // anim + 3 == 44 (present)
-        // Present → the AND with a true self-read holds.
+                      // Present → the AND with a true self-read holds.
         assert_eq!(
             ev_with_anim("SelfAnimExist(anim + 3) && Anim = 41", &ch, &actions),
             Value::Int(1)
@@ -7024,8 +7356,14 @@ mod tests {
                 hi = hi.max(v);
             }
         }
-        assert!(lo < 100, "min draw {lo} unexpectedly high — range not covered");
-        assert!(hi > 900, "max draw {hi} unexpectedly low — range not covered");
+        assert!(
+            lo < 100,
+            "min draw {lo} unexpectedly high — range not covered"
+        );
+        assert!(
+            hi > 900,
+            "max draw {hi} unexpectedly low — range not covered"
+        );
     }
 
     #[test]
@@ -7038,7 +7376,10 @@ mod tests {
         b.seed_rng(12345);
         let seq_a: Vec<Value> = (0..20).map(|_| ev("random", &a)).collect();
         let seq_b: Vec<Value> = (0..20).map(|_| ev("random", &b)).collect();
-        assert_eq!(seq_a, seq_b, "equal seeds must yield equal random sequences");
+        assert_eq!(
+            seq_a, seq_b,
+            "equal seeds must yield equal random sequences"
+        );
     }
 
     #[test]
@@ -7070,8 +7411,14 @@ mod tests {
         let r2 = ch.random();
         // `next_u31` returns the generator state in 1..=2^31-2.
         const PARK_MILLER_MAX: i32 = 2_147_483_646;
-        assert!((1..=PARK_MILLER_MAX).contains(&r1), "raw draw out of range: {r1}");
-        assert!((1..=PARK_MILLER_MAX).contains(&r2), "raw draw out of range: {r2}");
+        assert!(
+            (1..=PARK_MILLER_MAX).contains(&r1),
+            "raw draw out of range: {r1}"
+        );
+        assert!(
+            (1..=PARK_MILLER_MAX).contains(&r2),
+            "raw draw out of range: {r2}"
+        );
         assert_ne!(r1, r2, "successive raw draws should differ");
     }
 
@@ -7143,7 +7490,11 @@ mod tests {
         // range and vary, never panicking.
         let mut ch = Character::new();
         ch.seed_rng(0);
-        assert_ne!(ch.rng_seed.get(), 0, "seed 0 must be normalized away from 0");
+        assert_ne!(
+            ch.rng_seed.get(),
+            0,
+            "seed 0 must be normalized away from 0"
+        );
         let mut any_nonzero = false;
         for _ in 0..20 {
             if let Value::Int(v) = ev("random", &ch) {
@@ -7151,6 +7502,9 @@ mod tests {
                 any_nonzero |= v != 0;
             }
         }
-        assert!(any_nonzero, "seed-0 stream must still produce nonzero draws");
+        assert!(
+            any_nonzero,
+            "seed-0 stream must still produce nonzero draws"
+        );
     }
 }

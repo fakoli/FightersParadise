@@ -485,8 +485,8 @@ mod tests {
     use super::*;
     use crate::{Facing, MoveConnect, MoveType, StageView, StateType};
     use fp_combat::{AnimType, Damage, HitDef, HitFlags, HitTimes, PauseTime};
-    use fp_vm::{eval, parse_str, EvalContext, Value};
     use fp_formats::air::{AnimAction, AnimFrame, BlendMode};
+    use fp_vm::{eval, parse_str, EvalContext, Value};
     use std::collections::HashMap;
 
     /// Builds a one-action, one-frame AIR file whose single frame carries the
@@ -588,7 +588,10 @@ mod tests {
         // Knockback points AWAY from the attacker. Attacker faces right, so the
         // away direction is +x; the defender is to the attacker's right and is
         // pushed further right (positive x).
-        assert!(d.vel.x > 0.0, "defender pushed away (+x) from a right-facer");
+        assert!(
+            d.vel.x > 0.0,
+            "defender pushed away (+x) from a right-facer"
+        );
         assert_eq!(d.vel.x, 4.0);
         assert_eq!(d.vel.y, -3.0);
 
@@ -705,8 +708,16 @@ mod tests {
     #[test]
     fn resolution_carries_hitsound_on_hit_and_guardsound_on_guard() {
         use fp_combat::SoundId;
-        let hitsound = SoundId { group: 5, sample: 0, common: false };
-        let guardsound = SoundId { group: 6, sample: 1, common: true };
+        let hitsound = SoundId {
+            group: 5,
+            sample: 0,
+            common: false,
+        };
+        let guardsound = SoundId {
+            group: 6,
+            sample: 1,
+            common: true,
+        };
 
         // ---- Clean hit → resolution carries the hitsound. ----
         let (mut a, a_air) = make_attacker();
@@ -730,7 +741,11 @@ mod tests {
         d.holding_back = true; // guardflag MA admits a standing block
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guarded hit");
         assert_eq!(res.result, HitResult::Guard);
-        assert_eq!(res.hit_sound, Some(guardsound), "a guard uses the guardsound");
+        assert_eq!(
+            res.hit_sound,
+            Some(guardsound),
+            "a guard uses the guardsound"
+        );
     }
 
     /// Spark SOURCE coverage on the `resolve_attack` connect path (T002 / FL2a):
@@ -756,9 +771,18 @@ mod tests {
         let (mut d, d_air) = make_defender();
         let states = HashMap::new();
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("clean hit");
-        assert_eq!(res.result, HitResult::Hit, "the common-spark hit must connect");
+        assert_eq!(
+            res.result,
+            HitResult::Hit,
+            "the common-spark hit must connect"
+        );
         // The connecting attacker's HitDef carries the source the engine reads.
-        let sparkno = a.active_hitdef.as_ref().expect("active hitdef").resources.sparkno;
+        let sparkno = a
+            .active_hitdef
+            .as_ref()
+            .expect("active hitdef")
+            .resources
+            .sparkno;
         assert_eq!(
             SparkSource::classify(sparkno),
             SparkSource::Common { anim: 2 },
@@ -774,7 +798,12 @@ mod tests {
         let (mut d, d_air) = make_defender();
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("clean hit");
         assert_eq!(res.result, HitResult::Hit, "the own-spark hit must connect");
-        let sparkno = a.active_hitdef.as_ref().expect("active hitdef").resources.sparkno;
+        let sparkno = a
+            .active_hitdef
+            .as_ref()
+            .expect("active hitdef")
+            .resources
+            .sparkno;
         assert_eq!(
             SparkSource::classify(sparkno),
             SparkSource::Own { anim: 5 },
@@ -861,8 +890,14 @@ mod tests {
         a.hitpause = 20;
         d.hitpause = 20;
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
-        assert_eq!(a.hitpause, 20, "longer existing attacker pause is preserved");
-        assert_eq!(d.hitpause, 20, "longer existing defender pause is preserved");
+        assert_eq!(
+            a.hitpause, 20,
+            "longer existing attacker pause is preserved"
+        );
+        assert_eq!(
+            d.hitpause, 20,
+            "longer existing defender pause is preserved"
+        );
     }
 
     #[test]
@@ -1148,7 +1183,10 @@ mod tests {
         assert!(!a.has_target, "no target before any hit");
 
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
-        assert!(a.has_target, "defender became the attacker's target on connect");
+        assert!(
+            a.has_target,
+            "defender became the attacker's target on connect"
+        );
     }
 
     /// P8a: `AttackResolution.attacker_state` carries the HitDef's `p1stateno`
@@ -1197,7 +1235,10 @@ mod tests {
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guards");
         assert_eq!(res.result, HitResult::Guard);
-        assert!(a.has_target, "a guarded contact still makes the defender a target");
+        assert!(
+            a.has_target,
+            "a guarded contact still makes the defender a target"
+        );
     }
 
     /// P8a (Proctor): the lifecycle simplification — once `has_target` is set it
@@ -1214,7 +1255,10 @@ mod tests {
 
         // hitonce blocks the second call (returns None) but the target stays set.
         assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
-        assert!(a.has_target, "has_target is sticky; no release in the flat 1-v-1 model");
+        assert!(
+            a.has_target,
+            "has_target is sticky; no release in the flat 1-v-1 model"
+        );
     }
 
     /// P8a (Proctor): `p1stateno` is independent of `p2stateno`. Setting both on
@@ -1354,7 +1398,10 @@ mod tests {
         let states = HashMap::new();
 
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
-        assert_eq!(a.power, 100, "getpower = 0 leaves the attacker meter untouched");
+        assert_eq!(
+            a.power, 100,
+            "getpower = 0 leaves the attacker meter untouched"
+        );
         assert_eq!(d.power, 60, "givepower still applies to the defender");
     }
 
@@ -1366,13 +1413,19 @@ mod tests {
         // Clamp at power_max.
         let (mut a, a_air) = make_attacker();
         if let Some(hd) = a.active_hitdef.as_mut() {
-            hd.getpower = PowerGain { hit: i32::MAX, guard: 0 };
+            hd.getpower = PowerGain {
+                hit: i32::MAX,
+                guard: 0,
+            };
         }
         a.power_max = 3000;
         let (mut d, d_air) = make_defender();
         let states = HashMap::new();
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
-        assert_eq!(a.power, 3000, "getpower clamps at power_max, never overflows");
+        assert_eq!(
+            a.power, 3000,
+            "getpower clamps at power_max, never overflows"
+        );
 
         // A miss (out of reach) grants no power to either participant.
         let (mut a2, a_air2) = make_attacker();
@@ -1398,22 +1451,36 @@ mod tests {
         let (mut a, a_air) = make_attacker(); // HitDef attr defaults to S, NA
         let (mut d, d_air) = make_defender();
         // Arm slot 0 to override a standing normal attack -> state 700.
-        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states)
             .expect("override fires as a connection");
         assert_eq!(res.result, HitResult::Hit);
         assert_eq!(res.damage, 0, "override applies no damage");
-        assert_eq!(res.defender_state, 700, "defender redirected to the override state");
-        assert_eq!(d.state_no, 700, "defender actually entered the override state");
+        assert_eq!(
+            res.defender_state, 700,
+            "defender redirected to the override state"
+        );
+        assert_eq!(
+            d.state_no, 700,
+            "defender actually entered the override state"
+        );
         assert_eq!(d.life, 1000, "no life lost under a hit override");
-        assert_eq!(d.vel, Vec2::new(0.0, 0.0), "no knockback under a hit override");
+        assert_eq!(
+            d.vel,
+            Vec2::new(0.0, 0.0),
+            "no knockback under a hit override"
+        );
         // The attacker still registered a connection (so hitonce holds).
         assert!(a.move_connect.hit);
         assert!(a.has_target);
         // The slot was consumed.
-        assert!(!d.hit_overrides.slots[0].is_active(), "matching slot consumed");
+        assert!(
+            !d.hit_overrides.slots[0].is_active(),
+            "matching slot consumed"
+        );
     }
 
     /// On a `HitOverride` match the attacker still counts the hit as a connection,
@@ -1429,12 +1496,19 @@ mod tests {
             hd.givepower = PowerGain { hit: 60, guard: 30 };
         }
         let (mut d, d_air) = make_defender();
-        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
         let states = HashMap::new();
 
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("override fires");
-        assert_eq!(a.power, 70, "attacker still gains getpower.hit on an override connection");
-        assert_eq!(d.power, 0, "defender's givepower is NOT granted under an override");
+        assert_eq!(
+            a.power, 70,
+            "attacker still gains getpower.hit on an override connection"
+        );
+        assert_eq!(
+            d.power, 0,
+            "defender's givepower is NOT granted under an override"
+        );
     }
 
     /// A `HitOverride` whose attr does NOT match the attacker is ignored — the
@@ -1445,14 +1519,21 @@ mod tests {
         let (mut a, a_air) = make_attacker(); // attr S, NA
         let (mut d, d_air) = make_defender();
         // Override only throws; the attacker's S,NA is a normal strike -> no match.
-        d.hit_overrides.arm(0, AttackAttrSet::parse(", NT,ST,HT"), 700, 30);
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse(", NT,ST,HT"), 700, 30);
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("normal hit");
         assert_eq!(res.result, HitResult::Hit);
-        assert_eq!(res.damage, 30, "normal hit damage applied (override did not match)");
+        assert_eq!(
+            res.damage, 30,
+            "normal hit damage applied (override did not match)"
+        );
         assert_eq!(d.state_no, 5000, "normal get-hit state, not the override");
-        assert!(d.hit_overrides.slots[0].is_active(), "non-matching slot is NOT consumed");
+        assert!(
+            d.hit_overrides.slots[0].is_active(),
+            "non-matching slot is NOT consumed"
+        );
     }
 
     /// An inactive (expired) `HitOverride` slot never fires.
@@ -1461,11 +1542,15 @@ mod tests {
         use crate::invuln::AttackAttrSet;
         let (mut a, a_air) = make_attacker();
         let (mut d, d_air) = make_defender();
-        d.hit_overrides.arm(0, AttackAttrSet::parse("S, NA"), 700, 0); // time 0 = inactive
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse("S, NA"), 700, 0); // time 0 = inactive
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("normal hit");
-        assert_eq!(res.defender_state, 5000, "inactive override slot is ignored");
+        assert_eq!(
+            res.defender_state, 5000,
+            "inactive override slot is ignored"
+        );
         assert_eq!(d.life, 1000 - 30, "normal damage applied");
     }
 
@@ -1477,7 +1562,9 @@ mod tests {
     /// controller through [`Character::tick_with`] without the executor crate's
     /// private test harness.
     fn state_with_ctrl(number: i32, ctrl_type: &str) -> (HashMap<i32, CompiledState>, AirFile) {
-        use crate::loader::{CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup};
+        use crate::loader::{
+            CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup,
+        };
         let controller = CompiledController {
             state_number: number,
             label: String::new(),
@@ -1533,8 +1620,14 @@ mod tests {
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
 
         // The fall vars were carried from the HitDef (not the hardcoded 0).
-        assert!(d.get_hit_vars.fall != 0, "defender is in a falling reaction");
-        assert_eq!(d.get_hit_vars.fall_damage, 70, "fall.damage carried from HitDef");
+        assert!(
+            d.get_hit_vars.fall != 0,
+            "defender is in a falling reaction"
+        );
+        assert_eq!(
+            d.get_hit_vars.fall_damage, 70,
+            "fall.damage carried from HitDef"
+        );
         assert!(
             (d.get_hit_vars.fall_yvel - (-7.0)).abs() < 1e-4,
             "fall.yvelocity carried"
@@ -1661,7 +1754,10 @@ mod tests {
         let states = HashMap::new();
 
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects air target");
-        assert_eq!(d.get_hit_vars.animtype, 4, "air defender uses air_animtype (Up=4)");
+        assert_eq!(
+            d.get_hit_vars.animtype, 4,
+            "air defender uses air_animtype (Up=4)"
+        );
         assert_eq!(ev_against("GetHitVar(animtype)", &d), Value::Int(4));
     }
 
@@ -1849,7 +1945,10 @@ mod tests {
         assert_eq!(d.life, 1000, "no damage while invulnerable");
         assert_eq!(d.state_no, 0, "no get-hit state change");
         assert_eq!(a.hitpause, 0, "a blocked hit pauses nobody");
-        assert!(!a.move_connect.contact(), "blocked hit does not connect the move");
+        assert!(
+            !a.move_connect.contact(),
+            "blocked hit does not connect the move"
+        );
     }
 
     /// P9 AC2/AC3: once the NotHitBy window EXPIRES (time_remaining hits 0) the
@@ -1887,7 +1986,10 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "a normal attack is not a throw -> not blocked");
+        assert!(
+            res.is_some(),
+            "a normal attack is not a throw -> not blocked"
+        );
         assert_eq!(d.life, 1000 - 30);
     }
 
@@ -1936,7 +2038,10 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "HitBy admitting S,NA lets a S,NA attack land");
+        assert!(
+            res.is_some(),
+            "HitBy admitting S,NA lets a S,NA attack land"
+        );
         assert_eq!(d.life, 1000 - 30);
     }
 
@@ -1972,7 +2077,10 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "a standing attack is not in the air-only window");
+        assert!(
+            res.is_some(),
+            "a standing attack is not in the air-only window"
+        );
         assert_eq!(d.life, 1000 - 30);
     }
 
@@ -2074,14 +2182,23 @@ mod tests {
         // Blocked: no contact bookkeeping at all.
         assert!(resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).is_none());
         assert!(!a.has_target, "an invuln-blocked hit establishes no target");
-        assert!(!a.move_connect.contact(), "blocked hit does not connect the move");
+        assert!(
+            !a.move_connect.contact(),
+            "blocked hit does not connect the move"
+        );
 
         // Window expires; the SAME move (never marked connected, so hitonce does
         // NOT forbid it) now lands on the no-longer-invulnerable defender.
         d.invuln.slot1.time_remaining = 0;
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "the pass-through move still lands after expiry");
-        assert!(a.has_target, "the landing hit finally establishes the target");
+        assert!(
+            res.is_some(),
+            "the pass-through move still lands after expiry"
+        );
+        assert!(
+            a.has_target,
+            "the landing hit finally establishes the target"
+        );
         assert_eq!(d.life, 1000 - 30);
     }
 
@@ -2141,11 +2258,18 @@ mod tests {
         let (mut a, a_air) = make_attacker();
         attacker_with_attr(&mut a, "S, NA");
         let (mut d, d_air) = make_defender();
-        assert_eq!(d.invuln, crate::invuln::InvulnMask::default(), "fresh defender has the default mask");
+        assert_eq!(
+            d.invuln,
+            crate::invuln::InvulnMask::default(),
+            "fresh defender has the default mask"
+        );
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "the default (all-inactive) mask never blocks");
+        assert!(
+            res.is_some(),
+            "the default (all-inactive) mask never blocks"
+        );
         assert_eq!(d.life, 1000 - 30);
     }
 
@@ -2222,7 +2346,11 @@ mod tests {
                 resolve_attack(&mut attacker, &lc.air, &mut defender, &lc.air, &lc.states)
             {
                 assert_eq!(r.result, fp_combat::HitResult::Hit);
-                assert_eq!(defender.life, life_before - 30, "real KFM punch dealt 30 dmg");
+                assert_eq!(
+                    defender.life,
+                    life_before - 30,
+                    "real KFM punch dealt 30 dmg"
+                );
                 assert!(defender.state_no >= 5000, "entered a get-hit state");
                 // The applied knockback points away from the right-facing
                 // attacker. We assert it via the resolution recipe and the
@@ -2333,7 +2461,8 @@ mod tests {
             defender.state_type = StateType::Standing; // grounded -> ground animtype
             attacker.move_connect.reset();
 
-            if resolve_attack(&mut attacker, &lc.air, &mut defender, &lc.air, &lc.states).is_some() {
+            if resolve_attack(&mut attacker, &lc.air, &mut defender, &lc.air, &lc.states).is_some()
+            {
                 assert_ne!(
                     defender.get_hit_vars.animtype, 0,
                     "real KFM Hard HitDef must set a non-Light GetHitVar(animtype)"
@@ -2400,8 +2529,14 @@ mod tests {
 
         resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
         assert_eq!(a.hitpause, 8, "fresh attacker takes the new pausetime.p1");
-        assert_eq!(d.hitpause, 15, "longer existing defender pause is preserved");
-        assert_eq!(d.shaketime, 15, "longer existing defender shake is preserved");
+        assert_eq!(
+            d.hitpause, 15,
+            "longer existing defender pause is preserved"
+        );
+        assert_eq!(
+            d.shaketime, 15,
+            "longer existing defender shake is preserved"
+        );
     }
 
     /// AC1: a GUARDED hit still pauses both participants. The documented fallback
@@ -2420,9 +2555,18 @@ mod tests {
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("guards");
         assert_eq!(res.result, HitResult::Guard);
         // Guard falls back to `pausetime` (p1 on the attacker, p2 on the defender).
-        assert_eq!(a.hitpause, 9, "guard pauses the attacker (pausetime.p1 fallback)");
-        assert_eq!(d.hitpause, 14, "guard pauses the defender (pausetime.p2 fallback)");
-        assert_eq!(d.shaketime, 14, "guard shaketime from the pausetime.p2 fallback");
+        assert_eq!(
+            a.hitpause, 9,
+            "guard pauses the attacker (pausetime.p1 fallback)"
+        );
+        assert_eq!(
+            d.hitpause, 14,
+            "guard pauses the defender (pausetime.p2 fallback)"
+        );
+        assert_eq!(
+            d.shaketime, 14,
+            "guard shaketime from the pausetime.p2 fallback"
+        );
     }
 
     /// AC1: a zero `pausetime` HitDef connects (damage applies) but freezes
@@ -2439,8 +2583,14 @@ mod tests {
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
         assert_eq!(res.result, HitResult::Hit);
         assert_eq!(d.life, 1000 - 30, "damage still applies with no hit-stop");
-        assert_eq!(a.hitpause, 0, "zero pausetime.p1 leaves the attacker unpaused");
-        assert_eq!(d.hitpause, 0, "zero pausetime.p2 leaves the defender unpaused");
+        assert_eq!(
+            a.hitpause, 0,
+            "zero pausetime.p1 leaves the attacker unpaused"
+        );
+        assert_eq!(
+            d.hitpause, 0,
+            "zero pausetime.p2 leaves the defender unpaused"
+        );
         assert_eq!(d.shaketime, 0, "zero pausetime.p2 leaves no shake");
     }
 
@@ -2461,18 +2611,41 @@ mod tests {
         assert_eq!(d.hitpause, 3);
 
         // Attacker: 2 frozen ticks, then resume.
-        assert!(a.tick_with(&states, &a_air, None, StageView::default()).hitpaused);
+        assert!(
+            a.tick_with(&states, &a_air, None, StageView::default())
+                .hitpaused
+        );
         assert_eq!(a.hitpause, 1);
-        assert!(a.tick_with(&states, &a_air, None, StageView::default()).hitpaused);
+        assert!(
+            a.tick_with(&states, &a_air, None, StageView::default())
+                .hitpaused
+        );
         assert_eq!(a.hitpause, 0);
-        assert!(!a.tick_with(&states, &a_air, None, StageView::default()).hitpaused, "attacker resumes after 2 ticks");
+        assert!(
+            !a.tick_with(&states, &a_air, None, StageView::default())
+                .hitpaused,
+            "attacker resumes after 2 ticks"
+        );
 
         // Defender: 3 frozen ticks, then resume.
-        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
-        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
-        assert!(d.tick_with(&states, &d_air, None, StageView::default()).hitpaused);
+        assert!(
+            d.tick_with(&states, &d_air, None, StageView::default())
+                .hitpaused
+        );
+        assert!(
+            d.tick_with(&states, &d_air, None, StageView::default())
+                .hitpaused
+        );
+        assert!(
+            d.tick_with(&states, &d_air, None, StageView::default())
+                .hitpaused
+        );
         assert_eq!(d.hitpause, 0);
-        assert!(!d.tick_with(&states, &d_air, None, StageView::default()).hitpaused, "defender resumes after 3 ticks");
+        assert!(
+            !d.tick_with(&states, &d_air, None, StageView::default())
+                .hitpaused,
+            "defender resumes after 3 ticks"
+        );
     }
 
     /// P9 AC3 gated real-KFM: drive KFM's get-up state (`common1` `[Statedef 5120]`,
@@ -2571,7 +2744,10 @@ mod tests {
                 {
                     overlapped = true;
                     assert!(res.is_none(), "NotHitBy window ignores the connecting hit");
-                    assert_eq!(d.life, lc.constants.life_max, "no damage while invulnerable");
+                    assert_eq!(
+                        d.life, lc.constants.life_max,
+                        "no damage while invulnerable"
+                    );
                     break;
                 }
             }
@@ -2614,8 +2790,14 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "first juggle hit lands while the pool can pay");
-        assert_eq!(d.juggle_points, 11, "pool charged the move's juggle cost (15 - 4)");
+        assert!(
+            res.is_some(),
+            "first juggle hit lands while the pool can pay"
+        );
+        assert_eq!(
+            d.juggle_points, 11,
+            "pool charged the move's juggle cost (15 - 4)"
+        );
     }
 
     /// When the pool can no longer pay the move's juggle cost, the hit is dropped
@@ -2632,9 +2814,18 @@ mod tests {
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
         assert!(res.is_none(), "insufficient juggle drops the hit");
-        assert_eq!(d.life, life_before, "no damage applied on a juggle-dropped hit");
-        assert_eq!(d.juggle_points, 3, "pool not charged when the hit is dropped");
-        assert!(!a.move_connect.contact(), "a dropped juggle hit does not connect");
+        assert_eq!(
+            d.life, life_before,
+            "no damage applied on a juggle-dropped hit"
+        );
+        assert_eq!(
+            d.juggle_points, 3,
+            "pool not charged when the hit is dropped"
+        );
+        assert!(
+            !a.move_connect.contact(),
+            "a dropped juggle hit does not connect"
+        );
     }
 
     /// A GROUNDED defender is never juggle-gated, even with an empty pool and a
@@ -2649,7 +2840,10 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "a grounded hit lands regardless of juggle points");
+        assert!(
+            res.is_some(),
+            "a grounded hit lands regardless of juggle points"
+        );
         assert_eq!(d.juggle_points, 0, "grounded hit does not spend juggle");
     }
 
@@ -2665,6 +2859,9 @@ mod tests {
         let states = HashMap::new();
 
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
-        assert!(res.is_some(), "a zero-cost move lands even with an empty pool");
+        assert!(
+            res.is_some(),
+            "a zero-cost move lands even with an empty pool"
+        );
     }
 }

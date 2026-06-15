@@ -29,9 +29,7 @@ use fp_core::Vec2;
 pub mod collision;
 pub mod push;
 
-pub use collision::{
-    any_clsn_overlap, any_overlap, place_clsn, rects_overlap, Clsn, Facing,
-};
+pub use collision::{any_clsn_overlap, any_overlap, place_clsn, rects_overlap, Clsn, Facing};
 pub use push::{
     clamp_body_to_bounds, clamp_to_bounds, push_bodies, resolve_push, PushBody, PushResolution,
 };

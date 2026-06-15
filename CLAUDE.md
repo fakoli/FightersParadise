@@ -44,8 +44,9 @@ cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
   `check`/`clippy`/`fmt`/`fmt-check`/`doc`/`clean`/`ci`) and `scripts/fp.sh` (windowed-game start/stop/
   restart/status supervisor) exist; there is **no** justfile or xtask. Every `make` target is a plain `cargo`
   command, so anything in the Makefile can also be run by hand.
-  Note: CI does **not** gate on `cargo fmt --check` (the `ci` workflow runs clippy + tests; the codebase
-  isn't rustfmt-clean — backlog CB3). The Makefile's `fmt-check` target exists but is not wired into CI.
+  Note: CI **now gates on `cargo fmt --all --check`** (backlog CB3, done) — the workspace was run through
+  `cargo fmt --all` once and is rustfmt-clean, so keep it that way (run `make fmt` before committing). The
+  `ci` workflow runs fmt-check + clippy + tests; the Makefile's `fmt-check` target and `make ci` mirror it.
 
 ### Live-debugging the windowed app (how to actually SEE what it renders)
 

@@ -173,9 +173,7 @@ impl StoryboardPlayer {
         let start = if scene_count == 0 {
             0
         } else {
-            storyboard
-                .start_scene
-                .clamp(0, scene_count as i32 - 1) as usize
+            storyboard.start_scene.clamp(0, scene_count as i32 - 1) as usize
         };
         let done = scene_count == 0;
         let cursors = if done {
@@ -238,9 +236,7 @@ impl StoryboardPlayer {
         if let Some(scene) = self.storyboard.scenes.get(self.scene_index) {
             let animations = &self.storyboard.animations;
             for cursor in &mut self.cursors {
-                if let Some(action) =
-                    layer_action(scene, animations, cursor.index)
-                {
+                if let Some(action) = layer_action(scene, animations, cursor.index) {
                     advance_cursor(cursor, action);
                 }
             }
@@ -773,7 +769,11 @@ end.time = 4
         let mut player = StoryboardPlayer::new(sb);
         // Scene 0 has end.time 0; first tick should roll all the way to scene 2.
         player.tick();
-        assert_eq!(player.scene_index(), 2, "rolled past both zero-length scenes");
+        assert_eq!(
+            player.scene_index(),
+            2,
+            "rolled past both zero-length scenes"
+        );
         assert!(!player.is_done());
         let draws = player.draw_list();
         assert_eq!(draws.len(), 1);
@@ -819,7 +819,11 @@ end.time = 10
         player.tick(); // t=3
         assert_eq!(player.draw_list().len(), 1, "t=3 visible");
         player.tick(); // t=4
-        assert_eq!(player.draw_list().len(), 1, "t=4 visible (endtime inclusive)");
+        assert_eq!(
+            player.draw_list().len(),
+            1,
+            "t=4 visible (endtime inclusive)"
+        );
         player.tick(); // t=5
         assert!(player.draw_list().is_empty(), "t=5 past endtime");
     }
@@ -861,7 +865,10 @@ end.time = 3
 ";
         let sb = Storyboard::from_def(text);
         let mut player = StoryboardPlayer::new(sb);
-        assert!(player.draw_list().is_empty(), "unresolved anim draws nothing");
+        assert!(
+            player.draw_list().is_empty(),
+            "unresolved anim draws nothing"
+        );
         for _ in 0..3 {
             player.tick();
         }
@@ -899,7 +906,10 @@ end.time = 5
 ";
         let sb = Storyboard::from_def(text);
         let player = StoryboardPlayer::new(sb);
-        assert!(player.draw_list().is_empty(), "out-of-range spriteno skipped");
+        assert!(
+            player.draw_list().is_empty(),
+            "out-of-range spriteno skipped"
+        );
     }
 
     #[test]
@@ -978,13 +988,20 @@ layer0.spriteno = 2,0
             assert_eq!(player.scene_index(), 0, "still scene 0 at t={t} (<7)");
         }
         player.tick(); // t reaches 7 -> roll to scene 1
-        assert_eq!(player.scene_index(), 1, "scene 0 ends exactly at its end.time");
+        assert_eq!(
+            player.scene_index(),
+            1,
+            "scene 0 ends exactly at its end.time"
+        );
         assert_eq!(player.scene_time(), 0);
         // Scene 1 holds for exactly 2 ticks.
         player.tick(); // t=1 in scene 1
         assert_eq!(player.scene_index(), 1, "scene 1 still showing at t=1 (<2)");
         player.tick(); // t=2 -> past the last scene
-        assert!(player.is_done(), "scene 1 ends at its own end.time, then done");
+        assert!(
+            player.is_done(),
+            "scene 1 ends at its own end.time, then done"
+        );
     }
 
     /// Clearcolor tracks the *current* scene and changes when playback rolls into
@@ -1008,11 +1025,19 @@ end.time = 2
         player.tick();
         player.tick(); // -> scene 1
         assert_eq!(player.scene_index(), 1);
-        assert_eq!(player.clearcolor(), (0, 255, 0), "scene 1 clearcolor changed");
+        assert_eq!(
+            player.clearcolor(),
+            (0, 255, 0),
+            "scene 1 clearcolor changed"
+        );
         player.tick();
         player.tick(); // -> scene 2 (no clearcolor)
         assert_eq!(player.scene_index(), 2);
-        assert_eq!(player.clearcolor(), (0, 0, 0), "scene 2 declares none -> black");
+        assert_eq!(
+            player.clearcolor(),
+            (0, 0, 0),
+            "scene 2 declares none -> black"
+        );
         player.tick();
         player.tick(); // done
         assert!(player.is_done());
@@ -1038,15 +1063,30 @@ fadein.col = 10,20,30
         assert_eq!(f0.alpha, 1.0, "t=0 alpha is fully opaque");
         player.tick(); // t=1
         let f1 = player.fade().expect("still fading in at t=1");
-        assert!((f1.alpha - 0.75).abs() < 1e-6, "t=1 -> 3/4, got {}", f1.alpha);
+        assert!(
+            (f1.alpha - 0.75).abs() < 1e-6,
+            "t=1 -> 3/4, got {}",
+            f1.alpha
+        );
         player.tick(); // t=2
         let f2 = player.fade().expect("still fading in at t=2");
-        assert!((f2.alpha - 0.5).abs() < 1e-6, "t=2 -> 1/2, got {}", f2.alpha);
+        assert!(
+            (f2.alpha - 0.5).abs() < 1e-6,
+            "t=2 -> 1/2, got {}",
+            f2.alpha
+        );
         player.tick(); // t=3
         let f3 = player.fade().expect("still fading in at t=3");
-        assert!((f3.alpha - 0.25).abs() < 1e-6, "t=3 -> 1/4, got {}", f3.alpha);
+        assert!(
+            (f3.alpha - 0.25).abs() < 1e-6,
+            "t=3 -> 1/4, got {}",
+            f3.alpha
+        );
         player.tick(); // t=4: fade-in complete -> no overlay
-        assert!(player.fade().is_none(), "t=4 == fadein.time -> fade-in done");
+        assert!(
+            player.fade().is_none(),
+            "t=4 == fadein.time -> fade-in done"
+        );
     }
 
     /// Fade-out: in the scene's last `fadeout.time` ticks the overlay ramps from
@@ -1070,16 +1110,32 @@ fadeout.col = 5,6,7
         // t=6: first fade-out tick -> 1/4 opaque.
         let f6 = player.fade().expect("fading out at t=6");
         assert_eq!(f6.color, (5, 6, 7));
-        assert!((f6.alpha - 0.25).abs() < 1e-6, "t=6 -> 1/4, got {}", f6.alpha);
+        assert!(
+            (f6.alpha - 0.25).abs() < 1e-6,
+            "t=6 -> 1/4, got {}",
+            f6.alpha
+        );
         player.tick(); // t=7
         let f7 = player.fade().expect("fading out at t=7");
-        assert!((f7.alpha - 0.5).abs() < 1e-6, "t=7 -> 1/2, got {}", f7.alpha);
+        assert!(
+            (f7.alpha - 0.5).abs() < 1e-6,
+            "t=7 -> 1/2, got {}",
+            f7.alpha
+        );
         player.tick(); // t=8
         let f8 = player.fade().expect("fading out at t=8");
-        assert!((f8.alpha - 0.75).abs() < 1e-6, "t=8 -> 3/4, got {}", f8.alpha);
+        assert!(
+            (f8.alpha - 0.75).abs() < 1e-6,
+            "t=8 -> 3/4, got {}",
+            f8.alpha
+        );
         player.tick(); // t=9 (final tick of the scene)
         let f9 = player.fade().expect("fading out at the final tick");
-        assert!((f9.alpha - 1.0).abs() < 1e-6, "t=9 -> fully opaque, got {}", f9.alpha);
+        assert!(
+            (f9.alpha - 1.0).abs() < 1e-6,
+            "t=9 -> fully opaque, got {}",
+            f9.alpha
+        );
     }
 
     /// A scene with neither `fadein.time` nor `fadeout.time` never reports a fade.
@@ -1132,13 +1188,25 @@ fadeout.col = 9,9,9
         // Fade-out window is [0,3); it wins all three ticks.
         let f0 = player.fade().expect("fade at t=0");
         assert_eq!(f0.color, (9, 9, 9), "fade-out color wins the overlap");
-        assert!((f0.alpha - (1.0 / 3.0)).abs() < 1e-6, "t=0 -> 1/3, got {}", f0.alpha);
+        assert!(
+            (f0.alpha - (1.0 / 3.0)).abs() < 1e-6,
+            "t=0 -> 1/3, got {}",
+            f0.alpha
+        );
         player.tick(); // t=1
         let f1 = player.fade().expect("fade at t=1");
-        assert!((f1.alpha - (2.0 / 3.0)).abs() < 1e-6, "t=1 -> 2/3, got {}", f1.alpha);
+        assert!(
+            (f1.alpha - (2.0 / 3.0)).abs() < 1e-6,
+            "t=1 -> 2/3, got {}",
+            f1.alpha
+        );
         player.tick(); // t=2 (final tick)
         let f2 = player.fade().expect("fade at t=2");
-        assert!((f2.alpha - 1.0).abs() < 1e-6, "t=2 -> fully opaque, got {}", f2.alpha);
+        assert!(
+            (f2.alpha - 1.0).abs() < 1e-6,
+            "t=2 -> fully opaque, got {}",
+            f2.alpha
+        );
     }
 
     /// BGM is offered exactly once per scene that declares one, on the scene's

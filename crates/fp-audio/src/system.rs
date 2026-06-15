@@ -526,9 +526,7 @@ mod tests {
             "distinct channels must not cut each other off"
         );
         assert!(
-            sys.is_channel_occupied(0)
-                && sys.is_channel_occupied(1)
-                && sys.is_channel_occupied(2)
+            sys.is_channel_occupied(0) && sys.is_channel_occupied(1) && sys.is_channel_occupied(2)
         );
 
         // Re-playing channel 1 cuts off ONLY channel 1.
@@ -567,7 +565,11 @@ mod tests {
 
         sys.stop(7);
         assert!(!sys.is_channel_occupied(7));
-        assert_eq!(inner.borrow().stops, vec![7], "stop is forwarded even if free");
+        assert_eq!(
+            inner.borrow().stops,
+            vec![7],
+            "stop is forwarded even if free"
+        );
     }
 
     #[test]
@@ -585,7 +587,11 @@ mod tests {
 
         let r = inner.borrow();
         let vols: Vec<f32> = r.plays.iter().map(|(_, v, _)| *v).collect();
-        assert_eq!(vols, vec![0.0, 2.5, -0.5], "volume must pass through unchanged");
+        assert_eq!(
+            vols,
+            vec![0.0, 2.5, -0.5],
+            "volume must pass through unchanged"
+        );
     }
 
     #[test]
@@ -625,7 +631,10 @@ mod tests {
         let mut sys = AudioSystem::with_backend(Box::new(NullBackend));
         let sound = make_sound(3);
         sys.play_sound(&sound, 0, 1.0);
-        assert!(sys.is_channel_occupied(0), "occupancy tracked even when silent");
+        assert!(
+            sys.is_channel_occupied(0),
+            "occupancy tracked even when silent"
+        );
         sys.play_sound(&sound, 0, 0.5); // cut-off path, still silent
         sys.play_sound(&sound, -1, 1.0); // always-new path
         sys.stop(0);

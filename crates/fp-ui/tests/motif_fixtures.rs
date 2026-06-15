@@ -40,7 +40,10 @@ fn data_asset(name: &str) -> PathBuf {
 fn real_kfm_system_def_parses_menu_grid_and_files() {
     let path = motif_fixture("system.def");
     if !path.exists() {
-        eprintln!("skipping: {} not present (test-assets/ is local-only)", path.display());
+        eprintln!(
+            "skipping: {} not present (test-assets/ is local-only)",
+            path.display()
+        );
         return;
     }
 
@@ -68,7 +71,11 @@ fn real_kfm_system_def_parses_menu_grid_and_files() {
 
     // [Title Info] — the KFM motif enables ALL 11 canonical items.
     let kinds: Vec<_> = sys.title.items.iter().map(|i| i.kind).collect();
-    assert_eq!(kinds, MenuItemKind::ALL.to_vec(), "all 11 items enabled in order");
+    assert_eq!(
+        kinds,
+        MenuItemKind::ALL.to_vec(),
+        "all 11 items enabled in order"
+    );
     // Spot-check a few labels.
     assert_eq!(sys.title.items[0].label, "ARCADE");
     assert_eq!(sys.title.items[1].label, "VS MODE");
@@ -94,7 +101,10 @@ fn real_kfm_system_def_parses_menu_grid_and_files() {
 fn real_kfm_select_def_parses_roster() {
     let path = motif_fixture("select.def");
     if !path.exists() {
-        eprintln!("skipping: {} not present (test-assets/ is local-only)", path.display());
+        eprintln!(
+            "skipping: {} not present (test-assets/ is local-only)",
+            path.display()
+        );
         return;
     }
 
@@ -110,10 +120,17 @@ fn real_kfm_select_def_parses_roster() {
             _ => None,
         })
         .collect();
-    assert_eq!(chars.len(), 1, "exactly one roster character in real select.def");
+    assert_eq!(
+        chars.len(),
+        1,
+        "exactly one roster character in real select.def"
+    );
     let kfm = chars[0];
     assert_eq!(kfm.name, "kfm");
-    assert_eq!(kfm.def_path, "kfm/kfm.def", "bare name resolves to kfm/kfm.def");
+    assert_eq!(
+        kfm.def_path, "kfm/kfm.def",
+        "bare name resolves to kfm/kfm.def"
+    );
     assert_eq!(kfm.stage.as_deref(), Some("stages/kfm.def"));
 
     // [Options] arcade.maxmatches is present.
@@ -140,7 +157,11 @@ fn shipped_default_system_def_parses() {
     let kinds: Vec<_> = sys.title.items.iter().map(|i| i.kind).collect();
     assert_eq!(
         kinds,
-        vec![MenuItemKind::Versus, MenuItemKind::Training, MenuItemKind::Exit]
+        vec![
+            MenuItemKind::Versus,
+            MenuItemKind::Training,
+            MenuItemKind::Exit
+        ]
     );
     let labels: Vec<_> = sys.title.items.iter().map(|i| i.label.as_str()).collect();
     assert_eq!(labels, vec!["VS MODE", "TRAINING", "EXIT"]);
@@ -165,7 +186,10 @@ fn shipped_default_select_def_resolves_trainingdummy() {
             _ => None,
         })
         .collect();
-    assert!(!chars.is_empty(), "default roster has at least one character");
+    assert!(
+        !chars.is_empty(),
+        "default roster has at least one character"
+    );
 
     let dummy = chars[0];
     assert_eq!(dummy.name, "Training Dummy");
@@ -173,7 +197,9 @@ fn shipped_default_select_def_resolves_trainingdummy() {
 
     // The default roster also carries a randomselect icon.
     assert!(
-        sel.slots.iter().any(|s| matches!(s, SelectSlot::RandomSelect)),
+        sel.slots
+            .iter()
+            .any(|s| matches!(s, SelectSlot::RandomSelect)),
         "default roster includes a randomselect slot"
     );
 

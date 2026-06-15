@@ -235,8 +235,7 @@ pub fn place_clsn(clsn: Clsn, pos: Vec2<f32>, facing: Facing) -> Rect {
 /// assert!(!any_overlap(&attack, &[]));        // empty set never hits
 /// ```
 pub fn any_overlap(a: &[Rect], b: &[Rect]) -> bool {
-    a.iter()
-        .any(|ra| b.iter().any(|rb| rects_overlap(ra, rb)))
+    a.iter().any(|ra| b.iter().any(|rb| rects_overlap(ra, rb)))
 }
 
 /// Returns `true` if any Clsn box in `a` overlaps any Clsn box in `b`, placing both
@@ -637,14 +636,20 @@ mod tests {
         let box_ = Clsn::new(3.0, -9.0, 21.0, 4.0);
         let pos = Vec2::new(15.0, -2.0);
         for facing in [Facing::Right, Facing::Left] {
-            assert!(rect_eq(box_.place(pos, facing), place_clsn(box_, pos, facing)));
+            assert!(rect_eq(
+                box_.place(pos, facing),
+                place_clsn(box_, pos, facing)
+            ));
         }
     }
 
     #[test]
     fn any_overlap_is_symmetric() {
         // any_overlap(a, b) == any_overlap(b, a) since rects_overlap is symmetric.
-        let a = [Rect::new(0.0, 0.0, 10.0, 10.0), Rect::new(50.0, 50.0, 5.0, 5.0)];
+        let a = [
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(50.0, 50.0, 5.0, 5.0),
+        ];
         let b = [Rect::new(5.0, 5.0, 3.0, 3.0)];
         assert_eq!(any_overlap(&a, &b), any_overlap(&b, &a));
         assert!(any_overlap(&a, &b));
@@ -654,15 +659,25 @@ mod tests {
     fn any_overlap_first_box_hits_short_circuit_ok() {
         // The very first pair overlapping must still return true (covers the
         // .any() short-circuit returning early without skipping a real hit).
-        let a = [Rect::new(0.0, 0.0, 10.0, 10.0), Rect::new(500.0, 0.0, 1.0, 1.0)];
-        let b = [Rect::new(1.0, 1.0, 1.0, 1.0), Rect::new(900.0, 0.0, 1.0, 1.0)];
+        let a = [
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(500.0, 0.0, 1.0, 1.0),
+        ];
+        let b = [
+            Rect::new(1.0, 1.0, 1.0, 1.0),
+            Rect::new(900.0, 0.0, 1.0, 1.0),
+        ];
         assert!(any_overlap(&a, &b));
     }
 
     #[test]
     fn any_overlap_many_vs_many_all_disjoint() {
-        let a: Vec<Rect> = (0..8).map(|i| Rect::new(i as f32 * 100.0, 0.0, 10.0, 10.0)).collect();
-        let b: Vec<Rect> = (0..8).map(|i| Rect::new(i as f32 * 100.0 + 50.0, 0.0, 10.0, 10.0)).collect();
+        let a: Vec<Rect> = (0..8)
+            .map(|i| Rect::new(i as f32 * 100.0, 0.0, 10.0, 10.0))
+            .collect();
+        let b: Vec<Rect> = (0..8)
+            .map(|i| Rect::new(i as f32 * 100.0 + 50.0, 0.0, 10.0, 10.0))
+            .collect();
         assert!(!any_overlap(&a, &b));
     }
 
@@ -687,9 +702,30 @@ mod tests {
         let attack = [Clsn::new(0.0, -10.0, 10.0, 0.0)];
         let none: [Clsn; 0] = [];
         let pos = Vec2::new(0.0, 0.0);
-        assert!(!any_clsn_overlap(&attack, pos, Facing::Right, &none, pos, Facing::Left));
-        assert!(!any_clsn_overlap(&none, pos, Facing::Right, &attack, pos, Facing::Left));
-        assert!(!any_clsn_overlap(&none, pos, Facing::Right, &none, pos, Facing::Left));
+        assert!(!any_clsn_overlap(
+            &attack,
+            pos,
+            Facing::Right,
+            &none,
+            pos,
+            Facing::Left
+        ));
+        assert!(!any_clsn_overlap(
+            &none,
+            pos,
+            Facing::Right,
+            &attack,
+            pos,
+            Facing::Left
+        ));
+        assert!(!any_clsn_overlap(
+            &none,
+            pos,
+            Facing::Right,
+            &none,
+            pos,
+            Facing::Left
+        ));
     }
 
     #[test]
@@ -701,9 +737,23 @@ mod tests {
         let a_pos = Vec2::new(0.0, 0.0);
         let d_pos = Vec2::new(60.0, 0.0);
         // Facing right (toward defender on the +X side): hit.
-        assert!(any_clsn_overlap(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left));
+        assert!(any_clsn_overlap(
+            &attack,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Left
+        ));
         // Facing left (away from defender): attack box mirrors to -55..-10, whiff.
-        assert!(!any_clsn_overlap(&attack, a_pos, Facing::Left, &hurt, d_pos, Facing::Left));
+        assert!(!any_clsn_overlap(
+            &attack,
+            a_pos,
+            Facing::Left,
+            &hurt,
+            d_pos,
+            Facing::Left
+        ));
     }
 
     #[test]
@@ -802,7 +852,10 @@ mod tests {
         // in KFM include reversed pairs like `19,0,-10,-80`).
         for &c in clsn1.iter().chain(clsn2.iter()) {
             let r = c.to_rect();
-            assert!(r.w >= 0.0 && r.h >= 0.0, "normalized rect has negative size: {r:?}");
+            assert!(
+                r.w >= 0.0 && r.h >= 0.0,
+                "normalized rect has negative size: {r:?}"
+            );
             assert!(r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite());
             let _ = place_clsn(c, Vec2::new(160.0, 0.0), Facing::Left);
         }
@@ -811,9 +864,15 @@ mod tests {
         // `Clsn1[0] = 16,-80, 61,-71` (reaches out to local x=61). Pit it against a
         // KFM standing hurt box `Clsn2[0] = -13,0,16,-79` on an opponent facing left.
         let jab = Clsn::new(16.0, -80.0, 61.0, -71.0);
-        assert!(clsn1.contains(&jab), "expected KFM jab Clsn1 box in fixture");
+        assert!(
+            clsn1.contains(&jab),
+            "expected KFM jab Clsn1 box in fixture"
+        );
         let stand_hurt = Clsn::new(-13.0, 0.0, 16.0, -79.0);
-        assert!(clsn2.contains(&stand_hurt), "expected KFM standing hurt box in fixture");
+        assert!(
+            clsn2.contains(&stand_hurt),
+            "expected KFM standing hurt box in fixture"
+        );
 
         // Attacker axis x=80 facing right -> jab world x 96..141, y -80..-71.
         // Defender facing left; place its axis so the hurt box reaches the jab.

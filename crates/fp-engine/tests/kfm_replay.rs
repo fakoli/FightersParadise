@@ -118,7 +118,8 @@ fn kfm_two_runs_are_byte_equal_every_frame() {
         let sa = a.snapshot().expect("snapshot a");
         let sb = b.snapshot().expect("snapshot b");
         assert_eq!(
-            sa, sb,
+            sa,
+            sb,
             "real KFM diverged at frame {frame} (game_time {})",
             a.game_time()
         );

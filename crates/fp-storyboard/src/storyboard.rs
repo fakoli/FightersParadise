@@ -681,12 +681,8 @@ fn parse_color(value: Option<&str>) -> Option<(u8, u8, u8)> {
         tracing::warn!("storyboard: malformed color {v:?}; ignoring");
         return None;
     }
-    let comp = |s: &str| -> Option<u8> {
-        s.trim()
-            .parse::<i32>()
-            .ok()
-            .map(|n| n.clamp(0, 255) as u8)
-    };
+    let comp =
+        |s: &str| -> Option<u8> { s.trim().parse::<i32>().ok().map(|n| n.clamp(0, 255) as u8) };
     match (comp(parts[0]), comp(parts[1]), comp(parts[2])) {
         (Some(r), Some(g), Some(b)) => Some((r, g, b)),
         _ => {
@@ -848,7 +844,11 @@ type = null
         let sb = Storyboard::from_def(text);
         assert_eq!(sb.bg_groups.len(), 1, "only BG0 is a group, not BG0Ctrl");
         assert_eq!(sb.bg_groups[0].name, "BG0");
-        assert_eq!(sb.bg_groups[0].layers.len(), 1, "[BG0Ctrl 0] is not a BG0 layer");
+        assert_eq!(
+            sb.bg_groups[0].layers.len(),
+            1,
+            "[BG0Ctrl 0] is not a BG0 layer"
+        );
         assert_eq!(sb.bg_groups[0].layers[0].name, "Sky");
     }
 
@@ -1261,7 +1261,9 @@ end.time = 30
         assert_eq!(sb.animations[&10].frames.len(), 1);
         // The layer references an action that was parsed.
         assert_eq!(sb.scenes[0].layers[0].anim, Some(10));
-        assert!(sb.animations.contains_key(&sb.scenes[0].layers[0].anim.unwrap()));
+        assert!(sb
+            .animations
+            .contains_key(&sb.scenes[0].layers[0].anim.unwrap()));
     }
 
     /// A storyboard with no embedded action blocks yields an empty animation map
@@ -1380,9 +1382,7 @@ clearcolor =  10 , 20 , 30
     /// `Storyboard::load` returns `Err` (never panics) when the file is absent.
     #[test]
     fn load_missing_file_errors() {
-        let res = Storyboard::load(Path::new(
-            "/nonexistent/definitely/not/here/storyboard.def",
-        ));
+        let res = Storyboard::load(Path::new("/nonexistent/definitely/not/here/storyboard.def"));
         assert!(res.is_err(), "loading a missing file must return Err");
     }
 

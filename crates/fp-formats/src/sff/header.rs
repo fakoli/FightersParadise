@@ -94,9 +94,10 @@ pub fn parse_header(input: &[u8]) -> FpResult<SffHeader> {
         ));
     }
 
-    let (rest, _) = tag(SFF_SIGNATURE.as_slice())(input).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
-        FpError::parse("SFF", "invalid file signature (expected 'ElecbyteSpr\\0')")
-    })?;
+    let (rest, _) =
+        tag(SFF_SIGNATURE.as_slice())(input).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {
+            FpError::parse("SFF", "invalid file signature (expected 'ElecbyteSpr\\0')")
+        })?;
 
     // Version bytes: minor3, minor2, minor1, major
     let (rest, version_minor3) = le_u8(rest).map_err(|_: nom::Err<nom::error::Error<&[u8]>>| {

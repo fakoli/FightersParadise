@@ -391,9 +391,7 @@ fn eval_inner(expr: &Expr, ctx: &dyn EvalContext) -> Eval {
             op,
             operand,
         } => eval_animelem_tail(name, element, *op, operand, ctx),
-        Expr::TimeModTail { divisor, remainder } => {
-            eval_timemod_tail(divisor, remainder, ctx)
-        }
+        Expr::TimeModTail { divisor, remainder } => eval_timemod_tail(divisor, remainder, ctx),
         Expr::HitDefAttrTail {
             standtype,
             attr_codes,
@@ -443,11 +441,7 @@ fn eval_timemod_tail(divisor: &Expr, remainder: &Expr, ctx: &dyn EvalContext) ->
 /// against its active `HitDef`. With no `HitDef` active (or on a context that
 /// does not model one — the default seam) the match is `false`, so the form
 /// evaluates to `0` and the surrounding `&& movecontact` simply does not fire.
-fn eval_hitdefattr_tail(
-    standtype: &str,
-    attr_codes: &[String],
-    ctx: &dyn EvalContext,
-) -> Eval {
+fn eval_hitdefattr_tail(standtype: &str, attr_codes: &[String], ctx: &dyn EvalContext) -> Eval {
     Eval::Int(i32::from(ctx.hitdef_attr_matches(standtype, attr_codes)))
 }
 
@@ -889,16 +883,12 @@ fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
         "ceil" if args.len() == 1 => round_to_int(eval_inner(&args[0], ctx), f32::ceil),
         // ---- Type-preserving binary min / max (intentional divergence from
         // Ikemen's float-always; matches the doc & author expectation, §8) ----
-        "min" if args.len() == 2 => minmax(
-            eval_inner(&args[0], ctx),
-            eval_inner(&args[1], ctx),
-            true,
-        ),
-        "max" if args.len() == 2 => minmax(
-            eval_inner(&args[0], ctx),
-            eval_inner(&args[1], ctx),
-            false,
-        ),
+        "min" if args.len() == 2 => {
+            minmax(eval_inner(&args[0], ctx), eval_inner(&args[1], ctx), true)
+        }
+        "max" if args.len() == 2 => {
+            minmax(eval_inner(&args[0], ctx), eval_inner(&args[1], ctx), false)
+        }
         // ---- Transcendentals → f32 (§8) ----
         "sin" if args.len() == 1 => float_fn(eval_inner(&args[0], ctx), f32::sin),
         "cos" if args.len() == 1 => float_fn(eval_inner(&args[0], ctx), f32::cos),
@@ -1088,7 +1078,11 @@ mod tests {
     /// Renders `(name, member)` into a stable, case-insensitive lookup key for
     /// the member-keyed trigger path (`GetHitVar(member)`).
     fn member_key(name: &str, member: &str) -> String {
-        format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+        format!(
+            "{}#{}",
+            name.to_ascii_lowercase(),
+            member.to_ascii_lowercase()
+        )
     }
 
     /// An in-memory [`EvalContext`] for evaluator tests, with a deterministic RNG
@@ -1113,8 +1107,7 @@ mod tests {
             self
         }
         fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
-            self.member_triggers
-                .insert(member_key(name, member), value);
+            self.member_triggers.insert(member_key(name, member), value);
             self
         }
         fn with_var(mut self, index: i32, value: i32) -> Self {
@@ -1153,13 +1146,22 @@ mod tests {
                 .unwrap_or(Value::DEFAULT)
         }
         fn var(&self, index: i32) -> Value {
-            self.vars.get(&index).copied().map_or(Value::DEFAULT, Value::Int)
+            self.vars
+                .get(&index)
+                .copied()
+                .map_or(Value::DEFAULT, Value::Int)
         }
         fn fvar(&self, index: i32) -> Value {
-            self.fvars.get(&index).copied().map_or(Value::DEFAULT, Value::Float)
+            self.fvars
+                .get(&index)
+                .copied()
+                .map_or(Value::DEFAULT, Value::Float)
         }
         fn sysvar(&self, index: i32) -> Value {
-            self.sysvars.get(&index).copied().map_or(Value::DEFAULT, Value::Int)
+            self.sysvars
+                .get(&index)
+                .copied()
+                .map_or(Value::DEFAULT, Value::Int)
         }
         fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
             self.redirects
@@ -1391,18 +1393,38 @@ mod tests {
             }
         }
         // `0 && probe` must NOT read `probe`.
-        let ctx = CountingCtx { reads: Cell::new(0) };
+        let ctx = CountingCtx {
+            reads: Cell::new(0),
+        };
         assert_eq!(eval(&parse_str("0 && probe").unwrap(), &ctx), Value::Int(0));
-        assert_eq!(ctx.reads.get(), 0, "&& should short-circuit and not read probe");
+        assert_eq!(
+            ctx.reads.get(),
+            0,
+            "&& should short-circuit and not read probe"
+        );
 
         // `1 || probe` must NOT read `probe`.
-        let ctx2 = CountingCtx { reads: Cell::new(0) };
-        assert_eq!(eval(&parse_str("1 || probe").unwrap(), &ctx2), Value::Int(1));
-        assert_eq!(ctx2.reads.get(), 0, "|| should short-circuit and not read probe");
+        let ctx2 = CountingCtx {
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            eval(&parse_str("1 || probe").unwrap(), &ctx2),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ctx2.reads.get(),
+            0,
+            "|| should short-circuit and not read probe"
+        );
 
         // `1 && probe` MUST read it once.
-        let ctx3 = CountingCtx { reads: Cell::new(0) };
-        assert_eq!(eval(&parse_str("1 && probe").unwrap(), &ctx3), Value::Int(1));
+        let ctx3 = CountingCtx {
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            eval(&parse_str("1 && probe").unwrap(), &ctx3),
+            Value::Int(1)
+        );
         assert_eq!(ctx3.reads.get(), 1, "&& must evaluate RHS when LHS is true");
     }
 
@@ -1530,14 +1552,32 @@ mod tests {
             }
         }
         // cond(1, 42, untaken) → 42, never touching `untaken`.
-        let ctx = CountingCtx { reads: Cell::new(0) };
-        assert_eq!(eval(&parse_str("cond(1, 42, untaken)").unwrap(), &ctx), Value::Int(42));
-        assert_eq!(ctx.reads.get(), 0, "cond must not evaluate the untaken branch");
+        let ctx = CountingCtx {
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            eval(&parse_str("cond(1, 42, untaken)").unwrap(), &ctx),
+            Value::Int(42)
+        );
+        assert_eq!(
+            ctx.reads.get(),
+            0,
+            "cond must not evaluate the untaken branch"
+        );
 
         // cond(0, untaken, 7) → 7, never touching `untaken`.
-        let ctx2 = CountingCtx { reads: Cell::new(0) };
-        assert_eq!(eval(&parse_str("cond(0, untaken, 7)").unwrap(), &ctx2), Value::Int(7));
-        assert_eq!(ctx2.reads.get(), 0, "cond must not evaluate the untaken branch");
+        let ctx2 = CountingCtx {
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            eval(&parse_str("cond(0, untaken, 7)").unwrap(), &ctx2),
+            Value::Int(7)
+        );
+        assert_eq!(
+            ctx2.reads.get(),
+            0,
+            "cond must not evaluate the untaken branch"
+        );
     }
 
     // ---- Math functions (AC5) ----
@@ -1644,8 +1684,7 @@ mod tests {
     fn parameterized_trigger_ref_with_evaluated_args() {
         // A real trigger-with-args case: the args are evaluated before lookup, so
         // `AnimElemTime(1 + 1)` looks up with `[Int(2)]`.
-        let ctx = MockContext::new()
-            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(5));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(5));
         assert_eq!(ev("AnimElemTime(1 + 1)", &ctx), Value::Int(5));
         // Different (unregistered) arg → default.
         assert_eq!(ev("AnimElemTime(9)", &ctx), Value::Int(0));
@@ -1734,8 +1773,14 @@ mod tests {
     fn cb8_enemy_index_resolves_through_enemynear() {
         // CB8: `enemy(2)` lowers to EnemyNear(2); `enemy`/`enemy(0)` use Enemy.
         let ctx = MockContext::new()
-            .with_redirect(Redirect::Enemy, MockContext::new().with_trigger("X", &[], Value::Int(10)))
-            .with_redirect(Redirect::EnemyNear(2), MockContext::new().with_trigger("X", &[], Value::Int(20)));
+            .with_redirect(
+                Redirect::Enemy,
+                MockContext::new().with_trigger("X", &[], Value::Int(10)),
+            )
+            .with_redirect(
+                Redirect::EnemyNear(2),
+                MockContext::new().with_trigger("X", &[], Value::Int(20)),
+            );
         assert_eq!(ev("enemy, x", &ctx), Value::Int(10));
         assert_eq!(ev("enemy(0), x", &ctx), Value::Int(10));
         assert_eq!(ev("enemy(2), x", &ctx), Value::Int(20));
@@ -1830,8 +1875,16 @@ mod tests {
         // hands back a concrete Value every time (the internal Bottom sentinel
         // is fully encapsulated).
         for src in [
-            "1 / 0", "5 % 0", "ln(0)", "(0 - 1) ** 0.5", "\"x\"", "(1,2)",
-            "5.0 % 2", "floor(ln(0))", "(1 / 0) + 1", "abs(ln(0))",
+            "1 / 0",
+            "5 % 0",
+            "ln(0)",
+            "(0 - 1) ** 0.5",
+            "\"x\"",
+            "(1,2)",
+            "5.0 % 2",
+            "floor(ln(0))",
+            "(1 / 0) + 1",
+            "abs(ln(0))",
         ] {
             let v = evb(src);
             assert!(
@@ -1890,7 +1943,10 @@ mod tests {
         // Value::Float(NaN), now it is the safe default 0.
         let v = evb("0 * -5.8751624776690396e128");
         assert_eq!(v, Value::Int(0));
-        assert!(!matches!(v, Value::Float(f) if f.is_nan()), "no public NaN may escape");
+        assert!(
+            !matches!(v, Value::Float(f) if f.is_nan()),
+            "no public NaN may escape"
+        );
         // The mirror case via the trigger seam (unknown trigger → Int(0)).
         let ctx = MockContext::new();
         assert_eq!(ev("A * -5.8751624776690396e128", &ctx), Value::Int(0));
@@ -2047,10 +2103,19 @@ mod tests {
                 Value::Int(1)
             }
         }
-        let ctx = CountingCtx { reads: Cell::new(0) };
+        let ctx = CountingCtx {
+            reads: Cell::new(0),
+        };
         // `(1/0)` is Bottom → falsey → short-circuit.
-        assert_eq!(eval(&parse_str("(1 / 0) && probe").unwrap(), &ctx), Value::Int(0));
-        assert_eq!(ctx.reads.get(), 0, "&& must not read RHS when LHS is bottom/false");
+        assert_eq!(
+            eval(&parse_str("(1 / 0) && probe").unwrap(), &ctx),
+            Value::Int(0)
+        );
+        assert_eq!(
+            ctx.reads.get(),
+            0,
+            "&& must not read RHS when LHS is bottom/false"
+        );
     }
 
     #[test]
@@ -2189,7 +2254,11 @@ mod tests {
         assert_eq!(evb("cond(1, 2)"), Value::Int(0));
         // Registered as a trigger, it resolves through ctx.trigger with the
         // evaluated args (proving the args ARE evaluated for the fall-through).
-        let ctx = MockContext::new().with_trigger("cond", &[Value::Int(1), Value::Int(2)], Value::Int(77));
+        let ctx = MockContext::new().with_trigger(
+            "cond",
+            &[Value::Int(1), Value::Int(2)],
+            Value::Int(77),
+        );
         assert_eq!(ev("cond(1, 2)", &ctx), Value::Int(77));
     }
 
@@ -2306,9 +2375,18 @@ mod tests {
                 }
             }
         }
-        assert_eq!(eval(&parse_str("var(0)").unwrap(), &TriggerOnly), Value::Int(11));
-        assert_eq!(eval(&parse_str("fvar(0)").unwrap(), &TriggerOnly), Value::Float(2.5));
-        assert_eq!(eval(&parse_str("sysvar(0)").unwrap(), &TriggerOnly), Value::Int(99));
+        assert_eq!(
+            eval(&parse_str("var(0)").unwrap(), &TriggerOnly),
+            Value::Int(11)
+        );
+        assert_eq!(
+            eval(&parse_str("fvar(0)").unwrap(), &TriggerOnly),
+            Value::Float(2.5)
+        );
+        assert_eq!(
+            eval(&parse_str("sysvar(0)").unwrap(), &TriggerOnly),
+            Value::Int(99)
+        );
     }
 
     // ---- AC5: trigger refs — case-insensitive, float-valued, multi-arg ----
@@ -2336,8 +2414,8 @@ mod tests {
     fn trigger_ref_with_multiple_evaluated_args() {
         // A multi-arg trigger: both args are evaluated (left-to-right) before the
         // lookup. Models e.g. `ProjHit(id, ...)`-shaped triggers.
-        let ctx = MockContext::new()
-            .with_trigger("two", &[Value::Int(3), Value::Int(8)], Value::Int(55));
+        let ctx =
+            MockContext::new().with_trigger("two", &[Value::Int(3), Value::Int(8)], Value::Int(55));
         assert_eq!(ev("two(1 + 2, 2 * 4)", &ctx), Value::Int(55));
     }
 
@@ -2402,7 +2480,10 @@ mod tests {
         let ctx = MockContext::new().with_seed(42);
         let a = ev("random(0, 1000000)", &ctx);
         let b = ev("random(0, 1000000)", &ctx);
-        assert_ne!(a, b, "successive random(..) draws should advance the RNG state");
+        assert_ne!(
+            a, b,
+            "successive random(..) draws should advance the RNG state"
+        );
     }
 
     #[test]
@@ -2454,8 +2535,14 @@ mod tests {
         // produce byte-identical results (rollback/replay requirement, §11). Uses
         // the parened `random(..)` call form so the RNG seam is actually exercised.
         let expr = "cond(random(0, 1) < 1, random(0, 99) + var(0), fvar(0) * 2.0)";
-        let ctx_a = MockContext::new().with_seed(2024).with_var(0, 7).with_fvar(0, 1.5);
-        let ctx_b = MockContext::new().with_seed(2024).with_var(0, 7).with_fvar(0, 1.5);
+        let ctx_a = MockContext::new()
+            .with_seed(2024)
+            .with_var(0, 7)
+            .with_fvar(0, 1.5);
+        let ctx_b = MockContext::new()
+            .with_seed(2024)
+            .with_var(0, 7)
+            .with_fvar(0, 1.5);
         assert_eq!(ev(expr, &ctx_a), ev(expr, &ctx_b));
     }
 
@@ -2491,7 +2578,10 @@ mod tests {
             .with_trigger("animtype", &[], Value::Int(3))
             .with_trigger("selfanimexist", &[Value::Int(5050)], Value::Int(1));
         assert_eq!(
-            ev("(animtype = [4,5]) && SelfAnimExist(5047 + animtype)", &ctx2),
+            ev(
+                "(animtype = [4,5]) && SelfAnimExist(5047 + animtype)",
+                &ctx2
+            ),
             Value::Int(0)
         );
     }
@@ -2649,8 +2739,8 @@ mod tests {
     fn redirected_parameterized_trigger_uses_target_and_evaluated_args() {
         // `enemy, AnimElemTime(1 + 1)` — the arg is evaluated (to 2) and the lookup
         // happens against the ENEMY context.
-        let enemy = MockContext::new()
-            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(5));
+        let enemy =
+            MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(5));
         let ctx = MockContext::new().with_redirect(Redirect::Enemy, enemy);
         assert_eq!(ev("enemy, AnimElemTime(1 + 1)", &ctx), Value::Int(5));
     }
@@ -2744,7 +2834,11 @@ mod tests {
             eval(&parse_str("cond(0, (enemy, life), 9)").unwrap(), &ctx),
             Value::Int(9)
         );
-        assert_eq!(ctx.resolves.get(), 0, "untaken redirect branch must not resolve");
+        assert_eq!(
+            ctx.resolves.get(),
+            0,
+            "untaken redirect branch must not resolve"
+        );
 
         // When taken, it resolves exactly once.
         let ctx2 = CountingRedirect {
@@ -2755,7 +2849,11 @@ mod tests {
             eval(&parse_str("cond(1, (enemy, life), 9)").unwrap(), &ctx2),
             Value::Int(1)
         );
-        assert_eq!(ctx2.resolves.get(), 1, "taken redirect branch resolves once");
+        assert_eq!(
+            ctx2.resolves.get(),
+            1,
+            "taken redirect branch resolves once"
+        );
     }
 
     // ---- AC3: a deep chain that dead-ends mid-way collapses the whole expr ----
@@ -2824,11 +2922,13 @@ mod tests {
         assert_eq!(ev("(Vel Y > 0) && (Pos Y >= 0)", &ctx), Value::Int(0));
 
         // Through a redirect: `enemy, P2BodyDist X < 40` (kfm.cns AI logic).
-        let enemy = MockContext::new().with_trigger("P2BodyDist", &[Value::Int(0)], Value::Float(20.0));
+        let enemy =
+            MockContext::new().with_trigger("P2BodyDist", &[Value::Int(0)], Value::Float(20.0));
         let ctx = MockContext::new().with_redirect(Redirect::Enemy, enemy);
         assert_eq!(ev("enemy, P2BodyDist X < 40", &ctx), Value::Int(1));
         // The bare (self) form reads the un-redirected context: default 0 here.
-        assert_eq!(ev("P2BodyDist X < 40", &MockContext::new()), Value::Int(1)); // 0 < 40
+        assert_eq!(ev("P2BodyDist X < 40", &MockContext::new()), Value::Int(1));
+        // 0 < 40
     }
 
     #[test]
@@ -2919,8 +3019,11 @@ mod tests {
     fn gethitvar_multi_segment_member_routes_through_string_seam() {
         // A three-segment dotted member is one identifier; it routes through the
         // string seam by its full name (task 4.11, item a).
-        let ctx = MockContext::new()
-            .with_member_trigger("GetHitVar", "fall.envshake.time", Value::Int(5));
+        let ctx = MockContext::new().with_member_trigger(
+            "GetHitVar",
+            "fall.envshake.time",
+            Value::Int(5),
+        );
         assert_eq!(ev("GetHitVar(fall.envshake.time)", &ctx), Value::Int(5));
     }
 
@@ -2928,8 +3031,8 @@ mod tests {
     fn gethitvar_through_redirect_uses_target_member_seam() {
         // `enemy, GetHitVar(fall.yvel)` reads the member from the REDIRECTED
         // context's member seam, never the local one.
-        let enemy = MockContext::new()
-            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-9.0));
+        let enemy =
+            MockContext::new().with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-9.0));
         let ctx = MockContext::new()
             .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
             .with_redirect(Redirect::Enemy, enemy);
@@ -2960,9 +3063,15 @@ mod tests {
         // Acceptance criterion 2 (additive/safe): with a context whose
         // `trigger_str` returns the default (no resolver yet), `const(...)` still
         // evaluates to 0 — no regression.
-        assert_eq!(ev("const(velocity.walk.fwd.x)", &MockContext::new()), Value::Int(0));
+        assert_eq!(
+            ev("const(velocity.walk.fwd.x)", &MockContext::new()),
+            Value::Int(0)
+        );
         // Even composed in arithmetic / comparison it stays a harmless 0.
-        assert_eq!(ev("const(movement.yaccel) > 0", &MockContext::new()), Value::Int(0));
+        assert_eq!(
+            ev("const(movement.yaccel) > 0", &MockContext::new()),
+            Value::Int(0)
+        );
     }
 
     #[test]
@@ -2985,8 +3094,8 @@ mod tests {
     fn const_trigger_name_is_case_insensitive_through_eval() {
         // `const` is matched case-insensitively (MUGEN is case-insensitive); any
         // casing routes through the string seam.
-        let ctx = MockContext::new()
-            .with_member_trigger("const", "movement.yaccel", Value::Float(0.44));
+        let ctx =
+            MockContext::new().with_member_trigger("const", "movement.yaccel", Value::Float(0.44));
         for src in [
             "const(movement.yaccel)",
             "Const(movement.yaccel)",
@@ -3000,8 +3109,8 @@ mod tests {
     fn const_through_redirect_uses_target_member_seam() {
         // `enemy, const(movement.yaccel)` reads the constant from the REDIRECTED
         // context's member seam, never the local one.
-        let enemy = MockContext::new()
-            .with_member_trigger("const", "movement.yaccel", Value::Float(0.9));
+        let enemy =
+            MockContext::new().with_member_trigger("const", "movement.yaccel", Value::Float(0.9));
         let ctx = MockContext::new()
             .with_member_trigger("const", "movement.yaccel", Value::Float(0.44))
             .with_redirect(Redirect::Enemy, enemy);
@@ -3040,7 +3149,7 @@ mod tests {
             .with_var(0, 2)
             .with_trigger("const", &[Value::Int(2)], Value::Int(70))
             .with_member_trigger("const", "2", Value::Int(999)); // must NOT be hit
-        // `const(1+1)` → arg evaluates to 2 → numeric trigger("const",[2]).
+                                                                 // `const(1+1)` → arg evaluates to 2 → numeric trigger("const",[2]).
         assert_eq!(ev("const(1+1)", &ctx), Value::Int(70));
         // `const(var(0))` → var(0)=2 → same numeric lookup.
         assert_eq!(ev("const(var(0))", &ctx), Value::Int(70));
@@ -3077,10 +3186,16 @@ mod tests {
             .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4));
         let int_v = ev("const(size.ground.front)", &ctx);
         assert_eq!(int_v, Value::Int(16));
-        assert!(int_v.is_int(), "an int constant must stay Int, got {int_v:?}");
+        assert!(
+            int_v.is_int(),
+            "an int constant must stay Int, got {int_v:?}"
+        );
         let flt_v = ev("const(velocity.walk.fwd.x)", &ctx);
         assert_eq!(flt_v, Value::Float(2.4));
-        assert!(flt_v.is_float(), "a float constant must stay Float, got {flt_v:?}");
+        assert!(
+            flt_v.is_float(),
+            "a float constant must stay Float, got {flt_v:?}"
+        );
     }
 
     #[test]
@@ -3090,9 +3205,15 @@ mod tests {
         // arithmetic (`const(velocity.walk.fwd.x) * 60` for a per-second speed)
         // and comparisons. With the seam resolving, the value flows through; the
         // 5.6c gap was exactly this composing to 0 because const read 0.
-        let ctx = MockContext::new()
-            .with_member_trigger("const", "velocity.walk.fwd.x", Value::Float(2.4));
-        assert_eq!(ev("const(velocity.walk.fwd.x) * 10", &ctx), Value::Float(24.0));
+        let ctx = MockContext::new().with_member_trigger(
+            "const",
+            "velocity.walk.fwd.x",
+            Value::Float(2.4),
+        );
+        assert_eq!(
+            ev("const(velocity.walk.fwd.x) * 10", &ctx),
+            Value::Float(24.0)
+        );
         assert_eq!(ev("const(velocity.walk.fwd.x) > 0", &ctx), Value::Int(1));
         assert_eq!(ev("const(velocity.walk.fwd.x) < 0", &ctx), Value::Int(0));
         // And it short-circuits naturally in a boolean guard.
@@ -3139,8 +3260,7 @@ mod tests {
             fn trigger_str(&self, name: &str, key: &str) -> Value {
                 // Record whether the verbatim mixed-case dotted member arrived
                 // unchanged and the trigger name is "const".
-                let exact = name.eq_ignore_ascii_case("const")
-                    && key == "Velocity.Walk.Fwd.X";
+                let exact = name.eq_ignore_ascii_case("const") && key == "Velocity.Walk.Fwd.X";
                 self.seen.set(Some(("const", exact)));
                 Value::Int(if exact { 1 } else { 0 })
             }
@@ -3181,7 +3301,10 @@ mod tests {
         assert_eq!(ev("const(velocity.walk.back.x)", &ctx), Value::Float(-2.3));
         assert_eq!(ev("const(size.ground.back)", &ctx), Value::Int(15));
         // Negation of a float const stays a float.
-        assert_eq!(ev("0.0 - const(velocity.walk.back.x)", &ctx), Value::Float(2.3));
+        assert_eq!(
+            ev("0.0 - const(velocity.walk.back.x)", &ctx),
+            Value::Float(2.3)
+        );
     }
 
     // ---- Gap 4: `command = "name"` string equality ----
@@ -3200,15 +3323,33 @@ mod tests {
         }
         let ctx = CmdCtx("recovery");
         // `command = "recovery"` fires; a different name does not.
-        assert_eq!(eval(&parse_str("command = \"recovery\"").unwrap(), &ctx), Value::Int(1));
-        assert_eq!(eval(&parse_str("command = \"x\"").unwrap(), &ctx), Value::Int(0));
+        assert_eq!(
+            eval(&parse_str("command = \"recovery\"").unwrap(), &ctx),
+            Value::Int(1)
+        );
+        assert_eq!(
+            eval(&parse_str("command = \"x\"").unwrap(), &ctx),
+            Value::Int(0)
+        );
         // Reversed operand order works too: `"recovery" = command`.
-        assert_eq!(eval(&parse_str("\"recovery\" = command").unwrap(), &ctx), Value::Int(1));
+        assert_eq!(
+            eval(&parse_str("\"recovery\" = command").unwrap(), &ctx),
+            Value::Int(1)
+        );
         // `!=` negates the seam result.
-        assert_eq!(eval(&parse_str("command != \"x\"").unwrap(), &ctx), Value::Int(1));
-        assert_eq!(eval(&parse_str("command != \"recovery\"").unwrap(), &ctx), Value::Int(0));
+        assert_eq!(
+            eval(&parse_str("command != \"x\"").unwrap(), &ctx),
+            Value::Int(1)
+        );
+        assert_eq!(
+            eval(&parse_str("command != \"recovery\"").unwrap(), &ctx),
+            Value::Int(0)
+        );
         // Case-insensitive `command` keyword.
-        assert_eq!(eval(&parse_str("Command = \"recovery\"").unwrap(), &ctx), Value::Int(1));
+        assert_eq!(
+            eval(&parse_str("Command = \"recovery\"").unwrap(), &ctx),
+            Value::Int(1)
+        );
     }
 
     #[test]
@@ -3282,9 +3423,8 @@ mod tests {
             name: "Vel".into(),
             args: vec![Expr::Str("W".into())],
         };
-        let ctx = MockContext::new()
-            .with_trigger("Vel", &[Value::Int(0)], Value::Float(9.0)); // code 0 == X
-        // "W" → axis_arg_code 0, so it reads the X-coded value.
+        let ctx = MockContext::new().with_trigger("Vel", &[Value::Int(0)], Value::Float(9.0)); // code 0 == X
+                                                                                               // "W" → axis_arg_code 0, so it reads the X-coded value.
         assert_eq!(eval(&ast, &ctx), Value::Float(9.0));
     }
 
@@ -3297,8 +3437,8 @@ mod tests {
         // (b) the family is exactly AnimElem + AnimElemTime (TimeMod / AnimElemNo
         // are no longer mis-folded into this form — see the parser tests).
         for head in ["AnimElem", "AnimElemTime"] {
-            let ctx = MockContext::new()
-                .with_trigger("animelemtime", &[Value::Int(4)], Value::Int(3));
+            let ctx =
+                MockContext::new().with_trigger("animelemtime", &[Value::Int(4)], Value::Int(3));
             let src = format!("{head} = 4, >= 0");
             assert_eq!(ev(&src, &ctx), Value::Int(1), "{src}");
             // Secondary that fails → false.
@@ -3311,8 +3451,7 @@ mod tests {
     fn animelem_tail_float_element_index_and_operand() {
         // A float element index narrows to int for the AnimElemTime lookup; a
         // float operand compares with float promotion. `AnimElem = 2.0, >= 0.5`.
-        let ctx = MockContext::new()
-            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(1));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(1));
         assert_eq!(ev("AnimElem = 2.0, >= 0.5", &ctx), Value::Int(1));
         assert_eq!(ev("AnimElem = 2.0, >= 1.5", &ctx), Value::Int(0));
     }
@@ -3321,8 +3460,7 @@ mod tests {
     fn animelem_tail_unreached_element_never_fires_regardless_of_secondary() {
         // The conjunction's "reached" guard dominates: a not-yet-reached element
         // (negative time) is always false, even if the secondary would pass.
-        let ctx = MockContext::new()
-            .with_trigger("animelemtime", &[Value::Int(9)], Value::Int(-5));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(9)], Value::Int(-5));
         assert_eq!(ev("AnimElem = 9, <= 0", &ctx), Value::Int(0));
         assert_eq!(ev("AnimElem = 9, = -5", &ctx), Value::Int(0));
         assert_eq!(ev("AnimElem = 9, < 100", &ctx), Value::Int(0));
@@ -3347,8 +3485,7 @@ mod tests {
             other => panic!("expected a redirected AnimElem tail, got {other:?}"),
         }
         // The non-redirected tail still evaluates correctly against a context.
-        let ctx = MockContext::new()
-            .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0));
+        let ctx = MockContext::new().with_trigger("animelemtime", &[Value::Int(2)], Value::Int(0));
         assert_eq!(ev("AnimElem = 2, >= 0", &ctx), Value::Int(1));
     }
 
@@ -3393,11 +3530,17 @@ mod tests {
     #[test]
     fn member_arg_multi_segment_member_routes_by_name() {
         // A three-segment member is one identifier; it routes by its full name.
-        let ctx = MockContext::new()
-            .with_member_trigger("GetHitVar", "fall.envshake.time", Value::Int(5));
+        let ctx = MockContext::new().with_member_trigger(
+            "GetHitVar",
+            "fall.envshake.time",
+            Value::Int(5),
+        );
         assert_eq!(ev("GetHitVar(fall.envshake.time)", &ctx), Value::Int(5));
         // Unknown member → safe default, never a panic.
-        assert_eq!(ev("GetHitVar(fall.envshake.time)", &MockContext::new()), Value::Int(0));
+        assert_eq!(
+            ev("GetHitVar(fall.envshake.time)", &MockContext::new()),
+            Value::Int(0)
+        );
     }
 
     // ---- Gap 4: command string equality — OR chains, chained edge, case ----
@@ -3406,18 +3549,29 @@ mod tests {
     fn command_or_chain_fires_when_any_command_active() {
         // Real kfm.cns shape: `Command = "a" || Command = "b"`.
         let ctx = CommandCtx { active: vec!["b"] };
-        assert_eq!(ev("Command = \"a\" || Command = \"b\"", &ctx), Value::Int(1));
+        assert_eq!(
+            ev("Command = \"a\" || Command = \"b\"", &ctx),
+            Value::Int(1)
+        );
         let ctx = CommandCtx { active: vec!["a"] };
-        assert_eq!(ev("Command = \"a\" || Command = \"b\"", &ctx), Value::Int(1));
+        assert_eq!(
+            ev("Command = \"a\" || Command = \"b\"", &ctx),
+            Value::Int(1)
+        );
         let ctx = CommandCtx { active: vec!["c"] };
-        assert_eq!(ev("Command = \"a\" || Command = \"b\"", &ctx), Value::Int(0));
+        assert_eq!(
+            ev("Command = \"a\" || Command = \"b\"", &ctx),
+            Value::Int(0)
+        );
     }
 
     #[test]
     fn command_string_equality_is_case_insensitive_on_name() {
         // MUGEN command names compare case-insensitively; the seam delegates the
         // match to the context, which uses eq_ignore_ascii_case here.
-        let ctx = CommandCtx { active: vec!["HoldFwd"] };
+        let ctx = CommandCtx {
+            active: vec!["HoldFwd"],
+        };
         assert_eq!(ev("command = \"holdfwd\"", &ctx), Value::Int(1));
         assert_eq!(ev("command = \"HOLDFWD\"", &ctx), Value::Int(1));
     }
@@ -3430,7 +3584,9 @@ mod tests {
         // falls to the numeric path: the Str RHS is bottom → the whole thing is 0,
         // REGARDLESS of whether "holdfwd" is active. Pin this so the seam's
         // narrow shape-match is not accidentally widened.
-        let ctx = CommandCtx { active: vec!["holdfwd"] };
+        let ctx = CommandCtx {
+            active: vec!["holdfwd"],
+        };
         assert_eq!(ev("var(2) = command = \"holdfwd\"", &ctx), Value::Int(0));
     }
 
@@ -3485,9 +3641,14 @@ mod tests {
         // casing of `GetHitVar` must route through the string seam (item a). The
         // member name itself is forwarded verbatim and matched per the context's
         // own (case-insensitive) table.
-        let ctx = MockContext::new()
-            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5));
-        for src in ["GetHitVar(fall.yvel)", "gethitvar(fall.yvel)", "GETHITVAR(fall.yvel)", "GetHitVar(FALL.YVEL)"] {
+        let ctx =
+            MockContext::new().with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5));
+        for src in [
+            "GetHitVar(fall.yvel)",
+            "gethitvar(fall.yvel)",
+            "GETHITVAR(fall.yvel)",
+            "GetHitVar(FALL.YVEL)",
+        ] {
             assert_eq!(ev(src, &ctx), Value::Float(-4.5), "{src}");
         }
     }
@@ -3503,7 +3664,7 @@ mod tests {
             .with_var(0, 2)
             .with_trigger("GetHitVar", &[Value::Int(2)], Value::Int(70))
             .with_member_trigger("GetHitVar", "2", Value::Int(999)); // must NOT be hit
-        // `GetHitVar(1+1)` → arg evaluates to 2 → numeric trigger("GetHitVar",[2]).
+                                                                     // `GetHitVar(1+1)` → arg evaluates to 2 → numeric trigger("GetHitVar",[2]).
         assert_eq!(ev("GetHitVar(1+1)", &ctx), Value::Int(70));
         // `GetHitVar(var(0))` → var(0)=2 → same numeric lookup.
         assert_eq!(ev("GetHitVar(var(0))", &ctx), Value::Int(70));
@@ -3517,7 +3678,10 @@ mod tests {
             .with_trigger("GetHitVar", &[], Value::Int(11))
             .with_trigger("GetHitVar", &[Value::Int(1), Value::Int(2)], Value::Int(22));
         // Build the AST forms directly (the surface syntax is unusual but legal).
-        let zero = Expr::Call { name: "GetHitVar".into(), args: vec![] };
+        let zero = Expr::Call {
+            name: "GetHitVar".into(),
+            args: vec![],
+        };
         assert_eq!(eval(&zero, &ctx), Value::Int(11));
         let two = Expr::Call {
             name: "GetHitVar".into(),
@@ -3545,8 +3709,8 @@ mod tests {
     fn gethitvar_member_composes_in_arithmetic_and_comparison() {
         // The member read is an ordinary atom in a larger expression: it composes
         // in arithmetic (with float promotion) and comparisons, end to end.
-        let ctx = MockContext::new()
-            .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.0));
+        let ctx =
+            MockContext::new().with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.0));
         assert_eq!(ev("GetHitVar(fall.yvel) + 1.0", &ctx), Value::Float(-3.0));
         assert_eq!(ev("GetHitVar(fall.yvel) < 0", &ctx), Value::Int(1));
         assert_eq!(ev("GetHitVar(fall.yvel) > 0", &ctx), Value::Int(0));
@@ -3782,7 +3946,10 @@ mod tests {
     fn hitdefattr_tail_routes_through_seam_and_composes_with_and() {
         // `hitdefattr = C, NA && movecontact`: the HitDefAttr tail routes through
         // the `hitdef_attr_matches` seam, and the `&& movecontact` survives.
-        let ctx = HitDefCtx { standtype: "C", code: "NA" };
+        let ctx = HitDefCtx {
+            standtype: "C",
+            code: "NA",
+        };
         // The seam matches → tail is 1; `movecontact` is unseeded (0) so the AND is
         // 0 — but the point is it EVALUATES rather than collapsing to const 0.
         assert_eq!(ev("hitdefattr = C, NA && movecontact", &ctx), Value::Int(0));
@@ -3813,6 +3980,9 @@ mod tests {
         assert_eq!(ev("ProjHit1000 = 1, > 5", &ctx), Value::Int(0));
         // It still composes in a boolean without collapsing the whole expression.
         let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(5));
-        assert_eq!(ev("projcontact2000 = 1, < 20 || time > 2", &ctx), Value::Int(1));
+        assert_eq!(
+            ev("projcontact2000 = 1, < 20 || time > 2", &ctx),
+            Value::Int(1)
+        );
     }
 }

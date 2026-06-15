@@ -71,23 +71,23 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds,
-    Winner, DEFAULT_MATCH_SEED,
+    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner,
+    DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
+use fp_input::{
+    map_controller, AiDifficulty, Button as PadButton, ControllerInput, CpuAi, RawController,
+    DEADZONE_DEFAULT,
+};
 use fp_render::{
     BlendMode, GlyphFont, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture, TextDrawParams,
 };
 use fp_stage::{BgLayer, Stage};
 use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout, SelectDef, SystemDef};
-use fp_input::{
-    map_controller, AiDifficulty, Button as PadButton, ControllerInput, CpuAi, RawController,
-    DEADZONE_DEFAULT,
-};
 use sdl2::controller::{Axis, Button as SdlPadButton, GameController};
 use sdl2::event::Event;
-use sdl2::keyboard::{Keycode, KeyboardState, Scancode};
+use sdl2::keyboard::{KeyboardState, Keycode, Scancode};
 use sdl2::GameControllerSubsystem;
 
 // The single-character CNS driver (now `#[cfg(test)]`) and the legacy
@@ -166,7 +166,10 @@ fn main() {
     // The `validate` subcommand is a headless CLI report — it must NOT open an
     // SDL2 window or a GPU device, so it is intercepted here, before `run()`.
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|a| a.eq_ignore_ascii_case("validate")) {
+    if args
+        .get(1)
+        .is_some_and(|a| a.eq_ignore_ascii_case("validate"))
+    {
         std::process::exit(run_validate(&args));
     }
 
@@ -318,7 +321,8 @@ impl CnsCharacter {
 
         // 2. Run the command matcher (facing-relative; F/B respect facing).
         let facing_right = self.entity.facing == fp_character::Facing::Right;
-        self.matcher.check_commands(&self.input_buffer, facing_right);
+        self.matcher
+            .check_commands(&self.input_buffer, facing_right);
 
         // 3. Snapshot active commands into the entity's command source so
         //    `command = "..."` triggers evaluate against live input this tick.
@@ -1150,13 +1154,28 @@ impl Hud {
         let power_y = MARGIN + BAR_H + POWER_GAP;
 
         // P1 life bar, top-left, growing rightward.
-        let p1_bar = HudRect { x: MARGIN, y: MARGIN, w: BAR_W, h: BAR_H };
+        let p1_bar = HudRect {
+            x: MARGIN,
+            y: MARGIN,
+            w: BAR_W,
+            h: BAR_H,
+        };
         self.draw_life_bar(frame, p1_bar, m.p1(), false);
         // P1 power bar, directly beneath the life bar, also growing rightward.
-        let p1_power = HudRect { x: MARGIN, y: power_y, w: POWER_BAR_W, h: POWER_BAR_H };
+        let p1_power = HudRect {
+            x: MARGIN,
+            y: power_y,
+            w: POWER_BAR_W,
+            h: POWER_BAR_H,
+        };
         self.draw_power_bar(frame, p1_power, m.p1(), false);
         // P2 life bar, top-right, draining toward the center (mirrored).
-        let p2_bar = HudRect { x: win_w - MARGIN - BAR_W, y: MARGIN, w: BAR_W, h: BAR_H };
+        let p2_bar = HudRect {
+            x: win_w - MARGIN - BAR_W,
+            y: MARGIN,
+            w: BAR_W,
+            h: BAR_H,
+        };
         self.draw_life_bar(frame, p2_bar, m.p2(), true);
         // P2 power bar, beneath the life bar, mirrored to anchor at the right edge.
         let p2_power = HudRect {
@@ -1238,7 +1257,11 @@ impl Hud {
         // Color shifts from green (healthy) to red (near death).
         let color = if frac > 0.33 { &self.green } else { &self.red };
         if fill_w > 0.0 {
-            let fill_x = if mirror { bar.x + (bar.w - fill_w) } else { bar.x };
+            let fill_x = if mirror {
+                bar.x + (bar.w - fill_w)
+            } else {
+                bar.x
+            };
             self.fill(
                 frame,
                 color,
@@ -1268,7 +1291,11 @@ impl Hud {
         let frac = power_fraction(player.power(), player.power_max());
         let fill_w = bar.w * frac;
         if fill_w > 0.0 {
-            let fill_x = if mirror { bar.x + (bar.w - fill_w) } else { bar.x };
+            let fill_x = if mirror {
+                bar.x + (bar.w - fill_w)
+            } else {
+                bar.x
+            };
             self.fill(
                 frame,
                 &self.blue,
@@ -1361,11 +1388,7 @@ fn draw_centered_text(
 /// loaded (the pre-FL2b fallback): yellow on KO, green/red on a P1/P2 win, white
 /// on a draw, and `None` during intro/fight (the bars carry that state). Kept as
 /// a small helper so the fallback mapping is one place and matches the original.
-fn announcer_quad_color(
-    hud: &Hud,
-    state: RoundState,
-    winner: Option<Winner>,
-) -> Option<&HudColor> {
+fn announcer_quad_color(hud: &Hud, state: RoundState, winner: Option<Winner>) -> Option<&HudColor> {
     match (state, winner) {
         (RoundState::Ko, _) => Some(&hud.yellow),
         (RoundState::Win, Some(Winner::P1)) => Some(&hud.green),
@@ -1538,14 +1561,20 @@ fn load_common_fx_from(sff_path: &Path, air_path: &Path) -> Option<(AirFile, Com
     let sff = match SffFile::load(sff_path) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("common-fx sff {} failed to load: {e}; common sparks disabled", sff_path.display());
+            tracing::warn!(
+                "common-fx sff {} failed to load: {e}; common sparks disabled",
+                sff_path.display()
+            );
             return None;
         }
     };
     let air = match AirFile::load(air_path) {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!("common-fx air {} failed to load: {e}; common sparks disabled", air_path.display());
+            tracing::warn!(
+                "common-fx air {} failed to load: {e}; common sparks disabled",
+                air_path.display()
+            );
             return None;
         }
     };
@@ -1600,7 +1629,8 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
             // are ever spawned then).
             EffectSide::Common => {
                 if let Some(fx) = run.common_fx.as_mut() {
-                    fx.render.get_or_create_sprite(&fx.sff, sprite, renderer, None);
+                    fx.render
+                        .get_or_create_sprite(&fx.sff, sprite, renderer, None);
                 }
             }
         }
@@ -1882,12 +1912,20 @@ fn draw_player_clsn(
 
     for hurt in &anim_frame.clsn2 {
         frame.draw_debug_box(&clsn_to_screen_box(
-            hurt, anchor_x, anchor_y, facing, CLSN2_COLOR,
+            hurt,
+            anchor_x,
+            anchor_y,
+            facing,
+            CLSN2_COLOR,
         ));
     }
     for attack in &anim_frame.clsn1 {
         frame.draw_debug_box(&clsn_to_screen_box(
-            attack, anchor_x, anchor_y, facing, CLSN1_COLOR,
+            attack,
+            anchor_x,
+            anchor_y,
+            facing,
+            CLSN1_COLOR,
         ));
     }
 }
@@ -2104,16 +2142,10 @@ impl StageRender {
                 screen_x - cached.axis_x as f32,
                 screen_y - cached.axis_y as f32,
             );
-            let sprite_size =
-                Vec2::new(cached.texture.width as f32, cached.texture.height as f32);
+            let sprite_size = Vec2::new(cached.texture.width as f32, cached.texture.height as f32);
 
             // One rect for the non-tiling default; the full tiled set otherwise.
-            let rects = fp_stage::tile_rects(
-                anchor,
-                sprite_size,
-                bg.tile,
-                Vec2::new(win_w, win_h),
-            );
+            let rects = fp_stage::tile_rects(anchor, sprite_size, bg.tile, Vec2::new(win_w, win_h));
             for rect in rects {
                 let params = SpriteDrawParams {
                     x: rect.x,
@@ -2255,10 +2287,7 @@ impl StoryboardKind {
 /// Every failure path (unreadable `.def`, absent key, unloadable storyboard/SFF)
 /// returns `None` so the match simply renders no extra overlay — never a panic,
 /// never a regression to the normal intro.
-fn load_character_storyboard(
-    char_def: &Path,
-    kind: StoryboardKind,
-) -> Option<StoryboardOverlay> {
+fn load_character_storyboard(char_def: &Path, kind: StoryboardKind) -> Option<StoryboardOverlay> {
     let def = match fp_formats::def::DefFile::load(char_def) {
         Ok(d) => d,
         Err(e) => {
@@ -2389,7 +2418,9 @@ impl StoryboardOverlay {
         // its first tick (a fresh player arms scene 0; each roll-over arms the new
         // scene). Then advance the scene cursor.
         if let Some(bgm) = self.player.bgm_to_start() {
-            tracing::info!("storyboard: scene BGM transition -> {bgm} (no music backend; not played)");
+            tracing::info!(
+                "storyboard: scene BGM transition -> {bgm} (no music backend; not played)"
+            );
         }
         self.player.tick();
     }
@@ -2412,9 +2443,9 @@ impl StoryboardOverlay {
             .entry(clear_rgb)
             .or_insert_with(|| HudColor::new(renderer, clear_rgb.0, clear_rgb.1, clear_rgb.2));
         if let Some(fade) = self.player.fade() {
-            self.color_quads
-                .entry(fade.color)
-                .or_insert_with(|| HudColor::new(renderer, fade.color.0, fade.color.1, fade.color.2));
+            self.color_quads.entry(fade.color).or_insert_with(|| {
+                HudColor::new(renderer, fade.color.0, fade.color.1, fade.color.2)
+            });
         }
     }
 
@@ -2437,7 +2468,12 @@ impl StoryboardOverlay {
     /// match (it is a full-screen cutscene), so the caller invokes it *after* the
     /// fighters/stage and instead of (not under) the normal scene.
     fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, win_h: f32) {
-        let cover = HudRect { x: 0.0, y: 0.0, w: win_w, h: win_h };
+        let cover = HudRect {
+            x: 0.0,
+            y: 0.0,
+            w: win_w,
+            h: win_h,
+        };
 
         // Cover the whole window with the current scene's clear color so the
         // cutscene reads as a full-screen overlay rather than compositing over the
@@ -2456,8 +2492,16 @@ impl StoryboardOverlay {
         // Map storyboard-local coords into the window. localcoord defaults to
         // (320, 240); guard against a zero/degenerate coordinate space.
         let (local_w, local_h) = self.player.storyboard().localcoord;
-        let sx = if local_w > 0 { win_w / local_w as f32 } else { 1.0 };
-        let sy = if local_h > 0 { win_h / local_h as f32 } else { 1.0 };
+        let sx = if local_w > 0 {
+            win_w / local_w as f32
+        } else {
+            1.0
+        };
+        let sy = if local_h > 0 {
+            win_h / local_h as f32
+        } else {
+            1.0
+        };
 
         for draw in self.player.draw_list() {
             let Some(cached) = self.sprite_cache.get(&draw.sprite) else {
@@ -2813,11 +2857,7 @@ fn active_storyboard(
         return ActiveStoryboard::Ending;
     }
     // The intro plays only during round 1's intro phase, before it has finished.
-    if has_intro
-        && !intro_done
-        && round_number == 1
-        && round_state == RoundState::Intro
-    {
+    if has_intro && !intro_done && round_number == 1 && round_state == RoundState::Intro {
         return ActiveStoryboard::Intro;
     }
     ActiveStoryboard::None
@@ -2910,7 +2950,13 @@ fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode 
         // <p1.def> <p2.def> [stage.def] → two-player match from two characters.
         n if n >= 3 && is_def_path(&args[1]) && is_def_path(&args[2]) => {
             let stage = stage_arg(args, 3);
-            load_match_or_fallback(Path::new(&args[1]), Path::new(&args[2]), stage, pal, renderer)
+            load_match_or_fallback(
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                stage,
+                pal,
+                renderer,
+            )
         }
         // <sff> <air> [..] → legacy viewer (first arg is NOT a .def).
         n if n >= 3 && !is_def_path(&args[1]) => {
@@ -3131,13 +3177,19 @@ fn load_screenpack(p1_def: &Path, renderer: &Renderer) -> Option<ScreenpackHud> 
     let def = match fp_formats::def::DefFile::load(&fight_def) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("screenpack {} failed to parse: {e}; using quad HUD", fight_def.display());
+            tracing::warn!(
+                "screenpack {} failed to parse: {e}; using quad HUD",
+                fight_def.display()
+            );
             return None;
         }
     };
     let layout = ScreenpackLayout::parse(&def);
     if layout.sff.is_empty() {
-        tracing::warn!("screenpack {} has no [Files] sff; using quad HUD", fight_def.display());
+        tracing::warn!(
+            "screenpack {} has no [Files] sff; using quad HUD",
+            fight_def.display()
+        );
         return None;
     }
 
@@ -3146,7 +3198,10 @@ fn load_screenpack(p1_def: &Path, renderer: &Renderer) -> Option<ScreenpackHud> 
     let sff = match SffFile::load(&sff_path) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("screenpack sff {} failed to load: {e}; using quad HUD", sff_path.display());
+            tracing::warn!(
+                "screenpack sff {} failed to load: {e}; using quad HUD",
+                sff_path.display()
+            );
             return None;
         }
     };
@@ -3161,7 +3216,10 @@ fn load_screenpack(p1_def: &Path, renderer: &Renderer) -> Option<ScreenpackHud> 
             match fp_formats::fnt::FntFont::load(&path) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    tracing::warn!("screenpack font {} failed to load: {e}; skipping", path.display());
+                    tracing::warn!(
+                        "screenpack font {} failed to load: {e}; skipping",
+                        path.display()
+                    );
                     None
                 }
             }
@@ -3437,8 +3495,7 @@ impl MenuApp {
             Some(run) => self.screen = RunScreen::Fight(Box::new(run)),
             None => {
                 tracing::warn!("could not start match; returning to title");
-                self.screen =
-                    RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+                self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
             }
         }
     }
@@ -3482,7 +3539,15 @@ fn draw_title_screen(
     // Motif name as a header near the top.
     let mut y = 60.0;
     if !title_name.is_empty() {
-        draw_centered_text(frame, font, &to_menu_text(title_name), win_w, y, TITLE_SCALE, 1.0);
+        draw_centered_text(
+            frame,
+            font,
+            &to_menu_text(title_name),
+            win_w,
+            y,
+            TITLE_SCALE,
+            1.0,
+        );
     }
 
     // Menu items, vertically stacked and centered, the cursor item marked.
@@ -3775,9 +3840,10 @@ fn run() -> fp_core::FpResult<()> {
     // owning both in the same scope and dropping surface (inside Renderer) when
     // we exit the main loop.
     let surface = unsafe {
-        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window).map_err(
-            |e| fp_core::FpError::Render(format!("failed to create surface: {e}")),
-        )?)
+        instance.create_surface_unsafe(
+            wgpu::SurfaceTargetUnsafe::from_window(&window)
+                .map_err(|e| fp_core::FpError::Render(format!("failed to create surface: {e}")))?,
+        )
     }
     .map_err(|e| fp_core::FpError::Render(format!("failed to create surface: {e}")))?;
 
@@ -3968,13 +4034,11 @@ fn run() -> fp_core::FpResult<()> {
                         }
                     }
                 }
-                RunScreen::Select(ref mut select) => {
-                    match select.update(menu_in, frame_counter) {
-                        screens::SelectOutcome::Pending => {}
-                        screens::SelectOutcome::Cancelled => app.return_to_title(),
-                        screens::SelectOutcome::Done(pick) => app.enter_fight(pick, &renderer),
-                    }
-                }
+                RunScreen::Select(ref mut select) => match select.update(menu_in, frame_counter) {
+                    screens::SelectOutcome::Pending => {}
+                    screens::SelectOutcome::Cancelled => app.return_to_title(),
+                    screens::SelectOutcome::Done(pick) => app.enter_fight(pick, &renderer),
+                },
                 RunScreen::Fight(_) | RunScreen::Quit => {}
             }
 
@@ -3998,9 +4062,7 @@ fn run() -> fp_core::FpResult<()> {
                 Some(Mode::Static(..)) | Some(Mode::TestPattern(..)) | None => {}
             }
             // The menu Fight screen advances its match here too.
-            if let Some(RunScreen::Fight(run)) =
-                menu_app.as_mut().map(|a| &mut a.screen)
-            {
+            if let Some(RunScreen::Fight(run)) = menu_app.as_mut().map(|a| &mut a.screen) {
                 tick_match_run(run, p1_input, p2_input);
             }
             accumulator -= TICK_DURATION;
@@ -4052,10 +4114,8 @@ fn run() -> fp_core::FpResult<()> {
                     if let Some(cached) = v.sprite_cache.get(&anim_frame.sprite) {
                         let center_x = win_w as f32 / 2.0;
                         let ground_y = win_h as f32 * 0.7;
-                        let draw_x =
-                            center_x - cached.axis_x as f32 + anim_frame.offset.x as f32;
-                        let draw_y =
-                            ground_y - cached.axis_y as f32 + anim_frame.offset.y as f32;
+                        let draw_x = center_x - cached.axis_x as f32 + anim_frame.offset.x as f32;
+                        let draw_y = ground_y - cached.axis_y as f32 + anim_frame.offset.y as f32;
                         let (render_blend, alpha) = map_blend_mode(&anim_frame.blend);
                         let params = SpriteDrawParams {
                             x: draw_x,
@@ -4257,8 +4317,8 @@ mod tests {
         // A right-down + (a, c) controller snapshot must surface those exact bits.
         let raw = RawController {
             dpad_right: true,
-            stick_y: 30000, // down (SDL: +Y is down)
-            face_west: true,     // a
+            stick_y: 30000,       // down (SDL: +Y is down)
+            face_west: true,      // a
             shoulder_right: true, // c
             ..RawController::default()
         };
@@ -4575,11 +4635,7 @@ mod tests {
             );
             // And the storyboard parses into a non-empty, playable scene model.
             let sb = fp_storyboard::Storyboard::load(&sb_path).expect("storyboard loads");
-            assert!(
-                !sb.scenes.is_empty(),
-                "KFM {} has scenes",
-                kind.def_key()
-            );
+            assert!(!sb.scenes.is_empty(), "KFM {} has scenes", kind.def_key());
             assert!(
                 !sb.sprite_path.is_empty(),
                 "KFM {} declares a sprite file",
@@ -4597,7 +4653,6 @@ mod tests {
         assert_eq!(clamp_elem(0, 0), 0); // empty action
     }
 
-
     // =====================================================================
     // Task 7.2 — two-player Match wiring (the playable demo)
     // =====================================================================
@@ -4606,12 +4661,26 @@ mod tests {
     /// safe against a zero/negative `life_max` and overkill/over-full life.
     #[test]
     fn life_fraction_is_clamped_and_safe() {
-        assert!((life_fraction(1000, 1000) - 1.0).abs() < 1e-6, "full life is 1.0");
-        assert!((life_fraction(500, 1000) - 0.5).abs() < 1e-6, "half life is 0.5");
+        assert!(
+            (life_fraction(1000, 1000) - 1.0).abs() < 1e-6,
+            "full life is 1.0"
+        );
+        assert!(
+            (life_fraction(500, 1000) - 0.5).abs() < 1e-6,
+            "half life is 0.5"
+        );
         assert!((life_fraction(0, 1000)).abs() < 1e-6, "no life is 0.0");
-        assert_eq!(life_fraction(-50, 1000), 0.0, "overkill clamps to 0, not negative");
+        assert_eq!(
+            life_fraction(-50, 1000),
+            0.0,
+            "overkill clamps to 0, not negative"
+        );
         assert_eq!(life_fraction(2000, 1000), 1.0, "over-full clamps to 1");
-        assert_eq!(life_fraction(100, 0), 0.0, "zero life_max yields 0, no div-by-zero");
+        assert_eq!(
+            life_fraction(100, 0),
+            0.0,
+            "zero life_max yields 0, no div-by-zero"
+        );
         assert_eq!(life_fraction(100, -10), 0.0, "negative life_max yields 0");
     }
 
@@ -4620,12 +4689,26 @@ mod tests {
     /// zero/negative `power_max`.
     #[test]
     fn power_fraction_is_clamped_and_safe() {
-        assert!((power_fraction(3000, 3000) - 1.0).abs() < 1e-6, "full meter is 1.0");
-        assert!((power_fraction(1500, 3000) - 0.5).abs() < 1e-6, "half meter is 0.5");
+        assert!(
+            (power_fraction(3000, 3000) - 1.0).abs() < 1e-6,
+            "full meter is 1.0"
+        );
+        assert!(
+            (power_fraction(1500, 3000) - 0.5).abs() < 1e-6,
+            "half meter is 0.5"
+        );
         assert!((power_fraction(0, 3000)).abs() < 1e-6, "empty meter is 0.0");
         assert_eq!(power_fraction(-50, 3000), 0.0, "negative power clamps to 0");
-        assert_eq!(power_fraction(9999, 3000), 1.0, "over-full meter clamps to 1");
-        assert_eq!(power_fraction(100, 0), 0.0, "zero power_max yields 0, no div-by-zero");
+        assert_eq!(
+            power_fraction(9999, 3000),
+            1.0,
+            "over-full meter clamps to 1"
+        );
+        assert_eq!(
+            power_fraction(100, 0),
+            0.0,
+            "zero power_max yields 0, no div-by-zero"
+        );
         assert_eq!(power_fraction(100, -10), 0.0, "negative power_max yields 0");
     }
 
@@ -4634,9 +4717,18 @@ mod tests {
     #[test]
     fn world_to_screen_x_centers_on_window() {
         let win_w = 640.0;
-        assert!((world_to_screen_x(0.0, win_w) - 320.0).abs() < 1e-6, "origin at center");
-        assert!(world_to_screen_x(-60.0, win_w) < 320.0, "negative world X is left of center");
-        assert!(world_to_screen_x(60.0, win_w) > 320.0, "positive world X is right of center");
+        assert!(
+            (world_to_screen_x(0.0, win_w) - 320.0).abs() < 1e-6,
+            "origin at center"
+        );
+        assert!(
+            world_to_screen_x(-60.0, win_w) < 320.0,
+            "negative world X is left of center"
+        );
+        assert!(
+            world_to_screen_x(60.0, win_w) > 320.0,
+            "positive world X is right of center"
+        );
     }
 
     // =====================================================================
@@ -4663,7 +4755,10 @@ mod tests {
             (with_cam - world_to_screen_x(-40.0, win_w)).abs() < 1e-6,
             "camera +100 maps pos.x-100 (the world scrolls under the camera)"
         );
-        assert!(with_cam < no_cam, "panning the camera right pushes the fighter left");
+        assert!(
+            with_cam < no_cam,
+            "panning the camera right pushes the fighter left"
+        );
     }
 
     /// `bg_sprite_id` accepts in-range group/image and rejects (with `None`) any
@@ -4671,9 +4766,16 @@ mod tests {
     #[test]
     fn bg_sprite_id_validates_u16_range() {
         assert_eq!(bg_sprite_id(0, 0), Some(SpriteId::new(0, 0)));
-        assert_eq!(bg_sprite_id(65535, 65535), Some(SpriteId::new(65535, 65535)));
+        assert_eq!(
+            bg_sprite_id(65535, 65535),
+            Some(SpriteId::new(65535, 65535))
+        );
         assert_eq!(bg_sprite_id(-1, 0), None, "negative group is out of range");
-        assert_eq!(bg_sprite_id(0, 70000), None, "image > u16::MAX is out of range");
+        assert_eq!(
+            bg_sprite_id(0, 70000),
+            None,
+            "image > u16::MAX is out of range"
+        );
     }
 
     /// `stage_arg` picks up a `.def` extra argument as the stage and ignores a
@@ -4696,7 +4798,11 @@ mod tests {
             "p2.def".to_string(),
             "notes.txt".to_string(),
         ];
-        assert_eq!(stage_arg(&non_def, 3), None, "a non-.def extra arg is not a stage");
+        assert_eq!(
+            stage_arg(&non_def, 3),
+            None,
+            "a non-.def extra arg is not a stage"
+        );
     }
 
     /// A missing stage path degrades to no stage (the flat-background fallback)
@@ -4737,8 +4843,16 @@ mod tests {
         assert!(m.p1().pos().x < 0.0, "P1 starts left of center");
         assert!(m.p2().pos().x > 0.0, "P2 starts right of center");
         // Facing each other (left fighter faces right, right fighter faces left).
-        assert_eq!(m.p1().facing(), fp_character::Facing::Right, "P1 faces the opponent");
-        assert_eq!(m.p2().facing(), fp_character::Facing::Left, "P2 faces the opponent");
+        assert_eq!(
+            m.p1().facing(),
+            fp_character::Facing::Right,
+            "P1 faces the opponent"
+        );
+        assert_eq!(
+            m.p2().facing(),
+            fp_character::Facing::Left,
+            "P2 faces the opponent"
+        );
         // Both at full life, intro phase, 99-second clock, no winner yet.
         assert_eq!(m.p1().life(), m.p1().life_max());
         assert_eq!(m.p2().life(), m.p2().life_max());
@@ -4761,7 +4875,10 @@ mod tests {
                         .get("value")
                         .is_some_and(|e| e.source.trim() == STATE_WALK.to_string())
             });
-            assert!(walks, "each fighter must have the stand->walk bridge in [Statedef -1]");
+            assert!(
+                walks,
+                "each fighter must have the stand->walk bridge in [Statedef -1]"
+            );
         }
     }
 
@@ -4769,7 +4886,9 @@ mod tests {
     /// input on P1 (and an idle P2) without panicking, advancing the round.
     #[test]
     fn two_kfm_match_ticks_without_panic() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
         for i in 0..240u32 {
             let p1 = MatchInput {
                 left: i % 3 == 0,
@@ -4814,9 +4933,14 @@ mod tests {
     /// the same one the app's default mode uses.
     #[test]
     fn headless_two_player_attack_connects_and_drops_life() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
 
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
         let p2_life_before = m.p2().life();
         assert_eq!(p2_life_before, m.p2().life_max(), "P2 starts at full life");
 
@@ -4824,7 +4948,10 @@ mod tests {
         // into punching range; the player-push pins the two at touching distance.
         for _ in 0..240 {
             m.tick(
-                MatchInput { right: true, ..MatchInput::none() },
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
                 MatchInput::none(),
             );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
@@ -4838,7 +4965,10 @@ mod tests {
         let mut p2_was_hit = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -4879,8 +5009,13 @@ mod tests {
     /// requests plus a panic-free play pump are the observable contract here.
     #[test]
     fn headless_two_player_attack_surfaces_and_plays_sound_requests() {
-        let Some(mut m) = build_kfm_match() else { return };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
 
         // The exact audio layer the live app holds: a silent-fallback mixer plus
         // a per-fighter decoded-sound cache. NullBackend forces silence so the
@@ -4900,7 +5035,13 @@ mod tests {
 
         // Phase 1: walk into punching range (holding "right" = forward for P1).
         for _ in 0..240 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             pump(&m, &mut audio, &mut p1_audio, &mut p2_audio);
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
                 break;
@@ -4912,7 +5053,10 @@ mod tests {
         let mut saw_request = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -4944,7 +5088,9 @@ mod tests {
     /// must accrue regardless; the KO consequence is asserted once P2 is downed.
     #[test]
     fn headless_two_player_sustained_attacks_advance_round() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
         if !run_until_fight(&mut m) {
             eprintln!("skipping: match never reached the fight phase");
             return;
@@ -4954,7 +5100,10 @@ mod tests {
         // Close to range first.
         for _ in 0..240 {
             m.tick(
-                MatchInput { right: true, ..MatchInput::none() },
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
                 MatchInput::none(),
             );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
@@ -4964,7 +5113,10 @@ mod tests {
         // Hammer P2 with light punches for a long budget (KFM has ~1000 life).
         for i in 0..6000 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -5019,7 +5171,11 @@ mod tests {
         // Sanity: start standing with control, facing right.
         assert_eq!(pc.entity.state_no, STATE_STAND, "starts in stand state");
         assert!(pc.entity.ctrl, "starts with control");
-        assert_eq!(pc.entity.facing, fp_character::Facing::Right, "starts facing right");
+        assert_eq!(
+            pc.entity.facing,
+            fp_character::Facing::Right,
+            "starts facing right"
+        );
 
         // CRITICAL: this whole path runs WITHOUT any app-side shim.
         // `holdfwd = /$F` compiles natively in fp-input, `alive` resolves to
@@ -5287,7 +5443,11 @@ mod tests {
     #[test]
     fn clamp_elem_handles_extreme_values() {
         assert_eq!(clamp_elem(i32::MIN, 4), 0, "very-negative clamps to 0");
-        assert_eq!(clamp_elem(i32::MAX, 4), 3, "very-large clamps to last index");
+        assert_eq!(
+            clamp_elem(i32::MAX, 4),
+            3,
+            "very-large clamps to last index"
+        );
         assert_eq!(clamp_elem(0, 1), 0, "single-frame action");
         assert_eq!(clamp_elem(5, 1), 0, "single-frame action clamps to 0");
     }
@@ -5373,7 +5533,10 @@ mod tests {
                 break;
             }
         }
-        assert!(walking, "facing left, holding forward should reach walk (20)");
+        assert!(
+            walking,
+            "facing left, holding forward should reach walk (20)"
+        );
         let x_before = pc.entity.pos.x;
         let mut saw_forward_vel = false;
         for _ in 0..5 {
@@ -5415,7 +5578,11 @@ mod tests {
                 break;
             }
         }
-        assert!(walked, "first hold should enter walk; got {}", pc.entity.state_no);
+        assert!(
+            walked,
+            "first hold should enter walk; got {}",
+            pc.entity.state_no
+        );
 
         // Release → stand.
         let mut stood = false;
@@ -5426,7 +5593,11 @@ mod tests {
                 break;
             }
         }
-        assert!(stood, "release should return to stand; got {}", pc.entity.state_no);
+        assert!(
+            stood,
+            "release should return to stand; got {}",
+            pc.entity.state_no
+        );
 
         // Hold AGAIN → forward locomotion again. This is the key live-evaluation
         // assertion: a forward command fires on the *new* hold, proving triggers
@@ -5504,7 +5675,10 @@ mod tests {
                     .get("value")
                     .is_some_and(|e| e.source.trim() == STATE_WALK.to_string())
         });
-        assert!(walks, "a ChangeState -> walk(20) must be present in [Statedef -1]");
+        assert!(
+            walks,
+            "a ChangeState -> walk(20) must be present in [Statedef -1]"
+        );
     }
 
     // ---- AC2 (5.6b end-to-end): the `alive` trigger now resolves natively, so
@@ -5602,7 +5776,10 @@ mod tests {
         // (logged + skipped) rather than panicking on junk. An empty string and a
         // bare unknown token must both be `Err`, never a panic.
         assert!(compile_command("").is_err(), "empty command is an error");
-        assert!(compile_command("   ").is_err(), "whitespace-only is an error");
+        assert!(
+            compile_command("   ").is_err(),
+            "whitespace-only is an error"
+        );
         assert!(
             compile_command("not_a_token").is_err(),
             "an unknown token is an error, not a panic"
@@ -5772,7 +5949,11 @@ mod tests {
                 break;
             }
         }
-        assert!(walking, "hold Forward should reach walk; got {}", pc.entity.state_no);
+        assert!(
+            walking,
+            "hold Forward should reach walk; got {}",
+            pc.entity.state_no
+        );
 
         // Release until we are back in stand.
         let mut stood = false;
@@ -5783,7 +5964,11 @@ mod tests {
                 break;
             }
         }
-        assert!(stood, "release should return to stand; got {}", pc.entity.state_no);
+        assert!(
+            stood,
+            "release should return to stand; got {}",
+            pc.entity.state_no
+        );
 
         // Within a few more idle ticks the x-velocity must reach ~0 (friction
         // coast-down + the `Time = 4` hard stop). Allow up to 8 ticks of slack.
@@ -5849,7 +6034,10 @@ mod tests {
                 alpha.is_finite() && (0.0..1.0).contains(&alpha),
                 "alpha for AdditiveAlpha({v}) must be a finite [0,1) value, got {alpha}"
             );
-            assert!(alpha >= prev, "alpha must be non-decreasing in the byte value");
+            assert!(
+                alpha >= prev,
+                "alpha must be non-decreasing in the byte value"
+            );
             prev = alpha;
         }
         // The maximum byte (255) is the largest representable, just under 1.0.
@@ -5987,8 +6175,13 @@ mod tests {
     /// the walk speed — with the two shims now deleted (Part C).
     #[test]
     fn app_built_match_walks_p1_toward_opponent() {
-        let Some(mut m) = build_kfm_match() else { return };
-        assert!(run_until_fight(&mut m), "fight must go live before driving input");
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
+        assert!(
+            run_until_fight(&mut m),
+            "fight must go live before driving input"
+        );
 
         // P1 faces right (toward P2); holding right is "fwd". The gap between the
         // two must shrink as P1 closes in (they start ~120px apart, well outside
@@ -5996,7 +6189,13 @@ mod tests {
         let gap_before = (m.p1().pos().x - m.p2().pos().x).abs();
         let p1_x_before = m.p1().pos().x;
         for _ in 0..60 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
         }
         let gap_after = (m.p1().pos().x - m.p2().pos().x).abs();
         assert!(
@@ -6017,7 +6216,10 @@ mod tests {
     fn build_player_seeds_position_state_control_and_full_life() {
         let def = test_asset("kfm/kfm.def");
         if !def.exists() {
-            eprintln!("skipping build_player seed test: {} not present", def.display());
+            eprintln!(
+                "skipping build_player seed test: {} not present",
+                def.display()
+            );
             return;
         }
         let player = match build_player(&def, P1_START_X, None) {
@@ -6029,11 +6231,24 @@ mod tests {
         };
         // The exact start X the demo places P1 at (before Match::new's facing seed,
         // which does not move X).
-        assert!((player.pos().x - P1_START_X).abs() < 1e-6, "P1 seeded at P1_START_X");
-        assert!((player.pos().y).abs() < 1e-6, "seeded on the ground plane (y=0)");
-        assert_eq!(player.character.state_no, STATE_STAND, "starts in the stand state");
+        assert!(
+            (player.pos().x - P1_START_X).abs() < 1e-6,
+            "P1 seeded at P1_START_X"
+        );
+        assert!(
+            (player.pos().y).abs() < 1e-6,
+            "seeded on the ground plane (y=0)"
+        );
+        assert_eq!(
+            player.character.state_no, STATE_STAND,
+            "starts in the stand state"
+        );
         assert!(player.character.ctrl, "starts with control");
-        assert_eq!(player.anim(), STATE_STAND, "starts on the stand animation (action 0)");
+        assert_eq!(
+            player.anim(),
+            STATE_STAND,
+            "starts on the stand animation (action 0)"
+        );
         assert!(player.life() > 0, "starts with positive life");
         assert_eq!(player.life(), player.life_max(), "starts at FULL life");
     }
@@ -6043,7 +6258,9 @@ mod tests {
 
     #[test]
     fn player_current_frame_resolves_stand_and_none_for_missing_anim() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
         // After ticking through the intro into the fight, P1's stand anim has frames.
         assert!(run_until_fight(&mut m), "drive to the fight phase");
         assert!(
@@ -6076,8 +6293,14 @@ mod tests {
     fn app_stage_bounds_wired_and_fighters_start_inside() {
         let Some(m) = build_kfm_match() else { return };
         let bounds = m.bounds();
-        assert!((bounds.left - -STAGE_HALF_WIDTH).abs() < 1e-6, "left bound = -STAGE_HALF_WIDTH");
-        assert!((bounds.right - STAGE_HALF_WIDTH).abs() < 1e-6, "right bound = STAGE_HALF_WIDTH");
+        assert!(
+            (bounds.left - -STAGE_HALF_WIDTH).abs() < 1e-6,
+            "left bound = -STAGE_HALF_WIDTH"
+        );
+        assert!(
+            (bounds.right - STAGE_HALF_WIDTH).abs() < 1e-6,
+            "right bound = STAGE_HALF_WIDTH"
+        );
         // Both start strictly inside the playfield (their centers, at least).
         assert!(
             m.p1().pos().x > bounds.left && m.p1().pos().x < bounds.right,
@@ -6104,7 +6327,10 @@ mod tests {
         // phase times out immediately. This drives the engine's time-over branch
         // (not the KO-by-damage branch Forge covers), using the exact `build_player`
         // construction the demo uses.
-        let (p1, p2) = match (build_player(&def, P1_START_X, None), build_player(&def, P2_START_X, None)) {
+        let (p1, p2) = match (
+            build_player(&def, P1_START_X, None),
+            build_player(&def, P2_START_X, None),
+        ) {
             (Ok(a), Ok(b)) => (a, b),
             _ => {
                 eprintln!("skipping time-over test: a player failed to build");
@@ -6118,7 +6344,11 @@ mod tests {
             0,
         );
         assert_eq!(m.round_state(), RoundState::Intro, "starts in intro");
-        assert_eq!(m.timer(), 0, "a zero-second round starts with an empty clock");
+        assert_eq!(
+            m.timer(),
+            0,
+            "a zero-second round starts with an empty clock"
+        );
 
         // Tick neutrally through intro + the KO hold into the decided round.
         let mut reached_win = false;
@@ -6152,7 +6382,10 @@ mod tests {
             eprintln!("skipping ko-before-win test: {} not present", def.display());
             return;
         }
-        let (p1, p2) = match (build_player(&def, P1_START_X, None), build_player(&def, P2_START_X, None)) {
+        let (p1, p2) = match (
+            build_player(&def, P1_START_X, None),
+            build_player(&def, P2_START_X, None),
+        ) {
             (Ok(a), Ok(b)) => (a, b),
             _ => return,
         };
@@ -6183,7 +6416,9 @@ mod tests {
 
     #[test]
     fn match_survives_conflicting_and_all_button_input_on_both_players() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
         // Both directions held at once (no net horizontal), every button pressed,
         // on BOTH players simultaneously, for a long budget. Must never panic and
         // the round must still advance off the intro.
@@ -6217,13 +6452,22 @@ mod tests {
     /// a NaN-inducing `life_max <= 0`.
     #[test]
     fn life_values_stay_hud_safe_through_a_fight() {
-        let Some(mut m) = build_kfm_match() else { return };
+        let Some(mut m) = build_kfm_match() else {
+            return;
+        };
         assert!(run_until_fight(&mut m), "drive to fight");
         for i in 0..600 {
             let inp = if i % 3 == 0 {
-                MatchInput { right: true, x: true, ..MatchInput::none() }
+                MatchInput {
+                    right: true,
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
-                MatchInput { right: true, ..MatchInput::none() }
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                }
             };
             m.tick(inp, MatchInput::none());
             for p in [m.p1(), m.p2()] {
@@ -6231,7 +6475,10 @@ mod tests {
                 assert!(p.life() <= p.life_max(), "life never exceeds its max");
                 // The HUD fraction must always be a finite [0,1] value for any life.
                 let f = life_fraction(p.life(), p.life_max());
-                assert!(f.is_finite() && (0.0..=1.0).contains(&f), "HUD fraction in [0,1]");
+                assert!(
+                    f.is_finite() && (0.0..=1.0).contains(&f),
+                    "HUD fraction in [0,1]"
+                );
             }
             if m.round_state() != RoundState::Fight {
                 break;
@@ -6256,7 +6503,10 @@ mod tests {
         // Extensionless / unusual names are not .def.
         assert!(!is_def_path("kfm"));
         assert!(!is_def_path("kfm.def.bak"));
-        assert!(!is_def_path(".def"), "a bare dotfile named .def has no extension");
+        assert!(
+            !is_def_path(".def"),
+            "a bare dotfile named .def has no extension"
+        );
     }
 
     // ---- AC2 (HUD geometry): the P2 bar is mirrored to the right edge and the
@@ -6279,7 +6529,10 @@ mod tests {
         // Mirror symmetry about the center.
         let left = world_to_screen_x(-30.0, win_w);
         let right = world_to_screen_x(30.0, win_w);
-        assert!((center - left - (right - center)).abs() < 1e-4, "symmetric about center");
+        assert!(
+            (center - left - (right - center)).abs() < 1e-4,
+            "symmetric about center"
+        );
     }
 
     // --- Clsn debug overlay box-mapping math (audit #34) ---
@@ -6302,10 +6555,19 @@ mod tests {
         // A local box to the right of and above the axis, facing right: X/Y are
         // just translated by the anchor; no mirroring.
         let local = fp_core::Rect::new(10.0, -40.0, 20.0, 30.0); // x,y,w,h
-        let b = clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Right, CLSN1_COLOR);
+        let b = clsn_to_screen_box(
+            &local,
+            100.0,
+            200.0,
+            fp_character::Facing::Right,
+            CLSN1_COLOR,
+        );
         assert!((b.x - 110.0).abs() < 1e-4, "x = anchor_x + local.x");
         assert!((b.w - 20.0).abs() < 1e-4, "width preserved");
-        assert!((b.y - 160.0).abs() < 1e-4, "y = anchor_y + local.y (Y down)");
+        assert!(
+            (b.y - 160.0).abs() < 1e-4,
+            "y = anchor_y + local.y (Y down)"
+        );
         assert!((b.h - 30.0).abs() < 1e-4, "height preserved");
         assert_eq!(b.color, CLSN1_COLOR);
     }
@@ -6316,14 +6578,30 @@ mod tests {
         // untouched, matching fp_physics::place_clsn. The left/right edges swap,
         // but the result stays a non-negative-width rect.
         let local = fp_core::Rect::new(10.0, -40.0, 20.0, 30.0);
-        let right =
-            clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Right, CLSN2_COLOR);
-        let left =
-            clsn_to_screen_box(&local, 100.0, 200.0, fp_character::Facing::Left, CLSN2_COLOR);
+        let right = clsn_to_screen_box(
+            &local,
+            100.0,
+            200.0,
+            fp_character::Facing::Right,
+            CLSN2_COLOR,
+        );
+        let left = clsn_to_screen_box(
+            &local,
+            100.0,
+            200.0,
+            fp_character::Facing::Left,
+            CLSN2_COLOR,
+        );
 
         // Facing left: edges run from anchor - local.right() to anchor - local.x.
-        assert!((left.x - 70.0).abs() < 1e-4, "left edge = anchor_x - local.right()");
-        assert!((left.w - 20.0).abs() < 1e-4, "width preserved under mirroring");
+        assert!(
+            (left.x - 70.0).abs() < 1e-4,
+            "left edge = anchor_x - local.right()"
+        );
+        assert!(
+            (left.w - 20.0).abs() < 1e-4,
+            "width preserved under mirroring"
+        );
         // Y is identical to the right-facing case (facing never affects Y).
         assert!((left.y - right.y).abs() < 1e-4);
         assert!((left.h - right.h).abs() < 1e-4);
@@ -6331,7 +6609,10 @@ mod tests {
         // anchor X: their centers are equidistant from the anchor.
         let rc = right.x + right.w / 2.0;
         let lc = left.x + left.w / 2.0;
-        assert!(((100.0 - lc) - (rc - 100.0)).abs() < 1e-4, "symmetric about anchor");
+        assert!(
+            ((100.0 - lc) - (rc - 100.0)).abs() < 1e-4,
+            "symmetric about anchor"
+        );
     }
 
     #[test]
@@ -6351,19 +6632,34 @@ mod tests {
     #[test]
     fn p1_draws_behind_p2_orders_by_sprpriority() {
         // Lower priority draws first (behind). P1 lower -> P1 behind (true).
-        assert!(p1_draws_behind_p2(0, 2), "lower P1 priority draws behind P2");
+        assert!(
+            p1_draws_behind_p2(0, 2),
+            "lower P1 priority draws behind P2"
+        );
         // P1 higher -> P1 in front -> P2 drawn first (false).
-        assert!(!p1_draws_behind_p2(5, 1), "higher P1 priority draws in front of P2");
+        assert!(
+            !p1_draws_behind_p2(5, 1),
+            "higher P1 priority draws in front of P2"
+        );
         // Negative priorities order the same way (lower behind).
         assert!(p1_draws_behind_p2(-3, 0), "more-negative P1 draws behind");
-        assert!(!p1_draws_behind_p2(1, -1), "P1 above a negative P2 draws in front");
+        assert!(
+            !p1_draws_behind_p2(1, -1),
+            "P1 above a negative P2 draws in front"
+        );
     }
 
     #[test]
     fn p1_draws_behind_p2_tie_keeps_p1_behind() {
         // Equal priorities: stable, deterministic default — P1 behind P2.
-        assert!(p1_draws_behind_p2(2, 2), "a tie keeps P1 behind P2 (stable order)");
-        assert!(p1_draws_behind_p2(0, 0), "default-priority tie keeps P1 behind");
+        assert!(
+            p1_draws_behind_p2(2, 2),
+            "a tie keeps P1 behind P2 (stable order)"
+        );
+        assert!(
+            p1_draws_behind_p2(0, 0),
+            "default-priority tie keeps P1 behind"
+        );
     }
 
     #[test]
@@ -6372,7 +6668,10 @@ mod tests {
         // must convert to the renderer's no-op identity (no is_active gate needed).
         let out = char_palfx_to_render(fp_character::CurPalFx::IDENTITY);
         assert_eq!(out, fp_render::PalFx::IDENTITY);
-        assert!(out.is_identity(), "inactive effect renders byte-identically");
+        assert!(
+            out.is_identity(),
+            "inactive effect renders byte-identically"
+        );
     }
 
     #[test]
@@ -6458,7 +6757,11 @@ mod tests {
     /// must read 99, never 5940. Guards the screenpack-path timer-unit contract.
     #[test]
     fn timer_frames_convert_to_whole_seconds() {
-        assert_eq!(timer_frames_to_seconds(5940), 99, "99s round = 5940 frames -> 99");
+        assert_eq!(
+            timer_frames_to_seconds(5940),
+            99,
+            "99s round = 5940 frames -> 99"
+        );
         assert_eq!(timer_frames_to_seconds(60), 1);
         assert_eq!(timer_frames_to_seconds(0), 0);
         // Floors mid-second (sub-60 remainder is dropped, MUGEN-style).
@@ -6500,7 +6803,17 @@ mod tests {
             .expect("shipped HUD font.fnt must load");
         // Every character used by ROUND N / KO / P1 WINS / P2 WINS / DRAW and the
         // digit timer must be mapped.
-        for s in ["KO", "ROUND", "WINS", "DRAW", "P1", "P2", "0123456789", " ", ":"] {
+        for s in [
+            "KO",
+            "ROUND",
+            "WINS",
+            "DRAW",
+            "P1",
+            "P2",
+            "0123456789",
+            " ",
+            ":",
+        ] {
             for c in s.chars() {
                 assert!(
                     font.glyph(c).is_some(),
@@ -6515,12 +6828,20 @@ mod tests {
     /// args (program name + paths) untouched for the rest of CLI routing.
     #[test]
     fn parse_pal_flags_extracts_selections_and_keeps_paths() {
-        let args: Vec<String> = ["fp-app", "kfm.def", "--p1-pal", "3", "ken.def", "--p2-pal", "7"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = [
+            "fp-app", "kfm.def", "--p1-pal", "3", "ken.def", "--p2-pal", "7",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let (sel, rest) = parse_pal_flags(&args);
-        assert_eq!(sel, PalSelection { p1: Some(3), p2: Some(7) });
+        assert_eq!(
+            sel,
+            PalSelection {
+                p1: Some(3),
+                p2: Some(7)
+            }
+        );
         // The flags (and their values) are stripped; the positional args survive
         // in order so `select_mode`'s file routing is unchanged.
         assert_eq!(rest, vec!["fp-app", "kfm.def", "ken.def"]);
@@ -6546,7 +6867,10 @@ mod tests {
     #[test]
     fn parse_pal_flags_tolerates_bad_values() {
         // Missing value at end-of-args.
-        let a: Vec<String> = ["fp-app", "--p1-pal"].iter().map(|s| s.to_string()).collect();
+        let a: Vec<String> = ["fp-app", "--p1-pal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let (sel, rest) = parse_pal_flags(&a);
         assert_eq!(sel.p1, None);
         assert_eq!(rest, vec!["fp-app"]);
@@ -6624,7 +6948,10 @@ mod tests {
     fn build_player_palette_selection_is_safe() {
         let def = test_asset("kfm/kfm.def");
         if !def.exists() {
-            eprintln!("skipping palette-selection test: {} not present", def.display());
+            eprintln!(
+                "skipping palette-selection test: {} not present",
+                def.display()
+            );
             return;
         }
         // KFM has no `.act` overrides, so selecting one is out of range: the
@@ -6694,8 +7021,7 @@ mod tests {
     fn shipped_common_fx_loads() {
         let sff = shipped_fx_asset("fightfx.sff");
         let air = shipped_fx_asset("fightfx.air");
-        let loaded = load_common_fx_from(&sff, &air)
-            .expect("shipped common-fx asset must load");
+        let loaded = load_common_fx_from(&sff, &air).expect("shipped common-fx asset must load");
         let (air, render) = loaded;
         // The render bundle carries the parsed SFF with sprites.
         assert!(
@@ -6704,7 +7030,10 @@ mod tests {
         );
         // The AIR authors the standard KFM common spark actions.
         for g in [0, 1, 2, 3, 40] {
-            assert!(air.action(g).is_some(), "fightfx.air must author common action {g}");
+            assert!(
+                air.action(g).is_some(),
+                "fightfx.air must author common action {g}"
+            );
         }
     }
 
@@ -6737,8 +7066,8 @@ mod tests {
             return;
         }
         // The fightfx AIR ships, so it must load (not gated on it).
-        let air = AirFile::load(&shipped_fx_asset("fightfx.air"))
-            .expect("shipped fightfx.air must load");
+        let air =
+            AirFile::load(&shipped_fx_asset("fightfx.air")).expect("shipped fightfx.air must load");
 
         let mut m = match build_two_player_match(&def, &def, PalSelection::default()) {
             Ok(m) => m,
@@ -6757,7 +7086,13 @@ mod tests {
             }
         }
         for _ in 0..240 {
-            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            m.tick(
+                MatchInput {
+                    right: true,
+                    ..MatchInput::none()
+                },
+                MatchInput::none(),
+            );
             if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
                 break;
             }
@@ -6766,7 +7101,10 @@ mod tests {
         let mut saw_common = false;
         for i in 0..400 {
             let inp = if i % 3 == 0 {
-                MatchInput { x: true, ..MatchInput::none() }
+                MatchInput {
+                    x: true,
+                    ..MatchInput::none()
+                }
             } else {
                 MatchInput::none()
             };
@@ -6862,7 +7200,10 @@ mod tests {
             &motif.system.select_info,
             &motif.select_path,
         );
-        assert!(!select.is_empty(), "shipped roster has a choosable character");
+        assert!(
+            !select.is_empty(),
+            "shipped roster has a choosable character"
+        );
     }
 
     /// A missing motif resolves to the built-in fallback title menu (VS /
@@ -6960,7 +7301,11 @@ mod tests {
         let fallback = Path::new("/no/such/fallback-select.def");
         let resolved = resolve_select_path(&system_path, &system, fallback);
         // The shipped motif's declared select.def sits next to system.def.
-        assert!(resolved.exists(), "declared select.def resolved: {}", resolved.display());
+        assert!(
+            resolved.exists(),
+            "declared select.def resolved: {}",
+            resolved.display()
+        );
         assert!(
             resolved.ends_with("select.def"),
             "resolved to the declared select.def"
@@ -7017,11 +7362,12 @@ mod tests {
         let got = pick_p2_input(
             MatchInput::none(),
             Some(&mut ai),
-            fp_input::AiObservation {
-                opponent_dx: 300.0,
-            },
+            fp_input::AiObservation { opponent_dx: 300.0 },
         );
-        assert!(got.right && !got.left, "AI approaches toward a right opponent");
+        assert!(
+            got.right && !got.left,
+            "AI approaches toward a right opponent"
+        );
     }
 
     #[test]

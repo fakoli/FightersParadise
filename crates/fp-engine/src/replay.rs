@@ -121,7 +121,12 @@ impl ReplayLog {
     /// which stamps them automatically — to record the character identities so a
     /// later [`replay_match`] can reject a replay into the wrong characters.
     #[must_use]
-    pub fn new(match_seed: i32, bounds: StageBounds, rounds_to_win: i32, round_seconds: i32) -> Self {
+    pub fn new(
+        match_seed: i32,
+        bounds: StageBounds,
+        rounds_to_win: i32,
+        round_seconds: i32,
+    ) -> Self {
         Self {
             format_version: REPLAY_FORMAT_VERSION,
             match_seed,
@@ -328,8 +333,20 @@ mod tests {
     #[test]
     fn replay_log_encode_decode_round_trips() {
         let mut log = ReplayLog::new(7, StageBounds::new(-100.0, 100.0), 2, 99);
-        log.push(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
-        log.push(MatchInput::none(), MatchInput { a: true, ..MatchInput::none() });
+        log.push(
+            MatchInput {
+                right: true,
+                ..MatchInput::none()
+            },
+            MatchInput::none(),
+        );
+        log.push(
+            MatchInput::none(),
+            MatchInput {
+                a: true,
+                ..MatchInput::none()
+            },
+        );
 
         let bytes = log.encode().expect("encode");
         let decoded = ReplayLog::decode(&bytes).expect("decode");
@@ -342,7 +359,10 @@ mod tests {
         let mut bytes = log.encode().expect("encode");
         bytes.truncate(bytes.len() / 2);
         // Truncated input is a recoverable error, never a panic.
-        assert!(matches!(ReplayLog::decode(&bytes), Err(ReplayError::Codec(_))));
+        assert!(matches!(
+            ReplayLog::decode(&bytes),
+            Err(ReplayError::Codec(_))
+        ));
     }
 
     #[test]

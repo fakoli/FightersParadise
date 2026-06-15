@@ -234,7 +234,10 @@ impl SystemDef {
             fonts: parse_fonts(def),
             select_file: def.get("Files", "select").unwrap_or("").to_string(),
             fight_file: def.get("Files", "fight").unwrap_or("").to_string(),
-            logo_storyboard: def.get("Files", "logo.storyboard").unwrap_or("").to_string(),
+            logo_storyboard: def
+                .get("Files", "logo.storyboard")
+                .unwrap_or("")
+                .to_string(),
             intro_storyboard: def
                 .get("Files", "intro.storyboard")
                 .unwrap_or("")
@@ -353,7 +356,12 @@ fn parse_pos(def: &DefFile, section: &str, key: &str) -> Option<Pos> {
     match parse_int_pair(raw) {
         Some((x, y)) => Some(Pos::new(x, y)),
         None => {
-            tracing::warn!(section, key, raw, "system.def: malformed position; ignoring");
+            tracing::warn!(
+                section,
+                key,
+                raw,
+                "system.def: malformed position; ignoring"
+            );
             None
         }
     }
@@ -370,7 +378,12 @@ fn parse_pos_or_scalar(def: &DefFile, section: &str, key: &str) -> Pos {
                 (Some(x), Some(y)) => Pos::new(x, y),
                 (Some(x), None) => Pos::new(x, x),
                 _ => {
-                    tracing::warn!(section, key, raw, "system.def: malformed spacing; defaulting");
+                    tracing::warn!(
+                        section,
+                        key,
+                        raw,
+                        "system.def: malformed spacing; defaulting"
+                    );
                     Pos::default()
                 }
             }
@@ -403,7 +416,12 @@ fn parse_int_pair_opt(def: &DefFile, section: &str, key: &str) -> Option<(i32, i
     match parse_int_pair(raw) {
         Some(p) => Some(p),
         None => {
-            tracing::warn!(section, key, raw, "system.def: malformed int pair; ignoring");
+            tracing::warn!(
+                section,
+                key,
+                raw,
+                "system.def: malformed int pair; ignoring"
+            );
             None
         }
     }
@@ -613,10 +631,8 @@ mystery.key = ignored
 
     #[test]
     fn fonts_stop_at_first_gap() {
-        let def = DefFile::from_str(
-            "[Files]\nfont1 = a.fnt\nfont2 = b.fnt\nfont4 = d.fnt\n",
-        )
-        .unwrap();
+        let def =
+            DefFile::from_str("[Files]\nfont1 = a.fnt\nfont2 = b.fnt\nfont4 = d.fnt\n").unwrap();
         let s = SystemDef::parse(&def);
         assert_eq!(s.fonts, vec!["a.fnt".to_string(), "b.fnt".to_string()]);
     }

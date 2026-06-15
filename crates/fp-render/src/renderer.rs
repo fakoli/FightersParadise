@@ -99,10 +99,22 @@ pub struct DebugBox {
 /// clip space `(-1..1, -1..1)`. Returns column-major `[f32; 16]` for wgpu.
 fn ortho_projection(width: f32, height: f32) -> [f32; 16] {
     [
-        2.0 / width, 0.0,           0.0, 0.0,
-        0.0,        -2.0 / height,  0.0, 0.0,
-        0.0,         0.0,           1.0, 0.0,
-       -1.0,         1.0,           0.0, 1.0,
+        2.0 / width,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -2.0 / height,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1.0,
+        1.0,
+        0.0,
+        1.0,
     ]
 }
 
@@ -200,12 +212,15 @@ impl Renderer {
             .ok_or_else(|| FpError::Render("no suitable GPU adapter found".into()))?;
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("fp_device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            }, None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("fp_device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
             .await
             .map_err(|e| FpError::Render(format!("failed to create device: {e}")))?;
 
@@ -306,9 +321,7 @@ impl Renderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("palette_shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/palette.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/palette.wgsl").into()),
         });
 
         // --- Pipelines ---
@@ -422,40 +435,39 @@ impl Renderer {
                 bind_group_layouts: &[&uniform_bind_group_layout],
                 push_constant_ranges: &[],
             });
-        let pipeline_debug =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("debug_pipeline"),
-                layout: Some(&debug_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &debug_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[DebugVertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &debug_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let pipeline_debug = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("debug_pipeline"),
+            layout: Some(&debug_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &debug_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[DebugVertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &debug_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         // --- Uniform buffer ---
 
@@ -656,15 +668,23 @@ impl RenderFrame<'_> {
         h: f32,
         uv: [f32; 4],
     ) {
-        let (u_left, u_right) = if params.flip_h { (uv[2], uv[0]) } else { (uv[0], uv[2]) };
-        let (v_top, v_bottom) = if params.flip_v { (uv[3], uv[1]) } else { (uv[1], uv[3]) };
+        let (u_left, u_right) = if params.flip_h {
+            (uv[2], uv[0])
+        } else {
+            (uv[0], uv[2])
+        };
+        let (v_top, v_bottom) = if params.flip_v {
+            (uv[3], uv[1])
+        } else {
+            (uv[1], uv[3])
+        };
 
         // Corner positions relative to sprite origin, before rotation.
         let mut corners = [
-            [params.x,     params.y    ],
-            [params.x + w, params.y    ],
+            [params.x, params.y],
+            [params.x + w, params.y],
             [params.x + w, params.y + h],
-            [params.x,     params.y + h],
+            [params.x, params.y + h],
         ];
 
         // Rotate around sprite center if angle is non-zero.
@@ -683,10 +703,26 @@ impl RenderFrame<'_> {
 
         let a = params.alpha;
         let vertices = [
-            SpriteVertex { position: corners[0], uv: [u_left,  v_top   ], alpha: a },
-            SpriteVertex { position: corners[1], uv: [u_right, v_top   ], alpha: a },
-            SpriteVertex { position: corners[2], uv: [u_right, v_bottom], alpha: a },
-            SpriteVertex { position: corners[3], uv: [u_left,  v_bottom], alpha: a },
+            SpriteVertex {
+                position: corners[0],
+                uv: [u_left, v_top],
+                alpha: a,
+            },
+            SpriteVertex {
+                position: corners[1],
+                uv: [u_right, v_top],
+                alpha: a,
+            },
+            SpriteVertex {
+                position: corners[2],
+                uv: [u_right, v_bottom],
+                alpha: a,
+            },
+            SpriteVertex {
+                position: corners[3],
+                uv: [u_left, v_bottom],
+                alpha: a,
+            },
         ];
 
         // Bump-allocate this quad's 4-vertex slot in the shared vertex buffer.
@@ -796,14 +832,32 @@ impl RenderFrame<'_> {
     /// same frame (and is dropped past the per-frame quad cap, with a debug log).
     pub fn draw_image(&mut self, image: &ImageTexture, x: f32, y: f32, w: f32, h: f32) {
         let vertices = [
-            SpriteVertex { position: [x, y], uv: [0.0, 0.0], alpha: 1.0 },
-            SpriteVertex { position: [x + w, y], uv: [1.0, 0.0], alpha: 1.0 },
-            SpriteVertex { position: [x + w, y + h], uv: [1.0, 1.0], alpha: 1.0 },
-            SpriteVertex { position: [x, y + h], uv: [0.0, 1.0], alpha: 1.0 },
+            SpriteVertex {
+                position: [x, y],
+                uv: [0.0, 0.0],
+                alpha: 1.0,
+            },
+            SpriteVertex {
+                position: [x + w, y],
+                uv: [1.0, 0.0],
+                alpha: 1.0,
+            },
+            SpriteVertex {
+                position: [x + w, y + h],
+                uv: [1.0, 1.0],
+                alpha: 1.0,
+            },
+            SpriteVertex {
+                position: [x, y + h],
+                uv: [0.0, 1.0],
+                alpha: 1.0,
+            },
         ];
         let quad = self.sprite_quad_count;
         if quad >= MAX_SPRITE_QUADS {
-            tracing::debug!("sprite quad cap {MAX_SPRITE_QUADS} reached this frame; dropping image");
+            tracing::debug!(
+                "sprite quad cap {MAX_SPRITE_QUADS} reached this frame; dropping image"
+            );
             return;
         }
         let vertex_stride = std::mem::size_of::<SpriteVertex>() as u64;
@@ -1025,10 +1079,7 @@ fn build_debug_box_verts(
             [rx0, ry1],
         ];
         for p in quad {
-            verts[i] = DebugVertex {
-                position: p,
-                color,
-            };
+            verts[i] = DebugVertex { position: p, color };
             i += 1;
         }
     };
@@ -1056,14 +1107,22 @@ pub(crate) fn build_sprite_quad(
     let w = width as f32 * params.scale_x;
     let h = height as f32 * params.scale_y;
 
-    let (u_left, u_right) = if params.flip_h { (1.0, 0.0) } else { (0.0, 1.0) };
-    let (v_top, v_bottom) = if params.flip_v { (1.0, 0.0) } else { (0.0, 1.0) };
+    let (u_left, u_right) = if params.flip_h {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let (v_top, v_bottom) = if params.flip_v {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
 
     let mut corners = [
-        [params.x,     params.y    ],
-        [params.x + w, params.y    ],
+        [params.x, params.y],
+        [params.x + w, params.y],
         [params.x + w, params.y + h],
-        [params.x,     params.y + h],
+        [params.x, params.y + h],
     ];
 
     if params.angle != 0.0 {
@@ -1081,10 +1140,26 @@ pub(crate) fn build_sprite_quad(
 
     let a = params.alpha;
     [
-        SpriteVertex { position: corners[0], uv: [u_left,  v_top   ], alpha: a },
-        SpriteVertex { position: corners[1], uv: [u_right, v_top   ], alpha: a },
-        SpriteVertex { position: corners[2], uv: [u_right, v_bottom], alpha: a },
-        SpriteVertex { position: corners[3], uv: [u_left,  v_bottom], alpha: a },
+        SpriteVertex {
+            position: corners[0],
+            uv: [u_left, v_top],
+            alpha: a,
+        },
+        SpriteVertex {
+            position: corners[1],
+            uv: [u_right, v_top],
+            alpha: a,
+        },
+        SpriteVertex {
+            position: corners[2],
+            uv: [u_right, v_bottom],
+            alpha: a,
+        },
+        SpriteVertex {
+            position: corners[3],
+            uv: [u_left, v_bottom],
+            alpha: a,
+        },
     ]
 }
 
@@ -1194,14 +1269,26 @@ mod tests {
         // TR (64,0) -> (64, 64)
         // BR (64,64) -> (0, 64)
         // BL (0,64) -> (0, 0)
-        assert!(positions_approx_eq(verts[0].position, [64.0, 0.0]),
-            "TL got {:?}", verts[0].position);
-        assert!(positions_approx_eq(verts[1].position, [64.0, 64.0]),
-            "TR got {:?}", verts[1].position);
-        assert!(positions_approx_eq(verts[2].position, [0.0, 64.0]),
-            "BR got {:?}", verts[2].position);
-        assert!(positions_approx_eq(verts[3].position, [0.0, 0.0]),
-            "BL got {:?}", verts[3].position);
+        assert!(
+            positions_approx_eq(verts[0].position, [64.0, 0.0]),
+            "TL got {:?}",
+            verts[0].position
+        );
+        assert!(
+            positions_approx_eq(verts[1].position, [64.0, 64.0]),
+            "TR got {:?}",
+            verts[1].position
+        );
+        assert!(
+            positions_approx_eq(verts[2].position, [0.0, 64.0]),
+            "BR got {:?}",
+            verts[2].position
+        );
+        assert!(
+            positions_approx_eq(verts[3].position, [0.0, 0.0]),
+            "BL got {:?}",
+            verts[3].position
+        );
     }
 
     #[test]
@@ -1271,7 +1358,11 @@ mod tests {
             invertall: false,
             ..crate::params::PalFx::IDENTITY
         });
-        assert_eq!(off.color, [1.0, 0.0, 0.0, 0.0], "invertall=false → color.y=0");
+        assert_eq!(
+            off.color,
+            [1.0, 0.0, 0.0, 0.0],
+            "invertall=false → color.y=0"
+        );
     }
 
     #[test]

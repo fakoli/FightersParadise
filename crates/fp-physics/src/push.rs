@@ -445,7 +445,10 @@ mod tests {
 
     #[test]
     fn clamp_inside_is_unchanged() {
-        assert!(approx(clamp_to_bounds(100.0, 10.0, 10.0, 0.0, 200.0), 100.0));
+        assert!(approx(
+            clamp_to_bounds(100.0, 10.0, 10.0, 0.0, 200.0),
+            100.0
+        ));
     }
 
     #[test]
@@ -457,7 +460,10 @@ mod tests {
     #[test]
     fn clamp_right_over_edge() {
         // Center 500, half_right 10 -> right edge 510, above 200. Pull to 200 - 10.
-        assert!(approx(clamp_to_bounds(500.0, 10.0, 10.0, 0.0, 200.0), 190.0));
+        assert!(approx(
+            clamp_to_bounds(500.0, 10.0, 10.0, 0.0, 200.0),
+            190.0
+        ));
     }
 
     #[test]
@@ -465,7 +471,10 @@ mod tests {
         // Left edge exactly on bound_left: already valid, unchanged.
         assert!(approx(clamp_to_bounds(10.0, 10.0, 10.0, 0.0, 200.0), 10.0));
         // Right edge exactly on bound_right: unchanged.
-        assert!(approx(clamp_to_bounds(190.0, 10.0, 10.0, 0.0, 200.0), 190.0));
+        assert!(approx(
+            clamp_to_bounds(190.0, 10.0, 10.0, 0.0, 200.0),
+            190.0
+        ));
     }
 
     #[test]
@@ -573,7 +582,10 @@ mod tests {
         let a2 = PushBody { center: r1.a, ..a };
         let b2 = PushBody { center: r1.b, ..b };
         let r2 = resolve_push(a2, b2);
-        assert!(!r2.pushed, "second pass on just-touching bodies must not push");
+        assert!(
+            !r2.pushed,
+            "second pass on just-touching bodies must not push"
+        );
         assert!(approx(r2.a, r1.a) && approx(r2.b, r1.b));
     }
 
@@ -640,7 +652,7 @@ mod tests {
         // the narrow body's full width; both still split evenly and separate.
         let wide = PushBody::new(0.0, 50.0, 50.0, Facing::Right); // -50..50
         let narrow = PushBody::new(0.0, 5.0, 5.0, Facing::Left); // -5..5
-        // overlap = min(50,5) - max(-50,-5) = 5 - (-5) = 10, half = 5.
+                                                                 // overlap = min(50,5) - max(-50,-5) = 5 - (-5) = 10, half = 5.
         let r = resolve_push(wide, narrow);
         assert!(r.pushed);
         // Equal centers tie-break: a (wide) left, b (narrow) right.
@@ -669,9 +681,12 @@ mod tests {
         // min_center (30) > max_center (10): left edge must win deterministically.
         let c = clamp_to_bounds(5.0, 30.0, 30.0, 0.0, 40.0);
         assert!(approx(c, 30.0)); // left edge sits on bound_left = 0.
-        // And it holds no matter where the (impossible-to-fit) center starts.
+                                  // And it holds no matter where the (impossible-to-fit) center starts.
         assert!(approx(clamp_to_bounds(1000.0, 30.0, 30.0, 0.0, 40.0), 30.0));
-        assert!(approx(clamp_to_bounds(-1000.0, 30.0, 30.0, 0.0, 40.0), 30.0));
+        assert!(approx(
+            clamp_to_bounds(-1000.0, 30.0, 30.0, 0.0, 40.0),
+            30.0
+        ));
     }
 
     #[test]

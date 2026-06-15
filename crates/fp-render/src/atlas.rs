@@ -305,9 +305,7 @@ mod tests {
 
         let mut atlas = TextureAtlas::new(&device, 256, 256);
         let id = SpriteId::new(5, 3);
-        atlas
-            .pack(&queue, id, 16, 16, &[0u8; 16 * 16])
-            .unwrap();
+        atlas.pack(&queue, id, 16, 16, &[0u8; 16 * 16]).unwrap();
 
         assert!(atlas.get(id).is_some());
         assert!(atlas.get(SpriteId::new(99, 99)).is_none());
@@ -321,7 +319,11 @@ mod tests {
         };
 
         let atlas = &mut TextureAtlas::new(&device, 256, 256);
-        assert!(atlas.pack(&queue, SpriteId::new(0, 0), 0, 10, &[]).is_none());
-        assert!(atlas.pack(&queue, SpriteId::new(0, 0), 10, 0, &[]).is_none());
+        assert!(atlas
+            .pack(&queue, SpriteId::new(0, 0), 0, 10, &[])
+            .is_none());
+        assert!(atlas
+            .pack(&queue, SpriteId::new(0, 0), 10, 0, &[])
+            .is_none());
     }
 }

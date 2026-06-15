@@ -391,11 +391,9 @@ impl CommandMatcher {
                     }
                 }
             }
-            CommandElement::Simultaneous(elements) => {
-                elements.iter().all(|e| {
-                    Self::element_matches(e, buffer, frame_offset, facing_right)
-                })
-            }
+            CommandElement::Simultaneous(elements) => elements
+                .iter()
+                .all(|e| Self::element_matches(e, buffer, frame_offset, facing_right)),
         }
     }
 }
@@ -859,8 +857,8 @@ mod tests {
         let cmd = CommandDef {
             name: "test_expire".into(),
             elements: compile_command("x").unwrap(),
-            time: 2,          // Only look back 2 frames
-            buffer_time: 2,   // Active for 2 ticks after detection
+            time: 2,        // Only look back 2 frames
+            buffer_time: 2, // Active for 2 ticks after detection
         };
         let mut matcher = CommandMatcher::new(vec![cmd]);
         let mut buffer = InputBuffer::new();
@@ -942,8 +940,14 @@ mod tests {
         ));
         matcher.check_commands(&buffer, true);
         let names = matcher.active_command_names();
-        assert!(names.iter().any(|n| n == "holdfwd"), "holdfwd active: {names:?}");
-        assert!(names.iter().any(|n| n == "punch"), "punch active: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "holdfwd"),
+            "holdfwd active: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "punch"),
+            "punch active: {names:?}"
+        );
         assert_eq!(names.len(), 2, "exactly the two active commands: {names:?}");
         // It agrees with `command_active` for every name.
         for n in &names {

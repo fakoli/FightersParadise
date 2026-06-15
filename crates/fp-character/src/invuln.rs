@@ -419,8 +419,16 @@ mod tests {
         assert!(s.pairs.is_empty(), "no pair tokens => all pairs");
         assert!(!s.any);
         // Matches any class with any pair.
-        assert!(s.matches(&attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack)));
-        assert!(s.matches(&attr(StateClass::Air, AttackPower::Hyper, AttackKind::Projectile)));
+        assert!(s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
+        assert!(s.matches(&attr(
+            StateClass::Air,
+            AttackPower::Hyper,
+            AttackKind::Projectile
+        )));
     }
 
     #[test]
@@ -432,22 +440,50 @@ mod tests {
         assert!(s.state_types.contains(&StateClass::Air));
         assert_eq!(s.pairs.len(), 3);
         // Throws of any power, any state-type, match.
-        assert!(s.matches(&attr(StateClass::Standing, AttackPower::Normal, AttackKind::Throw)));
-        assert!(s.matches(&attr(StateClass::Crouching, AttackPower::Hyper, AttackKind::Throw)));
+        assert!(s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Throw
+        )));
+        assert!(s.matches(&attr(
+            StateClass::Crouching,
+            AttackPower::Hyper,
+            AttackKind::Throw
+        )));
         // A normal strike does NOT match (only throws are listed).
-        assert!(!s.matches(&attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack)));
+        assert!(!s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
     }
 
     #[test]
     fn parse_subset_statetype_group_constrains_class() {
         // `SA, NA` — standing or air normal-attacks only.
         let s = AttackAttrSet::parse("SA, NA");
-        assert!(s.matches(&attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack)));
-        assert!(s.matches(&attr(StateClass::Air, AttackPower::Normal, AttackKind::Attack)));
+        assert!(s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
+        assert!(s.matches(&attr(
+            StateClass::Air,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
         // Crouching is not in the group.
-        assert!(!s.matches(&attr(StateClass::Crouching, AttackPower::Normal, AttackKind::Attack)));
+        assert!(!s.matches(&attr(
+            StateClass::Crouching,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
         // Wrong pair.
-        assert!(!s.matches(&attr(StateClass::Standing, AttackPower::Special, AttackKind::Attack)));
+        assert!(!s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Special,
+            AttackKind::Attack
+        )));
     }
 
     #[test]
@@ -455,7 +491,11 @@ mod tests {
         for v in ["*", "", "   "] {
             let s = AttackAttrSet::parse(v);
             assert!(s.any, "{v:?} should be a wildcard");
-            assert!(s.matches(&attr(StateClass::Crouching, AttackPower::Special, AttackKind::Throw)));
+            assert!(s.matches(&attr(
+                StateClass::Crouching,
+                AttackPower::Special,
+                AttackKind::Throw
+            )));
         }
     }
 
@@ -464,14 +504,25 @@ mod tests {
         // Unparseable -> empty state-types, empty pairs, not wildcard.
         let s = AttackAttrSet::parse("garbage");
         assert!(!s.any);
-        assert!(s.state_types.is_empty(), "no valid state-type letters parsed");
+        assert!(
+            s.state_types.is_empty(),
+            "no valid state-type letters parsed"
+        );
         // Matches nothing (empty state-type group).
-        assert!(!s.matches(&attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack)));
+        assert!(!s.matches(&attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack
+        )));
     }
 
     #[test]
     fn nothitby_empty_set_blocks_nothing_hitby_empty_set_blocks_everything() {
-        let any_attr = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack);
+        let any_attr = attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack,
+        );
         let empty = AttackAttrSet::parse("garbage"); // empty, not wildcard
 
         // NotHitBy with an empty set: matches nothing => blocks nothing.
@@ -490,12 +541,19 @@ mod tests {
             time_remaining: 5,
             ignore_hitpause: false,
         };
-        assert!(hby.blocks(&any_attr), "empty HitBy blocks everything (full invuln)");
+        assert!(
+            hby.blocks(&any_attr),
+            "empty HitBy blocks everything (full invuln)"
+        );
     }
 
     #[test]
     fn nothitby_blocks_matching_hitby_blocks_nonmatching() {
-        let punch = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack);
+        let punch = attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack,
+        );
         let throw = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Throw);
 
         // NotHitBy covering throws: blocks the throw, allows the punch.
@@ -521,7 +579,11 @@ mod tests {
 
     #[test]
     fn inactive_slot_never_blocks() {
-        let punch = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack);
+        let punch = attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack,
+        );
         let slot = InvulnSlot {
             attrs: AttackAttrSet::parse("SCA"),
             mode: InvulnMode::NotHitBy,
@@ -553,7 +615,11 @@ mod tests {
 
     #[test]
     fn mask_blocks_if_either_slot_blocks() {
-        let punch = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Attack);
+        let punch = attr(
+            StateClass::Standing,
+            AttackPower::Normal,
+            AttackKind::Attack,
+        );
         let throw = attr(StateClass::Standing, AttackPower::Normal, AttackKind::Throw);
 
         // Slot 1 blocks punches, slot 2 blocks throws — a hit must pass BOTH.
@@ -575,8 +641,15 @@ mod tests {
         assert!(mask.blocks(&throw), "slot2 blocks the throw");
 
         // A special projectile passes both (neither slot lists it).
-        let proj = attr(StateClass::Standing, AttackPower::Special, AttackKind::Projectile);
-        assert!(!mask.blocks(&proj), "an unlisted projectile passes both slots");
+        let proj = attr(
+            StateClass::Standing,
+            AttackPower::Special,
+            AttackKind::Projectile,
+        );
+        assert!(
+            !mask.blocks(&proj),
+            "an unlisted projectile passes both slots"
+        );
     }
 
     #[test]
@@ -599,7 +672,10 @@ mod tests {
         // During a hit-pause: slot1 frozen, slot2 still counts down.
         mask.tick(true);
         assert_eq!(mask.slot1.time_remaining, 5, "frozen during pause");
-        assert_eq!(mask.slot2.time_remaining, 4, "ignorehitpause counts during pause");
+        assert_eq!(
+            mask.slot2.time_remaining, 4,
+            "ignorehitpause counts during pause"
+        );
 
         // Not paused: both count down.
         mask.tick(false);

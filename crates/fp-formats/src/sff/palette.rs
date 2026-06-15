@@ -246,9 +246,15 @@ mod tests {
         // 256 RGBA colors. Color 0 black, color 1 green, with explicit padding.
         let mut data = vec![0u8; 1024];
         // color 0: black, on-disk alpha 5 (must be forced to 0 == transparent)
-        data[0] = 0; data[1] = 0; data[2] = 0; data[3] = 5;
+        data[0] = 0;
+        data[1] = 0;
+        data[2] = 0;
+        data[3] = 5;
         // color 1: green, on-disk alpha 0 (must be forced to 255 == opaque)
-        data[4] = 0; data[5] = 255; data[6] = 0; data[7] = 0;
+        data[4] = 0;
+        data[5] = 255;
+        data[6] = 0;
+        data[7] = 0;
 
         let pal = rgba_to_palette(&data, 256);
 
@@ -263,10 +269,16 @@ mod tests {
         // A 32-color palette (KFM's per-sprite size): only 128 bytes of data.
         let mut data = vec![0u8; 32 * 4];
         // color 1: blue
-        data[4] = 0; data[5] = 0; data[6] = 255; data[7] = 0;
+        data[4] = 0;
+        data[5] = 0;
+        data[6] = 255;
+        data[7] = 0;
         // color 31 (last in range): white
         let last = 31 * 4;
-        data[last] = 255; data[last + 1] = 255; data[last + 2] = 255; data[last + 3] = 0;
+        data[last] = 255;
+        data[last + 1] = 255;
+        data[last + 2] = 255;
+        data[last + 3] = 0;
 
         let pal = rgba_to_palette(&data, 32);
 
@@ -275,7 +287,7 @@ mod tests {
         // In-range colors decode and are forced opaque (except index 0).
         assert_eq!(&pal[4..8], &[0, 0, 255, 255]); // color 1: blue, opaque
         assert_eq!(&pal[124..128], &[255, 255, 255, 255]); // color 31: white, opaque
-        // Out-of-range colors (>= 32) stay transparent black.
+                                                           // Out-of-range colors (>= 32) stay transparent black.
         assert_eq!(&pal[128..132], &[0, 0, 0, 0]); // color 32: untouched
         assert_eq!(&pal[1020..1024], &[0, 0, 0, 0]); // color 255: untouched
     }
@@ -286,12 +298,15 @@ mod tests {
         // decoder must clamp to what's available rather than reading past the
         // slice (no panic, no garbage).
         let mut data = vec![0u8; 8]; // 2 colors
-        data[4] = 200; data[5] = 100; data[6] = 50; data[7] = 0; // color 1
+        data[4] = 200;
+        data[5] = 100;
+        data[6] = 50;
+        data[7] = 0; // color 1
         let pal = rgba_to_palette(&data, 256);
 
         assert_eq!(&pal[0..4], &[0, 0, 0, 0]); // color 0: transparent
         assert_eq!(&pal[4..8], &[200, 100, 50, 255]); // color 1: opaque
-        // Everything past the supplied data stays transparent black.
+                                                      // Everything past the supplied data stays transparent black.
         assert_eq!(&pal[8..12], &[0, 0, 0, 0]);
     }
 

@@ -217,7 +217,10 @@ fn keyboard_input_trace_fighter_responds_to_movement_and_attack() {
         40,
     );
     eprintln!("[input-trace] UP -> jump-start anim 40: {jumped}");
-    assert!(jumped, "holding Up must put P1 into the jump-start state (anim 40)");
+    assert!(
+        jumped,
+        "holding Up must put P1 into the jump-start state (anim 40)"
+    );
 
     // --- Movement: Down -> crouch anim 11. ---
     let mut m = fresh_live_match(&make_player);
@@ -231,7 +234,10 @@ fn keyboard_input_trace_fighter_responds_to_movement_and_attack() {
         11,
     );
     eprintln!("[input-trace] DOWN -> crouch anim 11: {crouched}");
-    assert!(crouched, "holding Down must put P1 into the crouch state (anim 11)");
+    assert!(
+        crouched,
+        "holding Down must put P1 into the crouch state (anim 11)"
+    );
 
     // --- Attack: press the `a` button (light attack) -> attack anim 200. ---
     // This is what `match_input_from_keyboard` emits for the U key. A Press

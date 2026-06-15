@@ -681,7 +681,10 @@ somethingweird = 42
         let def = &cns.statedefs[0];
         assert_eq!(def.hitdefpersist.as_deref(), Some("1"));
         assert_eq!(def.facep2.as_deref(), Some("1"));
-        assert_eq!(def.extra.get("somethingweird").map(String::as_str), Some("42"));
+        assert_eq!(
+            def.extra.get("somethingweird").map(String::as_str),
+            Some("42")
+        );
     }
 
     #[test]
@@ -1208,7 +1211,8 @@ type = C
     fn whitespace_around_keys_and_section_numbers_tolerated() {
         // Tabs and extra spaces around the `=` and inside the section header
         // are tolerated.
-        let text = "[Statedef    42  ]\n\ttype\t=\tS\n[State  42 ,  lbl ]\n type =Null\n trigger1= 1 \n";
+        let text =
+            "[Statedef    42  ]\n\ttype\t=\tS\n[State  42 ,  lbl ]\n type =Null\n trigger1= 1 \n";
         let cns = CnsFile::from_str(text).unwrap();
         assert_eq!(cns.statedefs.len(), 1);
         let def = &cns.statedefs[0];
@@ -1238,14 +1242,14 @@ type = C
             "[",
             "]",
             "[]",
-            "[Statedef]",       // no number -> header rejected
-            "[Statedef ]",      // empty number -> header rejected
-            "[Statedef x]",     // non-numeric -> header rejected
+            "[Statedef]",   // no number -> header rejected
+            "[Statedef ]",  // empty number -> header rejected
+            "[Statedef x]", // non-numeric -> header rejected
             "=",
             "= value with no key",
             "key with no equals",
-            "[Statedef 1]\n[State]\n",  // [State] with no number
-            "[Statedef 1]\ntype\n",     // key, no '='
+            "[Statedef 1]\n[State]\n", // [State] with no number
+            "[Statedef 1]\ntype\n",    // key, no '='
             "\u{feff}\u{feff}[Statedef 1]\ntype = S\n", // double BOM (only first stripped)
         ];
         for t in texts {
@@ -1339,11 +1343,13 @@ hitcountpersist = 1
         assert_eq!(landing.triggerall, vec!["Time = 1"]);
         assert_eq!(landing.trigger_group(1).unwrap(), &["stateno = 52"]);
         assert_eq!(landing.trigger_group(2).unwrap(), &["stateno = 106"]);
-        assert_eq!(landing.params.get("value").map(String::as_str), Some("40, 0"));
+        assert_eq!(
+            landing.params.get("value").map(String::as_str),
+            Some("40, 0")
+        );
 
         // Sanity on scale: a real character file has many controllers overall.
-        let total_controllers: usize =
-            cns.statedefs.iter().map(|s| s.controllers.len()).sum();
+        let total_controllers: usize = cns.statedefs.iter().map(|s| s.controllers.len()).sum();
         assert!(
             total_controllers > 10,
             "kfm.cns should yield many controllers, got {total_controllers}"
@@ -1410,7 +1416,10 @@ hitcountpersist = 1
             .iter()
             .flat_map(|s| &s.controllers)
             .any(|c| !c.triggerall.is_empty());
-        assert!(any_triggerall, "common1.cns should use triggerall somewhere");
+        assert!(
+            any_triggerall,
+            "common1.cns should use triggerall somewhere"
+        );
         let any_persistent = cns
             .statedefs
             .iter()

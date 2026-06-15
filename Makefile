@@ -116,7 +116,8 @@ clean: ## Remove the target/ build directory (cargo clean)
 # ---- aggregate ---------------------------------------------------------------
 
 .PHONY: ci
-ci: clippy fmt-check test ## Run the full local gate: clippy -D warnings + fmt-check + test
-	@echo "==> local CI gate passed (clippy + fmt-check + test)"
-	@echo "    NOTE: GitHub CI does NOT run fmt-check yet (backlog CB3), and real-content"
-	@echo "    tests are no-op on CI because test-assets is gitignored (known issue #36)."
+ci: fmt-check clippy test ## Run the full local gate: fmt-check + clippy -D warnings + test
+	@echo "==> local CI gate passed (fmt-check + clippy + test)"
+	@echo "    NOTE: this mirrors GitHub CI, which now gates on cargo fmt --all --check"
+	@echo "    (backlog CB3, done). Real-content KFM tests remain no-op on CI because"
+	@echo "    test-assets is gitignored (known issue #36)."

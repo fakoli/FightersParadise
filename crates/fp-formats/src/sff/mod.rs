@@ -176,10 +176,8 @@ impl SffFile {
                 ),
             ));
         }
-        let num_palettes =
-            (file_header.palette_length as usize) / palette::PALETTE_SUBHEADER_SIZE;
-        let palettes =
-            palette::parse_all_palettes(&data[pal_start..pal_end], num_palettes as u32)?;
+        let num_palettes = (file_header.palette_length as usize) / palette::PALETTE_SUBHEADER_SIZE;
+        let palettes = palette::parse_all_palettes(&data[pal_start..pal_end], num_palettes as u32)?;
 
         // Extract LData block
         let ldata_start = file_header.ldata_offset as usize;
@@ -246,9 +244,10 @@ impl SffFile {
     /// represented here; this returns a recoverable error for them. Use
     /// [`Self::decode_sprite_rgba`] to obtain their pixels as RGBA.
     pub fn decode_sprite(&self, index: usize) -> FpResult<Vec<u8>> {
-        let sprite = self.sprites.get(index).ok_or_else(|| {
-            FpError::not_found("sprite", format!("index {index}"))
-        })?;
+        let sprite = self
+            .sprites
+            .get(index)
+            .ok_or_else(|| FpError::not_found("sprite", format!("index {index}")))?;
 
         // SFF v1 stores each sprite as an inline PCX image inside the backing
         // buffer (`ldata` holds the whole file). Decode that directly.
@@ -331,9 +330,10 @@ impl SffFile {
     /// Index 0 of an indexed palette is transparent (MUGEN convention). Never
     /// panics; bad content yields a recoverable [`FpError`].
     pub fn decode_sprite_rgba(&self, index: usize) -> FpResult<Vec<u8>> {
-        let sprite = self.sprites.get(index).ok_or_else(|| {
-            FpError::not_found("sprite", format!("index {index}"))
-        })?;
+        let sprite = self
+            .sprites
+            .get(index)
+            .ok_or_else(|| FpError::not_found("sprite", format!("index {index}")))?;
 
         // SFF v1: indexed PCX through the sprite's extracted palette.
         if self.version == SffVersion::V1 {
@@ -390,9 +390,10 @@ impl SffFile {
         index: usize,
         palette: &[u8],
     ) -> FpResult<Vec<u8>> {
-        let sprite = self.sprites.get(index).ok_or_else(|| {
-            FpError::not_found("sprite", format!("index {index}"))
-        })?;
+        let sprite = self
+            .sprites
+            .get(index)
+            .ok_or_else(|| FpError::not_found("sprite", format!("index {index}")))?;
 
         // SFF v1: inline PCX indices remapped through the external palette.
         if self.version == SffVersion::V1 {
@@ -473,9 +474,10 @@ impl SffFile {
     ///   through the v1 RGB path is the bug that rendered v2 characters as black
     ///   silhouettes; the version split below is the fix.
     pub fn palette(&self, index: usize) -> FpResult<[u8; PALETTE_RGBA_SIZE]> {
-        let pal = self.palettes.get(index).ok_or_else(|| {
-            FpError::not_found("palette", format!("index {index}"))
-        })?;
+        let pal = self
+            .palettes
+            .get(index)
+            .ok_or_else(|| FpError::not_found("palette", format!("index {index}")))?;
 
         // Follow link if this palette doesn't have its own data
         let data_pal = if pal.linked_index as usize != index && pal.data_length == 0 {
@@ -551,7 +553,10 @@ fn detect_version(data: &[u8]) -> FpResult<SffVersion> {
     if data.len() < 16 {
         return Err(FpError::parse(
             "SFF",
-            format!("file too small for SFF header: {} bytes (need 16)", data.len()),
+            format!(
+                "file too small for SFF header: {} bytes (need 16)",
+                data.len()
+            ),
         ));
     }
     if &data[0..12] != SFF_SIGNATURE.as_slice() {
@@ -591,7 +596,7 @@ mod tests {
         let ldata_offset: u32 = 556;
         let ldata_length: u32 = 1024; // 256 colors * 4 bytes (RGBA)
         let tdata_offset: u32 = 556 + 1024; // 1580
-        // RLE8 data: size prefix (4 bytes) + 2 byte run = 6 bytes
+                                            // RLE8 data: size prefix (4 bytes) + 2 byte run = 6 bytes
         let tdata_length: u32 = 6;
 
         let total = tdata_offset as usize + tdata_length as usize;
@@ -602,8 +607,11 @@ mod tests {
         // fields begin at offset 36 and store COUNTS, not byte-lengths, for the
         // sprite/palette tables — mirroring `header::make_test_header`.
         buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
-        buf[12] = 0; buf[13] = 0; buf[14] = 1; buf[15] = 2; // version 2.1.0.0
-        // sprite_offset @36
+        buf[12] = 0;
+        buf[13] = 0;
+        buf[14] = 1;
+        buf[15] = 2; // version 2.1.0.0
+                     // sprite_offset @36
         buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
         // num_sprites @40 (count, not byte length)
         buf[40..44].copy_from_slice(&1u32.to_le_bytes());
@@ -622,28 +630,28 @@ mod tests {
 
         // --- Sprite sub-header at offset 512 ---
         let s = sprite_offset as usize;
-        buf[s..s+2].copy_from_slice(&0u16.to_le_bytes());     // group
-        buf[s+2..s+4].copy_from_slice(&0u16.to_le_bytes());   // image
-        buf[s+4..s+6].copy_from_slice(&2u16.to_le_bytes());   // width = 2
-        buf[s+6..s+8].copy_from_slice(&2u16.to_le_bytes());   // height = 2
-        buf[s+8..s+10].copy_from_slice(&0i16.to_le_bytes());  // axis_x
-        buf[s+10..s+12].copy_from_slice(&0i16.to_le_bytes()); // axis_y
-        buf[s+12..s+14].copy_from_slice(&0u16.to_le_bytes()); // linked_index = self
-        buf[s+14] = 2; // format = RLE8
-        buf[s+15] = 8; // color_depth = 8
-        buf[s+16..s+20].copy_from_slice(&0u32.to_le_bytes()); // data_offset within TData
-        buf[s+20..s+24].copy_from_slice(&tdata_length.to_le_bytes()); // data_length
-        buf[s+24..s+26].copy_from_slice(&0u16.to_le_bytes()); // palette_index
-        buf[s+26..s+28].copy_from_slice(&1u16.to_le_bytes()); // flags: bit0=1 -> TData
+        buf[s..s + 2].copy_from_slice(&0u16.to_le_bytes()); // group
+        buf[s + 2..s + 4].copy_from_slice(&0u16.to_le_bytes()); // image
+        buf[s + 4..s + 6].copy_from_slice(&2u16.to_le_bytes()); // width = 2
+        buf[s + 6..s + 8].copy_from_slice(&2u16.to_le_bytes()); // height = 2
+        buf[s + 8..s + 10].copy_from_slice(&0i16.to_le_bytes()); // axis_x
+        buf[s + 10..s + 12].copy_from_slice(&0i16.to_le_bytes()); // axis_y
+        buf[s + 12..s + 14].copy_from_slice(&0u16.to_le_bytes()); // linked_index = self
+        buf[s + 14] = 2; // format = RLE8
+        buf[s + 15] = 8; // color_depth = 8
+        buf[s + 16..s + 20].copy_from_slice(&0u32.to_le_bytes()); // data_offset within TData
+        buf[s + 20..s + 24].copy_from_slice(&tdata_length.to_le_bytes()); // data_length
+        buf[s + 24..s + 26].copy_from_slice(&0u16.to_le_bytes()); // palette_index
+        buf[s + 26..s + 28].copy_from_slice(&1u16.to_le_bytes()); // flags: bit0=1 -> TData
 
         // --- Palette sub-header at offset 540 ---
         let p = palette_offset as usize;
-        buf[p..p+2].copy_from_slice(&1u16.to_le_bytes());     // group
-        buf[p+2..p+4].copy_from_slice(&1u16.to_le_bytes());   // item
-        buf[p+4..p+6].copy_from_slice(&256u16.to_le_bytes()); // num_colors
-        buf[p+6..p+8].copy_from_slice(&0u16.to_le_bytes());   // linked_index = self
-        buf[p+8..p+12].copy_from_slice(&0u32.to_le_bytes());  // data_offset in LData
-        buf[p+12..p+16].copy_from_slice(&1024u32.to_le_bytes()); // data_length (RGBA)
+        buf[p..p + 2].copy_from_slice(&1u16.to_le_bytes()); // group
+        buf[p + 2..p + 4].copy_from_slice(&1u16.to_le_bytes()); // item
+        buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes()); // num_colors
+        buf[p + 6..p + 8].copy_from_slice(&0u16.to_le_bytes()); // linked_index = self
+        buf[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes()); // data_offset in LData
+        buf[p + 12..p + 16].copy_from_slice(&1024u32.to_le_bytes()); // data_length (RGBA)
 
         // --- LData: palette RGBA data at offset 556 ---
         // SFF v2 stores 4 bytes per color. Color 0: black (forced transparent).
@@ -651,15 +659,21 @@ mod tests {
         // on purpose) — the decoder must force non-zero indices to opaque, not
         // honor this stored byte, or every sprite would render invisible.
         let l = ldata_offset as usize;
-        buf[l] = 0; buf[l+1] = 0; buf[l+2] = 0; buf[l+3] = 0;       // color 0: black
-        buf[l+4] = 255; buf[l+5] = 0; buf[l+6] = 0; buf[l+7] = 0;   // color 1: red, pad=0
+        buf[l] = 0;
+        buf[l + 1] = 0;
+        buf[l + 2] = 0;
+        buf[l + 3] = 0; // color 0: black
+        buf[l + 4] = 255;
+        buf[l + 5] = 0;
+        buf[l + 6] = 0;
+        buf[l + 7] = 0; // color 1: red, pad=0
 
         // --- TData: RLE8 data at offset 1324 ---
         // Decompressed size = 4 (2x2 pixels), run of 4 x color 1
         let t = tdata_offset as usize;
-        buf[t..t+4].copy_from_slice(&4u32.to_le_bytes()); // decompressed size = 4
-        buf[t+4] = 0x44; // bit6 set, lower 6 bits = 4 -> run of 4
-        buf[t+5] = 0x01; // color = 1
+        buf[t..t + 4].copy_from_slice(&4u32.to_le_bytes()); // decompressed size = 4
+        buf[t + 4] = 0x44; // bit6 set, lower 6 bits = 4 -> run of 4
+        buf[t + 5] = 0x01; // color = 1
 
         buf
     }
@@ -705,12 +719,12 @@ mod tests {
         // Color 0: black, transparent
         assert_eq!(rgba[0], 0); // R
         assert_eq!(rgba[3], 0); // A = transparent
-        // Color 1: red, opaque
+                                // Color 1: red, opaque
         assert_eq!(rgba[4], 255); // R
-        assert_eq!(rgba[5], 0);   // G
-        assert_eq!(rgba[6], 0);   // B
-        // A = opaque even though the on-disk 4th byte (padding) was 0: the v2
-        // decoder must not honor the stored alpha or every sprite goes invisible.
+        assert_eq!(rgba[5], 0); // G
+        assert_eq!(rgba[6], 0); // B
+                                // A = opaque even though the on-disk 4th byte (padding) was 0: the v2
+                                // decoder must not honor the stored alpha or every sprite goes invisible.
         assert_eq!(rgba[7], 255);
     }
 

@@ -38,8 +38,8 @@ use fp_core::{FpError, FpResult};
 use fp_input::{CommandMatcherSnapshot, InputBufferSnapshot};
 
 use crate::{
-    Effect, Freeze, FreezeExempt, Match, MatchState, Player, RoundResetState, RoundState, StageBounds,
-    Winner,
+    Effect, Freeze, FreezeExempt, Match, MatchState, Player, RoundResetState, RoundState,
+    StageBounds, Winner,
 };
 
 /// A serializable snapshot of one [`Player`]'s mutable runtime state (#38).
@@ -259,9 +259,8 @@ impl Match {
     /// characters) with [`Match::restore_snapshot`].
     pub fn snapshot(&self) -> FpResult<Vec<u8>> {
         let snap = MatchSnapshot::capture(self);
-        bincode::serialize(&snap).map_err(|e| {
-            FpError::Other(format!("match snapshot serialize failed: {e}"))
-        })
+        bincode::serialize(&snap)
+            .map_err(|e| FpError::Other(format!("match snapshot serialize failed: {e}")))
     }
 
     /// Captures this match's runtime state as a typed [`MatchSnapshot`]
@@ -291,9 +290,8 @@ impl Match {
     ///   fingerprints do not match this match's loaded characters (#38) — the match
     ///   is left **unchanged** in that case.
     pub fn restore_snapshot(&mut self, bytes: &[u8]) -> FpResult<()> {
-        let snap: MatchSnapshot = bincode::deserialize(bytes).map_err(|e| {
-            FpError::Other(format!("match snapshot deserialize failed: {e}"))
-        })?;
+        let snap: MatchSnapshot = bincode::deserialize(bytes)
+            .map_err(|e| FpError::Other(format!("match snapshot deserialize failed: {e}")))?;
         snap.apply_to(self)
     }
 

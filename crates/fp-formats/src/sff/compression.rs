@@ -16,14 +16,10 @@ use fp_core::{FpError, FpResult};
 /// decompressed size. The actual compressed data follows.
 pub fn decompress_rle8(data: &[u8]) -> FpResult<Vec<u8>> {
     if data.len() < 4 {
-        return Err(FpError::parse(
-            "SFF",
-            "RLE8 data too short for size header",
-        ));
+        return Err(FpError::parse("SFF", "RLE8 data too short for size header"));
     }
 
-    let decompressed_size =
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let decompressed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
     let mut output = Vec::with_capacity(decompressed_size);
     let mut i = 4; // skip the 4-byte size prefix
@@ -93,14 +89,10 @@ pub fn decompress_rle8(data: &[u8]) -> FpResult<Vec<u8>> {
 /// zero-padded buffer rather than panicking (never-crash).
 pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
     if data.len() < 4 {
-        return Err(FpError::parse(
-            "SFF",
-            "RLE5 data too short for size header",
-        ));
+        return Err(FpError::parse("SFF", "RLE5 data too short for size header"));
     }
 
-    let decompressed_size =
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let decompressed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
     // A single SFF sprite is at most a few megapixels; reject absurd sizes from a
     // corrupt prefix rather than attempting a multi-gigabyte allocation (never-crash).
@@ -108,7 +100,9 @@ pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
     if decompressed_size > MAX_RLE5_OUTPUT {
         return Err(FpError::parse(
             "SFF",
-            format!("RLE5 declared size {decompressed_size} exceeds sane limit ({MAX_RLE5_OUTPUT})"),
+            format!(
+                "RLE5 declared size {decompressed_size} exceeds sane limit ({MAX_RLE5_OUTPUT})"
+            ),
         ));
     }
 
@@ -207,14 +201,10 @@ pub fn decompress_rle5(data: &[u8]) -> FpResult<Vec<u8>> {
 /// rather than panicking (never-crash).
 pub fn decompress_lz5(data: &[u8]) -> FpResult<Vec<u8>> {
     if data.len() < 4 {
-        return Err(FpError::parse(
-            "SFF",
-            "LZ5 data too short for size header",
-        ));
+        return Err(FpError::parse("SFF", "LZ5 data too short for size header"));
     }
 
-    let decompressed_size =
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let decompressed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
     // The compressed bit-stream begins after the 4-byte size prefix.
     let rle = &data[4..];
@@ -629,10 +619,10 @@ mod tests {
         //   colour    = 0x07            -> c = 7
         //   inner: write 7 five times (rl: 4,3,2,1,0 then -1); dl-- = -1 -> stop.
         let data = [
-            5, 0, 0, 0, //
-            0x04,       // rl = 4
-            0x80,       // dl = 0, explicit-colour flag set
-            0x07,       // colour = 7
+            5, 0, 0, 0,    //
+            0x04, // rl = 4
+            0x80, // dl = 0, explicit-colour flag set
+            0x07, // colour = 7
         ];
         let result = decompress_rle5(&data).unwrap();
         assert_eq!(result, vec![7, 7, 7, 7, 7]);
@@ -644,9 +634,9 @@ mod tests {
         //   rl byte   = 0x04 -> rl = 4 (emit 0 five times)
         //   data byte = 0x00 -> dl = 0, flag clear -> c stays 0
         let data = [
-            5, 0, 0, 0, //
-            0x04,       // rl = 4
-            0x00,       // dl = 0, no explicit colour -> colour 0
+            5, 0, 0, 0,    //
+            0x04, // rl = 4
+            0x00, // dl = 0, no explicit colour -> colour 0
         ];
         let result = decompress_rle5(&data).unwrap();
         assert_eq!(result, vec![0, 0, 0, 0, 0]);
@@ -661,12 +651,12 @@ mod tests {
         //   segment 1 = 0x23 -> colour 0x23&0x1f = 3, run (0x23>>5)+1 = 2 -> [3,3]
         //   segment 2 = 0x47 -> colour 0x47&0x1f = 7, run (0x47>>5)+1 = 3 -> [7,7,7]
         let data = [
-            6, 0, 0, 0, //
-            0x00,       // rl = 0
-            0x82,       // dl = 2, explicit-colour flag set
-            0x05,       // header colour = 5
-            0x23,       // segment: colour 3, run 2
-            0x47,       // segment: colour 7, run 3
+            6, 0, 0, 0,    //
+            0x00, // rl = 0
+            0x82, // dl = 2, explicit-colour flag set
+            0x05, // header colour = 5
+            0x23, // segment: colour 3, run 2
+            0x47, // segment: colour 7, run 3
         ];
         let result = decompress_rle5(&data).unwrap();
         assert_eq!(result, vec![5, 3, 3, 7, 7, 7]);
@@ -696,10 +686,10 @@ mod tests {
         // The read head then saturates on the last byte; remaining packets write
         // zero-derived padding until the 8-byte buffer is full.
         let data = [
-            8, 0, 0, 0, //
-            0x02,       // rl = 2
-            0x80,       // dl = 0, explicit-colour flag set
-            0x09,       // colour = 9
+            8, 0, 0, 0,    //
+            0x02, // rl = 2
+            0x80, // dl = 0, explicit-colour flag set
+            0x09, // colour = 9
         ];
         let result = decompress_rle5(&data).unwrap();
         assert_eq!(result.len(), 8, "output must match declared size");
@@ -758,10 +748,10 @@ mod tests {
         //   token 0x43 -> n=2, color=3 -> emit 3,3
         //   token 0x27 -> n=1, color=7 -> emit 7
         let data = [
-            3, 0, 0, 0, //
-            0x00,       // control: bits clear -> literal tokens
-            0x43,       // n=2 (0x43>>5), color=3 (0x43&0x1f)
-            0x27,       // n=1, color=7
+            3, 0, 0, 0,    //
+            0x00, // control: bits clear -> literal tokens
+            0x43, // n=2 (0x43>>5), color=3 (0x43&0x1f)
+            0x27, // n=1, color=7
         ];
         let result = decompress_lz5(&data).unwrap();
         assert_eq!(result, vec![3, 3, 7]);
@@ -772,10 +762,10 @@ mod tests {
         // A literal token with the top 3 bits clear (d & 0xe0 == 0) is a long run
         // of zeros: length = next_byte + 8.
         let data = [
-            8, 0, 0, 0, //
-            0x00,       // control: bit0 clear -> literal
-            0x00,       // d & 0xe0 == 0 -> long zero run
-            0x00,       // length = 0 + 8 = 8 zeros
+            8, 0, 0, 0,    //
+            0x00, // control: bit0 clear -> literal
+            0x00, // d & 0xe0 == 0 -> long zero run
+            0x00, // length = 0 + 8 = 8 zeros
         ];
         let result = decompress_lz5(&data).unwrap();
         assert_eq!(result, vec![0; 8]);
@@ -790,11 +780,11 @@ mod tests {
         //     rbc<8 so distance = next_byte + 1 = 0 + 1 = 1
         //   copy 2 bytes at distance 1: p[1]=p[0]=9, p[2]=p[1]=9
         let data = [
-            3, 0, 0, 0, //
-            0x02,       // control: bit0=lit, bit1=back-ref
-            0x29,       // literal: n=1, color=9
-            0x01,       // short back-ref: n=1, distance from next byte
-            0x00,       // distance - 1 = 0 -> distance = 1
+            3, 0, 0, 0,    //
+            0x02, // control: bit0=lit, bit1=back-ref
+            0x29, // literal: n=1, color=9
+            0x01, // short back-ref: n=1, distance from next byte
+            0x00, // distance - 1 = 0 -> distance = 1
         ];
         let result = decompress_lz5(&data).unwrap();
         assert_eq!(result, vec![9, 9, 9]);
@@ -810,12 +800,12 @@ mod tests {
         //     n    = next2=0x00 + 2 = 2 -> copy n+1 = 3 bytes
         //   copy 3 bytes at distance 3: p[3..6] = p[0..3] = 1,2,3
         let data = [
-            6, 0, 0, 0, //
-            0x08,       // control: 3 literals then a back-ref
+            6, 0, 0, 0,    //
+            0x08, // control: 3 literals then a back-ref
             0x21, 0x22, 0x23, // literals 1, 2, 3
-            0x00,       // long back-ref marker (d & 0x3f == 0)
-            0x02,       // distance bytes -> dist = 3
-            0x00,       // length byte -> n = 2 -> copy 3 bytes
+            0x00, // long back-ref marker (d & 0x3f == 0)
+            0x02, // distance bytes -> dist = 3
+            0x00, // length byte -> n = 2 -> copy 3 bytes
         ];
         let result = decompress_lz5(&data).unwrap();
         assert_eq!(result, vec![1, 2, 3, 1, 2, 3]);
@@ -840,9 +830,9 @@ mod tests {
         // Declares 64 output bytes but supplies almost no stream. The decoder
         // must terminate (never-crash) and zero-pad to the declared size.
         let data = [
-            64, 0, 0, 0, //
-            0x00,        // control: literal
-            0x21,        // single literal token (n=1, color=1)
+            64, 0, 0, 0,    //
+            0x00, // control: literal
+            0x21, // single literal token (n=1, color=1)
         ];
         let result = decompress_lz5(&data).unwrap();
         assert_eq!(result.len(), 64, "output must match declared size");
@@ -937,9 +927,7 @@ mod tests {
             encoder.set_color(png::ColorType::Rgb);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().unwrap();
-            writer
-                .write_image_data(&[255, 0, 0, 0, 0, 255])
-                .unwrap();
+            writer.write_image_data(&[255, 0, 0, 0, 0, 255]).unwrap();
         }
 
         // decompress_png (index path) must NOT silently mis-handle truecolor: it

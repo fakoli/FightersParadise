@@ -1601,7 +1601,9 @@ pub fn resolve_hit(hitdef: &HitDef, defender: DefenderState) -> HitOutcome {
 /// Picks the suggested defender get-hit state: the HitDef's `p2stateno` override if set,
 /// else the stance-based common get-hit state (`5000` / `5010` / `5020`).
 fn suggested_gethit_state(hitdef: &HitDef, stance: Stance) -> i32 {
-    hitdef.p2stateno.unwrap_or_else(|| stance.common_gethit_state())
+    hitdef
+        .p2stateno
+        .unwrap_or_else(|| stance.common_gethit_state())
 }
 
 #[cfg(test)]
@@ -1647,7 +1649,10 @@ mod tests {
         // MUGEN defaults: getpower = round(damage*0.7), givepower = round(damage*0.6);
         // each guard amount is the hit amount / 2 (integer division).
         let hd = HitDef {
-            damage: Damage { hit: 100, guard: 10 },
+            damage: Damage {
+                hit: 100,
+                guard: 10,
+            },
             ..HitDef::default()
         };
         // 100 * 0.7 = 70, guard 35.
@@ -1873,9 +1878,23 @@ mod tests {
         let pos = Vec2::new(0.0, 0.0);
 
         // No attack boxes.
-        assert!(!detect_hit(&[], pos, Facing::Right, &hurt, pos, Facing::Left));
+        assert!(!detect_hit(
+            &[],
+            pos,
+            Facing::Right,
+            &hurt,
+            pos,
+            Facing::Left
+        ));
         // No hurt boxes.
-        assert!(!detect_hit(&attack, pos, Facing::Right, &[], pos, Facing::Left));
+        assert!(!detect_hit(
+            &attack,
+            pos,
+            Facing::Right,
+            &[],
+            pos,
+            Facing::Left
+        ));
         // Both empty.
         assert!(!detect_hit(&[], pos, Facing::Right, &[], pos, Facing::Left));
         // Contact variant agrees.
@@ -1916,7 +1935,11 @@ mod tests {
         // Spark id is -1 (none); both sounds are None (no sound).
         assert_eq!(
             hd.resources,
-            HitResources { sparkno: -1, hitsound: None, guardsound: None }
+            HitResources {
+                sparkno: -1,
+                hitsound: None,
+                guardsound: None
+            }
         );
         // priority is the MUGEN default (4, Hit).
         assert_eq!(hd.priority.kind, PriorityType::Hit);
@@ -1938,20 +1961,35 @@ mod tests {
             ground_velocity: Vec2::new(-4.0, 0.0),
             air_velocity: Vec2::new(-3.0, -6.0),
             guard_velocity: -2.0,
-            hittimes: HitTimes { ground: 15, air: 18, guard: 9 },
+            hittimes: HitTimes {
+                ground: 15,
+                air: 18,
+                guard: 9,
+            },
             fall: true,
             fall_xvelocity: Some(-2.5),
             fall_yvelocity: -4.5,
             fall_damage: 70,
             p1stateno: Some(1000),
             p2stateno: Some(5050),
-            priority: Priority { value: 5, kind: PriorityType::Miss },
+            priority: Priority {
+                value: 5,
+                kind: PriorityType::Miss,
+            },
             id: 7,
             chainid: -1,
             resources: HitResources {
                 sparkno: 2,
-                hitsound: Some(SoundId { group: 5, sample: 0, common: false }),
-                guardsound: Some(SoundId { group: 6, sample: 0, common: false }),
+                hitsound: Some(SoundId {
+                    group: 5,
+                    sample: 0,
+                    common: false,
+                }),
+                guardsound: Some(SoundId {
+                    group: 6,
+                    sample: 0,
+                    common: false,
+                }),
             },
             getpower: PowerGain { hit: 63, guard: 31 },
             givepower: PowerGain { hit: 54, guard: 27 },
@@ -1976,7 +2014,13 @@ mod tests {
         assert_eq!(AnimType::default(), AnimType::Light);
         assert_eq!(HitType::default(), HitType::High);
         assert_eq!(PriorityType::default(), PriorityType::Hit);
-        assert_eq!(Priority::default(), Priority { value: 4, kind: PriorityType::Hit });
+        assert_eq!(
+            Priority::default(),
+            Priority {
+                value: 4,
+                kind: PriorityType::Hit
+            }
+        );
         assert_eq!(AttackAttr::default(), AttackAttr::parse("S, NA"));
     }
 
@@ -2111,15 +2155,60 @@ mod tests {
     #[test]
     fn attack_attr_all_letter_combinations() {
         let cases = [
-            ("S, NA", StateClass::Standing, AttackPower::Normal, AttackKind::Attack),
-            ("S, NT", StateClass::Standing, AttackPower::Normal, AttackKind::Throw),
-            ("S, NP", StateClass::Standing, AttackPower::Normal, AttackKind::Projectile),
-            ("C, SA", StateClass::Crouching, AttackPower::Special, AttackKind::Attack),
-            ("C, ST", StateClass::Crouching, AttackPower::Special, AttackKind::Throw),
-            ("C, SP", StateClass::Crouching, AttackPower::Special, AttackKind::Projectile),
-            ("A, HA", StateClass::Air, AttackPower::Hyper, AttackKind::Attack),
-            ("A, HT", StateClass::Air, AttackPower::Hyper, AttackKind::Throw),
-            ("A, HP", StateClass::Air, AttackPower::Hyper, AttackKind::Projectile),
+            (
+                "S, NA",
+                StateClass::Standing,
+                AttackPower::Normal,
+                AttackKind::Attack,
+            ),
+            (
+                "S, NT",
+                StateClass::Standing,
+                AttackPower::Normal,
+                AttackKind::Throw,
+            ),
+            (
+                "S, NP",
+                StateClass::Standing,
+                AttackPower::Normal,
+                AttackKind::Projectile,
+            ),
+            (
+                "C, SA",
+                StateClass::Crouching,
+                AttackPower::Special,
+                AttackKind::Attack,
+            ),
+            (
+                "C, ST",
+                StateClass::Crouching,
+                AttackPower::Special,
+                AttackKind::Throw,
+            ),
+            (
+                "C, SP",
+                StateClass::Crouching,
+                AttackPower::Special,
+                AttackKind::Projectile,
+            ),
+            (
+                "A, HA",
+                StateClass::Air,
+                AttackPower::Hyper,
+                AttackKind::Attack,
+            ),
+            (
+                "A, HT",
+                StateClass::Air,
+                AttackPower::Hyper,
+                AttackKind::Throw,
+            ),
+            (
+                "A, HP",
+                StateClass::Air,
+                AttackPower::Hyper,
+                AttackKind::Projectile,
+            ),
         ];
         for (s, class, power, kind) in cases {
             let a = AttackAttr::parse(s);
@@ -2154,22 +2243,19 @@ mod tests {
     #[test]
     fn attack_attr_malformed_exhaustive_safe_default() {
         let bad = [
-            "",
-            "   ",
-            ",",
-            "S",          // class only, no attack token
-            "S,",         // trailing comma -> empty attack
-            "S, ",        // comma + whitespace -> empty attack
-            "X, NA",      // unknown class
-            "S, N",       // attack too short
-            "S, NAB",     // attack too long
-            "S, ZA",      // unknown power letter
-            "S, NZ",      // unknown kind letter
-            "S, ZZ",      // both unknown
-            "NA, S",      // tokens swapped
-            "S, N, A",    // multiple commas
-            "1, 23",      // numeric garbage
-            "SS, NA",     // 2-char class
+            "", "   ", ",", "S",       // class only, no attack token
+            "S,",      // trailing comma -> empty attack
+            "S, ",     // comma + whitespace -> empty attack
+            "X, NA",   // unknown class
+            "S, N",    // attack too short
+            "S, NAB",  // attack too long
+            "S, ZA",   // unknown power letter
+            "S, NZ",   // unknown kind letter
+            "S, ZZ",   // both unknown
+            "NA, S",   // tokens swapped
+            "S, N, A", // multiple commas
+            "1, 23",   // numeric garbage
+            "SS, NA",  // 2-char class
             "garbage",
         ];
         for s in bad {
@@ -2219,7 +2305,7 @@ mod tests {
         assert!(hla.contains(HitFlags::parse("HL")));
         assert!(hla.contains(HitFlags::empty())); // everything contains empty
         assert!(!HitFlags::parse("H").contains(hla)); // smaller doesn't contain bigger
-        // Empty contains only empty.
+                                                      // Empty contains only empty.
         assert!(HitFlags::empty().contains(HitFlags::empty()));
         assert!(!HitFlags::empty().contains(HitFlags::parse("H")));
     }
@@ -2258,7 +2344,10 @@ mod tests {
                 "detect_hit and detect_hit_contact disagree at dx={dx}"
             );
             if let Some(c) = contact {
-                assert!(c.w > 0.0 && c.h > 0.0, "contact must have positive area at dx={dx}");
+                assert!(
+                    c.w > 0.0 && c.h > 0.0,
+                    "contact must have positive area at dx={dx}"
+                );
             }
         }
     }
@@ -2301,9 +2390,17 @@ mod tests {
         let hurt = [Clsn::new(0.0, -10.0, 10.0, 0.0)];
         let a_pos = Vec2::new(0.0, 0.0);
         let d_pos = Vec2::new(10.0, 0.0);
-        assert!(!detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Right));
+        assert!(!detect_hit(
+            &attack,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Right
+        ));
         assert!(
-            detect_hit_contact(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Right).is_none()
+            detect_hit_contact(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Right)
+                .is_none()
         );
     }
 
@@ -2316,8 +2413,17 @@ mod tests {
         let attack = [Clsn::new(0.0, -100.0, 20.0, -80.0)];
         let hurt = [Clsn::new(0.0, -20.0, 20.0, 0.0)];
         let pos = Vec2::new(0.0, 0.0);
-        assert!(!detect_hit(&attack, pos, Facing::Right, &hurt, pos, Facing::Right));
-        assert!(detect_hit_contact(&attack, pos, Facing::Right, &hurt, pos, Facing::Right).is_none());
+        assert!(!detect_hit(
+            &attack,
+            pos,
+            Facing::Right,
+            &hurt,
+            pos,
+            Facing::Right
+        ));
+        assert!(
+            detect_hit_contact(&attack, pos, Facing::Right, &hurt, pos, Facing::Right).is_none()
+        );
     }
 
     /// Both characters facing right (e.g. a cross-up): facing applies to BOTH
@@ -2351,9 +2457,23 @@ mod tests {
         let a_pos = Vec2::new(0.0, 0.0);
         let d_pos = Vec2::new(12.0, 0.0);
         // Facing right: hurt world x 12-30..12-5 = -18..7 -> overlaps attack 0..10.
-        assert!(detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Right));
+        assert!(detect_hit(
+            &attack,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Right
+        ));
         // Facing left: hurt mirrors to world x 12+5..12+30 = 17..42 -> no overlap.
-        assert!(!detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left));
+        assert!(!detect_hit(
+            &attack,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Left
+        ));
     }
 
     /// Multiple attacker and defender boxes: a hit registers if ANY pair
@@ -2374,7 +2494,14 @@ mod tests {
         ];
         let a_pos = Vec2::new(0.0, 0.0);
         let d_pos = Vec2::new(5.0, 0.0);
-        assert!(detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Right));
+        assert!(detect_hit(
+            &attack,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Right
+        ));
         // First contact: attacker[0] whiffs both, attacker[1] vs defender[0] is
         // the first overlapping pair -> intersection x 5..15 (overlap of 0..20 &
         // 5..15) = (5, w=10).
@@ -2397,7 +2524,14 @@ mod tests {
             detect_hit(&normal, a_pos, Facing::Right, &hurt, d_pos, Facing::Left),
             detect_hit(&reversed, a_pos, Facing::Right, &hurt, d_pos, Facing::Left),
         );
-        assert!(detect_hit(&reversed, a_pos, Facing::Right, &hurt, d_pos, Facing::Left));
+        assert!(detect_hit(
+            &reversed,
+            a_pos,
+            Facing::Right,
+            &hurt,
+            d_pos,
+            Facing::Left
+        ));
     }
 
     /// Self-overlapping at the same axis: a character "hitting itself" geometry
@@ -2408,7 +2542,14 @@ mod tests {
         let attack = [Clsn::new(-10.0, -10.0, 10.0, 10.0)];
         let hurt = [Clsn::new(-5.0, -5.0, 5.0, 5.0)];
         let pos = Vec2::new(100.0, 50.0);
-        assert!(detect_hit(&attack, pos, Facing::Right, &hurt, pos, Facing::Right));
+        assert!(detect_hit(
+            &attack,
+            pos,
+            Facing::Right,
+            &hurt,
+            pos,
+            Facing::Right
+        ));
     }
 
     // ---- (4) never-panics / purity ----
@@ -2452,8 +2593,7 @@ mod tests {
         let a_pos = Vec2::new(0.0, 0.0);
         let d_pos = Vec2::new(60.0, 0.0);
         let first = detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left);
-        let first_c =
-            detect_hit_contact(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left);
+        let first_c = detect_hit_contact(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left);
         for _ in 0..32 {
             assert_eq!(
                 detect_hit(&attack, a_pos, Facing::Right, &hurt, d_pos, Facing::Left),
@@ -2535,7 +2675,10 @@ mod tests {
         // against the standing hurt box `Clsn2[0] = -13,0,16,-79`.
         let jab = Clsn::new(16.0, -80.0, 61.0, -71.0);
         let stand_hurt = Clsn::new(-13.0, 0.0, 16.0, -79.0);
-        assert!(clsn1.contains(&jab), "expected KFM jab Clsn1 box in fixture");
+        assert!(
+            clsn1.contains(&jab),
+            "expected KFM jab Clsn1 box in fixture"
+        );
         assert!(
             clsn2.contains(&stand_hurt),
             "expected KFM standing hurt box in fixture"
@@ -2602,7 +2745,11 @@ mod tests {
             damage: Damage { hit: 50, guard: 7 },
             guard_velocity: -3.0,
             ground_velocity: Vec2::new(8.0, 0.0),
-            hittimes: HitTimes { ground: 12, air: 20, guard: 9 },
+            hittimes: HitTimes {
+                ground: 12,
+                air: 20,
+                guard: 9,
+            },
             pausetime: PauseTime { p1: 11, p2: 11 },
             fall: true,
             fall_yvelocity: -5.0,
@@ -2634,7 +2781,11 @@ mod tests {
             damage: Damage { hit: 50, guard: 7 },
             ground_velocity: Vec2::new(8.0, -2.0),
             air_velocity: Vec2::new(6.0, -9.0),
-            hittimes: HitTimes { ground: 12, air: 25, guard: 9 },
+            hittimes: HitTimes {
+                ground: 12,
+                air: 25,
+                guard: 9,
+            },
             pausetime: PauseTime { p1: 10, p2: 10 },
             fall: true,
             fall_yvelocity: -6.5,
@@ -2663,7 +2814,11 @@ mod tests {
             damage: Damage { hit: 40, guard: 6 },
             ground_velocity: Vec2::new(8.0, 0.0),
             air_velocity: Vec2::new(5.0, -8.0),
-            hittimes: HitTimes { ground: 12, air: 25, guard: 9 },
+            hittimes: HitTimes {
+                ground: 12,
+                air: 25,
+                guard: 9,
+            },
             ..HitDef::default()
         };
         // Airborne, not holding back -> air hit.
@@ -2730,7 +2885,11 @@ mod tests {
             hitflag: HitFlags::parse("MAF"),
             damage: Damage { hit: 33, guard: 4 },
             ground_velocity: Vec2::new(6.0, 0.0),
-            hittimes: HitTimes { ground: 10, air: 20, guard: 8 },
+            hittimes: HitTimes {
+                ground: 10,
+                air: 20,
+                guard: 8,
+            },
             ..HitDef::default()
         };
         let d = DefenderState::new(Stance::Crouch, true, false);
@@ -2756,7 +2915,7 @@ mod tests {
         let hit = resolve_hit(&hd, DefenderState::new(Stance::Crouch, false, false));
         assert_eq!(hit.result, HitResult::Hit);
         assert_eq!(hit.gethit_state, 5050); // override, not 5010
-        // Guard case.
+                                            // Guard case.
         let guard = resolve_hit(&hd, DefenderState::new(Stance::Crouch, true, false));
         assert_eq!(guard.result, HitResult::Guard);
         assert_eq!(guard.gethit_state, 5050);
@@ -2812,7 +2971,11 @@ mod tests {
             hitflag: HitFlags::parse("MAF"),
             damage: Damage { hit: 44, guard: 6 },
             guard_velocity: -2.5,
-            hittimes: HitTimes { ground: 10, air: 20, guard: 7 },
+            hittimes: HitTimes {
+                ground: 10,
+                air: 20,
+                guard: 7,
+            },
             ..HitDef::default()
         };
         let d = DefenderState::new(Stance::Crouch, true, false);
@@ -2835,7 +2998,11 @@ mod tests {
             damage: Damage { hit: 60, guard: 9 },
             air_velocity: Vec2::new(7.0, -10.0), // must NOT be used on a guard
             guard_velocity: -4.0,
-            hittimes: HitTimes { ground: 12, air: 30, guard: 11 },
+            hittimes: HitTimes {
+                ground: 12,
+                air: 30,
+                guard: 11,
+            },
             fall: true, // must be suppressed on guard
             fall_yvelocity: -8.0,
             ..HitDef::default()
@@ -2863,7 +3030,11 @@ mod tests {
             damage: Damage { hit: 20, guard: 2 },
             ground_velocity: Vec2::new(3.0, 0.0),
             air_velocity: Vec2::new(9.0, -9.0),
-            hittimes: HitTimes { ground: 5, air: 40, guard: 0 },
+            hittimes: HitTimes {
+                ground: 5,
+                air: 40,
+                guard: 0,
+            },
             ..HitDef::default()
         };
 
@@ -2954,9 +3125,16 @@ mod tests {
         let hd = HitDef {
             guardflag: HitFlags::parse("M"),
             hitflag: HitFlags::parse("MAF"),
-            damage: Damage { hit: -10, guard: -3 }, // negative (heal-on-hit / odd content)
+            damage: Damage {
+                hit: -10,
+                guard: -3,
+            }, // negative (heal-on-hit / odd content)
             ground_velocity: Vec2::new(f32::INFINITY, f32::NEG_INFINITY),
-            hittimes: HitTimes { ground: -5, air: 20, guard: -2 },
+            hittimes: HitTimes {
+                ground: -5,
+                air: 20,
+                guard: -2,
+            },
             ..HitDef::default()
         };
         // Hit path: negative hit damage and non-finite velocity pass through, no panic.
@@ -3050,11 +3228,19 @@ mod tests {
     fn sound_id_parse_group_and_sample() {
         assert_eq!(
             SoundId::parse("5, 0"),
-            Some(SoundId { group: 5, sample: 0, common: true })
+            Some(SoundId {
+                group: 5,
+                sample: 0,
+                common: true
+            })
         );
         assert_eq!(
             SoundId::parse("5, 3"),
-            Some(SoundId { group: 5, sample: 3, common: true })
+            Some(SoundId {
+                group: 5,
+                sample: 3,
+                common: true
+            })
         );
     }
 
@@ -3064,12 +3250,20 @@ mod tests {
     fn sound_id_parse_s_prefix_is_own() {
         assert_eq!(
             SoundId::parse("S5, 2"),
-            Some(SoundId { group: 5, sample: 2, common: false })
+            Some(SoundId {
+                group: 5,
+                sample: 2,
+                common: false
+            })
         );
         // Lower-case flag too.
         assert_eq!(
             SoundId::parse("s10, 1"),
-            Some(SoundId { group: 10, sample: 1, common: false })
+            Some(SoundId {
+                group: 10,
+                sample: 1,
+                common: false
+            })
         );
     }
 
@@ -3079,16 +3273,28 @@ mod tests {
     fn sound_id_parse_sample_defaults_to_zero() {
         assert_eq!(
             SoundId::parse("7"),
-            Some(SoundId { group: 7, sample: 0, common: true })
+            Some(SoundId {
+                group: 7,
+                sample: 0,
+                common: true
+            })
         );
         assert_eq!(
             SoundId::parse("  9  "),
-            Some(SoundId { group: 9, sample: 0, common: true })
+            Some(SoundId {
+                group: 9,
+                sample: 0,
+                common: true
+            })
         );
         // Garbage sample → defaults to 0 (group still valid).
         assert_eq!(
             SoundId::parse("4, nope"),
-            Some(SoundId { group: 4, sample: 0, common: true })
+            Some(SoundId {
+                group: 4,
+                sample: 0,
+                common: true
+            })
         );
     }
 

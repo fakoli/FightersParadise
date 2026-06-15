@@ -186,7 +186,11 @@ fn build_match() -> Match {
     p2c.pos = Vec2::new(50.0, 0.0);
     let p1 = Player::new(p1c, rng_probe_loaded());
     let p2 = Player::new(p2c, rng_probe_loaded());
-    Match::new(p1, p2, StageBounds::new(-STAGE_HALF_WIDTH, STAGE_HALF_WIDTH))
+    Match::new(
+        p1,
+        p2,
+        StageBounds::new(-STAGE_HALF_WIDTH, STAGE_HALF_WIDTH),
+    )
 }
 
 /// A deterministic, varied `n`-frame input script (distinct per player) that
@@ -417,7 +421,9 @@ fn snapshot_restore_is_a_perfect_resume_point() {
         resumed.tick(p1, p2);
     }
     // ...then restore to the save-state and continue the real script.
-    resumed.restore_snapshot(&saved).expect("restore save-state");
+    resumed
+        .restore_snapshot(&saved)
+        .expect("restore save-state");
     for &(p1, p2) in &script[60..] {
         resumed.tick(p1, p2);
     }

@@ -115,7 +115,10 @@ fn hud_font_is_clean_room_only_magic_and_config_ascii() {
         runs.push(cur);
     }
 
-    assert!(!runs.is_empty(), "font.fnt must contain the ElecbyteFnt magic");
+    assert!(
+        !runs.is_empty(),
+        "font.fnt must contain the ElecbyteFnt magic"
+    );
     assert_eq!(
         runs[0], "ElecbyteFnt",
         "the first ASCII run must be the required FNT magic, found {:?}",
@@ -140,9 +143,7 @@ fn hud_font_is_clean_room_only_magic_and_config_ascii() {
         }
         // Otherwise it must be a numeric [Map] entry: all whitespace-separated
         // tokens parse as integers (the char code + x + width).
-        let all_numeric = r
-            .split_whitespace()
-            .all(|tok| tok.parse::<i64>().is_ok());
+        let all_numeric = r.split_whitespace().all(|tok| tok.parse::<i64>().is_ok());
         assert!(
             all_numeric,
             "unexpected non-numeric ASCII run in font.fnt (possible leaked text): {run:?}"

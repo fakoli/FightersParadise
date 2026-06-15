@@ -34,9 +34,12 @@ fn validate_wav_spec(bytes: &[u8]) -> FpResult<()> {
     let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size =
-            u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-                as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body = pos + 8;
         if id == b"fmt " {
             // fmt body: audio_format(u16), channels(u16), sample_rate(u32),
@@ -48,7 +51,7 @@ fn validate_wav_spec(bytes: &[u8]) -> FpResult<()> {
             let bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
             let supported = match audio_format {
                 1 => matches!(bits, 8 | 16 | 24 | 32), // PCM
-                3 => bits == 32,                        // IEEE float
+                3 => bits == 32,                       // IEEE float
                 _ => false,
             };
             if !supported {
@@ -140,9 +143,8 @@ impl Sound {
         // `Decoder` needs an owned, seekable reader. The raw bytes are small
         // (single SFX), so copying into a Cursor is cheap.
         let cursor = Cursor::new(bytes.to_vec());
-        let decoder = Decoder::new(cursor).map_err(|e| {
-            FpError::parse("WAV", format!("failed to decode sound data: {e}"))
-        })?;
+        let decoder = Decoder::new(cursor)
+            .map_err(|e| FpError::parse("WAV", format!("failed to decode sound data: {e}")))?;
 
         // `channels()` / `sample_rate()` describe the current frame and must be
         // read before the iterator is drained.
@@ -151,7 +153,11 @@ impl Sound {
 
         // Fast path: a WAV with a bogus oversized `data` length reports its
         // (inflated) remaining count here, so we can reject without allocating.
-        if decoder.size_hint().1.is_some_and(|n| n > MAX_DECODED_SAMPLES) {
+        if decoder
+            .size_hint()
+            .1
+            .is_some_and(|n| n > MAX_DECODED_SAMPLES)
+        {
             return Err(FpError::parse(
                 "WAV",
                 "declared sample count exceeds the decode budget",

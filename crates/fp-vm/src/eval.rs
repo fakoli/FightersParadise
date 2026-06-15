@@ -691,7 +691,11 @@ mod tests {
     /// the member-keyed trigger path (`GetHitVar(member)`). Both the trigger name
     /// and the member are lowercased so the lookup is case-insensitive.
     fn member_key(name: &str, member: &str) -> String {
-        format!("{}#{}", name.to_ascii_lowercase(), member.to_ascii_lowercase())
+        format!(
+            "{}#{}",
+            name.to_ascii_lowercase(),
+            member.to_ascii_lowercase()
+        )
     }
 
     /// A simple in-memory [`EvalContext`] backed by lookup tables, for
@@ -733,8 +737,7 @@ mod tests {
         /// Registers a member-keyed trigger value (e.g. `GetHitVar(member)`),
         /// keyed case-insensitively on both the trigger name and the member.
         fn with_member_trigger(mut self, name: &str, member: &str, value: Value) -> Self {
-            self.member_triggers
-                .insert(member_key(name, member), value);
+            self.member_triggers.insert(member_key(name, member), value);
             self
         }
 
@@ -830,7 +833,10 @@ mod tests {
             .with_trigger("animelemtime", &[Value::Int(2)], Value::Int(5))
             .with_trigger("animelemtime", &[Value::Int(3)], Value::Int(-1));
         assert_eq!(ctx.trigger("AnimElemTime", &[Value::Int(2)]), Value::Int(5));
-        assert_eq!(ctx.trigger("AnimElemTime", &[Value::Int(3)]), Value::Int(-1));
+        assert_eq!(
+            ctx.trigger("AnimElemTime", &[Value::Int(3)]),
+            Value::Int(-1)
+        );
         // Different arg → not found → default.
         assert_eq!(ctx.trigger("AnimElemTime", &[Value::Int(9)]), Value::Int(0));
     }
@@ -844,11 +850,17 @@ mod tests {
             .with_member_trigger("GetHitVar", "fall.yvel", Value::Float(-4.5))
             .with_member_trigger("GetHitVar", "xveladd", Value::Int(7))
             .with_member_trigger("GetHitVar", "animtype", Value::Int(2));
-        assert_eq!(ctx.trigger_str("GetHitVar", "fall.yvel"), Value::Float(-4.5));
+        assert_eq!(
+            ctx.trigger_str("GetHitVar", "fall.yvel"),
+            Value::Float(-4.5)
+        );
         assert_eq!(ctx.trigger_str("GetHitVar", "xveladd"), Value::Int(7));
         assert_eq!(ctx.trigger_str("GetHitVar", "animtype"), Value::Int(2));
         // Case-insensitive on both name and member.
-        assert_eq!(ctx.trigger_str("gethitvar", "FALL.YVEL"), Value::Float(-4.5));
+        assert_eq!(
+            ctx.trigger_str("gethitvar", "FALL.YVEL"),
+            Value::Float(-4.5)
+        );
         // Unknown member → safe default 0, never a panic.
         assert_eq!(ctx.trigger_str("GetHitVar", "nosuchfield"), Value::DEFAULT);
     }
@@ -1175,7 +1187,10 @@ mod tests {
         assert_eq!(ctx.trigger("Foo", &[]), Value::Int(1));
         assert_eq!(ctx.trigger("Foo", &[Value::Int(0)]), Value::Int(2));
         // An unseen arity falls back to the safe default.
-        assert_eq!(ctx.trigger("Foo", &[Value::Int(0), Value::Int(1)]), Value::DEFAULT);
+        assert_eq!(
+            ctx.trigger("Foo", &[Value::Int(0), Value::Int(1)]),
+            Value::DEFAULT
+        );
     }
 
     #[test]
@@ -1434,7 +1449,12 @@ mod tests {
             return;
         }
 
-        assert!(names_seen > 0, "fixtures present but no trigger-like names found");
-        eprintln!("real-fixture: probed {names_seen} trigger-like names; all resolved to safe default 0");
+        assert!(
+            names_seen > 0,
+            "fixtures present but no trigger-like names found"
+        );
+        eprintln!(
+            "real-fixture: probed {names_seen} trigger-like names; all resolved to safe default 0"
+        );
     }
 }

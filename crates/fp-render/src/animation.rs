@@ -343,10 +343,7 @@ mod tests {
 
     #[test]
     fn basic_frame_advancement() {
-        let action = make_action(
-            vec![make_frame(0, 0, 3), make_frame(0, 1, 3)],
-            0,
-        );
+        let action = make_action(vec![make_frame(0, 0, 3), make_frame(0, 1, 3)], 0);
         let mut ctrl = AnimController::new(action);
 
         assert_eq!(ctrl.frame_index(), 0);
@@ -355,7 +352,7 @@ mod tests {
         // Tick 3 times — frame 0 has 3 ticks
         assert!(!ctrl.tick()); // tick 1: timer 3->2
         assert!(!ctrl.tick()); // tick 2: timer 2->1
-        assert!(ctrl.tick());  // tick 3: timer 1->0, advance to frame 1
+        assert!(ctrl.tick()); // tick 3: timer 1->0, advance to frame 1
 
         assert_eq!(ctrl.frame_index(), 1);
         assert_eq!(ctrl.anim_elem(), 2);
@@ -363,10 +360,7 @@ mod tests {
 
     #[test]
     fn looping() {
-        let action = make_action(
-            vec![make_frame(0, 0, 2), make_frame(0, 1, 2)],
-            0,
-        );
+        let action = make_action(vec![make_frame(0, 0, 2), make_frame(0, 1, 2)], 0);
         let mut ctrl = AnimController::new(action);
 
         // Advance past both frames (4 ticks) to loop back
@@ -403,10 +397,7 @@ mod tests {
 
     #[test]
     fn infinite_tick_stops() {
-        let action = make_action(
-            vec![make_frame(0, 0, -1)],
-            0,
-        );
+        let action = make_action(vec![make_frame(0, 0, -1)], 0);
         let mut ctrl = AnimController::new(action);
 
         // Tick many times — should never advance
@@ -420,14 +411,8 @@ mod tests {
 
     #[test]
     fn set_action_resets() {
-        let action1 = make_action(
-            vec![make_frame(0, 0, 2), make_frame(0, 1, 2)],
-            0,
-        );
-        let action2 = make_action(
-            vec![make_frame(5, 0, 3)],
-            0,
-        );
+        let action1 = make_action(vec![make_frame(0, 0, 2), make_frame(0, 1, 2)], 0);
+        let action2 = make_action(vec![make_frame(5, 0, 3)], 0);
 
         let mut ctrl = AnimController::new(action1);
         ctrl.tick();
@@ -441,10 +426,7 @@ mod tests {
 
     #[test]
     fn anim_elem_time() {
-        let action = make_action(
-            vec![make_frame(0, 0, 5)],
-            0,
-        );
+        let action = make_action(vec![make_frame(0, 0, 5)], 0);
         let mut ctrl = AnimController::new(action);
 
         assert_eq!(ctrl.anim_elem_time(), 0);
@@ -456,10 +438,7 @@ mod tests {
 
     #[test]
     fn total_time_increments() {
-        let action = make_action(
-            vec![make_frame(0, 0, 2), make_frame(0, 1, 2)],
-            0,
-        );
+        let action = make_action(vec![make_frame(0, 0, 2), make_frame(0, 1, 2)], 0);
         let mut ctrl = AnimController::new(action);
 
         assert_eq!(ctrl.time(), 0);
@@ -474,7 +453,11 @@ mod tests {
     #[test]
     fn set_frame() {
         let action = make_action(
-            vec![make_frame(0, 0, 5), make_frame(0, 1, 5), make_frame(0, 2, 5)],
+            vec![
+                make_frame(0, 0, 5),
+                make_frame(0, 1, 5),
+                make_frame(0, 2, 5),
+            ],
             0,
         );
         let mut ctrl = AnimController::new(action);
@@ -519,10 +502,7 @@ mod tests {
     fn frame_scale_angle_produces_transform() {
         // A frame with scale/angle (and no interpolation) yields exactly that
         // transform — the resolved value the renderer maps onto SpriteDrawParams.
-        let action = make_action(
-            vec![xform_frame(4, (2.0, 0.5), 90.0, false, false)],
-            0,
-        );
+        let action = make_action(vec![xform_frame(4, (2.0, 0.5), 90.0, false, false)], 0);
         let ctrl = AnimController::new(action);
         let tf = ctrl.current_transform();
         assert!(approx(tf.scale.x, 2.0));
@@ -565,7 +545,11 @@ mod tests {
         assert_eq!(ctrl.frame_index(), 1, "should be on the second element");
         ctrl.tick();
         ctrl.tick();
-        assert_eq!(ctrl.anim_elem_time(), 2, "halfway through the 4-tick element");
+        assert_eq!(
+            ctrl.anim_elem_time(),
+            2,
+            "halfway through the 4-tick element"
+        );
 
         let tf = ctrl.current_transform();
         // scale.x: lerp(1.0, 2.0, 0.5) = 1.5; scale.y: lerp(1.0, 4.0, 0.5) = 2.5

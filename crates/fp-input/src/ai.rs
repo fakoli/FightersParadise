@@ -444,10 +444,16 @@ mod tests {
         let mut easy_attacks = 0;
         let mut hard_attacks = 0;
         for _ in 0..100 {
-            if easy.decide(AiObservation { opponent_dx: dx }).button(Button::A) {
+            if easy
+                .decide(AiObservation { opponent_dx: dx })
+                .button(Button::A)
+            {
                 easy_attacks += 1;
             }
-            if hard.decide(AiObservation { opponent_dx: dx }).button(Button::A) {
+            if hard
+                .decide(AiObservation { opponent_dx: dx })
+                .button(Button::A)
+            {
                 hard_attacks += 1;
             }
         }
@@ -492,9 +498,7 @@ mod tests {
         let right = AiObservation { opponent_dx: 30.0 };
         assert!(right.opponent_on_right());
         assert_eq!(right.distance(), 30.0);
-        let left = AiObservation {
-            opponent_dx: -30.0,
-        };
+        let left = AiObservation { opponent_dx: -30.0 };
         assert!(!left.opponent_on_right());
         assert_eq!(left.distance(), 30.0);
         // Exact overlap counts as "right" (toward screen-right).

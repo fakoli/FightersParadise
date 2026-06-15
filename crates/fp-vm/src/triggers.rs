@@ -188,6 +188,9 @@ mod tests {
         });
         assert!(fired);
         assert!(visited[0], "the active trigger1 group must be evaluated");
-        assert!(!visited[1], "the dead trigger3 group must never be evaluated");
+        assert!(
+            !visited[1],
+            "the dead trigger3 group must never be evaluated"
+        );
     }
 }
