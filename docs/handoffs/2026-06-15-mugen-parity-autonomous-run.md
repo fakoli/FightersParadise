@@ -54,11 +54,13 @@ All 25 PRD tasks are done. Recommended follow-ups (each logged from a reviewer S
 4. **TeamMatch semantics** — inner `Match` still runs its own round flow (life restore); consider a
    single-round/no-restore inner mode for Simul/Turns, and a real Draw result (currently P1-biased).
 5. **`.snd` ADX audio** — documented unsupported in `docs/mugen-compatibility.md`; only WAV/PCM decode.
-6. **Live visual verification still owed** — the SFF v2 color fix and keyboard input are verified by unit
-   + integration tests, but a live windowed screencapture could NOT run this session (screen locked while
-   unattended; SDL2 window had no GUI session). When at the machine, confirm visually with:
-   `RUST_LOG=error cargo run -p fp-app -- test-assets/kfm/kfm.def` (KFM should now render in **color**),
-   and tap arrow keys + an attack to confirm input. See "Live-debugging the windowed app" in CLAUDE.md.
+6. **Live visual verification — ✅ DONE (passed).** A `visual-validation` workflow
+   (`scripts/visual_capture.sh` → vision-judge agents) captured and visually confirmed: KFM (SFF v2)
+   renders in **full color** (not silhouettes), evilken (SFF v1) in color, the no-args title menu renders
+   (VS MODE / TRAINING / EXIT), and keyboard right-arrow walks P1 forward (round timer ticked 94→91).
+   Gotcha learned: a backgrounded SDL window beachballs (the pinwheel seen mid-run) — **activate the
+   window** (`osascript … set frontmost … to true`) before `screencapture`, and always `kill -9` after so
+   nothing lingers. The menu hang was purely this capture artifact, not an app bug.
 
 ## Invariants / gotchas (don't relearn)
 
