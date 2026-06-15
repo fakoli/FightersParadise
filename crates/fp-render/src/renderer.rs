@@ -55,6 +55,15 @@ impl PalFxUniform {
 /// (with a one-line debug log) rather than reallocating mid-frame.
 const MAX_DEBUG_BOXES: usize = 256;
 
+/// Maximum textured quads (sprites + glyphs) drawn in a single frame. The shared
+/// sprite vertex buffer holds this many quads (4 vertices each) so each
+/// [`draw_sprite`](RenderFrame::draw_sprite) bump-allocates its own slot rather
+/// than overwriting quad 0 — otherwise, because every per-quad render pass reads
+/// the vertex buffer only at submit time, all passes would draw the LAST quad
+/// written and every earlier sprite/glyph would vanish. Additional quads beyond
+/// this cap in one frame are dropped (with a one-line debug log).
+const MAX_SPRITE_QUADS: usize = 8192;
+
 /// Triangles per debug box: one quad for the fill (2) plus one quad per edge of
 /// the outline (4 edges × 2 = 8), so 10 triangles = 30 vertices.
 const DEBUG_VERTS_PER_BOX: usize = 30;
@@ -415,7 +424,7 @@ impl Renderer {
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sprite_vertex_buffer"),
-            size: (std::mem::size_of::<SpriteVertex>() * 4) as u64,
+            size: (std::mem::size_of::<SpriteVertex>() * 4 * MAX_SPRITE_QUADS) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -501,6 +510,7 @@ impl Renderer {
             view,
             encoder,
             debug_box_count: 0,
+            sprite_quad_count: 0,
         })
     }
 
@@ -528,6 +538,12 @@ pub struct RenderFrame<'a> {
     /// this frame; each [`draw_debug_box`](Self::draw_debug_box) call uses the
     /// next slot so earlier boxes are not overwritten.
     debug_box_count: usize,
+    /// Number of textured quads (sprites + glyphs) already written into the shared
+    /// sprite vertex buffer this frame. Each [`draw_sprite`](Self::draw_sprite) /
+    /// glyph bump-allocates the next 4-vertex slot and draws it via `base_vertex`,
+    /// so earlier quads survive to the single submit (the per-quad passes all read
+    /// the buffer only at submit time).
+    sprite_quad_count: usize,
 }
 
 impl RenderFrame<'_> {
@@ -616,11 +632,25 @@ impl RenderFrame<'_> {
             SpriteVertex { position: corners[3], uv: [u_left,  v_bottom], alpha: a },
         ];
 
+        // Bump-allocate this quad's 4-vertex slot in the shared vertex buffer.
+        // Every `draw_sprite` records its own render pass, and all `write_buffer`
+        // calls land before any pass executes at submit; writing every quad to
+        // offset 0 would leave only the LAST quad's vertices, so all passes would
+        // draw it and every earlier sprite/glyph would disappear. Giving each quad
+        // its own slot (and drawing it via `base_vertex`) lets them coexist.
+        let quad = self.sprite_quad_count;
+        if quad >= MAX_SPRITE_QUADS {
+            tracing::debug!("sprite quad cap {MAX_SPRITE_QUADS} reached this frame; dropping draw");
+            return;
+        }
+        let vertex_stride = std::mem::size_of::<SpriteVertex>() as u64;
+        let base_vertex = (quad * 4) as u64;
         self.renderer.queue.write_buffer(
             &self.renderer.vertex_buffer,
-            0,
+            base_vertex * vertex_stride,
             bytemuck::cast_slice(&vertices),
         );
+        self.sprite_quad_count += 1;
 
         // Upload this draw's PalFX tint (audit #33). The identity effect packs to
         // `PalFxUniform::IDENTITY`; `apply_palfx` runs unconditionally but is an
@@ -692,7 +722,10 @@ impl RenderFrame<'_> {
                 self.renderer.index_buffer.slice(..),
                 wgpu::IndexFormat::Uint16,
             );
-            pass.draw_indexed(0..6, 0, 0..1);
+            // Draw this quad's own 4-vertex slot via `base_vertex` (the 6 shared
+            // indices 0,1,2,0,2,3 are added to it), so earlier quads' vertices are
+            // untouched.
+            pass.draw_indexed(0..6, base_vertex as i32, 0..1);
         }
     }
 
