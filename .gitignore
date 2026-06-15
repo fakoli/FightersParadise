@@ -20,9 +20,16 @@
 /.run
 
 # MUGEN content files (not shipped with repo)
+# The global block exists to keep third-party/Elecbyte binary assets out of the
+# repo (clean-room guard). The ORIGINAL, clean-room conformance character under
+# assets/trainingdummy/ (authored from scratch for this engine, MIT — no Elecbyte
+# content) is the project's first SHIPPABLE character, so its binary SFF/SND are
+# explicitly un-ignored below. Do NOT add any third-party .sff/.snd here.
 *.sff
 *.snd
 *.fnt
+!/assets/trainingdummy/*.sff
+!/assets/trainingdummy/*.snd
 
 # Local-only sample MUGEN content for parser/integration testing
 # (third-party assets, e.g. Elecbyte KFM CC BY-NC — never shipped)

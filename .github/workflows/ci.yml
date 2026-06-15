@@ -40,3 +40,24 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # Real-content gate (closes #36's all-green-no-op gap).
+      #
+      # Background: the real-KFM regression tests under test-assets/ are
+      # asset-gated and skip cleanly when the assets are absent. test-assets/ is
+      # gitignored and NOT fetched on CI, so those tests run as green NO-OPS here
+      # — only synthetic tests truly execute. To actually exercise a real
+      # character load + match on CI, the project now SHIPS an ORIGINAL,
+      # clean-room conformance character (assets/trainingdummy, MIT, no Elecbyte
+      # content). The fp-app `training_dummy` integration tests and the
+      # `validate.rs` shipped-fixture unit test are NOT asset-gated and run in the
+      # `cargo test` step above on every CI run.
+      #
+      # This step adds a second, independent line of defense: it runs the
+      # `validate` CLI against the shipped fixture and fails the build if the
+      # fixture stops loading clean. It is a real end-to-end load of committed
+      # content, so unlike the KFM net it genuinely runs on CI.
+      - name: Validate shipped Training Dummy fixture (real-content gate, #36)
+        run: |
+          cargo run -p fp-app -- validate assets/trainingdummy/trainingdummy.def | tee /tmp/td_report.txt
+          grep -q "Result: PASS" /tmp/td_report.txt

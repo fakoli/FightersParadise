@@ -11,7 +11,19 @@
 //! cargo run -p fp-app -- <p1.def> <p2.def>     # P1 and P2 from two .def files
 //! cargo run -p fp-app -- <file.sff> <file.air> # legacy SFF+AIR animation viewer (demo mode)
 //! cargo run -p fp-app -- <file.sff>            # legacy single-sprite viewer
+//! cargo run -p fp-app -- validate <file.def>   # headless: load a character + print an
+//!                                              #   actionable validation report (no window)
 //! ```
+//!
+//! ## The `validate` subcommand (headless character linter)
+//!
+//! `validate <file.def>` loads a character through the same loader the live match
+//! uses and prints an actionable report — missing referenced sprites, unresolved
+//! `ChangeState`/`ChangeAnim` targets, expressions that failed to compile (silent
+//! const-`0` fallbacks), and unsupported controllers — then exits 0 (the report
+//! body carries the findings; a non-zero exit is reserved for a missing argument
+//! or a character that cannot be loaded at all). It opens no window, GPU, or
+//! audio device, so it runs anywhere. See [`validate`] for the analysis.
 //!
 //! ## The two-player match (task 7.2 — the playable milestone)
 //!
@@ -37,6 +49,8 @@
 //! With no arguments and no KFM assets present, the app shows a checkerboard test
 //! pattern. Missing or unloadable assets degrade gracefully to the test pattern
 //! with a clear log message; the app never panics.
+
+mod validate;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,9 +114,48 @@ fn main() {
 
     tracing::info!("Fighters Paradise v0.1.0");
 
+    // The `validate` subcommand is a headless CLI report — it must NOT open an
+    // SDL2 window or a GPU device, so it is intercepted here, before `run()`.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a.eq_ignore_ascii_case("validate")) {
+        std::process::exit(run_validate(&args));
+    }
+
     if let Err(e) = run() {
         tracing::error!("Fatal error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Runs the `validate <file.def>` subcommand: loads the character through the
+/// real loader, prints an actionable report to stdout, and returns the process
+/// exit code.
+///
+/// Per the task contract this **exits 0 with a summary** for any character that
+/// loads (even one with authoring problems) — the report's body carries the
+/// findings. A non-zero code is reserved for the two operational failures that
+/// are not about the character's *content*: a missing `<file.def>` argument
+/// (exit 2) and a character that cannot be loaded at all (exit 1, e.g. a missing
+/// required SFF/AIR). The report itself is printed to stdout (its job is to be
+/// the program's user-facing output); diagnostics go through `tracing`.
+fn run_validate(args: &[String]) -> i32 {
+    let Some(def_arg) = args.get(2) else {
+        eprintln!("usage: fp-app validate <file.def>");
+        return 2;
+    };
+    let def_path = Path::new(def_arg);
+    match validate::validate(def_path) {
+        Ok(report) => {
+            // stdout: this IS the program's output (a user-facing report), so a
+            // direct print is correct here — not logging.
+            print!("{}", validate::render_report(&report));
+            0
+        }
+        Err(e) => {
+            tracing::error!("validate: cannot load {}: {e}", def_path.display());
+            eprintln!("validate: failed to load {}: {e}", def_path.display());
+            1
+        }
     }
 }
 

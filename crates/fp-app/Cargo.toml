@@ -9,6 +9,7 @@ license.workspace = true
 fp-core.workspace = true
 fp-formats.workspace = true
 fp-character.workspace = true
+fp-vm.workspace = true
 fp-engine.workspace = true
 fp-audio.workspace = true
 fp-input.workspace = true

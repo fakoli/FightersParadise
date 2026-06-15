@@ -1,0 +1,217 @@
+; Training Dummy — Constants + States (ORIGINAL, clean-room content)
+; (c) 2025 Sekou Doumbouya, MIT. Authored from scratch; no Elecbyte data.
+;
+; This is the smallest self-contained MUGEN character that exercises the
+; engine breadth: idle / walk / crouch / jump locomotion, a standing attack
+; that emits a HitDef + PlaySnd, and a get-hit reaction state.
+
+; ---------------------------------------------------------------------------
+[Data]
+life = 1000
+attack = 100
+defence = 100
+power = 3000
+airjuggle = 15
+
+[Size]
+ground.front = 16
+ground.back = 16
+height = 70
+
+[Velocity]
+walk.fwd  = 2.4
+walk.back = -2.4
+run.fwd   = 4.6, 0
+run.back  = -4.5, 0
+jump.neu  = 0, -8.4
+jump.back = -2.55
+jump.fwd  = 2.5
+airjump.neu  = 0, -8.1
+airjump.back = -2.55
+airjump.fwd  = 2.5
+
+[Movement]
+yaccel = 0.44
+stand.friction = 0.85
+crouch.friction = 0.82
+airjump.num = 1
+airjump.height = 35
+
+; ---------------------------------------------------------------------------
+; Stand (idle)
+[Statedef 0]
+type = S
+physics = S
+ctrl = 1
+anim = 0
+
+[State 0, 1]
+type = ChangeAnim
+trigger1 = anim != 0
+value = 0
+
+[State 0, friction]
+type = VelSet
+trigger1 = 1
+x = 0
+
+; ---------------------------------------------------------------------------
+; Crouch start
+[Statedef 10]
+type = C
+physics = C
+anim = 11
+ctrl = 0
+
+[State 10, anim]
+type = ChangeAnim
+trigger1 = animtime = 0
+value = 11
+
+[State 10, ctrl]
+type = CtrlSet
+trigger1 = 1
+value = 1
+
+[State 10, hold]
+type = ChangeState
+trigger1 = command != "holddown"
+value = 12
+
+; Crouching (held)
+[Statedef 11]
+type = C
+physics = C
+anim = 11
+ctrl = 1
+
+[State 11, stand]
+type = ChangeState
+trigger1 = command != "holddown"
+value = 12
+
+; Crouch -> stand
+[Statedef 12]
+type = C
+physics = C
+anim = 12
+ctrl = 0
+
+[State 12, stand]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
+
+; ---------------------------------------------------------------------------
+; Walk
+[Statedef 20]
+type = S
+physics = S
+anim = 20
+ctrl = 1
+
+[State 20, fwd vel]
+type = VelSet
+triggerall = command = "holdfwd"
+trigger1 = 1
+x = const(velocity.walk.fwd)
+
+[State 20, back vel]
+type = VelSet
+triggerall = command = "holdback"
+trigger1 = 1
+x = const(velocity.walk.back)
+
+; ---------------------------------------------------------------------------
+; Jump start
+[Statedef 40]
+type = S
+physics = S
+anim = 40
+ctrl = 0
+
+[State 40, jump vel]
+type = VelSet
+trigger1 = animtime = 0
+y = const(velocity.jump.neu.y)
+
+[State 40, to air]
+type = ChangeState
+trigger1 = animtime = 0
+value = 50
+physics = A
+
+; Jump up (air)
+[Statedef 50]
+type = A
+physics = A
+anim = 41
+ctrl = 1
+
+; Jump land
+[Statedef 52]
+type = S
+physics = S
+anim = 52
+ctrl = 0
+
+[State 52, stand]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
+
+; ---------------------------------------------------------------------------
+; Standing light attack (emits a HitDef + a blip sound)
+[Statedef 200]
+type = S
+movetype = A
+physics = S
+anim = 200
+ctrl = 0
+poweradd = 20
+
+[State 200, sound]
+type = PlaySnd
+trigger1 = animelem = 2
+value = 0, 0
+
+[State 200, hit]
+type = HitDef
+trigger1 = animelem = 2
+attr = S, NA
+damage = 24, 6
+animtype = Light
+guardflag = MA
+hitflag = MAF
+pausetime = 8, 8
+sparkno = 0
+hitsound = 5, 0
+guardsound = 6, 0
+ground.type = High
+ground.slidetime = 8
+ground.hittime = 14
+ground.velocity = -4, 0
+air.velocity = -3, -3
+
+[State 200, end]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
+
+; ---------------------------------------------------------------------------
+; Get-hit: standing reaction
+[Statedef 5000]
+type = S
+movetype = H
+physics = S
+anim = 5000
+velset = 0, 0
+
+[State 5000, recover]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
