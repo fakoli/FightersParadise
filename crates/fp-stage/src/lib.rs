@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fp_core::{FpResult, Vec2};
+use fp_core::{FpResult, Rect, Vec2};
 
 /// Free-text metadata about a stage, from its `[Info]` section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -191,6 +191,13 @@ pub struct BgElement {
     /// `mask = 0/1` — whether palette index 0 is treated as transparent. MUGEN
     /// defaults this on; preserved for fidelity.
     pub mask: bool,
+    /// Runtime scroll offset, in world px, accumulated from [`BgElement::velocity`]
+    /// one tick at a time by [`BgElement::advance_scroll`]. **Not parsed** — it
+    /// starts at `(0, 0)` and is the engine's running auto-scroll position, added
+    /// to the element's draw position on top of parallax. Kept on the element so a
+    /// caller can advance the whole stage's scroll with [`Stage::advance_scroll`]
+    /// once per tick and read it back when drawing.
+    pub scroll: Vec2<f32>,
 }
 
 impl Default for BgElement {
@@ -207,7 +214,45 @@ impl Default for BgElement {
             velocity: Vec2::new(0.0, 0.0),
             layer: BgLayer::Back,
             mask: true,
+            scroll: Vec2::new(0.0, 0.0),
         }
+    }
+}
+
+impl BgElement {
+    /// Advances this element's runtime [`scroll`](BgElement::scroll) offset by one
+    /// tick of its [`velocity`](BgElement::velocity).
+    ///
+    /// A zero-velocity element never moves (the offset stays put); a non-zero
+    /// velocity accumulates linearly — after `n` calls the offset is `velocity * n`
+    /// (plus its starting value). To keep the accumulator from growing without
+    /// bound during long matches it is wrapped back into one tile period per axis
+    /// once a tile size is known: pass the element's drawn sprite size as
+    /// `tile_size`. Tiling repeats every `tile_size` px, so wrapping the offset
+    /// modulo the tile size is visually identical while keeping the float small and
+    /// precise. Pass a non-positive size on an axis (e.g. `0.0`) to disable
+    /// wrapping on that axis (the raw accumulation is kept).
+    pub fn advance_scroll(&mut self, tile_size: Vec2<f32>) {
+        self.scroll.x = advance_axis(self.scroll.x, self.velocity.x, tile_size.x);
+        self.scroll.y = advance_axis(self.scroll.y, self.velocity.y, tile_size.y);
+    }
+}
+
+/// Advances one scroll axis by `velocity`, wrapping into `[0, period)` when
+/// `period > 0` (and finite). A non-positive or non-finite `period` leaves the
+/// value un-wrapped (raw accumulation). The result is always finite: a non-finite
+/// intermediate collapses to `0.0` rather than poisoning the offset.
+fn advance_axis(offset: f32, velocity: f32, period: f32) -> f32 {
+    let next = offset + velocity;
+    if !next.is_finite() {
+        return 0.0;
+    }
+    if period.is_finite() && period > 0.0 {
+        // `rem_euclid` keeps the result in `[0, period)` even for negative
+        // velocities, matching a seamless repeating tile.
+        next.rem_euclid(period)
+    } else {
+        next
     }
 }
 
@@ -300,6 +345,106 @@ impl Stage {
         let lo = self.camera.bound_left.min(self.camera.bound_right);
         let hi = self.camera.bound_left.max(self.camera.bound_right);
         midpoint.clamp(lo, hi)
+    }
+
+    /// Advances every background element's auto-scroll offset by one tick,
+    /// wrapping each within its tile period.
+    ///
+    /// Call this once per fixed tick. `tile_size` resolves the per-element drawn
+    /// sprite size used to wrap the accumulator (see [`BgElement::advance_scroll`]):
+    /// it is called with each element's `(group, image)` sprite reference and must
+    /// return that sprite's `(width, height)` in px, or `None` when the size is
+    /// unknown (which disables wrapping for that element, keeping raw accumulation).
+    /// This indirection keeps `fp-stage` free of any SFF/GPU dependency — the
+    /// caller (which already owns the decoded sprites) supplies the sizes.
+    pub fn advance_scroll<F>(&mut self, mut tile_size: F)
+    where
+        F: FnMut(Vec2<i32>) -> Option<Vec2<f32>>,
+    {
+        for bg in &mut self.backgrounds {
+            let size = tile_size(bg.sprite).unwrap_or(Vec2::new(0.0, 0.0));
+            bg.advance_scroll(size);
+        }
+    }
+}
+
+/// Computes the destination rectangles that tile a single background sprite across
+/// a camera viewport.
+///
+/// MUGEN's `tile = x, y` is a *repeat count* per axis: `0` repeats the sprite
+/// enough times to fill the viewport, `1` draws it once (no tiling on that axis),
+/// and `n > 1` draws exactly `n` copies. `anchor` is the screen-space top-left of
+/// the element's **first** tile (after parallax + auto-scroll have been applied by
+/// the caller); `sprite` is the drawn sprite's `(width, height)` in px; `tile` is
+/// the parsed repeat count `(x, y)`; and `viewport` is the visible screen size
+/// `(width, height)`.
+///
+/// The returned rects are ordered row-major (all X tiles of the first row, then the
+/// next row) and are exactly `sprite`-sized. For an *infinite* (`tile = 0`) axis the
+/// span is back-filled so a tile that has scrolled partly off the left/top edge is
+/// still drawn — the first rect can start at a negative coordinate — and forward to
+/// the first tile fully past the right/bottom edge, so the viewport is always
+/// covered with no gap.
+///
+/// This is a pure function (no GPU state): it lets the tile geometry be unit-tested
+/// independently of rendering. A degenerate sprite (zero/negative/non-finite
+/// dimension on an axis) yields a single un-tiled rect at the anchor on that axis,
+/// never an unbounded loop.
+pub fn tile_rects(
+    anchor: Vec2<f32>,
+    sprite: Vec2<f32>,
+    tile: Vec2<i32>,
+    viewport: Vec2<f32>,
+) -> Vec<Rect> {
+    let xs = tile_offsets_1d(anchor.x, sprite.x, tile.x, viewport.x);
+    let ys = tile_offsets_1d(anchor.y, sprite.y, tile.y, viewport.y);
+
+    let mut rects = Vec::with_capacity(xs.len().saturating_mul(ys.len()));
+    for &y in &ys {
+        for &x in &xs {
+            rects.push(Rect::new(x, y, sprite.x, sprite.y));
+        }
+    }
+    rects
+}
+
+/// The 1-D core of [`tile_rects`]: the list of tile top-left coordinates on one
+/// axis. `anchor` is the first tile's coordinate, `size` the tile size on that
+/// axis, `count` the parsed repeat count (`0` = infinite, `1` = single, `n` =
+/// exactly `n`), and `view` the viewport extent on that axis.
+fn tile_offsets_1d(anchor: f32, size: f32, count: i32, view: f32) -> Vec<f32> {
+    // A non-drawable tile size can't tile; emit the single anchor tile.
+    if !size.is_finite() || size <= 0.0 || !anchor.is_finite() {
+        return vec![anchor];
+    }
+
+    match count {
+        // Single copy (or a malformed negative count → treat as one).
+        c if c == 1 || c < 0 => vec![anchor],
+        // Exactly `n` copies, marching forward from the anchor.
+        c if c > 1 => (0..c).map(|i| anchor + i as f32 * size).collect(),
+        // count == 0 → infinite: cover the whole viewport with no gaps.
+        _ => {
+            // Back-fill from the first tile still touching the left/top edge.
+            // The k-th tile spans [anchor + k*size, anchor + (k+1)*size); it is
+            // visible when its right edge > 0 and its left edge < view.
+            let view = if view.is_finite() && view > 0.0 {
+                view
+            } else {
+                // Without a real viewport, fall back to the single anchor tile
+                // rather than looping unbounded.
+                return vec![anchor];
+            };
+            let first_k = (-anchor / size).floor() as i64;
+            let last_k = ((view - anchor) / size).ceil() as i64;
+            // Guard the span: clamp to a generous cap so a pathological
+            // anchor/size never allocates without bound.
+            const MAX_TILES: i64 = 4096;
+            let span = (last_k - first_k).clamp(0, MAX_TILES);
+            (0..=span)
+                .map(|i| anchor + (first_k + i) as f32 * size)
+                .collect()
+        }
     }
 }
 
@@ -843,5 +988,243 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         stage.camera.bound_right = -100.0;
         let x = stage.camera_follow_x(0.0, 0.0);
         assert!((-100.0..=100.0).contains(&x));
+    }
+
+    // -----------------------------------------------------------------------
+    // T003 — tile-rect generation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tile_count_one_draws_a_single_rect() {
+        // tile = 1, 1 → exactly one rect at the anchor, sprite-sized.
+        let rects = tile_rects(
+            Vec2::new(10.0, 20.0),
+            Vec2::new(64.0, 32.0),
+            Vec2::new(1, 1),
+            Vec2::new(640.0, 480.0),
+        );
+        assert_eq!(rects, vec![Rect::new(10.0, 20.0, 64.0, 32.0)]);
+    }
+
+    #[test]
+    fn tile_count_zero_zero_fills_both_axes() {
+        // 0 on an axis means "fill that axis"; with both axes at 0 the rect set is
+        // the product of each axis's fill. X = 100px tiles over a 250px viewport,
+        // Y = 1000px tiles over a 480px viewport.
+        let rects = tile_rects(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 1000.0),
+            Vec2::new(0, 0),
+            Vec2::new(250.0, 480.0),
+        );
+        // Distinct X coordinates must cover [0, 250): 0,100,200 alone reach 300, and
+        // the fill marches to the first tile fully past the right edge (300, right
+        // edge 400). Distinct Y must cover [0, 480): 0 (right edge 1000) suffices,
+        // plus the one extra row the ceil() fill adds at 1000.
+        let mut xs: Vec<f32> = rects.iter().map(|r| r.x).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs.dedup();
+        assert_eq!(*xs.first().unwrap(), 0.0);
+        assert!(xs.last().unwrap() + 100.0 >= 250.0, "X must cover the viewport");
+        for pair in xs.windows(2) {
+            assert!((pair[1] - pair[0] - 100.0).abs() < 1e-4, "X gap at {pair:?}");
+        }
+        // Every rect is sprite-sized.
+        assert!(rects.iter().all(|r| r.w == 100.0 && r.h == 1000.0));
+    }
+
+    #[test]
+    fn tile_count_n_draws_exactly_n_copies_spaced_by_sprite_size() {
+        // tile.x = 3 → three copies at anchor, anchor+w, anchor+2w on the X axis.
+        let rects = tile_rects(
+            Vec2::new(5.0, 0.0),
+            Vec2::new(40.0, 30.0),
+            Vec2::new(3, 1),
+            Vec2::new(1000.0, 1000.0),
+        );
+        let xs: Vec<f32> = rects.iter().map(|r| r.x).collect();
+        assert_eq!(xs, vec![5.0, 45.0, 85.0]);
+        assert!(rects.iter().all(|r| r.w == 40.0 && r.h == 30.0));
+    }
+
+    #[test]
+    fn infinite_tiling_covers_the_whole_viewport_with_no_gap() {
+        // A small 50px-wide tile, infinite, must cover a 320px viewport: the union
+        // of the rects spans from <=0 to >=320 with contiguous 50px steps.
+        let rects = tile_rects(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(50.0, 50.0),
+            Vec2::new(0, 1),
+            Vec2::new(320.0, 50.0),
+        );
+        let mut xs: Vec<f32> = rects.iter().map(|r| r.x).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // First tile starts at or before 0, last tile's right edge is at or past 320.
+        assert!(*xs.first().unwrap() <= 0.0);
+        assert!(xs.last().unwrap() + 50.0 >= 320.0);
+        // Contiguous: each step is exactly one sprite width.
+        for pair in xs.windows(2) {
+            assert!((pair[1] - pair[0] - 50.0).abs() < 1e-4, "gap at {pair:?}");
+        }
+    }
+
+    #[test]
+    fn infinite_tiling_backfills_a_partly_scrolled_off_tile() {
+        // Anchor scrolled 30px to the left of the screen origin: the first visible
+        // tile starts at a negative X so its right edge still covers x=0.
+        let rects = tile_rects(
+            Vec2::new(-30.0, 0.0),
+            Vec2::new(50.0, 50.0),
+            Vec2::new(0, 1),
+            Vec2::new(200.0, 50.0),
+        );
+        let min_x = rects
+            .iter()
+            .map(|r| r.x)
+            .fold(f32::INFINITY, f32::min);
+        // The left-most tile starts at -30 (its right edge = 20 > 0, so it's drawn).
+        assert_eq!(min_x, -30.0);
+    }
+
+    #[test]
+    fn degenerate_zero_sprite_size_yields_single_rect_not_infinite_loop() {
+        // A zero-width sprite cannot tile; we must get exactly one rect, never hang.
+        let rects = tile_rects(
+            Vec2::new(7.0, 9.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0, 0),
+            Vec2::new(640.0, 480.0),
+        );
+        assert_eq!(rects, vec![Rect::new(7.0, 9.0, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn nonfinite_anchor_or_viewport_does_not_panic_or_loop() {
+        // Defensive: NaN/inf inputs collapse to the single-anchor fallback.
+        let rects = tile_rects(
+            Vec2::new(f32::NAN, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(0, 1),
+            Vec2::new(100.0, 100.0),
+        );
+        // X axis: NaN anchor → single fallback tile. Y axis: single tile (size 10
+        // covers [0,10) within the band). Product = 1 rect.
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].x.is_nan());
+    }
+
+    // -----------------------------------------------------------------------
+    // T003 — per-layer velocity scrolling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_velocity_never_moves_the_scroll_offset() {
+        let mut bg = BgElement {
+            velocity: Vec2::new(0.0, 0.0),
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            bg.advance_scroll(Vec2::new(64.0, 64.0));
+        }
+        assert_eq!(bg.scroll, Vec2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn velocity_accumulates_one_tick_at_a_time() {
+        // velocity = (3, -2), wrapping disabled (size 0) → raw accumulation.
+        let mut bg = BgElement {
+            velocity: Vec2::new(3.0, -2.0),
+            ..Default::default()
+        };
+        bg.advance_scroll(Vec2::new(0.0, 0.0));
+        assert_eq!(bg.scroll, Vec2::new(3.0, -2.0));
+        bg.advance_scroll(Vec2::new(0.0, 0.0));
+        assert_eq!(bg.scroll, Vec2::new(6.0, -4.0));
+        // After n ticks the offset is velocity * n.
+        for _ in 0..3 {
+            bg.advance_scroll(Vec2::new(0.0, 0.0));
+        }
+        assert_eq!(bg.scroll, Vec2::new(15.0, -10.0));
+    }
+
+    #[test]
+    fn scroll_wraps_within_one_tile_period() {
+        // velocity 30, tile size 50 → after two ticks offset is 60, wrapped to 10.
+        let mut bg = BgElement {
+            velocity: Vec2::new(30.0, 0.0),
+            ..Default::default()
+        };
+        bg.advance_scroll(Vec2::new(50.0, 50.0)); // 30
+        assert_eq!(bg.scroll.x, 30.0);
+        bg.advance_scroll(Vec2::new(50.0, 50.0)); // 60 → 10
+        assert!((bg.scroll.x - 10.0).abs() < 1e-4, "got {}", bg.scroll.x);
+        // Wrapping keeps it bounded over many ticks.
+        for _ in 0..1000 {
+            bg.advance_scroll(Vec2::new(50.0, 50.0));
+        }
+        assert!((0.0..50.0).contains(&bg.scroll.x));
+    }
+
+    #[test]
+    fn negative_velocity_wraps_to_positive_range() {
+        // rem_euclid keeps a leftward scroll inside [0, period).
+        let mut bg = BgElement {
+            velocity: Vec2::new(-30.0, 0.0),
+            ..Default::default()
+        };
+        bg.advance_scroll(Vec2::new(50.0, 50.0)); // -30 → 20
+        assert!((bg.scroll.x - 20.0).abs() < 1e-4, "got {}", bg.scroll.x);
+        assert!((0.0..50.0).contains(&bg.scroll.x));
+    }
+
+    #[test]
+    fn nonfinite_intermediate_scroll_collapses_to_zero() {
+        // A huge velocity that overflows to inf must not poison the offset.
+        let mut bg = BgElement {
+            velocity: Vec2::new(f32::INFINITY, 0.0),
+            ..Default::default()
+        };
+        bg.advance_scroll(Vec2::new(0.0, 0.0));
+        assert_eq!(bg.scroll.x, 0.0, "non-finite offset resets to 0");
+    }
+
+    #[test]
+    fn stage_advance_scroll_drives_every_background() {
+        let mut stage = Stage::parse(SYNTHETIC, None);
+        // The "Floor" element has velocity = (-2, 0); the others have none.
+        // Disable wrapping by reporting no sprite size so accumulation is exact.
+        for _ in 0..5 {
+            stage.advance_scroll(|_sprite| None);
+        }
+        let floor = stage
+            .backgrounds
+            .iter()
+            .find(|b| b.name == "Floor")
+            .expect("Floor BG present");
+        assert_eq!(floor.scroll, Vec2::new(-10.0, 0.0));
+        // A no-velocity element stays at the origin.
+        let sky = stage
+            .backgrounds
+            .iter()
+            .find(|b| b.name == "Sky")
+            .expect("Sky BG present");
+        assert_eq!(sky.scroll, Vec2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn stage_advance_scroll_wraps_with_reported_tile_size() {
+        let mut stage = Stage::parse(SYNTHETIC, None);
+        // Report a 3px-wide tile for every sprite: Floor's -2/tick offset wraps in
+        // [0, 3). After 5 ticks raw = -10, rem_euclid(3) = 2.
+        for _ in 0..5 {
+            stage.advance_scroll(|_sprite| Some(Vec2::new(3.0, 3.0)));
+        }
+        let floor = stage
+            .backgrounds
+            .iter()
+            .find(|b| b.name == "Floor")
+            .expect("Floor BG present");
+        assert!((floor.scroll.x - 2.0).abs() < 1e-4, "got {}", floor.scroll.x);
+        assert!((0.0..3.0).contains(&floor.scroll.x));
     }
 }

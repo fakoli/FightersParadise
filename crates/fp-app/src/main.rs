@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 
 use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
-use fp_core::SpriteId;
+use fp_core::{SpriteId, Vec2};
 use fp_engine::{EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
@@ -1908,16 +1908,41 @@ impl StageRender {
         }
     }
 
+    /// Advances every background element's auto-scroll offset one tick, wrapping
+    /// each within its drawn sprite's tile period.
+    ///
+    /// Delegates to [`fp_stage::Stage::advance_scroll`], resolving each element's
+    /// `(group, image)` to its already-cached GPU sprite size. An element whose
+    /// sprite is not yet decoded reports `None`, which keeps raw accumulation for
+    /// that element until it caches (then it wraps) — never a panic, never a stall.
+    fn advance_scroll(&mut self) {
+        let cache = &self.sprite_cache;
+        self.stage.advance_scroll(|sprite| {
+            let id = bg_sprite_id(sprite.x, sprite.y)?;
+            let cached = cache.get(&id)?;
+            Some(Vec2::new(
+                cached.texture.width as f32,
+                cached.texture.height as f32,
+            ))
+        });
+    }
+
     /// Draws every BG element on `layer`, in file order, applying each element's
-    /// parallax against the camera. A missing/uncached sprite is skipped.
+    /// parallax against the camera, its accumulated auto-scroll offset, and its
+    /// tiling. A missing/uncached sprite is skipped.
     ///
     /// `camera_x` is the camera's world X (from [`Stage::camera_follow_x`]).
     /// Each element's world X after parallax is
     /// [`fp_stage::parallax_screen_x`]`(start.x, delta.x, camera_x)`, mapped into
     /// the window with the same [`world_to_screen_x`] the fighters use so the
-    /// background and fighters share one coordinate frame. Vertical follow is not
+    /// background and fighters share one coordinate frame, then shifted by the
+    /// element's running auto-scroll offset (`bg.scroll`). Vertical follow is not
     /// yet implemented, so `camera_y` is `0` and `start.y` is anchored to the same
     /// ground line the fighters stand on.
+    ///
+    /// Tiling: when `bg.tile.x`/`.y` is non-`1`, the element repeats across the
+    /// viewport via [`fp_stage::tile_rects`] (`0` = fill the viewport, `n` = exactly
+    /// `n` copies); the non-tiling default (`tile = 1, 1`) draws a single copy.
     fn draw_layer(
         &self,
         frame: &mut fp_render::RenderFrame<'_>,
@@ -1935,22 +1960,39 @@ impl StageRender {
                 continue;
             };
 
-            // World X after parallax, then into screen space (shared frame).
+            // World X after parallax, then into screen space (shared frame), then
+            // shifted by the running auto-scroll offset.
             let world_x = fp_stage::parallax_screen_x(bg.start.x, bg.delta.x, camera_x);
-            let screen_x = world_to_screen_x(world_x, win_w);
+            let screen_x = world_to_screen_x(world_x, win_w) + bg.scroll.x;
             // Vertical follow is unimplemented (camera_y = 0); anchor start.y to
             // the ground line, Y down (matching the fighter draw convention).
-            let screen_y = ground_y + fp_stage::parallax_screen_y(bg.start.y, bg.delta.y, 0.0);
+            let screen_y =
+                ground_y + fp_stage::parallax_screen_y(bg.start.y, bg.delta.y, 0.0) + bg.scroll.y;
 
-            // Anchor by the sprite's axis like the fighters do.
-            let draw_x = screen_x - cached.axis_x as f32;
-            let draw_y = screen_y - cached.axis_y as f32;
-            let params = SpriteDrawParams {
-                x: draw_x,
-                y: draw_y,
-                ..Default::default()
-            };
-            frame.draw_sprite(&cached.texture, &cached.palette, &params);
+            // Anchor by the sprite's axis like the fighters do — this is the
+            // top-left of the first tile.
+            let anchor = Vec2::new(
+                screen_x - cached.axis_x as f32,
+                screen_y - cached.axis_y as f32,
+            );
+            let sprite_size =
+                Vec2::new(cached.texture.width as f32, cached.texture.height as f32);
+
+            // One rect for the non-tiling default; the full tiled set otherwise.
+            let rects = fp_stage::tile_rects(
+                anchor,
+                sprite_size,
+                bg.tile,
+                Vec2::new(win_w, win_h),
+            );
+            for rect in rects {
+                let params = SpriteDrawParams {
+                    x: rect.x,
+                    y: rect.y,
+                    ..Default::default()
+                };
+                frame.draw_sprite(&cached.texture, &cached.palette, &params);
+            }
         }
     }
 }
@@ -3344,6 +3386,15 @@ fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput
         .play_requests(&mut run.audio, run.m.p1(), run.m.p1_sound_requests());
     run.p2_audio
         .play_requests(&mut run.audio, run.m.p2(), run.m.p2_sound_requests());
+
+    // Advance each stage background's auto-scroll offset one tick. The cached GPU
+    // sprite size (when already decoded) lets the offset wrap within one tile
+    // period so it never grows unbounded; an undecoded sprite reports `None`,
+    // keeping raw accumulation until it caches. Driven here, in the fixed-tick
+    // path, so multi-tick catch-up frames scroll the right amount.
+    if let Some(stage) = run.stage.as_mut() {
+        stage.advance_scroll();
+    }
 }
 
 /// Decodes everything a [`MatchRun`] needs to draw this frame (both fighters'
