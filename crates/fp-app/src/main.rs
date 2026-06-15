@@ -89,6 +89,14 @@ const TICK_DURATION: Duration = Duration::from_nanos(16_666_667);
 /// Default character `.def` loaded when no CLI argument is given.
 const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 
+/// Shipped original common-effects (`fightfx`) sprite/animation set (audit #17).
+/// Loaded once per match to render common (`fightfx`) hit-sparks for KFM and
+/// conventional characters. Resolved relative to the process working directory;
+/// a missing/bad asset is a best-effort no-op (no spark, no panic).
+const COMMON_FX_SFF: &str = "assets/data/fightfx.sff";
+/// Shipped original common-effects animation file. See [`COMMON_FX_SFF`].
+const COMMON_FX_AIR: &str = "assets/data/fightfx.air";
+
 /// MUGEN common stand (idle) state number.
 const STATE_STAND: i32 = 0;
 /// MUGEN common walk state number. Only referenced by the single-character CNS
@@ -1134,6 +1142,80 @@ fn draw_player(
 }
 
 // ---------------------------------------------------------------------------
+// Common-effects (fightfx) asset (audit #17)
+// ---------------------------------------------------------------------------
+
+/// The shipped common-effects (`fightfx`) sprite source and its GPU cache.
+///
+/// Pairs the loaded `fightfx.sff` with a [`FighterRender`] cache so common
+/// ([`EffectSide::Common`]) hit-sparks can be decoded/drawn exactly like a
+/// fighter's sprites. The matching `fightfx.air` is installed onto the
+/// [`fp_engine::Match`] (via [`Match::set_common_fx`]) so the engine resolves the
+/// spark frames; this struct only owns the sprite/texture side a renderer needs.
+struct CommonFxRender {
+    /// The decoded common-effects sprite file (`fightfx.sff`).
+    sff: SffFile,
+    /// GPU sprite cache for the common-effects sprites, decoded on first use.
+    render: FighterRender,
+}
+
+/// Loads the shipped common-effects (`fightfx`) asset from the default paths,
+/// returning the parsed AIR (to install on the [`Match`]) and the SFF render
+/// bundle (for drawing).
+///
+/// Resolves the paths relative to the process working directory
+/// ([`COMMON_FX_SFF`] / [`COMMON_FX_AIR`]) and delegates to
+/// [`load_common_fx_from`]. Best-effort: a missing/unparseable asset yields
+/// `None` (logged), so the match simply renders no common sparks — never a panic,
+/// never a regression.
+fn load_common_fx() -> Option<(AirFile, CommonFxRender)> {
+    load_common_fx_from(Path::new(COMMON_FX_SFF), Path::new(COMMON_FX_AIR))
+}
+
+/// Loads a common-effects (`fightfx`) asset from explicit `sff_path`/`air_path`.
+///
+/// Both files are best-effort: a missing or unparseable `.sff`/`.air` returns
+/// `None` (logged at debug/warn), so common sparks are simply disabled — never a
+/// panic, never a regression. Split from [`load_common_fx`] so it is unit-testable
+/// against the shipped asset by absolute path (test CWD is the crate dir).
+fn load_common_fx_from(sff_path: &Path, air_path: &Path) -> Option<(AirFile, CommonFxRender)> {
+    if !sff_path.exists() || !air_path.exists() {
+        tracing::debug!(
+            sff = %sff_path.display(),
+            air = %air_path.display(),
+            "common-fx asset not present; common hit-sparks disabled"
+        );
+        return None;
+    }
+    let sff = match SffFile::load(sff_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("common-fx sff {} failed to load: {e}; common sparks disabled", sff_path.display());
+            return None;
+        }
+    };
+    let air = match AirFile::load(air_path) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("common-fx air {} failed to load: {e}; common sparks disabled", air_path.display());
+            return None;
+        }
+    };
+    tracing::info!(
+        "common-fx loaded: {} sprites from {}",
+        sff.sprites.len(),
+        sff_path.display()
+    );
+    Some((
+        air,
+        CommonFxRender {
+            sff,
+            render: FighterRender::default(),
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Hit-spark effect rendering (audit #17)
 // ---------------------------------------------------------------------------
 
@@ -1153,37 +1235,78 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
         .map(|fx| (fx.side, fx.sprite))
         .collect();
     for (side, sprite) in effects {
-        let (cache, sff) = match side {
-            EffectSide::P1 => (&mut run.p1_render, &run.m.p1().loaded.sff),
-            EffectSide::P2 => (&mut run.p2_render, &run.m.p2().loaded.sff),
-        };
-        cache.get_or_create_sprite(sff, sprite, renderer);
+        match side {
+            EffectSide::P1 => {
+                run.p1_render
+                    .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer);
+            }
+            EffectSide::P2 => {
+                run.p2_render
+                    .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer);
+            }
+            // A common spark draws from the shipped common-fx SFF into its own
+            // cache. A no-op when no common-fx asset is loaded (no such effects
+            // are ever spawned then).
+            EffectSide::Common => {
+                if let Some(fx) = run.common_fx.as_mut() {
+                    fx.render.get_or_create_sprite(&fx.sff, sprite, renderer);
+                }
+            }
+        }
     }
+}
+
+/// The sprite caches a hit-spark [`Effect`] may draw from, picked per effect by
+/// its [`EffectSide`] (audit #17): the two fighters' caches and the optional
+/// shared common-effects (`fightfx`) cache. Bundled so [`draw_effects`] stays a
+/// small, readable call.
+struct EffectRenders<'a> {
+    /// Player 1's sprite cache (for [`EffectSide::P1`] sparks).
+    p1_render: &'a FighterRender,
+    /// Player 2's sprite cache (for [`EffectSide::P2`] sparks).
+    p2_render: &'a FighterRender,
+    /// The shared common-effects cache (for [`EffectSide::Common`] sparks), or
+    /// `None` when no common-fx asset is loaded.
+    common_render: Option<&'a FighterRender>,
 }
 
 /// Draws every live hit-spark effect at its world position, over the fighters
 /// (audit #17).
 ///
 /// Each effect's sprite was cached by [`cache_effect_sprites`] in the owning
-/// side's per-character cache; this maps the effect's world position to screen
-/// (the same `world_to_screen_x` + ground-plane mapping the fighters use, offset
-/// by `camera_x`), anchors the sprite by its axis, and draws it additively (a
-/// spark glows). A missing/uncached sprite is skipped — never a panic. This draws
-/// only over the player/effect region; it does not touch the HUD/screenpack.
+/// source's cache (a fighter's, or the shared common-fx cache for common sparks).
+/// This maps the effect's world position to screen (the same `world_to_screen_x`
+/// plus ground-plane mapping the fighters use, offset by `camera_x`), anchors the
+/// sprite by its axis, and draws it additively (a spark glows). A missing/uncached
+/// sprite is skipped — never a panic. This draws only over the player/effect
+/// region; it does not touch the HUD/screenpack.
+///
+/// `renders` bundles the three sprite caches a spark may source from (P1, P2, and
+/// the optional shared common-fx cache) so the source is picked per effect.
 fn draw_effects(
     frame: &mut fp_render::RenderFrame<'_>,
-    p1_render: &FighterRender,
-    p2_render: &FighterRender,
+    renders: EffectRenders<'_>,
     m: &Match,
     camera_x: f32,
     win_w: f32,
     win_h: f32,
 ) {
+    let EffectRenders {
+        p1_render,
+        p2_render,
+        common_render,
+    } = renders;
     let ground_y = win_h * 0.8;
     for fx in m.effects() {
         let cache = match fx.side {
             EffectSide::P1 => p1_render,
             EffectSide::P2 => p2_render,
+            // A common spark draws from the shared common-fx cache; skip if the
+            // common-fx asset is absent (no such effect would spawn then anyway).
+            EffectSide::Common => match common_render {
+                Some(c) => c,
+                None => continue,
+            },
         };
         let Some(cached) = cache.sprite_cache.get(&fx.sprite) else {
             continue;
@@ -1995,6 +2118,11 @@ struct MatchRun {
     /// Whether the intro overlay has been played to completion this match, so it
     /// is shown once (during round 1's intro) and not re-triggered on later rounds.
     intro_storyboard_done: bool,
+    /// The shipped common-effects (`fightfx`) sprite source + GPU cache, when
+    /// loaded (audit #17). `None` when the asset is absent/bad — then common
+    /// (`fightfx`) hit-sparks simply don't render (no panic, no regression). The
+    /// matching AIR is installed on [`MatchRun::m`] via [`Match::set_common_fx`].
+    common_fx: Option<CommonFxRender>,
 }
 
 /// Which storyboard overlay (if any) is *active* for the current frame, given the
@@ -2195,7 +2323,19 @@ fn load_match_or_fallback(
     renderer: &Renderer,
 ) -> Mode {
     match build_two_player_match(p1_def, p2_def) {
-        Ok(m) => {
+        Ok(mut m) => {
+            // The shipped common-effects (`fightfx`) set is loaded best-effort
+            // (audit #17): when present, its AIR is installed on the match so
+            // common (`fightfx`) hit-sparks spawn, and its SFF render bundle is
+            // kept for drawing them; absent/bad, common sparks simply don't render
+            // (no panic, no regression).
+            let common_fx = match load_common_fx() {
+                Some((air, render)) => {
+                    m.set_common_fx(air);
+                    Some(render)
+                }
+                None => None,
+            };
             // Loading the stage is best-effort: `None` (no path, bad parse, or
             // missing SFF) keeps today's flat clear color (no regression).
             let stage = stage_def.and_then(StageRender::load);
@@ -2224,6 +2364,7 @@ fn load_match_or_fallback(
                 intro_storyboard,
                 ending_storyboard,
                 intro_storyboard_done: false,
+                common_fx,
             }))
         }
         Err(e) => {
@@ -2606,8 +2747,11 @@ fn run() -> fp_core::FpResult<()> {
                 // contact points (additive glow), but under the front BG and HUD.
                 draw_effects(
                     &mut frame,
-                    &run.p1_render,
-                    &run.p2_render,
+                    EffectRenders {
+                        p1_render: &run.p1_render,
+                        p2_render: &run.p2_render,
+                        common_render: run.common_fx.as_ref().map(|c| &c.render),
+                    },
                     &run.m,
                     camera_x,
                     win_wf,
@@ -4913,5 +5057,115 @@ mod tests {
         assert_eq!(timer_frames_to_seconds(119), 1);
         // Negative (shouldn't happen, but never render "-1").
         assert_eq!(timer_frames_to_seconds(-30), 0);
+    }
+
+    // ---- common-effects (fightfx) load path (audit #17) ----------------------
+
+    /// Resolves a path under the shipped (committed) `assets/data/` directory.
+    fn shipped_fx_asset(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/data")
+            .join(rel)
+    }
+
+    /// The shipped common-effects asset loads end to end: the SFF parses with
+    /// spark sprites and the AIR authors KFM's common spark actions. This is the
+    /// path `load_common_fx` takes at startup (here with absolute paths so it runs
+    /// regardless of the test CWD).
+    #[test]
+    fn shipped_common_fx_loads() {
+        let sff = shipped_fx_asset("fightfx.sff");
+        let air = shipped_fx_asset("fightfx.air");
+        let loaded = load_common_fx_from(&sff, &air)
+            .expect("shipped common-fx asset must load");
+        let (air, render) = loaded;
+        // The render bundle carries the parsed SFF with sprites.
+        assert!(
+            !render.sff.sprites.is_empty(),
+            "fightfx render bundle must carry spark sprites"
+        );
+        // The AIR authors the standard KFM common spark actions.
+        for g in [0, 1, 2, 3, 40] {
+            assert!(air.action(g).is_some(), "fightfx.air must author common action {g}");
+        }
+    }
+
+    /// A missing common-fx asset is a clean best-effort `None` — never a panic.
+    #[test]
+    fn missing_common_fx_is_none_not_panic() {
+        let missing_sff = shipped_fx_asset("does-not-exist.sff");
+        let missing_air = shipped_fx_asset("does-not-exist.air");
+        assert!(
+            load_common_fx_from(&missing_sff, &missing_air).is_none(),
+            "an absent common-fx asset must yield None, not a panic"
+        );
+        // A present SFF but absent AIR (and vice versa) is also a clean None.
+        let real_sff = shipped_fx_asset("fightfx.sff");
+        assert!(
+            load_common_fx_from(&real_sff, &missing_air).is_none(),
+            "a half-present common-fx asset must yield None"
+        );
+    }
+
+    /// Gated end-to-end (skip-if-KFM-missing): with the shipped common-fx AIR
+    /// installed on a real two-KFM match, a connecting KFM hit spawns a common
+    /// ([`EffectSide::Common`]) spark — the user-visible FL2a outcome wired
+    /// through the app's own match build path.
+    #[test]
+    fn kfm_match_with_common_fx_spawns_common_spark() {
+        let def = test_asset("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        // The fightfx AIR ships, so it must load (not gated on it).
+        let air = AirFile::load(&shipped_fx_asset("fightfx.air"))
+            .expect("shipped fightfx.air must load");
+
+        let mut m = match build_two_player_match(&def, &def) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skipping: KFM failed to build: {e}");
+                return;
+            }
+        };
+        m.set_common_fx(air);
+
+        // Run intro out, walk into range, and punch until a hit lands.
+        for _ in 0..400 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.round_state() == RoundState::Fight {
+                break;
+            }
+        }
+        for _ in 0..240 {
+            m.tick(MatchInput { right: true, ..MatchInput::none() }, MatchInput::none());
+            if (m.p1().pos().x - m.p2().pos().x).abs() <= 40.0 {
+                break;
+            }
+        }
+        let p2_before = m.p2().life();
+        let mut saw_common = false;
+        for i in 0..400 {
+            let inp = if i % 3 == 0 {
+                MatchInput { x: true, ..MatchInput::none() }
+            } else {
+                MatchInput::none()
+            };
+            m.tick(inp, MatchInput::none());
+            if m.effects().iter().any(|fx| fx.side == EffectSide::Common) {
+                saw_common = true;
+            }
+            if m.p2().life() < p2_before {
+                break;
+            }
+            if m.round_state() != RoundState::Fight {
+                break;
+            }
+        }
+        assert!(
+            saw_common,
+            "a real KFM hit (common sparkno) must spawn a common fightfx spark with the asset loaded"
+        );
     }
 }

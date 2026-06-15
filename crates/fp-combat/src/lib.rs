@@ -1182,27 +1182,22 @@ pub fn detect_hit_contact(
 /// number (`2`) means "use the **common** `fightfx` set". The magnitude is the
 /// action id either way, and `-1` is the documented "no spark" sentinel.
 ///
-/// **Important — what reaches this type is *not* the authored string.** The
-/// `HitDef` controller's `parse_resource_id` (in `fp-character`) **strips** the
-/// leading `S`/`s` and keeps the bare *positive* magnitude — it does **not** fold
-/// an `S` prefix into a negative integer. So given the current parser:
+/// **Encoding (set by the `fp-character` `HitDef` parser).** The authored
+/// `sparkno` string is folded into this single `i32` so its *sign* carries the
+/// own-vs-common distinction (see `fp-character`'s `parse_sparkno`):
 ///
-/// - `sparkno = -1` arrives as `-1` → [`SparkSource::None`] (no spark).
-/// - Any other **negative** value (a *literal* `sparkno = -N` in the CNS) arrives
-///   negative → [`SparkSource::Own`] at id `N` (attacker's own SFF/AIR).
-/// - Every **non-negative** value — **including the `S`-prefixed own-spark form**
-///   `S2`, which the parser flattens to `2` — arrives non-negative →
-///   [`SparkSource::Common`] at that id.
+/// - `sparkno = -1` → `-1` → [`SparkSource::None`] (the "no spark" sentinel).
+/// - a bare non-negative `N` (the common-`fightfx` form) → `N` →
+///   [`SparkSource::Common`] at action `N`.
+/// - an `S`-prefixed `Sn` (the own-spark form), or a literal negative `-N`, →
+///   a **negative** value → [`SparkSource::Own`] at the magnitude (attacker's own
+///   SFF/AIR). (`S0` is the one edge that degrades to `Common { anim: 0 }`, since
+///   `-0 == 0`; an own-spark action `0` is effectively never authored.)
 ///
-/// Consequence (tracked in `docs/known-issues.md`, audit #17): because the `S`
-/// prefix is lost upstream, the [`SparkSource::Own`] path is reachable **only** by
-/// a literal-negative `sparkno`, which authored content rarely uses. Conventional
-/// characters (Kung Fu Man included — its `sparkno` values are all `0/1/2/3/40`
-/// plus one `-1`) therefore classify as [`SparkSource::Common`], and with no
-/// `fightfx.sff` loaded those spawn no visible spark today. Restoring the
-/// `S`-prefix → own-spark distinction is an `fp-character` parser change (out of
-/// this type's scope); this enum classifies faithfully *given the value it is
-/// handed*.
+/// With the common `fightfx` set wired (`assets/data/fightfx.*`, audit #17), a
+/// [`SparkSource::Common`] spark now resolves against that shipped common-effects
+/// asset, and conventional characters (Kung Fu Man — `sparkno` `0/1/2/3/40` plus
+/// one `-1`) render a visible hit-spark on each connect.
 ///
 /// Use [`SparkSource::classify`] to turn a raw `sparkno` into one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1231,11 +1226,10 @@ impl SparkSource {
     /// Classifies a raw [`HitResources::sparkno`] into a [`SparkSource`].
     ///
     /// `-1` (and only `-1`) is the MUGEN "no spark" sentinel → [`SparkSource::None`].
-    /// Any other **negative** value (a *literal* `sparkno = -N`) is an attacker-own
-    /// spark whose action id is the magnitude (`-2` → own action `2`). A
-    /// **non-negative** value is a common `fightfx` spark at that action id — note
-    /// the `S`-prefixed own-spark form arrives here non-negative (the parser strips
-    /// the `S`), so it classifies as `Common`, not `Own` (see the type-level note).
+    /// Any other **negative** value is an attacker-own spark whose action id is the
+    /// magnitude (`-2` → own action `2`); this is the encoding the parser produces
+    /// for an `S`-prefixed `Sn` as well as for a literal negative `-N`. A
+    /// **non-negative** value is a common `fightfx` spark at that action id.
     /// Total and never panics.
     ///
     /// # Examples
@@ -1245,10 +1239,10 @@ impl SparkSource {
     ///
     /// // The default / sentinel: no spark.
     /// assert_eq!(SparkSource::classify(-1), SparkSource::None);
-    /// // A LITERAL negative → attacker's own set, id = magnitude.
+    /// // A negative value (a literal `-N`, or an `S`-prefixed `Sn` the parser
+    /// // encoded as `-n`) → attacker's own set, id = magnitude.
     /// assert_eq!(SparkSource::classify(-2), SparkSource::Own { anim: 2 });
-    /// // Non-negative → the common fightfx set (this is also where an
-    /// // `S`-prefixed own-spark lands today, since the parser strips the `S`).
+    /// // Non-negative → the common fightfx set.
     /// assert_eq!(SparkSource::classify(0), SparkSource::Common { anim: 0 });
     /// assert_eq!(SparkSource::classify(5), SparkSource::Common { anim: 5 });
     /// ```
