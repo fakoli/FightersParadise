@@ -22,5 +22,5 @@ pub use atlas::{AtlasRegion, TextureAtlas};
 pub use params::{apply_palfx, BlendMode, PalFx, SpriteDrawParams};
 pub use renderer::{DebugBox, RenderFrame, Renderer};
 pub use text::{layout_text, GlyphFont, PlacedGlyph, TextDrawParams};
-pub use texture::{PaletteTexture, SpriteTexture};
+pub use texture::{ImageTexture, PaletteTexture, SpriteTexture};
 pub use vertex::{DebugVertex, SpriteVertex};
