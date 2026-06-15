@@ -36,6 +36,17 @@ Start with: `fakoli-state next` (or `fakoli-state claim T0XX --worktree`), then 
 | **T029** | low | `.snd` ADX audio — decode or detect-and-skip (never panic); update compatibility matrix. |
 | **T030** | low | Doc/semantic cleanups: stale `SparkSource` doc in fp-combat; `EnvColor time=-1` persist-until-cleared. |
 | **T031** | low | FNT v2 sprite-font detection/support (vs the supported v1 bitmap font). |
+| **T032** | high | Helper lifecycle — `DestroySelf` + `RemoveTime`/expiry so helpers retire (root cause of the evilken slot-map saturation). |
+| **T033** | medium | `Explod` subsystem (`Explod`/`RemoveExplod`/`ModifyExplod`) — the most common deferred controller for conventional chars. |
+| **T034** | medium | Non-UTF-8 (Shift-JIS) CNS/CMD decoding (sf3_ryu loads zero states today). |
+
+**Post-run hotfix — PR #71 (merged, main `da3026b`):** a KFM-vs-evilken match froze
+("stuck / blocked by unbuilt systems"). Cause: a deferred controller in evilken's
+persistent state −2 (`RemoveExplod`) logged a `warn!` **every tick** (~1400 lines/sec),
+flooding the terminal and stalling the 60 Hz loop. Fix: log each deferred controller
+kind **once**; downgrade helper/projectile slot-map-full notices `warn!`→`debug!`.
+Verified: log lines 11299→40, deferred warns ~11190→1, match runs. The deeper root
+causes (helpers/explods never retire; Shift-JIS) are the F018 tasks T032–T034 above.
 
 The same orchestration harness can drive them: workflow script at
 `…/workflows/scripts/parity-wave-*.js` (implement→review→auto-fix→PR pipeline); compose a wave from
@@ -94,6 +105,14 @@ A running list of what made this session work — apply these next time.
     `screencapture -x -R x,y,w,h` (window geometry via `osascript`) is the working path. Needs Screen
     Recording granted to the controlling app; a locked screen has no GUI session (deferred the check once
     for this reason).
+
+**Logging in the hot loop**
+15. **A diagnostic/deferred log must NEVER fire per-tick in the 60 Hz loop.** A controller in a persistent
+    state (state −2 runs every frame) that `warn!`s each tick emits ~1400 lines/sec — the terminal-I/O
+    flood alone stalls the loop and *looks* like a hard freeze (the "stuck / blocked by unbuilt systems"
+    bug, PR #71). Rule: gate per-entity/per-tick diagnostics behind a **once-per-kind dedupe** (or `debug!`/
+    `trace!`), never a bare `warn!`. The "make the gap visible" intent (T015) is satisfied by logging the
+    first occurrence — not all 11,000 of them.
 
 ## Invariants (don't relearn)
 
