@@ -286,6 +286,59 @@ pub enum TargetOp {
     PowerAdd(i32),
 }
 
+/// Which kind of global freeze a `Pause` / `SuperPause` controller requested
+/// (faithfulness audit #24).
+///
+/// MUGEN has two distinct match-freeze controllers and they freeze a different
+/// set of entities:
+///
+/// - [`FreezeKind::Pause`] (`Pause`) freezes **every** player (the common
+///   default; MUGEN's `Pause` can be authored to exempt the triggerer via
+///   `movetime`/`pausetime`, but the de-facto use — and KFM's — freezes all).
+/// - [`FreezeKind::SuperPause`] (`SuperPause`) freezes the whole match **except**
+///   the player that triggered it, so a super-flash move keeps animating while
+///   everyone else (and the round clock / `GameTime`) is held still.
+///
+/// `fp-character` only *classifies* the request; the actual freeze (which
+/// players stop, the round timer / `GameTime` hold, and the countdown) is applied
+/// by the match coordinator (`fp-engine`), which is the only place that owns both
+/// players and the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeKind {
+    /// `Pause`: freeze all players for the duration.
+    Pause,
+    /// `SuperPause`: freeze all players **except** the triggering player.
+    SuperPause,
+}
+
+/// A deferred whole-match freeze a `Pause` / `SuperPause` controller wants
+/// applied (faithfulness audit #24).
+///
+/// `fp-character` ticks one character at a time and cannot stop the *other*
+/// player or the round clock from inside a single character's tick, so a
+/// `Pause`/`SuperPause` controller — exactly like a `Target*` controller — does
+/// not apply its effect inline. Instead it records the request on
+/// [`TickReport::freeze_request`], and the match coordinator (`fp-engine`)
+/// reads it after the tick to set up the freeze: it stops the affected players'
+/// simulation and the round timer / `GameTime` for [`time`](Self::time) ticks,
+/// keeping only the [`SuperPause`](FreezeKind::SuperPause) triggerer animating.
+///
+/// Only **one** freeze can be requested per tick: a later request in the same
+/// tick overwrites an earlier one (the last `Pause`/`SuperPause` to fire wins),
+/// matching the single-effect nature of the controller. Sound/anim spawning that
+/// MUGEN's `SuperPause` also performs (the flash sprite + sound) is out of scope
+/// here — this models only the freeze mechanic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreezeRequest {
+    /// Whether to freeze everyone ([`Pause`](FreezeKind::Pause)) or everyone but
+    /// the triggerer ([`SuperPause`](FreezeKind::SuperPause)).
+    pub kind: FreezeKind,
+    /// How many ticks the freeze lasts (the controller's `time` parameter). A
+    /// non-positive `time` is clamped to `0` (no freeze) before being emitted, so
+    /// a consumer never sees a negative duration.
+    pub time: i32,
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
@@ -319,6 +372,17 @@ pub struct TickReport {
     /// characters (`fp-engine`, task P8b) applies each [`TargetOp`] to the
     /// opponent after the tick.
     pub target_ops: Vec<TargetOp>,
+    /// A whole-match freeze (`Pause`/`SuperPause`) requested by a controller this
+    /// tick, or [`None`] when no `Pause`/`SuperPause` fired (audit #24).
+    ///
+    /// At most one freeze is recorded per tick (the last `Pause`/`SuperPause` to
+    /// fire wins); like the other request fields it is rebuilt per tick (a fresh
+    /// [`TickReport`] defaults it to [`None`]), so it never carries across ticks.
+    /// `fp-character` only *describes* the request; the match coordinator
+    /// (`fp-engine`) reads it after the tick and applies the actual freeze (stops
+    /// the affected players + the round timer / `GameTime`, exempting the
+    /// [`SuperPause`](FreezeKind::SuperPause) triggerer).
+    pub freeze_request: Option<FreezeRequest>,
 }
 
 impl Character {
@@ -1017,6 +1081,10 @@ impl Character {
             self.ctrl_hit_override(ctrl, env);
         } else if kind.eq_ignore_ascii_case("SprPriority") {
             self.ctrl_spr_priority(ctrl, env);
+        } else if kind.eq_ignore_ascii_case("Pause") {
+            self.ctrl_pause(ctrl, env, report, FreezeKind::Pause);
+        } else if kind.eq_ignore_ascii_case("SuperPause") {
+            self.ctrl_pause(ctrl, env, report, FreezeKind::SuperPause);
         } else if kind.eq_ignore_ascii_case("Null") {
             // Null intentionally does nothing.
         } else {
@@ -2131,6 +2199,40 @@ impl Character {
         if let Some(v) = self.eval_param_component(param, 0, env) {
             self.cur_sprpriority = v.to_int();
         }
+    }
+
+    /// `Pause` / `SuperPause`: request a whole-match freeze (faithfulness audit
+    /// #24).
+    ///
+    /// MUGEN's `Pause` freezes every player; `SuperPause` freezes the whole match
+    /// **except** the triggering player (so a super flash keeps animating while
+    /// everyone else, and the round clock / `GameTime`, holds still). Neither can
+    /// be applied from inside a single character's tick — stopping the *other*
+    /// player and the clock is the match coordinator's job — so this records a
+    /// [`FreezeRequest`] on [`TickReport::freeze_request`] (mirroring how `Target*`
+    /// controllers defer via [`TickReport::target_ops`]); `fp-engine` reads it
+    /// after the tick and applies the freeze.
+    ///
+    /// The `time` parameter is the freeze duration in ticks; it defaults to
+    /// MUGEN's `30` when absent and is clamped to `>= 0` (a non-positive `time`
+    /// requests no freeze). Only the freeze mechanic is modeled — `SuperPause`'s
+    /// flash sprite/sound and `Pause`'s command-buffer tweaks are out of scope.
+    /// At most one freeze is recorded per tick: a later `Pause`/`SuperPause`
+    /// overwrites an earlier request this tick. Never panics.
+    fn ctrl_pause(
+        &mut self,
+        ctrl: &CompiledController,
+        env: EvalEnv,
+        report: &mut TickReport,
+        kind: FreezeKind,
+    ) {
+        let time = ctrl
+            .params
+            .get("time")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(30, |v| v.to_int())
+            .max(0);
+        report.freeze_request = Some(FreezeRequest { kind, time });
     }
 
     /// `HitVelSet`: (re)set the character's velocity from its `GetHitVar` x/y
@@ -6904,6 +7006,91 @@ mod tests {
             report.sound_requests.is_empty(),
             "missing value → no request"
         );
+    }
+
+    // ---- audit #24: Pause / SuperPause emit a FreezeRequest into TickReport ----
+
+    /// Helper: build a single Pause/SuperPause state, run one tick, return report.
+    fn pause_tick(kind: &str, params: &[(&str, &str)]) -> TickReport {
+        let c = ctrl(0, kind, &[], &[(1, &["1"])], None, params);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        lc.tick(&mut ch)
+    }
+
+    #[test]
+    fn superpause_emits_freeze_request_with_time() {
+        let report = pause_tick("SuperPause", &[("time", "30")]);
+        assert_eq!(
+            report.freeze_request,
+            Some(FreezeRequest {
+                kind: FreezeKind::SuperPause,
+                time: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn pause_emits_freeze_request_with_time() {
+        let report = pause_tick("Pause", &[("time", "20")]);
+        assert_eq!(
+            report.freeze_request,
+            Some(FreezeRequest {
+                kind: FreezeKind::Pause,
+                time: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn superpause_without_time_defaults_to_30() {
+        // KFM's super moves author SuperPause with no `time`; MUGEN's default is 30.
+        let report = pause_tick("SuperPause", &[]);
+        assert_eq!(
+            report.freeze_request,
+            Some(FreezeRequest {
+                kind: FreezeKind::SuperPause,
+                time: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn pause_negative_time_is_clamped_to_zero() {
+        let report = pause_tick("Pause", &[("time", "-5")]);
+        assert_eq!(
+            report.freeze_request,
+            Some(FreezeRequest {
+                kind: FreezeKind::Pause,
+                time: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn no_pause_controller_leaves_freeze_request_none() {
+        let report = play_snd_tick(&[("value", "1, 0")]);
+        assert_eq!(report.freeze_request, None, "no Pause/SuperPause → None");
+    }
+
+    #[test]
+    fn pause_does_not_mutate_character_state() {
+        // The freeze is a deferred request: the controller must not move/pause the
+        // character itself (that is the coordinator's job).
+        let c = ctrl(0, "SuperPause", &[], &[(1, &["1"])], None, &[("time", "30")]);
+        let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(3.0, 4.0);
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "SuperPause dispatched");
+        assert!(report.freeze_request.is_some());
+        assert_eq!(ch.hitpause, 0, "no per-character hitpause set");
+        assert!((ch.vel.x - 3.0).abs() < 1e-6);
+        assert!((ch.vel.y - 4.0).abs() < 1e-6);
     }
 
     // ---- 8.3a AC: PlaySnd emits SoundRequest into TickReport ----
