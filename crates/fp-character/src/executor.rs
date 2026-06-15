@@ -9338,6 +9338,55 @@ mod tests {
         assert_eq!(parse_sparkno("S", -1), -1);
     }
 
+    /// End-to-end spark-SOURCE coverage for the two MUGEN cases (T002 / FL2a):
+    /// the `sparkno` string parsed via [`parse_sparkno`] and then classified by
+    /// [`fp_combat::SparkSource::classify`] must resolve to the correct source.
+    ///
+    /// - A bare (non-`S`) numeric id → a COMMON `fightfx` spark at that action
+    ///   (drawn from the shared common-effects set, NOT the attacker's SFF).
+    /// - An `S`-prefixed id → an attacker-OWN spark at that action (drawn from the
+    ///   attacker's own SFF), encoded negative so the sign carries the distinction.
+    ///
+    /// This is the `fp-character`-side assertion the acceptance criteria call for:
+    /// the `S`-prefix own-vs-common distinction is preserved all the way through
+    /// `parse_sparkno` into the source classification (it is NOT flattened).
+    #[test]
+    fn sparkno_resolves_to_correct_source_for_common_and_own() {
+        use fp_combat::SparkSource;
+
+        // Common case: a bare non-negative id is a common `fightfx` spark.
+        assert_eq!(
+            SparkSource::classify(parse_sparkno("3", -1)),
+            SparkSource::Common { anim: 3 },
+            "a bare numeric sparkno must resolve to the common fightfx set"
+        );
+        assert_eq!(
+            SparkSource::classify(parse_sparkno("0", -1)),
+            SparkSource::Common { anim: 0 },
+            "common action 0 (KFM's default) resolves to the common set"
+        );
+
+        // Own case: an `S`-prefixed id is the attacker's OWN spark, NOT the common
+        // set — the `S` marker survives parse + classify unflattened.
+        assert_eq!(
+            SparkSource::classify(parse_sparkno("S2", -1)),
+            SparkSource::Own { anim: 2 },
+            "an S-prefixed sparkno must resolve to the attacker's own set"
+        );
+        assert_eq!(
+            SparkSource::classify(parse_sparkno("s7", -1)),
+            SparkSource::Own { anim: 7 },
+            "a lowercase s-prefixed sparkno is still an own spark"
+        );
+
+        // Sentinel: `-1` is "no spark" for either path.
+        assert_eq!(
+            SparkSource::classify(parse_sparkno("-1", 0)),
+            SparkSource::None,
+            "-1 is the MUGEN no-spark sentinel"
+        );
+    }
+
     // ---- helper-fn unit coverage: parse_hit_type -----------------------------
 
     #[test]
