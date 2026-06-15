@@ -337,6 +337,11 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Parse `[Begin Action N]` header, returning the action number.
+///
+/// MUGEN allows an optional trailing comment after the number, e.g.
+/// `[Begin Action 12010, Tornado Whirlwind]`. Only the **leading integer**
+/// (the first comma-separated token) is parsed; any trailing `, <free-text>`
+/// label is ignored. Negative action numbers are tolerated.
 fn parse_begin_action(line: &str) -> Option<i32> {
     let line_lower = line.to_ascii_lowercase();
     let trimmed = line_lower.trim();
@@ -345,18 +350,28 @@ fn parse_begin_action(line: &str) -> Option<i32> {
     }
     let inner = &trimmed[1..trimmed.len() - 1].trim();
     let rest = inner.strip_prefix("begin action")?;
-    rest.trim().parse::<i32>().ok()
+    // Take only the leading number token, ignoring any `, <label>` comment.
+    let num_token = rest.trim().split(',').next()?.trim();
+    num_token.parse::<i32>().ok()
 }
 
 /// Parse `ClsnNDefault: count` header.
+///
+/// Tolerates stray junk characters between the `ClsnNDefault` prefix and the
+/// colon, as seen in real-world content like `Clsn2Defaultf: 1` (a stray `f`).
+/// Everything from the prefix up to the first `:` is ignored, so the common
+/// `Clsn1Default`/`Clsn2Default` headers are still recognized when malformed.
 fn parse_clsn_default(line: &str, prefix: &str) -> Option<usize> {
     let lower = line.to_ascii_lowercase();
     let p = prefix.to_ascii_lowercase();
     if !lower.starts_with(&p) {
         return None;
     }
-    let rest = &line[prefix.len()..];
-    let rest = rest.trim().strip_prefix(':')?;
+    // Skip everything after the prefix up to the first colon, ignoring any
+    // stray characters (e.g. the trailing `f` in `Clsn2Defaultf:`).
+    let after_prefix = &line[prefix.len()..];
+    let colon_pos = after_prefix.find(':')?;
+    let rest = &after_prefix[colon_pos + 1..];
     rest.trim().parse::<usize>().ok()
 }
 
@@ -417,11 +432,11 @@ fn parse_frame_line(line: &str, builder: &ActionBuilder) -> Option<AnimFrame> {
         return None;
     }
 
-    let group = parts[0].trim().parse::<i32>().ok()? as u16;
-    let image = parts[1].trim().parse::<i32>().ok()? as u16;
-    let x_offset = parts[2].trim().parse::<i16>().ok()?;
-    let y_offset = parts[3].trim().parse::<i16>().ok()?;
-    let ticks = parts[4].trim().parse::<i32>().ok()?;
+    let group = parse_leading_i32(parts[0])? as u16;
+    let image = parse_leading_i32(parts[1])? as u16;
+    let x_offset = parse_leading_i32(parts[2])? as i16;
+    let y_offset = parse_leading_i32(parts[3])? as i16;
+    let ticks = parse_leading_i32(parts[4])?;
 
     // Parse optional flip flags
     let mut flip_h = false;
@@ -479,6 +494,48 @@ fn parse_frame_line(line: &str, builder: &ActionBuilder) -> Option<AnimFrame> {
         clsn1,
         clsn2,
     })
+}
+
+/// Parse a frame column as an `i32`, tolerating trailing junk.
+///
+/// First tries a strict parse so well-formed columns are unchanged. If that
+/// fails, falls back to scanning the **leading integer** (optional sign + one or
+/// more digits) and ignores any unparseable tail, as seen in real content like
+/// `2..A` (parsed as `2`). Returns `None` only when there is no leading integer
+/// at all (so a fully-invalid column still drops the frame as before), or when a
+/// well-formed leading integer is out of `i32` range — the latter is warn-logged
+/// so a vanished frame stays diagnosable rather than dropping silently.
+fn parse_leading_i32(s: &str) -> Option<i32> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<i32>() {
+        return Some(n);
+    }
+    let bytes = t.as_bytes();
+    let mut end = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        end = 1;
+    }
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return None; // no digits found
+    }
+    match t[..end].parse::<i32>() {
+        Ok(n) => {
+            tracing::warn!(
+                "AIR: frame column had trailing junk, parsed leading integer: {t:?} -> {n}"
+            );
+            Some(n)
+        }
+        Err(_) => {
+            // The leading run of digits overflows `i32`; drop the column rather
+            // than guess. Warn-logged so the dropped frame is diagnosable.
+            tracing::warn!("AIR: frame column leading integer out of i32 range, dropping: {t:?}");
+            None
+        }
+    }
 }
 
 /// Parse a possibly-empty trimmed column as an `f32`, returning `None` for an
@@ -850,6 +907,175 @@ Interpolate Scale
         assert!(f.interpolate.scale);
         assert_eq!(f.scale.map(|s| s.x), Some(2.0));
         assert_eq!(f.angle, Some(30.0));
+    }
+
+    #[test]
+    fn parse_labeled_begin_action_header() {
+        // MUGEN allows `[Begin Action <n>, <free-text comment>]`; only the
+        // leading number is significant.
+        assert_eq!(
+            parse_begin_action("[Begin Action 12010, Tornado Whirlwind]"),
+            Some(12010)
+        );
+        assert_eq!(parse_begin_action("[Begin Action -3, x]"), Some(-3));
+        assert_eq!(
+            parse_begin_action("[Begin Action 10900, new charge up]"),
+            Some(10900)
+        );
+        // Plain headers (no label) still work.
+        assert_eq!(parse_begin_action("[Begin Action 0]"), Some(0));
+        assert_eq!(parse_begin_action("[Begin Action 200]"), Some(200));
+        // A header whose first token is not a number is rejected.
+        assert_eq!(parse_begin_action("[Begin Action foo, bar]"), None);
+        // An empty leading token (label present but no number) is rejected. This
+        // locks the behavior against a future refactor of the token extraction.
+        assert_eq!(parse_begin_action("[Begin Action , foo]"), None);
+        assert_eq!(parse_begin_action("[Begin Action ,]"), None);
+    }
+
+    #[test]
+    fn labeled_action_headers_not_folded() {
+        // Regression: a header with a trailing `, <label>` used to fail to parse
+        // its number, so the WHOLE header was missed and its frames were folded
+        // into the previous action — losing the labeled action entirely.
+        let air_text = "\
+[Begin Action 10]
+10,0, 0,0, 5
+[Begin Action 12010, Tornado Whirlwind]
+12010,0, 0,0, 7
+12010,1, 0,0, 6
+[Begin Action 12011, Tornado Whirlwind]
+12011,0, 0,0, 4
+[Begin Action 10900, new charge up]
+6020,0, 4,0, 4
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        // All four actions must be present and distinct.
+        assert_eq!(air.actions.len(), 4);
+        assert_eq!(air.action(10).unwrap().frames.len(), 1);
+
+        let a12010 = air.action(12010).expect("action 12010 must be present");
+        assert_eq!(a12010.frames.len(), 2);
+        // Its frames must NOT have been folded into action 10.
+        assert_eq!(a12010.frames[0].sprite, SpriteId::new(12010, 0));
+
+        assert!(air.action(12011).is_some());
+        assert!(air.action(10900).is_some());
+    }
+
+    #[test]
+    fn clsn_default_with_trailing_typo_recognized() {
+        // Real content contains `Clsn2Defaultf: 1` (a stray `f` before the
+        // colon). It must be recognized as a Clsn2Default header so the box is
+        // applied as the frame's default hurtbox, not dropped.
+        assert_eq!(parse_clsn_default("Clsn2Defaultf: 1", "Clsn2Default"), Some(1));
+        assert_eq!(parse_clsn_default("Clsn1Defaultx: 2", "Clsn1Default"), Some(2));
+        // Well-formed headers still parse.
+        assert_eq!(parse_clsn_default("Clsn2Default: 3", "Clsn2Default"), Some(3));
+
+        let air_text = "\
+[Begin Action 300]
+Clsn2Defaultf: 1
+ Clsn2[0] = -11, -87, 29, -5
+230, 0, 0,0, 2
+230, 1, 0,0, 2
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let action = air.action(300).expect("action 300 must parse");
+        // The default hurtbox must be applied to both frames.
+        assert_eq!(action.frames.len(), 2);
+        assert_eq!(action.frames[0].clsn2.len(), 1);
+        assert_eq!(action.frames[1].clsn2.len(), 1);
+        let box0 = &action.frames[0].clsn2[0];
+        assert_eq!(box0.x, -11.0);
+        assert_eq!(box0.y, -87.0);
+    }
+
+    #[test]
+    fn frame_line_with_trailing_junk_ticks() {
+        // Real content: `2650, 1, 0,0, 2..A` — the ticks column has trailing
+        // junk. The leading integer must be parsed and the frame kept rather
+        // than dropped.
+        let air_text = "\
+[Begin Action 2650]
+2650, 0, 0,0, 2,,A
+2650, 1, 0,0, 2..A
+2650, 2, 0,0, 2,,A
+";
+        let air = AirFile::from_str(air_text).unwrap();
+        let action = air.action(2650).expect("action 2650 must parse");
+        // All three frames must be present (the junk frame is not dropped).
+        assert_eq!(action.frames.len(), 3);
+        assert_eq!(action.frames[1].sprite, SpriteId::new(2650, 1));
+        assert_eq!(action.frames[1].ticks, 2);
+    }
+
+    #[test]
+    fn parse_leading_i32_behavior() {
+        // Strict values are unchanged.
+        assert_eq!(parse_leading_i32("2650"), Some(2650));
+        assert_eq!(parse_leading_i32(" -1 "), Some(-1));
+        assert_eq!(parse_leading_i32("+7"), Some(7));
+        // Trailing junk is tolerated, leading integer extracted.
+        assert_eq!(parse_leading_i32("2..A"), Some(2));
+        assert_eq!(parse_leading_i32("12x"), Some(12));
+        assert_eq!(parse_leading_i32("-3foo"), Some(-3));
+        // No leading integer -> None.
+        assert_eq!(parse_leading_i32("A"), None);
+        assert_eq!(parse_leading_i32(""), None);
+        assert_eq!(parse_leading_i32("+"), None);
+        // A well-formed leading integer that overflows i32 is dropped (warn-logged,
+        // not silently): both a bare overflow and overflow-with-junk return None.
+        assert_eq!(parse_leading_i32("99999999999"), None);
+        assert_eq!(parse_leading_i32("99999999999xx"), None);
+    }
+
+    // --- Real-fixture tests (skipped when test-assets/ is absent) ---
+
+    /// Resolves a path under the workspace's `test-assets/` directory.
+    fn test_asset(rel: &str) -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR points at crates/fp-formats; go up two levels.
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join(rel)
+    }
+
+    #[test]
+    fn real_fixture_evilken_labeled_actions_present() {
+        // evilken's special-move animations live under labeled `[Begin Action N,
+        // <comment>]` headers that the old parser dropped, folding their frames
+        // into the previous action. After the fix they must all be present.
+        let path = test_asset("evilken/evilken.air");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let air = AirFile::load(&path).expect("evilken.air should parse");
+
+        // Tornado Whirlwind + charge-up special moves (all labeled headers).
+        for n in [12010, 12011, 12012, 12013, 12030, 12031, 12032, 12033] {
+            assert!(
+                air.action(n).is_some(),
+                "evilken action {n} (labeled header) must be present"
+            );
+        }
+        // "new charge up" / "new charge up end".
+        assert!(
+            air.action(10900).is_some(),
+            "evilken action 10900 must be present"
+        );
+        assert!(
+            air.action(10901).is_some(),
+            "evilken action 10901 must be present"
+        );
+
+        // Action 2650 holds the `2..A` junk frame; it must still load with all
+        // its frames intact (the junk frame is kept, not dropped).
+        let a2650 = air.action(2650).expect("evilken action 2650 must be present");
+        assert!(
+            !a2650.frames.is_empty(),
+            "evilken action 2650 must retain its frames"
+        );
     }
 
     #[test]
