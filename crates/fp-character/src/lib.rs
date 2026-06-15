@@ -2044,6 +2044,53 @@ pub struct DrawAngle {
     pub active: bool,
 }
 
+/// The resolved per-frame animation transform (scale + rotation) the renderer
+/// applies to a character's sprite this tick (T009).
+///
+/// MUGEN's extended AIR lets each animation frame carry an optional
+/// `xscale, yscale` scale pair and an `angle` (degrees), and lets
+/// `Interpolate Scale` / `Interpolate Angle` lines request that the transform
+/// blend smoothly from the *previous* frame into the current one across the
+/// current element's duration. [`Character::anim_transform`] resolves all of that
+/// — filling in defaults and applying the interpolation against the character's
+/// own [`anim_elem`](Character::anim_elem) / [`anim_elem_time`](Character::anim_elem_time)
+/// cursor — into this struct, which the renderer maps onto its sprite-draw
+/// parameters (`scale_x`/`scale_y`, and `angle` converted to radians).
+///
+/// [`IDENTITY`](Self::IDENTITY) (also [`Default`]) is the no-op transform — unit
+/// scale, zero rotation — so a character whose AIR carries no scale/angle columns
+/// renders byte-identically to before this feature.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AnimTransform {
+    /// Per-axis scale factor (`1.0` = original size). Defaults to `(1.0, 1.0)`.
+    pub scale: Vec2<f32>,
+    /// Rotation in **degrees** (MUGEN's AIR `angle` unit). `0.0` = no rotation;
+    /// convert to radians before handing to the renderer.
+    pub angle_deg: f32,
+}
+
+impl AnimTransform {
+    /// The no-op transform: unit scale, zero rotation. A sprite drawn with it is
+    /// positioned exactly as before per-frame scale/angle existed.
+    pub const IDENTITY: Self = Self {
+        scale: Vec2 { x: 1.0, y: 1.0 },
+        angle_deg: 0.0,
+    };
+
+    /// Rotation in radians, for handing straight to the renderer's sprite
+    /// rotation (which is radians, clockwise, about the sprite center).
+    #[must_use]
+    pub fn angle_rad(&self) -> f32 {
+        self.angle_deg.to_radians()
+    }
+}
+
+impl Default for AnimTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
 /// The blend mode selected by the `Trans` state controller (T015).
 ///
 /// Mirrors MUGEN's `Trans` `trans` parameter. `AddAlpha` carries the source/dest

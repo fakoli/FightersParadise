@@ -19,7 +19,7 @@ mod texture;
 mod vertex;
 
 pub use afterimage::{ghost_alpha, ghost_palfx, AfterImageModulation, TrailTrans};
-pub use animation::AnimController;
+pub use animation::{interpolated_transform, AnimController, FrameTransform};
 pub use atlas::{AtlasRegion, TextureAtlas};
 pub use params::{apply_palfx, BlendMode, PalFx, SpriteDrawParams};
 pub use renderer::{DebugBox, RenderFrame, Renderer};

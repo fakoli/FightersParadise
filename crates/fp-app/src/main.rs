@@ -1460,15 +1460,25 @@ fn draw_player(
     // PalFX color tint (audit #33): the character's active tint (identity when
     // none, so an untinted sprite is byte-identical to before this feature).
     let palfx = char_palfx_to_render(player.character.palfx());
+
+    // Per-frame AIR scale/angle, with Interpolate blending (T009): resolve the
+    // current animation frame's transform from the character's anim cursor. The
+    // IDENTITY default keeps a character whose AIR carries no scale/angle columns
+    // byte-identical to before this feature. The angle is in degrees; the
+    // renderer takes radians.
+    let transform = player.character.anim_transform(&player.loaded.air);
+
     let params = SpriteDrawParams {
         x: draw_x,
         y: draw_y,
         flip_h,
         flip_v: anim_frame.flip_v,
+        scale_x: transform.scale.x,
+        scale_y: transform.scale.y,
+        angle: transform.angle_rad(),
         blend: render_blend,
         alpha,
         palfx,
-        ..Default::default()
     };
     frame.draw_sprite(&cached.texture, &cached.palette, &params);
 }
