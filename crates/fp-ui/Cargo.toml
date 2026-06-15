@@ -6,5 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-fp-core.workspace = true
+fp-formats.workspace = true
+fp-render.workspace = true
 tracing.workspace = true

@@ -1,0 +1,436 @@
+//! GPU-side screenpack HUD: turn a [`ScreenpackLayout`] + live match state into
+//! `fp-render` draw calls.
+//!
+//! [`ScreenpackHud`] owns the GPU-resident pieces of a screenpack — every
+//! `fight.sff` sprite uploaded as an `R8Unorm` index texture + its palette, and
+//! the `font0..fontN` fonts as [`GlyphFont`]s — built once with
+//! [`ScreenpackHud::build`]. Each frame, [`ScreenpackHud::draw`] takes a small
+//! [`MatchHudState`] (life/power fractions, names, round/KO/timer) and issues
+//! [`RenderFrame::draw_sprite`] / [`RenderFrame::draw_text`] calls to paint the
+//! life bars, power bars, names, round announcer, and timer.
+//!
+//! The bar-fill geometry ([`bar_fill_uv`], [`clamp_fraction`]) is pure and
+//! unit-tested; the GPU draw is a thin loop over it. `MatchHudState` is a plain
+//! data struct so this module need not depend on `fp-engine`: the caller (the
+//! app) fills it from `Player::life`/`power`/etc.
+
+use std::collections::HashMap;
+
+use fp_formats::fnt::FntFont;
+use fp_formats::sff::SffFile;
+use fp_render::{
+    GlyphFont, PaletteTexture, RenderFrame, Renderer, SpriteDrawParams, SpriteTexture,
+    TextDrawParams,
+};
+
+use crate::screenpack::{LifebarSide, PowerbarSide, ScreenpackLayout, SpriteRef};
+
+/// Live, per-frame HUD inputs the screenpack renderer needs, decoupled from any
+/// engine type so this crate does not depend on `fp-engine`.
+///
+/// The caller fills this each frame from the match: life/power fractions in
+/// `[0, 1]` (the app computes them via `Player::life`/`life_max` etc.), the two
+/// fighter display names, and the round/timer/KO readout.
+#[derive(Debug, Clone, Default)]
+pub struct MatchHudState {
+    /// P1 life fraction in `[0, 1]`.
+    pub p1_life: f32,
+    /// P2 life fraction in `[0, 1]`.
+    pub p2_life: f32,
+    /// P1 power (super-meter) fraction in `[0, 1]`.
+    pub p1_power: f32,
+    /// P2 power (super-meter) fraction in `[0, 1]`.
+    pub p2_power: f32,
+    /// P1 display name.
+    pub p1_name: String,
+    /// P2 display name.
+    pub p2_name: String,
+    /// The fight timer, in whole seconds; `None` hides the timer text.
+    pub timer_seconds: Option<i32>,
+    /// Text drawn by the round announcer (e.g. `"Round 1"`, `"KO"`, `"Fight"`);
+    /// empty hides it.
+    pub round_text: String,
+}
+
+/// A GPU-resident screenpack: the parsed layout, every referenced `fight.sff`
+/// sprite uploaded as a texture+palette, and the fonts uploaded as [`GlyphFont`]s.
+///
+/// Build once per match with [`ScreenpackHud::build`]; reuse across frames. The
+/// owned [`ScreenpackLayout`] is exposed via [`layout`](Self::layout) for the
+/// app's power-level sound routing.
+pub struct ScreenpackHud {
+    /// The parsed layout this HUD draws.
+    layout: ScreenpackLayout,
+    /// `fight.sff` sprites keyed by `(group, image)`, decoded + uploaded lazily
+    /// at build time.
+    sprites: HashMap<(u16, u16), GpuSprite>,
+    /// Fonts in `font0..` slot order; `fonts[i]` is the GPU upload of layout font
+    /// slot `i`. A font that failed to load is `None` (its text is skipped).
+    fonts: Vec<Option<GlyphFont>>,
+}
+
+/// One uploaded `fight.sff` sprite: its index texture, palette, and pixel size.
+struct GpuSprite {
+    texture: SpriteTexture,
+    palette: PaletteTexture,
+    width: f32,
+    height: f32,
+}
+
+impl ScreenpackHud {
+    /// Builds the GPU-resident HUD from a parsed [`ScreenpackLayout`], the loaded
+    /// `fight.sff`, and the loaded fonts (one per `font0..` slot, in order).
+    ///
+    /// `fonts` is indexed by font slot; pass `None` for a slot whose font failed
+    /// to load (its text is then skipped at draw time). Each sprite referenced by
+    /// the layout is decoded from `sff` and uploaded; a sprite that is missing or
+    /// fails to decode is skipped with a `tracing::warn!` and simply does not draw
+    /// — never a panic.
+    pub fn build(
+        renderer: &Renderer,
+        layout: ScreenpackLayout,
+        sff: &SffFile,
+        fonts: Vec<Option<FntFont>>,
+    ) -> Self {
+        let mut sprites = HashMap::new();
+        for r in layout_sprite_refs(&layout) {
+            let key = (r.group, r.image);
+            if sprites.contains_key(&key) {
+                continue;
+            }
+            if let Some(gpu) = upload_sprite(renderer, sff, r.group, r.image) {
+                sprites.insert(key, gpu);
+            }
+        }
+
+        let fonts = fonts
+            .into_iter()
+            .map(|f| f.map(|font| GlyphFont::new(renderer.device(), renderer.queue(), font)))
+            .collect();
+
+        Self { layout, sprites, fonts }
+    }
+
+    /// The parsed layout backing this HUD (e.g. for power-level sound routing).
+    pub fn layout(&self) -> &ScreenpackLayout {
+        &self.layout
+    }
+
+    /// Draws the whole screenpack HUD for the current frame.
+    ///
+    /// Order: P1 then P2 life bars (background → front fill), power bars, fighter
+    /// names, the timer, and the round announcer. Missing sprites/fonts are
+    /// silently skipped (logged once at build), so a partial screenpack still
+    /// renders whatever it does define.
+    pub fn draw(&self, frame: &mut RenderFrame<'_>, state: &MatchHudState) {
+        // Life bars.
+        self.draw_lifebar(frame, &self.layout.p1_lifebar, state.p1_life);
+        self.draw_lifebar(frame, &self.layout.p2_lifebar, state.p2_life);
+        // Power bars.
+        self.draw_powerbar(frame, &self.layout.p1_powerbar, state.p1_power);
+        self.draw_powerbar(frame, &self.layout.p2_powerbar, state.p2_power);
+        // Names.
+        self.draw_text_slot(
+            frame,
+            self.layout.p1_name.font,
+            self.layout.p1_name.pos.x as f32,
+            self.layout.p1_name.pos.y as f32,
+            &state.p1_name,
+        );
+        self.draw_text_slot(
+            frame,
+            self.layout.p2_name.font,
+            self.layout.p2_name.pos.x as f32,
+            self.layout.p2_name.pos.y as f32,
+            &state.p2_name,
+        );
+        // Timer.
+        if let Some(secs) = state.timer_seconds {
+            self.draw_text_slot(
+                frame,
+                self.layout.time.font,
+                self.layout.time.pos.x as f32,
+                self.layout.time.pos.y as f32,
+                &secs.to_string(),
+            );
+        }
+        // Round announcer.
+        if !state.round_text.is_empty() {
+            self.draw_text_slot(
+                frame,
+                self.layout.round.font,
+                self.layout.round.pos.x as f32,
+                self.layout.round.pos.y as f32,
+                &state.round_text,
+            );
+        }
+    }
+
+    /// Draws one life bar: its background layer at full size, then the front
+    /// layer clipped horizontally to `frac` of the bar's `range` span.
+    fn draw_lifebar(&self, frame: &mut RenderFrame<'_>, bar: &LifebarSide, frac: f32) {
+        let base_x = bar.pos.x as f32;
+        let base_y = bar.pos.y as f32;
+        // Background + mid draw whole.
+        self.draw_sprite_ref(frame, bar.bg, base_x, base_y);
+        self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
+        // Front fill clips to the life fraction over the bar's range.
+        self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
+    }
+
+    /// Draws one power bar (same layering as a life bar, clipped to `frac`).
+    fn draw_powerbar(&self, frame: &mut RenderFrame<'_>, bar: &PowerbarSide, frac: f32) {
+        let base_x = bar.pos.x as f32;
+        let base_y = bar.pos.y as f32;
+        self.draw_sprite_ref(frame, bar.bg, base_x, base_y);
+        self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
+        self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
+    }
+
+    /// Draws a bar's front-fill sprite clipped to `frac` of `range`.
+    ///
+    /// Uses [`bar_fill_uv`] to compute the visible UV sub-rectangle and the
+    /// destination width, so a `frac` of `0` draws nothing and `1` draws the full
+    /// sprite. A negative `range` span (P2's mirrored bar) clips from the right.
+    fn draw_bar_fill(
+        &self,
+        frame: &mut RenderFrame<'_>,
+        front: Option<SpriteRef>,
+        base_x: f32,
+        base_y: f32,
+        range: (i32, i32),
+        frac: f32,
+    ) {
+        let Some(r) = front else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let frac = clamp_fraction(frac);
+        if frac <= 0.0 {
+            return;
+        }
+        let (uv, dst_w, dst_x_off) = bar_fill_uv(range, frac, gpu.width);
+        let params = SpriteDrawParams {
+            x: base_x + r.offset.x as f32 + dst_x_off,
+            y: base_y + r.offset.y as f32,
+            ..Default::default()
+        };
+        frame.draw_sprite_region(&gpu.texture, &gpu.palette, &params, uv, dst_w, gpu.height);
+    }
+
+    /// Draws a sprite reference at its full size (background/mid layers, faces).
+    fn draw_sprite_ref(
+        &self,
+        frame: &mut RenderFrame<'_>,
+        spr: Option<SpriteRef>,
+        base_x: f32,
+        base_y: f32,
+    ) {
+        let Some(r) = spr else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let params = SpriteDrawParams {
+            x: base_x + r.offset.x as f32,
+            y: base_y + r.offset.y as f32,
+            ..Default::default()
+        };
+        frame.draw_sprite(&gpu.texture, &gpu.palette, &params);
+    }
+
+    /// Draws `text` at `(x, y)` using the font in slot `slot`, if loaded.
+    fn draw_text_slot(&self, frame: &mut RenderFrame<'_>, slot: usize, x: f32, y: f32, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(Some(font)) = self.fonts.get(slot) else { return };
+        let params = TextDrawParams { x, y, ..Default::default() };
+        frame.draw_text(font, text, &params);
+    }
+}
+
+/// Decodes and uploads one `fight.sff` sprite to the GPU, or `None` (with a
+/// warning) if it is missing or fails to decode.
+fn upload_sprite(renderer: &Renderer, sff: &SffFile, group: u16, image: u16) -> Option<GpuSprite> {
+    let (index, sprite) = sff
+        .sprites
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.group == group && s.image == image)?;
+    if sprite.width == 0 || sprite.height == 0 {
+        tracing::warn!(group, image, "screenpack sprite has zero dimensions; skipping");
+        return None;
+    }
+    let pixels = match sff.decode_sprite(index) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(group, image, error = %e, "screenpack sprite failed to decode; skipping");
+            return None;
+        }
+    };
+    let palette = match sff.palette(sprite.palette_index as usize) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(group, image, error = %e, "screenpack sprite palette missing; skipping");
+            return None;
+        }
+    };
+    let texture = SpriteTexture::new(
+        renderer.device(),
+        renderer.queue(),
+        sprite.width as u32,
+        sprite.height as u32,
+        &pixels,
+    );
+    let palette = PaletteTexture::new(renderer.device(), renderer.queue(), &palette);
+    Some(GpuSprite {
+        texture,
+        palette,
+        width: sprite.width as f32,
+        height: sprite.height as f32,
+    })
+}
+
+/// Collects every sprite reference used by a layout (both bars' layers + faces),
+/// so the builder can pre-upload exactly the sprites it will draw.
+fn layout_sprite_refs(layout: &ScreenpackLayout) -> Vec<SpriteRef> {
+    let mut refs = Vec::new();
+    let mut push_lifebar = |b: &LifebarSide| {
+        refs.extend(b.bg);
+        refs.extend(b.mid);
+        refs.extend(b.front);
+    };
+    push_lifebar(&layout.p1_lifebar);
+    push_lifebar(&layout.p2_lifebar);
+    let mut push_powerbar = |b: &PowerbarSide| {
+        refs.extend(b.bg);
+        refs.extend(b.mid);
+        refs.extend(b.front);
+    };
+    push_powerbar(&layout.p1_powerbar);
+    push_powerbar(&layout.p2_powerbar);
+    refs.extend(layout.p1_face.spr);
+    refs.extend(layout.p2_face.spr);
+    refs
+}
+
+/// Clamps a bar fraction into `[0, 1]`, mapping NaN to `0`.
+///
+/// Pure; mirrors `fp-app`'s `life_fraction`/`power_fraction` safety so the
+/// screenpack and quad HUDs agree on out-of-range inputs.
+pub fn clamp_fraction(frac: f32) -> f32 {
+    if frac.is_nan() {
+        0.0
+    } else {
+        frac.clamp(0.0, 1.0)
+    }
+}
+
+/// Computes the visible front-fill sub-rectangle for a bar at fraction `frac`.
+///
+/// Returns `(uv, dst_w, dst_x_off)`:
+/// - `uv` is the `[u_min, v_min, u_max, v_max]` source rectangle (whole sprite
+///   height, horizontally clipped to `frac`).
+/// - `dst_w` is the destination width in pixels (`sprite_w * frac`).
+/// - `dst_x_off` is the X offset to add to the draw position so a right-anchored
+///   (negative-span) bar clips from its right edge rather than its left.
+///
+/// A non-negative `range` span (`x1 >= x0`) clips from the **left** (P1's bar,
+/// which empties toward the centre); a negative span (`x1 < x0`, P2's mirrored
+/// bar) clips from the **right**. `sprite_w` is the full sprite width in pixels.
+///
+/// Pure and unit-tested — no GPU.
+pub fn bar_fill_uv(range: (i32, i32), frac: f32, sprite_w: f32) -> ([f32; 4], f32, f32) {
+    let frac = clamp_fraction(frac);
+    let dst_w = sprite_w * frac;
+    // Whether the bar empties toward the right edge (P2's mirrored range).
+    let right_anchored = range.1 < range.0;
+    if right_anchored {
+        // Keep the right `frac` of the sprite: u in [1-frac, 1], drawn shifted
+        // right so its right edge stays put.
+        let uv = [1.0 - frac, 0.0, 1.0, 1.0];
+        let dst_x_off = sprite_w - dst_w;
+        (uv, dst_w, dst_x_off)
+    } else {
+        // Keep the left `frac`: u in [0, frac], drawn at the bar's left edge.
+        let uv = [0.0, 0.0, frac, 1.0];
+        (uv, dst_w, 0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_fraction_bounds_and_nan() {
+        assert_eq!(clamp_fraction(-1.0), 0.0);
+        assert_eq!(clamp_fraction(0.0), 0.0);
+        assert_eq!(clamp_fraction(0.5), 0.5);
+        assert_eq!(clamp_fraction(1.0), 1.0);
+        assert_eq!(clamp_fraction(2.0), 1.0);
+        assert_eq!(clamp_fraction(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn full_fraction_draws_whole_sprite() {
+        let (uv, dst_w, off) = bar_fill_uv((0, 256), 1.0, 200.0);
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(dst_w, 200.0);
+        assert_eq!(off, 0.0);
+    }
+
+    #[test]
+    fn empty_fraction_draws_nothing_wide() {
+        let (uv, dst_w, off) = bar_fill_uv((0, 256), 0.0, 200.0);
+        assert_eq!(uv, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(dst_w, 0.0);
+        assert_eq!(off, 0.0);
+    }
+
+    #[test]
+    fn left_anchored_half_fill_clips_from_left() {
+        // P1 bar (positive span): half life -> left half of the sprite, at x=0.
+        let (uv, dst_w, off) = bar_fill_uv((0, 256), 0.5, 200.0);
+        assert_eq!(uv, [0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(dst_w, 100.0);
+        assert_eq!(off, 0.0);
+    }
+
+    #[test]
+    fn right_anchored_half_fill_clips_from_right() {
+        // P2 bar (negative span): half life -> right half of the sprite, shifted
+        // right so the right edge stays anchored.
+        let (uv, dst_w, off) = bar_fill_uv((0, -256), 0.5, 200.0);
+        assert_eq!(uv, [0.5, 0.0, 1.0, 1.0]);
+        assert_eq!(dst_w, 100.0);
+        assert_eq!(off, 100.0, "shift = sprite_w - dst_w keeps the right edge fixed");
+    }
+
+    #[test]
+    fn fraction_is_clamped_inside_bar_fill() {
+        // Over-range fraction clamps to a full bar, not a >100% draw.
+        let (uv, dst_w, _) = bar_fill_uv((0, 256), 1.5, 200.0);
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(dst_w, 200.0);
+    }
+
+    #[test]
+    fn collects_all_layout_sprite_refs() {
+        use crate::screenpack::{LifebarSide, Pos};
+        let layout = ScreenpackLayout {
+            p1_lifebar: LifebarSide {
+                bg: Some(SpriteRef { group: 0, image: 0, offset: Pos::default() }),
+                front: Some(SpriteRef { group: 2, image: 0, offset: Pos::default() }),
+                ..Default::default()
+            },
+            p2_lifebar: LifebarSide {
+                bg: Some(SpriteRef { group: 0, image: 1, offset: Pos::default() }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let refs = layout_sprite_refs(&layout);
+        // bg0, front0, bg1 -> 3 refs collected.
+        assert_eq!(refs.len(), 3);
+        assert!(refs.iter().any(|r| (r.group, r.image) == (0, 0)));
+        assert!(refs.iter().any(|r| (r.group, r.image) == (2, 0)));
+        assert!(refs.iter().any(|r| (r.group, r.image) == (0, 1)));
+    }
+}

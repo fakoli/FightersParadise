@@ -64,6 +64,7 @@ use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_render::{PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture};
 use fp_stage::{BgLayer, Stage};
+use fp_ui::{MatchHudState, ScreenpackHud, ScreenpackLayout};
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, KeyboardState, Scancode};
 
@@ -1474,6 +1475,10 @@ struct MatchRun {
     /// background (no regression); `Some` renders parallax background layers
     /// behind/in front of the fighters with a camera following their midpoint.
     stage: Option<StageRender>,
+    /// The loaded `fight.def` screenpack HUD, when one is available. `None` falls
+    /// back to the hand-rolled quad [`Hud`] (no regression); `Some` draws the real
+    /// lifebars/power/text via [`fp_ui::ScreenpackHud`] instead of the quads.
+    screenpack: Option<ScreenpackHud>,
 }
 
 /// The selected run mode after parsing CLI args and loading assets.
@@ -1579,6 +1584,10 @@ fn load_match_or_fallback(
             // Loading the stage is best-effort: `None` (no path, bad parse, or
             // missing SFF) keeps today's flat clear color (no regression).
             let stage = stage_def.and_then(StageRender::load);
+            // The screenpack HUD is best-effort too: `None` (no `fight.def` found,
+            // bad parse, or missing `fight.sff`) falls back to the hand-rolled quad
+            // HUD, so the default match looks exactly as before (no regression).
+            let screenpack = load_screenpack(p1_def, renderer);
             Mode::Match(Box::new(MatchRun {
                 m: Box::new(m),
                 p1_render: FighterRender::default(),
@@ -1590,6 +1599,7 @@ fn load_match_or_fallback(
                 p1_audio: FighterAudio::default(),
                 p2_audio: FighterAudio::default(),
                 stage,
+                screenpack,
             }))
         }
         Err(e) => {
@@ -1597,6 +1607,137 @@ fn load_match_or_fallback(
             let (s, p) = generate_test_pattern(renderer);
             Mode::TestPattern(s, p)
         }
+    }
+}
+
+/// Finds and loads a `fight.def` screenpack into a GPU-resident
+/// [`ScreenpackHud`], or returns `None` to fall back to the quad [`Hud`].
+///
+/// Search order (first hit wins), all best-effort:
+/// 1. the `FP_SCREENPACK` environment variable, if it points at a `fight.def`;
+/// 2. a `fight.def` next to the P1 character `.def`;
+/// 3. a `data/fight.def` next to the P1 character `.def`.
+///
+/// No screenpack ships with the engine (clean-room / asset-blocked), so in the
+/// default match this returns `None` and the hand-rolled quad HUD is used — no
+/// regression. A found-but-unparseable `fight.def`, or one whose `fight.sff`
+/// fails to load, also returns `None` (logged), never a panic.
+fn load_screenpack(p1_def: &Path, renderer: &Renderer) -> Option<ScreenpackHud> {
+    let fight_def = locate_fight_def(p1_def)?;
+    tracing::info!("Loading screenpack: {}", fight_def.display());
+
+    let def = match fp_formats::def::DefFile::load(&fight_def) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("screenpack {} failed to parse: {e}; using quad HUD", fight_def.display());
+            return None;
+        }
+    };
+    let layout = ScreenpackLayout::parse(&def);
+    if layout.sff.is_empty() {
+        tracing::warn!("screenpack {} has no [Files] sff; using quad HUD", fight_def.display());
+        return None;
+    }
+
+    // Resolve and load the fight.sff relative to the fight.def directory.
+    let sff_path = fp_formats::def::DefFile::resolve_path(&fight_def, &layout.sff);
+    let sff = match SffFile::load(&sff_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("screenpack sff {} failed to load: {e}; using quad HUD", sff_path.display());
+            return None;
+        }
+    };
+
+    // Load each font slot relative to the fight.def directory; a missing/bad font
+    // becomes `None` (its text is skipped) rather than failing the whole HUD.
+    let fonts = layout
+        .fonts
+        .iter()
+        .map(|rel| {
+            let path = fp_formats::def::DefFile::resolve_path(&fight_def, rel);
+            match fp_formats::fnt::FntFont::load(&path) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!("screenpack font {} failed to load: {e}; skipping", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
+
+    Some(ScreenpackHud::build(renderer, layout, &sff, fonts))
+}
+
+/// Returns the first existing `fight.def` candidate for the given P1 character
+/// `.def`, or `None` if none is found. See [`load_screenpack`] for the search
+/// order.
+fn locate_fight_def(p1_def: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(env) = std::env::var("FP_SCREENPACK") {
+        if !env.is_empty() {
+            candidates.push(PathBuf::from(env));
+        }
+    }
+    if let Some(dir) = p1_def.parent() {
+        candidates.push(dir.join("fight.def"));
+        candidates.push(dir.join("data").join("fight.def"));
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Builds the per-frame [`MatchHudState`] the screenpack renderer draws from a
+/// live [`Match`]: life/power fractions (via [`life_fraction`]/[`power_fraction`],
+/// so the screenpack and quad HUDs agree), both fighter names, the timer, and the
+/// round/KO/winner readout.
+fn match_hud_state(m: &Match) -> MatchHudState {
+    MatchHudState {
+        p1_life: life_fraction(m.p1().life(), m.p1().life_max()),
+        p2_life: life_fraction(m.p2().life(), m.p2().life_max()),
+        p1_power: power_fraction(m.p1().power(), m.p1().power_max()),
+        p2_power: power_fraction(m.p2().power(), m.p2().power_max()),
+        p1_name: m.p1().loaded.name.clone(),
+        p2_name: m.p2().loaded.name.clone(),
+        // `Match::timer()` is FRAMES remaining (its doc: "Divide by 60 for
+        // seconds"); `MatchHudState.timer_seconds` is whole seconds, drawn raw.
+        // Convert here so a real fight.def clock reads e.g. 99, not 5940.
+        timer_seconds: Some(timer_frames_to_seconds(m.timer())),
+        round_text: round_readout(m),
+    }
+}
+
+/// Converts the engine's frame-based round clock ([`Match::timer`], "frames
+/// remaining") into the whole seconds that [`MatchHudState::timer_seconds`]
+/// expects and the screenpack renderer draws verbatim.
+///
+/// The engine ticks at a fixed 60 Hz, so this is integer-divide by 60 (it floors,
+/// matching MUGEN's whole-second countdown). Negative inputs are clamped to `0`.
+fn timer_frames_to_seconds(frames: i32) -> i32 {
+    (frames / 60).max(0)
+}
+
+/// The round-announcer text for the current match state: a `KO`/win/draw readout
+/// once the round is decided, the round number during the intro, else empty.
+///
+/// Delegates to the pure [`round_label`] so the production mapping is exactly
+/// what the unit test exercises (no duplicated `match`).
+fn round_readout(m: &Match) -> String {
+    round_label(m.round_state(), m.winner(), m.round_number())
+}
+
+/// The pure `(state, winner, round_number)` → announcer-text mapping behind
+/// [`round_readout`], split out so it is testable without a live [`Match`].
+///
+/// `round_number` is only consulted for the [`RoundState::Intro`] case (the
+/// `"ROUND N"` readout); the others ignore it.
+fn round_label(state: RoundState, winner: Option<Winner>, round_number: i32) -> String {
+    match (state, winner) {
+        (RoundState::Ko, _) => "KO".to_string(),
+        (RoundState::Win, Some(Winner::P1)) => "P1 WINS".to_string(),
+        (RoundState::Win, Some(Winner::P2)) => "P2 WINS".to_string(),
+        (RoundState::Win, _) => "DRAW".to_string(),
+        (RoundState::Intro, _) => format!("ROUND {round_number}"),
+        _ => String::new(),
     }
 }
 
@@ -1802,8 +1943,17 @@ fn run() -> fp_core::FpResult<()> {
                     draw_player_clsn(&mut frame, run.m.p1(), camera_x, win_wf, win_hf);
                     draw_player_clsn(&mut frame, run.m.p2(), camera_x, win_wf, win_hf);
                 }
-                // Minimal HUD on top: life bars + KO/round indicator.
-                hud.draw(&mut frame, win_wf, &run.m);
+                // HUD on top. A loaded `fight.def` screenpack draws the real
+                // lifebars/power/text; absent one, the hand-rolled quad HUD draws
+                // (life bars + KO/round indicator) exactly as before — no
+                // regression for the default (screenpack-less) match.
+                match run.screenpack.as_ref() {
+                    Some(screenpack) => {
+                        let state = match_hud_state(&run.m);
+                        screenpack.draw(&mut frame, &state);
+                    }
+                    None => hud.draw(&mut frame, win_wf, &run.m),
+                }
             }
             Mode::Viewer(ref v) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -3796,5 +3946,78 @@ mod tests {
         assert_eq!(out.mul, [0.5, 1.0, 2.0]);
         assert!((out.color - 0.25).abs() < 1e-6);
         assert!(!out.is_identity(), "an active tint is not the no-op");
+    }
+
+    // =====================================================================
+    // PR-N — fight.def screenpack HUD wiring (audit #31)
+    // =====================================================================
+
+    /// With no `fight.def` anywhere on the search path (and no `FP_SCREENPACK`),
+    /// `locate_fight_def` finds nothing — so the match falls back to the quad HUD
+    /// (no regression for the default, screenpack-less match).
+    #[test]
+    fn locate_fight_def_returns_none_when_absent() {
+        // A character .def in a directory that contains no fight.def / data/fight.def.
+        let dir = std::env::temp_dir().join(format!("fp-screenpack-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1_def = dir.join("kfm.def");
+        // Guard against a leaked FP_SCREENPACK from the environment.
+        std::env::remove_var("FP_SCREENPACK");
+        assert!(
+            locate_fight_def(&p1_def).is_none(),
+            "no fight.def -> None -> quad HUD fallback"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `locate_fight_def` finds a `fight.def` sitting next to the P1 character def.
+    #[test]
+    fn locate_fight_def_finds_sibling() {
+        let dir = std::env::temp_dir().join(format!("fp-screenpack-sib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fight = dir.join("fight.def");
+        std::fs::write(&fight, "[Files]\nsff = fight.sff\n").unwrap();
+        let p1_def = dir.join("kfm.def");
+        std::env::remove_var("FP_SCREENPACK");
+        assert_eq!(
+            locate_fight_def(&p1_def).as_deref(),
+            Some(fight.as_path()),
+            "a sibling fight.def is located"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round announcer text reflects the decided round (KO / win / draw), the
+    /// round number during the intro, and is empty mid-fight.
+    ///
+    /// Exercises the **production** [`round_label`] (the very mapping
+    /// `round_readout` delegates to), not a test-only copy — so a divergence in
+    /// the real code cannot pass silently.
+    #[test]
+    fn round_readout_reflects_state() {
+        // KO marker wins regardless of winner.
+        assert_eq!(round_label(RoundState::Ko, None, 1), "KO");
+        assert_eq!(round_label(RoundState::Win, Some(Winner::P1), 1), "P1 WINS");
+        assert_eq!(round_label(RoundState::Win, Some(Winner::P2), 1), "P2 WINS");
+        assert_eq!(round_label(RoundState::Win, None, 1), "DRAW");
+        // The intro readout reflects the live round number (not a fixed "1").
+        assert_eq!(round_label(RoundState::Intro, None, 1), "ROUND 1");
+        assert_eq!(round_label(RoundState::Intro, None, 3), "ROUND 3");
+        assert_eq!(round_label(RoundState::Fight, None, 1), "");
+    }
+
+    /// The HUD timer is whole seconds, not the engine's frames-remaining clock:
+    /// `Match::timer()` returns frames (60/s), so a 99-second round (5940 frames)
+    /// must read 99, never 5940. Guards the screenpack-path timer-unit contract.
+    #[test]
+    fn timer_frames_convert_to_whole_seconds() {
+        assert_eq!(timer_frames_to_seconds(5940), 99, "99s round = 5940 frames -> 99");
+        assert_eq!(timer_frames_to_seconds(60), 1);
+        assert_eq!(timer_frames_to_seconds(0), 0);
+        // Floors mid-second (sub-60 remainder is dropped, MUGEN-style).
+        assert_eq!(timer_frames_to_seconds(59), 0);
+        assert_eq!(timer_frames_to_seconds(119), 1);
+        // Negative (shouldn't happen, but never render "-1").
+        assert_eq!(timer_frames_to_seconds(-30), 0);
     }
 }
