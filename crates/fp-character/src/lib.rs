@@ -797,42 +797,73 @@ impl WidthOverride {
 }
 
 /// A live MUGEN-style color tint the character is currently displaying (the
-/// `PalFX` controller's effect; faithfulness audit #33).
+/// `PalFX` controller's effect; faithfulness audit #33, full modulation set
+/// T008).
 ///
-/// MUGEN's `PalFX` recolors the character for a number of ticks: a per-channel
-/// signed `add`, a per-channel `mul`tiply, and a grayscale-blend `color` (`256`
-/// = full color, `0` = grayscale). The values are normalized here to the
-/// renderer's float scale — `add` is a signed fraction (`±1.0` = ±255 MUGEN
-/// units), `mul` a plain multiplier (`1.0` = unchanged), and `color` a
-/// `0.0..=1.0` color-retention fraction — so [`Character::palfx`] can hand them
-/// straight to the renderer's `fp_render::PalFx` without further conversion.
+/// MUGEN's `PalFX` recolors the character for a number of ticks with the full
+/// modulation set: a per-channel signed `add`, a per-channel `mul`tiply, a
+/// grayscale-blend `color` (`256` = full color, `0` = grayscale), a per-channel
+/// **sinusoidal** add `sinadd` that oscillates over a `sinadd_period`, and an
+/// `invertall` channel inversion. The static values are normalized here to the
+/// renderer's float scale — `add`/`sinadd` are signed fractions (`±1.0` = ±255
+/// MUGEN units), `mul` a plain multiplier (`1.0` = unchanged), and `color` a
+/// `0.0..=1.0` color-retention fraction.
+///
+/// The static `add`/`mul`/`color`/`invertall` are constant for the effect's
+/// lifetime, but `sinadd` makes the **effective** add change every tick — that
+/// per-frame coefficient is computed by [`effective`](Self::effective) from the
+/// [`elapsed`](Self::elapsed) tick counter, and [`Character::palfx`] returns
+/// that resolved value (no phase reaches the renderer).
 ///
 /// [`remaining`](Self::remaining) is the countdown in ticks; while `> 0` the
-/// effect is active and ticks down each (non-hit-paused) frame. A
-/// [`Default`]/[`IDENTITY`](Self::IDENTITY) effect (`remaining = 0`) is a no-op:
-/// [`Character::palfx`] returns the identity tint, so the sprite renders
-/// unchanged.
+/// effect is active and ticks down each (non-hit-paused) frame, with
+/// [`elapsed`](Self::elapsed) counting up in lock-step to drive the `sinadd`
+/// phase. A [`Default`]/[`IDENTITY`](Self::IDENTITY) effect (`remaining = 0`) is
+/// a no-op: [`Character::palfx`] returns the identity tint, so the sprite
+/// renders unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CurPalFx {
-    /// Signed per-channel add, as a fraction of full scale (`±1.0` = ±255).
+    /// Signed per-channel static add, as a fraction of full scale (`±1.0` =
+    /// ±255). The `sinadd` oscillation is added on top of this per tick.
     pub add: [f32; 3],
     /// Per-channel multiply (`1.0` = unchanged).
     pub mul: [f32; 3],
     /// Color-retention fraction in `0.0..=1.0` (`1.0` = full color, `0.0` =
     /// grayscale). Mirrors MUGEN's `PalFX color = 0..256`.
     pub color: f32,
+    /// Per-channel sinusoidal add **amplitude**, as a fraction of full scale
+    /// (`±1.0` = ±255). At tick `t` the add contribution is `sinadd[c] *
+    /// sin(2π · t / sinadd_period)`. `[0.0; 3]` (the default) oscillates nothing.
+    pub sinadd: [f32; 3],
+    /// Period of the `sinadd` oscillation in ticks (MUGEN `sinadd = r,g,b,period`).
+    /// `0` (or the absence of `sinadd`) disables the oscillation. A negative
+    /// period inverts the sine (MUGEN convention).
+    pub sinadd_period: i32,
+    /// MUGEN `PalFX invertall`: when `true`, each channel is inverted
+    /// (`1.0 - channel`) after the grayscale blend and before the multiply/add.
+    pub invertall: bool,
     /// Remaining active duration in ticks. `0` (or less) = inactive / no-op.
     pub remaining: i32,
+    /// Ticks elapsed since the effect was armed, driving the `sinadd` phase.
+    /// Counts up each active tick (alongside [`remaining`](Self::remaining)
+    /// counting down). Starts at `0`, so the first frame's `sinadd` phase is
+    /// `sin(0) = 0`.
+    pub elapsed: i32,
 }
 
 impl CurPalFx {
-    /// The identity (no-op) tint: full color, unit multiply, zero add, not
-    /// active. [`Character::palfx`] returns this when nothing is active.
+    /// The identity (no-op) tint: full color, unit multiply, zero add, no
+    /// oscillation, no inversion, not active. [`Character::palfx`] returns this
+    /// when nothing is active.
     pub const IDENTITY: Self = Self {
         add: [0.0, 0.0, 0.0],
         mul: [1.0, 1.0, 1.0],
         color: 1.0,
+        sinadd: [0.0, 0.0, 0.0],
+        sinadd_period: 0,
+        invertall: false,
         remaining: 0,
+        elapsed: 0,
     };
 
     /// Returns `true` while the effect is still running ([`remaining`](Self::remaining)
@@ -842,11 +873,55 @@ impl CurPalFx {
         self.remaining > 0
     }
 
-    /// Counts the effect down by one tick, expiring it (resetting to the
-    /// identity tint) when it reaches zero. Called once per non-hit-paused tick.
+    /// The per-tick **effective** signed add for the current
+    /// [`elapsed`](Self::elapsed) frame: the static [`add`](Self::add) plus the
+    /// `sinadd` oscillation `sinadd[c] · sin(2π · elapsed / sinadd_period)`.
+    ///
+    /// When `sinadd_period` is `0` the oscillation is disabled and this returns
+    /// the static add unchanged (so it is a no-op for a plain `PalFX`). Never
+    /// panics (division is guarded; non-finite results fall back to the static
+    /// add).
+    #[must_use]
+    pub fn effective_add(&self) -> [f32; 3] {
+        if self.sinadd_period == 0 {
+            return self.add;
+        }
+        let phase = std::f32::consts::TAU * (self.elapsed as f32) / (self.sinadd_period as f32);
+        let s = phase.sin();
+        let mut out = self.add;
+        for (slot, &amp) in out.iter_mut().zip(self.sinadd.iter()) {
+            let v = *slot + amp * s;
+            if v.is_finite() {
+                *slot = v;
+            }
+        }
+        out
+    }
+
+    /// The effect resolved for the current tick: a copy with the `sinadd`
+    /// oscillation folded into [`add`](Self::add) (so [`effective_add`] has
+    /// already been applied) and the oscillation parameters cleared. This is the
+    /// value handed to the renderer, which only ever sees a resolved per-frame
+    /// add — never a phase.
+    ///
+    /// [`effective_add`]: Self::effective_add
+    #[must_use]
+    pub fn effective(&self) -> Self {
+        Self {
+            add: self.effective_add(),
+            sinadd: [0.0; 3],
+            sinadd_period: 0,
+            ..*self
+        }
+    }
+
+    /// Counts the effect down by one tick (and the `sinadd` phase up by one),
+    /// expiring it (resetting to the identity tint) when [`remaining`](Self::remaining)
+    /// reaches zero. Called once per non-hit-paused tick.
     pub fn tick(&mut self) {
         if self.remaining > 0 {
             self.remaining -= 1;
+            self.elapsed = self.elapsed.saturating_add(1);
             if self.remaining <= 0 {
                 *self = Self::IDENTITY;
             }
@@ -2265,11 +2340,13 @@ impl Character {
         self.hitpause = ticks.max(0);
     }
 
-    /// Returns the character's current `PalFX` color tint (faithfulness audit
-    /// #33).
+    /// Returns the character's current `PalFX` color tint, resolved for this
+    /// tick (faithfulness audit #33; full modulation set T008).
     ///
     /// When a `PalFX` effect is active ([`CurPalFx::is_active`]) this is its
-    /// `add`/`mul`/`color` with the live countdown; otherwise it is the
+    /// per-frame [`effective`](CurPalFx::effective) modulation —
+    /// `add` (with the current `sinadd` oscillation already folded in), `mul`,
+    /// `color`, and `invertall` — with the live countdown; otherwise it is the
     /// **identity** tint ([`CurPalFx::IDENTITY`]), a guaranteed no-op so the
     /// sprite renders byte-identically. The renderer (`fp-app`) converts the
     /// returned effect into the renderer's `fp_render::PalFx` and passes it
@@ -2279,7 +2356,7 @@ impl Character {
     #[must_use]
     pub fn palfx(&self) -> CurPalFx {
         if self.cur_palfx.is_active() {
-            self.cur_palfx
+            self.cur_palfx.effective()
         } else {
             CurPalFx::IDENTITY
         }

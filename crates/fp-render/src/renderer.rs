@@ -9,17 +9,20 @@ use crate::vertex::{DebugVertex, SpriteVertex};
 /// Quad index data: two triangles forming a rectangle.
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
-/// GPU-side layout of the per-draw PalFX color-tint uniform (audit #33).
+/// GPU-side layout of the per-draw PalFX color-tint uniform (audit #33; full
+/// modulation set T008).
 ///
 /// `vec4` / `vec3+pad` aligned to 16 bytes to satisfy WGSL `uniform` layout
 /// rules. `add`/`mul` carry the three color channels in `.xyz` (`.w` is
-/// padding); `color` is the grayscale-retention fraction (`1.0` = full color),
+/// padding); `color.x` is the grayscale-retention fraction (`1.0` = full color)
+/// and `color.y` is the `invertall` flag (`1.0` = invert, `0.0` = leave),
 /// the rest of that vec4 is unused padding. The shader does NOT branch on the
 /// [identity](Self::IDENTITY) value — `apply_palfx` runs unconditionally — but
 /// the identity uniform makes that an *exact* IEEE-754 no-op (`mix(luma, rgb,
-/// 1.0) == rgb`, then `* 1.0 + 0.0 == rgb`, and the final clamp of already-in-
-/// range palette colors changes nothing), so an untinted sprite is byte-identical
-/// to the pre-feature path.
+/// 1.0) == rgb`, no inversion, then `* 1.0 + 0.0 == rgb`, and the final clamp of
+/// already-in-range palette colors changes nothing), so an untinted sprite is
+/// byte-identical to the pre-feature path. The `sinadd` oscillation is resolved
+/// into `add` per frame by the caller, so the GPU never sees a phase.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct PalFxUniform {
@@ -27,12 +30,14 @@ struct PalFxUniform {
     add: [f32; 4],
     /// Per-channel multiply in `.xyz` (`.w` padding).
     mul: [f32; 4],
-    /// Color-retention fraction in `.x`; `.yzw` padding.
+    /// Color-retention fraction in `.x`; `invertall` flag (`0.0`/`1.0`) in `.y`;
+    /// `.zw` padding.
     color: [f32; 4],
 }
 
 impl PalFxUniform {
-    /// The identity (no-op) uniform: full color, unit multiply, zero add.
+    /// The identity (no-op) uniform: full color, unit multiply, zero add, no
+    /// inversion.
     const IDENTITY: Self = Self {
         add: [0.0, 0.0, 0.0, 0.0],
         mul: [1.0, 1.0, 1.0, 0.0],
@@ -44,7 +49,7 @@ impl PalFxUniform {
         Self {
             add: [fx.add[0], fx.add[1], fx.add[2], 0.0],
             mul: [fx.mul[0], fx.mul[1], fx.mul[2], 0.0],
-            color: [fx.color, 0.0, 0.0, 0.0],
+            color: [fx.color, if fx.invertall { 1.0 } else { 0.0 }, 0.0, 0.0],
         }
     }
 }
@@ -1245,11 +1250,28 @@ mod tests {
             add: [0.1, -0.2, 0.3],
             mul: [0.5, 1.5, 2.0],
             color: 0.25,
+            invertall: false,
         };
         let u = PalFxUniform::from_palfx(&fx);
         assert_eq!(u.add, [0.1, -0.2, 0.3, 0.0]);
         assert_eq!(u.mul, [0.5, 1.5, 2.0, 0.0]);
         assert_eq!(u.color, [0.25, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn palfx_uniform_packs_invertall_flag_into_color_y() {
+        // The full modulation set (T008): `invertall` rides in `color.y` as a
+        // 0.0/1.0 flag so the shader can `mix` on it without a new uniform field.
+        let on = PalFxUniform::from_palfx(&crate::params::PalFx {
+            invertall: true,
+            ..crate::params::PalFx::IDENTITY
+        });
+        assert_eq!(on.color, [1.0, 1.0, 0.0, 0.0], "invertall=true → color.y=1");
+        let off = PalFxUniform::from_palfx(&crate::params::PalFx {
+            invertall: false,
+            ..crate::params::PalFx::IDENTITY
+        });
+        assert_eq!(off.color, [1.0, 0.0, 0.0, 0.0], "invertall=false → color.y=0");
     }
 
     #[test]

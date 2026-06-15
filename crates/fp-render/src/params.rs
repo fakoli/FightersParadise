@@ -11,44 +11,55 @@ pub enum BlendMode {
 }
 
 /// A MUGEN-style per-draw color tint (the `PalFX` / `AfterImage` color effect,
-/// audit #33).
+/// audit #33; full modulation set, T008).
 ///
 /// Applied to the palette-looked-up RGBA of every pixel, in MUGEN's order:
 /// first a grayscale blend controlled by [`color`](Self::color) (`256` = full
-/// color, `0` = fully grayscale), then a per-channel multiply
-/// ([`mul`](Self::mul)), then a per-channel signed add ([`add`](Self::add)); the
-/// result is clamped back into `0.0..=1.0`. The fragment shader
-/// (`shaders/palette.wgsl`) does the per-pixel math; this struct is the CPU-side
-/// description handed to the renderer.
+/// color, `0` = fully grayscale), then an optional channel **inversion**
+/// ([`invertall`](Self::invertall), `1.0 - channel`), then a per-channel
+/// multiply ([`mul`](Self::mul)), then a per-channel signed add
+/// ([`add`](Self::add)); the result is clamped back into `0.0..=1.0`. The
+/// fragment shader (`shaders/palette.wgsl`) does the per-pixel math; this struct
+/// is the CPU-side description handed to the renderer.
 ///
 /// The values mirror MUGEN's 0–255 integer convention but are pre-normalized to
 /// the shader's `0.0..` float scale by the caller: `add` is a signed fraction
 /// (`±1.0` = ±255), `mul` is a plain multiplier (`1.0` = unchanged), and `color`
-/// is a `0.0..=1.0` color-retention fraction (`1.0` = full color). The
+/// is a `0.0..=1.0` color-retention fraction (`1.0` = full color). MUGEN's
+/// `sinadd` oscillation is **not** a field here — the caller folds the current
+/// tick's sine contribution into [`add`](Self::add) before handing the effect to
+/// the renderer (so the GPU only ever sees the resolved per-frame add). The
 /// [`IDENTITY`](Self::IDENTITY) effect (also [`Default`]) is a guaranteed no-op:
 /// a sprite drawn with it is byte-for-byte identical to one drawn before this
 /// feature existed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PalFx {
     /// Signed per-channel add applied last, as a fraction of full scale
-    /// (`±1.0` = ±255 in MUGEN units). `[0.0; 3]` adds nothing.
+    /// (`±1.0` = ±255 in MUGEN units). `[0.0; 3]` adds nothing. The caller has
+    /// already folded the current tick's `sinadd` sine contribution into this.
     pub add: [f32; 3],
-    /// Per-channel multiply applied after the grayscale blend (`1.0` =
-    /// unchanged). `[1.0; 3]` leaves the color as-is.
+    /// Per-channel multiply applied after the grayscale blend / inversion
+    /// (`1.0` = unchanged). `[1.0; 3]` leaves the color as-is.
     pub mul: [f32; 3],
     /// Color-retention fraction in `0.0..=1.0`: `1.0` keeps full color, `0.0`
     /// is fully grayscale (luminance), values between blend the two. Mirrors
     /// MUGEN's `PalFX color = 0..256`.
     pub color: f32,
+    /// MUGEN `PalFX invertall`: when `true`, each channel is inverted
+    /// (`1.0 - channel`) after the grayscale blend and **before** the multiply
+    /// and add. `false` (the default) leaves the color uninverted.
+    pub invertall: bool,
 }
 
 impl PalFx {
-    /// The identity (no-op) effect: full color, unit multiply, zero add. A
-    /// sprite drawn with this is pixel-identical to one drawn with no effect.
+    /// The identity (no-op) effect: full color, unit multiply, zero add, no
+    /// inversion. A sprite drawn with this is pixel-identical to one drawn with
+    /// no effect.
     pub const IDENTITY: Self = Self {
         add: [0.0, 0.0, 0.0],
         mul: [1.0, 1.0, 1.0],
         color: 1.0,
+        invertall: false,
     };
 
     /// Returns `true` when this effect is the identity (no-op) — every channel
@@ -118,8 +129,9 @@ impl Default for SpriteDrawParams {
 const LUMA_WEIGHTS: [f32; 3] = [0.299, 0.587, 0.114];
 
 /// Applies a [`PalFx`] tint to a single linear RGB triple, mirroring the math the
-/// fragment shader performs per pixel: grayscale blend (`color`) → multiply
-/// (`mul`) → signed add (`add`), each channel clamped back to `0.0..=1.0`.
+/// fragment shader performs per pixel: grayscale blend (`color`) → optional
+/// channel inversion (`invertall`) → multiply (`mul`) → signed add (`add`), each
+/// channel clamped back to `0.0..=1.0`.
 ///
 /// This is the CPU reference used to unit-test the tint without a GPU; the WGSL
 /// `apply_palfx` in `shaders/palette.wgsl` is the exact same sequence. An
@@ -133,8 +145,11 @@ pub fn apply_palfx(rgb: [f32; 3], fx: &PalFx) -> [f32; 3] {
         // Grayscale blend: lerp(luma, channel, color). color = 1 keeps full
         // color; color = 0 collapses to luminance.
         let blended = luma + (rgb[i] - luma) * fx.color;
+        // MUGEN `invertall` flips each channel (1 - c) after the desaturation
+        // blend and before the multiply/add.
+        let inverted = if fx.invertall { 1.0 - blended } else { blended };
         // Multiply then signed add, then clamp.
-        out[i] = (blended * fx.mul[i] + fx.add[i]).clamp(0.0, 1.0);
+        out[i] = (inverted * fx.mul[i] + fx.add[i]).clamp(0.0, 1.0);
     }
     out
 }
@@ -222,11 +237,58 @@ mod tests {
             add: [0.1, 0.1, 0.1],
             mul: [2.0, 2.0, 2.0],
             color: 0.0,
+            invertall: false,
         };
         let c = [0.2, 0.2, 0.2];
         let luma = c[0] * LUMA_WEIGHTS[0] + c[1] * LUMA_WEIGHTS[1] + c[2] * LUMA_WEIGHTS[2];
         let expected = (luma * 2.0 + 0.1).clamp(0.0, 1.0);
         let out = apply_palfx(c, &fx);
         assert!(approx(out, [expected, expected, expected]));
+    }
+
+    #[test]
+    fn invertall_flips_each_channel() {
+        // With color=1 (no desaturation), mul=1, add=0, invertall flips every
+        // channel to (1 - c).
+        let fx = PalFx {
+            invertall: true,
+            ..PalFx::IDENTITY
+        };
+        let c = [0.2, 0.5, 0.9];
+        let out = apply_palfx(c, &fx);
+        assert!(approx(out, [0.8, 0.5, 0.1]), "invertall = 1 - channel");
+    }
+
+    #[test]
+    fn invertall_runs_before_mul_and_add() {
+        // Documented order: invert → mul → add. Invert 0.25 → 0.75, *2 → 1.5,
+        // +(-0.1) → 1.4, clamp → 1.0 on a high channel; check a mid channel too.
+        let fx = PalFx {
+            invertall: true,
+            mul: [2.0, 2.0, 2.0],
+            add: [-0.1, -0.1, -0.1],
+            color: 1.0,
+        };
+        let out = apply_palfx([0.25, 0.6, 0.6], &fx);
+        // ch0: (1-0.25)=0.75, *2=1.5, -0.1=1.4 → clamp 1.0
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        // ch1/2: (1-0.6)=0.4, *2=0.8, -0.1=0.7
+        assert!((out[1] - 0.7).abs() < 1e-5);
+        assert!((out[2] - 0.7).abs() < 1e-5);
+    }
+
+    #[test]
+    fn invertall_composes_with_grayscale_blend() {
+        // color=0 collapses to luma, THEN invertall flips that luma.
+        let fx = PalFx {
+            invertall: true,
+            color: 0.0,
+            ..PalFx::IDENTITY
+        };
+        let c = [0.2, 0.5, 0.9];
+        let luma = c[0] * LUMA_WEIGHTS[0] + c[1] * LUMA_WEIGHTS[1] + c[2] * LUMA_WEIGHTS[2];
+        let out = apply_palfx(c, &fx);
+        let inv = 1.0 - luma;
+        assert!(approx(out, [inv, inv, inv]));
     }
 }
