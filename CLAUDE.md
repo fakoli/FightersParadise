@@ -94,7 +94,7 @@ presentation features are partial/asset-blocked — see "Architecture Notes" and
 | `fp-render` | 46 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent), PalFX color-tint uniform, debug-box + `draw_text`/glyph primitives. |
 | `fp-core` | 20 | Implemented | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |
 | `fp-stage` | 13 | Implemented | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax camera render in `fp-app`. (Tile/velocity/mask/`type=anim` and vertical-follow parsed-not-rendered; no real stage fixture.) |
-| `fp-ui` | 17 | Implemented | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it (falls back to the quad HUD when absent). ([Combo]/[Face] parsed-not-drawn; single bg layer; no real fixture.) |
+| `fp-ui` | 17 | Implemented | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it (falls back to the quad HUD when absent). ([Combo] parsed-not-drawn; single bg layer; no real fixture.) |
 
 ~59,000 LOC across 14 crates. Dependency graph: `fp-app` → `fp-engine` → `fp-character` → `fp-vm` /
 `fp-combat` / `fp-physics` / `fp-input`; `fp-combat` depends only on `fp-core` + `fp-physics`; everything

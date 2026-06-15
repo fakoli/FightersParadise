@@ -2,7 +2,8 @@
 //!
 //! UI and motif system for the Fighters Paradise engine: the in-fight HUD
 //! rendered from a MUGEN `fight.def`/`fight.sff` **screenpack** (life bars, power
-//! bars, fighter names, round announcer, timer), instead of hand-rolled quads.
+//! bars, fighter portraits, names, round announcer, timer), instead of
+//! hand-rolled quads.
 //!
 //! Two layers:
 //!
@@ -27,7 +28,9 @@ pub mod screenpack;
 pub mod select_def;
 pub mod system_def;
 
-pub use renderer::{bar_fill_uv, clamp_fraction, combo_text, MatchHudState, ScreenpackHud};
+pub use renderer::{
+    bar_fill_uv, clamp_fraction, combo_text, face_draw_pos, MatchHudState, ScreenpackHud,
+};
 pub use screenpack::{
     ComboLayout, FaceSide, LifebarSide, NameSide, Pos, PowerbarSide, RoundLayout, ScreenpackLayout,
     SpriteRef, TextElem, TimeLayout,

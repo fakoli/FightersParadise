@@ -7,7 +7,7 @@
 //! [`ScreenpackHud::build`]. Each frame, [`ScreenpackHud::draw`] takes a small
 //! [`MatchHudState`] (life/power fractions, names, round/KO/timer) and issues
 //! [`RenderFrame::draw_sprite`] / [`RenderFrame::draw_text`] calls to paint the
-//! life bars, power bars, names, round announcer, and timer.
+//! life bars, power bars, fighter portraits, names, round announcer, and timer.
 //!
 //! The bar-fill geometry ([`bar_fill_uv`], [`clamp_fraction`]) is pure and
 //! unit-tested; the GPU draw is a thin loop over it. `MatchHudState` is a plain
@@ -23,7 +23,7 @@ use fp_render::{
     TextDrawParams,
 };
 
-use crate::screenpack::{LifebarSide, PowerbarSide, ScreenpackLayout, SpriteRef};
+use crate::screenpack::{FaceSide, LifebarSide, PowerbarSide, ScreenpackLayout, SpriteRef};
 
 /// Live, per-frame HUD inputs the screenpack renderer needs, decoupled from any
 /// engine type so this crate does not depend on `fp-engine`.
@@ -123,10 +123,11 @@ impl ScreenpackHud {
     /// Draws the whole screenpack HUD for the current frame.
     ///
     /// Order: P1 then P2 life bars (every `bg0..bgN` background layer → mid →
-    /// front fill), power bars, fighter names, the timer, the round announcer,
-    /// and — while a combo is active — the combo counter. Missing sprites/fonts
-    /// are silently skipped (logged once at build), so a partial screenpack still
-    /// renders whatever it does define.
+    /// front fill), power bars, fighter portraits ([`crate::screenpack::FaceSide`]),
+    /// fighter names, the timer, the round announcer, and — while a combo is
+    /// active — the combo counter. Missing sprites/fonts are silently skipped
+    /// (logged once at build), so a partial screenpack still renders whatever it
+    /// does define.
     pub fn draw(&self, frame: &mut RenderFrame<'_>, state: &MatchHudState) {
         // Life bars.
         self.draw_lifebar(frame, &self.layout.p1_lifebar, state.p1_life);
@@ -134,6 +135,9 @@ impl ScreenpackHud {
         // Power bars.
         self.draw_powerbar(frame, &self.layout.p1_powerbar, state.p1_power);
         self.draw_powerbar(frame, &self.layout.p2_powerbar, state.p2_power);
+        // Fighter portraits ([Face]).
+        self.draw_face(frame, &self.layout.p1_face);
+        self.draw_face(frame, &self.layout.p2_face);
         // Names.
         self.draw_text_slot(
             frame,
@@ -205,6 +209,20 @@ impl ScreenpackHud {
         }
         self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
         self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
+    }
+
+    /// Draws one player's portrait ([`FaceSide`]) at its parsed position.
+    ///
+    /// The draw position is the face's `pos` plus the sprite's `offset` (computed
+    /// purely by [`face_draw_pos`]); the portrait is drawn at full size (scale
+    /// `1.0`). A face with no sprite reference, or whose sprite failed to upload,
+    /// draws nothing.
+    fn draw_face(&self, frame: &mut RenderFrame<'_>, face: &FaceSide) {
+        let Some(r) = face.spr else { return };
+        let Some(gpu) = self.sprites.get(&(r.group, r.image)) else { return };
+        let (x, y) = face_draw_pos(face);
+        let params = SpriteDrawParams { x, y, ..Default::default() };
+        frame.draw_sprite(&gpu.texture, &gpu.palette, &params);
     }
 
     /// Draws a bar's front-fill sprite clipped to `frac` of `range`.
@@ -393,6 +411,24 @@ pub fn bar_fill_uv(range: (i32, i32), frac: f32, sprite_w: f32) -> ([f32; 4], f3
     }
 }
 
+/// Computes the screen position at which a player's portrait ([`FaceSide`]) is
+/// drawn: the face's anchor `pos` plus the sprite reference's `offset`.
+///
+/// Returns `(x, y)` in screen pixels. The portrait is drawn at full size (scale
+/// `1.0`); MUGEN screenpack `[Face]` elements carry no per-face scale, so the
+/// position is the only placement input. A face with no sprite reference still
+/// resolves to its bare `pos` (the renderer just skips the draw).
+///
+/// Pure and unit-tested — no GPU. Mirrors the `pos + offset` placement the
+/// renderer uses for every other screenpack sprite.
+pub fn face_draw_pos(face: &FaceSide) -> (f32, f32) {
+    let (ox, oy) = match face.spr {
+        Some(r) => (r.offset.x, r.offset.y),
+        None => (0, 0),
+    };
+    ((face.pos.x + ox) as f32, (face.pos.y + oy) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +545,69 @@ mod tests {
         assert_eq!(combo_text(2).as_deref(), Some("2 Hits"));
         assert_eq!(combo_text(5).as_deref(), Some("5 Hits"));
         assert_eq!(combo_text(99).as_deref(), Some("99 Hits"));
+    }
+
+    #[test]
+    fn face_draw_pos_places_p1_and_p2_portraits() {
+        // A parsed [Face] for each player resolves to its anchor pos + sprite
+        // offset — the position the renderer draws the portrait at.
+        use crate::screenpack::{FaceSide, Pos};
+        let p1 = FaceSide {
+            spr: Some(SpriteRef { group: 9000, image: 0, offset: Pos::new(1, 2) }),
+            pos: Pos::new(12, 12),
+        };
+        let p2 = FaceSide {
+            spr: Some(SpriteRef { group: 9000, image: 0, offset: Pos::default() }),
+            pos: Pos::new(308, 12),
+        };
+        // P1: pos (12,12) + offset (1,2) = (13, 14).
+        assert_eq!(face_draw_pos(&p1), (13.0, 14.0));
+        // P2: pos (308,12) + no offset = (308, 12); distinct from P1's spot.
+        assert_eq!(face_draw_pos(&p2), (308.0, 12.0));
+        assert_ne!(
+            face_draw_pos(&p1),
+            face_draw_pos(&p2),
+            "the two players' portraits sit at different screen positions"
+        );
+    }
+
+    #[test]
+    fn face_draw_pos_without_sprite_is_bare_pos() {
+        // No sprite ref -> position is just the anchor (the renderer skips drawing).
+        use crate::screenpack::{FaceSide, Pos};
+        let face = FaceSide { spr: None, pos: Pos::new(40, 50) };
+        assert_eq!(face_draw_pos(&face), (40.0, 50.0));
+    }
+
+    #[test]
+    fn parsed_face_layout_drives_p1_p2_placement() {
+        // End-to-end: a [Face] section parsed from a fight.def yields P1/P2
+        // portraits placed at the correct (pos + offset) positions for each side.
+        use crate::screenpack::Pos;
+        use fp_formats::def::DefFile;
+        let def = DefFile::from_str(
+            "[Face]\n\
+             p1.pos    = 12, 12\n\
+             p1.spr    = 9000, 0\n\
+             p1.offset = 1, 1\n\
+             p2.pos    = 308, 12\n\
+             p2.spr    = 9000, 0\n\
+             p2.offset = 0, 0\n",
+        )
+        .unwrap();
+        let layout = ScreenpackLayout::parse(&def);
+        // Both players have a portrait sprite parsed.
+        assert_eq!(
+            layout.p1_face.spr,
+            Some(SpriteRef { group: 9000, image: 0, offset: Pos::new(1, 1) })
+        );
+        assert_eq!(
+            layout.p2_face.spr,
+            Some(SpriteRef { group: 9000, image: 0, offset: Pos::default() })
+        );
+        // And each side draws at its parsed (pos + offset) position.
+        assert_eq!(face_draw_pos(&layout.p1_face), (13.0, 13.0));
+        assert_eq!(face_draw_pos(&layout.p2_face), (308.0, 12.0));
     }
 
     #[test]
