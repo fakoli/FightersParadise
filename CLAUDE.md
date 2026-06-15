@@ -4,14 +4,21 @@ A clean-room reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen
 fighting engine in Rust, aiming for a **completely customizable fighting-game engine**: bring your own
 characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 
-> **Current state (not v0.1.0 stubs):** this is a **playable two-character fighter**. `fp-app` renders a
-> two-character `fp_engine::Match` (P1 = keyboard), a life HUD, KO/winner readout, and best-of-3 rounds,
-> driven by **real Kung Fu Man data**. KFM's signature throw, supers (meter), hitpause, i-frames, hit
-> reactions, jump/airjump/land, and damage multipliers all work end to end. **No crate is a true stub
-> anymore** — `fp-stage` (parallax backgrounds), `fp-ui` (`fight.def` screenpack), and `fp-storyboard`
-> (intro/ending playback) have all graduated; several presentation features are wired but
-> partial/asset-blocked. See [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md)
-> for what's missing.
+> **Current state (not v0.1.0 stubs):** a **playable two-character fighter that now renders on screen.**
+> `fp-app` draws a two-character `fp_engine::Match` (P1 = keyboard) **over a full-color stage background**,
+> with a life HUD, KO/winner readout, and best-of-3 rounds. The engine logic — throws, supers (meter),
+> hitpause, i-frames, hit reactions, jump/airjump/land, damage multipliers — is implemented and
+> unit-tested (~2210 tests).
+>
+> ⚠️ **Visual rendering was a latent gap until 2026-06-15** — important context before trusting older
+> "it renders" claims. A live run (driven via compute-use; see "Live-debugging the windowed app" below)
+> showed the sprite vertex buffer overwrote every quad but the last, so **fighters never appeared** —
+> CPU tests passed but the screen was wrong. `#40` fixed it (bump-allocation) and `#41` added the
+> full-color RGBA stage-background path. Now: **SFF v1 characters (the bundled `evilken`) render in full
+> color**; **`KFM` is SFF v2 and currently renders as black silhouettes** — its sprites decode and the
+> shapes are correct, but the v2 palette parser is buggy (open task #32; precise root cause in the
+> **newest `docs/handoffs/` file**). **No crate is a true stub** — `fp-stage`, `fp-ui`, `fp-storyboard`
+> graduated. See [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md).
 
 ## Build & Run
 
@@ -29,14 +36,41 @@ cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
   injects `rustflags = ["-L", "/opt/homebrew/lib"]` for `aarch64-apple-darwin`, so no manual flags are
   needed locally. If you must set it by hand: `RUSTFLAGS="-L /opt/homebrew/lib"`.
 - **Linux prerequisite:** `apt install libsdl2-dev`.
-- No args runs the default two-KFM match from `DEFAULT_DEF = "test-assets/kfm/kfm.def"` (main.rs:71),
-  degrading to a checkerboard test pattern if KFM is absent. Bad/missing assets never panic.
+- **No args** boots the in-app **Title menu** (`cli_route` → `CliRoute::Menu`; main.rs ~2338) over the
+  shipped clean-room `assets/data/{system,select}.def` motif. Passing a **`.def` boots a direct match**
+  (`cargo run -p fp-app -- <char.def>` — same char both sides; `CliRoute::Direct`), bypassing the menu —
+  this is the fast path for rendering/visual work. Bad/missing assets never panic (test-pattern fallback).
 - A convenience Makefile (thin `cargo` wrappers: `make build`/`run`/`run-kfm`/`run-sprite`/`test`/`test-fast`/
   `check`/`clippy`/`fmt`/`fmt-check`/`doc`/`clean`/`ci`) and `scripts/fp.sh` (windowed-game start/stop/
   restart/status supervisor) exist; there is **no** justfile or xtask. Every `make` target is a plain `cargo`
   command, so anything in the Makefile can also be run by hand.
   Note: CI does **not** gate on `cargo fmt --check` (the `ci` workflow runs clippy + tests; the codebase
   isn't rustfmt-clean — backlog CB3). The Makefile's `fmt-check` target exists but is not wired into CI.
+
+### Live-debugging the windowed app (how to actually SEE what it renders)
+
+Rendering bugs are invisible to `cargo test` — `fp-render` has no headless GPU readback, so the suite can
+pass while the screen is blank (that is exactly how the fighters-don't-render bug survived). To verify
+visual behaviour you must look at the real window. The proven workflow (macOS, used for #40/#41):
+
+1. **Launch a direct match** so you skip the menu and it renders immediately:
+   `RUST_LOG=error ./target/debug/fp-app test-assets/evilken/evilken.def &` (build first; `evilken` is
+   SFF v1 and renders in full color — use it, not KFM, until task #32 lands).
+2. **You cannot use computer-use screenshots on this window.** `fp-app` is a bare `cargo` binary, so
+   `request_access` returns `not_installed` and computer-use's compositor filter hides it. Instead:
+   - Window geometry: `osascript -e 'tell application "System Events" to tell process "fp-app" to get
+     {position, size} of window 1'` → `x, y, w, h`.
+   - Capture it: **`screencapture -x -R x,y,w,h /tmp/s.png`** (macOS's own tool ignores the filter), then
+     `Read` the PNG. Needs **Screen Recording** granted to Claude (System Settings → Privacy & Security;
+     takes effect after a relaunch).
+3. **Instrument the draw path** with an env-gated `eprintln!` (e.g. `FP_DBG`) in `draw_player` /
+   `get_or_create_sprite` / `SffFile::palette` when a sprite is missing/black — that is how the
+   vertex-overwrite and the KFM v2 palette bugs were pinned. Revert the instrumentation before committing.
+4. **Generate image assets with nanobanana** (backgrounds, etc.):
+   `~/.claude/plugins/marketplaces/fakoli-plugins/plugins/nano-banana-pro/.venv/bin/python
+   .../skills/generate/scripts/nanobanana.py gen --prompt "..." --out x.png --aspect 4:3 --size 2K`
+   (subcommand is **`gen`**, not `generate`; `GEMINI_API_KEY` is in env; output is JPEG-in-`.png`, so run
+   `sips -s format png ...` to get a real PNG the `png` crate can decode).
 
 ## Project Structure
 
@@ -119,6 +153,7 @@ These are the keystones a new session (or maintainer) must understand first.
 | SFF orchestration + version detect + decode dispatch (`decode_sprite_rgba`) | `crates/fp-formats/src/sff/mod.rs` |
 | SFF codecs (RLE8/RLE5/LZ5 + PNG8/24/32 decode) | `crates/fp-formats/src/sff/compression.rs` |
 | SFF v1 PCX container + trailing-palette extraction | `crates/fp-formats/src/sff/v1.rs` |
+| **SFF palette resolution (`palette()`) + v2 palette sub-headers** — the KFM v2 silhouette bug lives here (task #32: v2 palettes read RGBA, `palette()` only does v1 RGB→RGBA; small per-sprite palettes also point at a wrong LData offset) | `crates/fp-formats/src/sff/{mod.rs,palette.rs}` |
 | CNS parser (largest text parser) | `crates/fp-formats/src/cns.rs` |
 | AIR / CMD / DEF / SND parsers | `crates/fp-formats/src/{air,cmd,def,snd}.rs` |
 | FNT v1 bitmap-font parser + ACT palette parser | `crates/fp-formats/src/{fnt,act}.rs` |
@@ -126,8 +161,8 @@ These are the keystones a new session (or maintainer) must understand first.
 | Input ring buffer | `crates/fp-input/src/buffer.rs` |
 | Physics integration + ground plane | `crates/fp-physics/src/lib.rs` |
 | AABB collision + `place_clsn` facing mirror | `crates/fp-physics/src/collision.rs` |
-| wgpu renderer + 3 blend pipelines + debug-box primitive | `crates/fp-render/src/renderer.rs` |
-| Palette-lookup + PalFX-tint fragment shader | `crates/fp-render/src/shaders/palette.wgsl` |
+| wgpu renderer + blend pipelines + **per-quad bump-allocated vertex buffer** (`draw_textured_quad`, `MAX_SPRITE_QUADS`; the #40 fix) + **RGBA image path** (`ImageTexture`, `pipeline_image`, `draw_image` — the #41 stage-background path) | `crates/fp-render/src/renderer.rs` |
+| Palette-lookup + PalFX-tint fragment shader; RGBA image shader (`image.wgsl`) | `crates/fp-render/src/shaders/{palette,image}.wgsl` |
 | Text / glyph rendering (`draw_text`) | `crates/fp-render/src/text.rs` |
 | Audio backend + cut-off policy | `crates/fp-audio/src/system.rs` |
 | Stage `[BGDef]`/`[BG]`/`[Camera]` parser + parallax model | `crates/fp-stage/src/lib.rs` |
