@@ -685,6 +685,39 @@ impl LoadedCharacter {
         self.palettes.len()
     }
 
+    /// The default costume palette index, or `None` to use the SFF-embedded
+    /// palette.
+    ///
+    /// MUGEN's default costume is the character's first `pal.defaults` entry (or
+    /// `pal1` when none is given): when a character ships external `.act` palettes
+    /// the engine renders *that* palette by default, **not** the SFF-embedded one.
+    /// Many CvS-style characters (e.g. evilken) store an indexed SFF whose embedded
+    /// palette is a dark placeholder and put the real costume colors in
+    /// `pal1` (`<name>.act`); without this default they render near-black.
+    ///
+    /// Returns the index of the lowest-numbered present `.act` slot whenever any
+    /// `.act` palette was loaded, and `None` otherwise. The loader fills
+    /// [`palettes`](Self::palettes) in ascending slot order so this is index 0
+    /// today, but the index is resolved by minimum `slot` rather than hardcoded —
+    /// the "lowest slot is index 0" invariant stays enforced even if the load order
+    /// ever changes. A character that ships **no** `.act` palettes (e.g. Kung Fu
+    /// Man, whose costume lives in the SFF itself) keeps the SFF-embedded palette,
+    /// byte-identical to before this default existed.
+    ///
+    /// This honors `pal.defaults` only to the precision of "the lowest present
+    /// slot"; the rare character whose `pal.defaults` prefers a slot other than its
+    /// lowest still defaults to its lowest loaded slot. That is exact for the
+    /// common case (a leading `pal.defaults = 1, …` with `pal1` present) and is a
+    /// documented, costume-only approximation otherwise.
+    #[must_use]
+    pub fn default_palette_index(&self) -> Option<usize> {
+        self.palettes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.slot)
+            .map(|(i, _)| i)
+    }
+
     /// Compiles this character's `.cmd` command list into a
     /// [`fp_input::CommandDef`] vector ready to feed a
     /// [`fp_input::CommandMatcher`].
@@ -2503,6 +2536,49 @@ mod tests {
             .filter_map(|i| loaded.override_palette(Some(i)))
             .any(|p| p != p0);
         assert!(differs, "all evilken .act palettes were identical");
+
+        // Because evilken ships `.act` palettes, its DEFAULT costume is pal1
+        // (index 0), not the SFF-embedded palette. This is the black-screen fix:
+        // the app defaults `active_palette` to this index so evilken renders in
+        // color instead of near-black.
+        assert_eq!(loaded.default_palette_index(), Some(0));
+
+        // And pal1 (the default costume) is a REAL, colorful palette — summing the
+        // RGB channels across all 256 entries gives substantial total brightness,
+        // unlike the near-black placeholder a CvS-style SFF embeds. This is *why*
+        // defaulting to pal1 fixes the black render.
+        let rgb_sum: u64 = p0
+            .chunks_exact(4)
+            .map(|px| u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]))
+            .sum();
+        assert!(
+            rgb_sum > 10_000,
+            "evilken pal1 should be a colorful costume (rgb_sum={rgb_sum}), not near-black"
+        );
+    }
+
+    /// `default_palette_index` is `None` for a character that ships no `.act`
+    /// palettes (e.g. Kung Fu Man, whose costume lives in the SFF), so such a
+    /// character keeps its SFF-embedded palette. Gated on the local KFM asset.
+    #[test]
+    fn default_palette_index_none_without_act_palettes() {
+        let def = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-assets")
+            .join("kfm/kfm.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let Ok(loaded) = LoadedCharacter::load(&def) else {
+            eprintln!("skipping: kfm.def failed to load");
+            return;
+        };
+        assert_eq!(loaded.palette_count(), 0, "KFM ships no .act palettes");
+        assert_eq!(
+            loaded.default_palette_index(),
+            None,
+            "a character without .act palettes must keep the SFF-embedded palette"
+        );
     }
 
     // ---- AC1: load_constants reads [Data] and falls back per-field ----
