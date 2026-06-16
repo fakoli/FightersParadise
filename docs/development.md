@@ -7,14 +7,20 @@ session) needs to get productive fast. For design background see
 [Known Issues](known-issues.md) and the [Roadmap](roadmap.md); for contribution
 conventions see the root [CONTRIBUTING](../CONTRIBUTING.md).
 
-> **Project state (not early stubs):** this is a **playable two-character
-> fighter** driven by real Kung Fu Man data — KFM's throw, supers (meter),
-> hitpause, i-frames, hit reactions, jump/airjump/land, and damage multipliers
-> all work end to end. **No crate is a true stub anymore** — `fp-stage`,
-> `fp-ui`, and `fp-storyboard` have all graduated (several presentation features
-> are wired but partial or asset-blocked). The root
-> [CHANGELOG.md](../CHANGELOG.md) and `docs/knowledge-base/04-codebase-review.md`
-> are **stale** — trust the source, [CLAUDE.md](../CLAUDE.md), and this doc.
+> **Project state (v1.0, 2026-06-15 and later):** this is a **complete,
+> playable fighting game**, not just an engine. From the **Title screen** you
+> flow through character select → stage select → fight, plus a Setup/Options
+> screen with live key remapping and HUD / life-power-bar customization.
+> Bring-your-own content is **discovered from directories** the MUGEN way (a
+> `chars/` roster, a `stages/` folder, `data/<motif>/` screenpacks). Characters
+> now walk, run, and jump correctly — bare velocity consts resolve since PRs
+> #98/#99. A **GUI-free behavioral test harness** (motion synthesizer, range-of-
+> motion table, evilken move-execution) runs fully headless without a window.
+> **No crate is a stub anymore** — `fp-stage`, `fp-ui`, and `fp-storyboard`
+> have all graduated (several presentation features are wired but partial or
+> asset-blocked). The root [CHANGELOG.md](../CHANGELOG.md) and
+> `docs/knowledge-base/04-codebase-review.md` are **stale** — trust the source,
+> [CLAUDE.md](../CLAUDE.md), and this doc.
 
 ## Prerequisites
 
@@ -104,10 +110,10 @@ targets:
 | `make clean` | `cargo clean` (removes `target/`) |
 | `make ci` | Local gate: `clippy -D warnings` + `fmt-check` + `test` |
 
-> `make ci` runs `fmt-check`, but **GitHub CI does not** yet — adopting
-> `rustfmt` is tracked as backlog CB3, so do not be surprised if `make ci`
-> flags formatting that CI is green on. `make ci` is therefore *stricter* than
-> GitHub CI. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+> CI now gates on `cargo fmt --all --check` (backlog CB3, done). `make ci`
+> matches CI exactly: `fmt-check` + `clippy -D warnings` + `test`. Run `make fmt`
+> before committing to stay clean.
+> See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
 ## scripts/fp.sh — windowed-game process control
 
@@ -199,26 +205,76 @@ fixtures. See the [clean-room constraints](#worktree-discipline--clean-room).
 ## Testing
 
 ```sh
-make test                       # full workspace suite (~2045 pass incl. doc-tests)
+make test                       # full workspace suite (~2644 pass incl. doc-tests)
 cargo test --workspace          # the same, by hand
 make test-fast CRATE=fp-vm      # one crate, fast iteration
 make test-fast                  # all crates' lib/bin unit tests only (skips integration + doc tests)
 ```
 
-The suite is large and green: ~2,045 tests pass (~2,000 `#[test]` attributes plus
+The suite is large and green: ~2,644 tests pass (~2,600 `#[test]` attributes plus
 doc-tests). Rough per-crate share:
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `fp-character` | 692 | `fp-input` | 103 |
-| `fp-vm` | 491 | `fp-engine` | 121 |
+| `fp-character` | 792 | `fp-input` | 210 |
+| `fp-vm` | 501 | `fp-engine` | 121 |
 | `fp-formats` | 182 | `fp-physics` | 90 |
 | `fp-combat` | 84 | `fp-app` | 89 |
-| `fp-storyboard` | 63 | `fp-audio` | 34 |
+| `fp-storyboard` | 65 | `fp-audio` | 34 |
 | `fp-render` | 46 | `fp-core` | 20 |
 | `fp-stage` | 13 | `fp-ui` | 17 |
 
 (Every crate now has tests — `fp-stage` and `fp-ui` graduated from stubs.)
+
+### GUI-free behavioral test harness
+
+The engine now has a **headless, CI-runnable behavioral test harness** that does
+not require an SDL2 window. It asserts in-game motion and move behavior using
+the engine's own input path.
+
+Three layers, all running under plain `cargo test --workspace`:
+
+1. **Motion synthesizer** (`fp-input` — `fp_input::synth::synthesize_motion`):
+   lowers a `CommandDef` (a parsed `.cmd` motion like `~D,DF,F,a`) into a
+   frame-by-frame `Vec<InputState>`. The synthesizer is **self-validating**: its
+   own unit tests replay every synthesized motion through the real
+   `CommandMatcher` and assert the command fires. Covers QCF, DP, charge,
+   double-QCF, and `+`-simultaneous motions with synthetic `CommandDef`s — no
+   assets required.
+
+2. **Range-of-motion table** (`fp-character` — `tests::trainingdummy_range_of_motion_table`):
+   a table-driven test on the shipped **training dummy** (no `test-assets`
+   needed) that feeds each locomotion command to a `Character` via
+   `ActiveCommands::from_names` and asserts the resulting state/pos/vel:
+
+   | Command | Expected state | Assertion |
+   | ------- | -------------- | --------- |
+   | `holdfwd` | walk (20) | `pos.x` increases |
+   | `holdback` | walk (20) | `pos.x` decreases |
+   | `holddown` | crouch (10/11) | `pos.y` unchanged |
+   | `holdup` | jump start (40) | `pos.y` decreases (rises) |
+   | `holdup`+`holdfwd` | jump fwd (40) | `pos.x` increases, `pos.y` decreases |
+   | `holdup`+`holdback` | jump back (40) | `pos.x` decreases, `pos.y` decreases |
+
+3. **Move-execution test** (`fp-engine`, `tests/evilken_moves.rs` — asset-gated):
+   enumerates every command declared in `evilken.cmd`, synthesizes its motion as
+   `MatchInput` frames, feeds them through `Match::tick` (the **real**
+   `CommandMatcher` path), and asserts `move_type == Attack`. Supers are
+   exercised with `power = power_max` (3000). Skips cleanly when
+   `test-assets/evilken/` is absent (same gate as the KFM real-content tests).
+
+**Running them:**
+
+```sh
+cargo test --workspace                   # all three run; evilken skips without test-assets
+cargo test -p fp-input synth             # motion-synthesizer unit tests only
+cargo test -p fp-character range_of_motion  # table-driven locomotion test
+# with evilken linked:
+cargo test -p fp-engine evilken          # move-execution test (requires test-assets/evilken/)
+```
+
+The design doc is at
+[`docs/knowledge-base/2026-06-16-behavioral-test-harness.md`](knowledge-base/2026-06-16-behavioral-test-harness.md).
 
 ### Real-content tests are gated
 
@@ -248,29 +304,28 @@ push/PR to `main`:
 
 1. `actions/checkout`
 2. Install `libsdl2-dev`
-3. Install the **stable** toolchain + `clippy` component
-4. Cargo cache (`Swatinem/rust-cache`)
-5. **Clippy** — `cargo clippy --workspace --all-targets -- -D warnings`
-6. **Build** — `cargo build --workspace`
-7. **Test** — `cargo test --workspace`
+3. Install the **stable** toolchain + `clippy` + `rustfmt` components
+4. **Rustfmt** — `cargo fmt --all --check` (backlog CB3, done)
+5. Cargo cache (`Swatinem/rust-cache`)
+6. **Clippy** — `cargo clippy --workspace --all-targets -- -D warnings`
+7. **Build** — `cargo build --workspace`
+8. **Test** — `cargo test --workspace`
+9. **Validate shipped training dummy** — `cargo run -p fp-app -- validate assets/trainingdummy/trainingdummy.def`
 
 Notes:
 
 - Warnings are denied via the **`RUSTFLAGS: "-D warnings"` env var** set globally
   in the workflow, not by the clippy flag alone.
-- There is **no `cargo fmt --check` gate** (codebase isn't rustfmt-clean yet;
-  backlog **CB3**). `make ci` runs `fmt-check` locally, so it's stricter than CI.
+- `cargo fmt --all --check` is a CI gate: the workspace is rustfmt-clean; run
+  `make fmt` before committing.
 - See above for the **#36 asset-gate**: real-content tests are no-ops on CI.
 
 ### Before you push
 
-Run the same gate CI enforces (clippy + build + test), plus formatting if you
-intend to keep the tree fmt-clean:
+Run the same gate CI enforces:
 
 ```sh
-make ci          # clippy -D warnings + fmt-check + test (stricter than CI)
-# or the CI-exact subset:
-make clippy && make build && make test
+make ci          # fmt-check + clippy -D warnings + test — matches CI exactly
 ```
 
 ## How this codebase was built — the reviewed agent build-loop
@@ -323,9 +378,13 @@ These two rules are non-negotiable.
 
 - **No Elecbyte/MUGEN engine source or copyrighted assets are shipped or
   tracked.** This is a clean-room reimplementation.
-- `git ls-files` shows **zero** `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
-  files. The only tracked binary asset is the project's own `assets/banner.png`.
-  `.gitignore` blanket-ignores `*.sff`, `*.snd`, `*.fnt`, and `/test-assets`.
+- `git ls-files` shows **zero third-party** `.sff/.air/.cmd/.cns/.def/.snd/.fnt/.pcx/.act`
+  files. The only tracked originals are: `assets/banner.png`, the original
+  `assets/trainingdummy/` conformance character (MIT), the clean-room
+  `assets/data/` effects/font/common-states (`fightfx.sff`, `font.fnt`,
+  `common1.cns`), and the shipped default motif `assets/data/system.def` /
+  `assets/data/select.def`. `.gitignore` blanket-ignores `*.sff`, `*.snd`,
+  `*.fnt`, and `/test-assets`, with targeted exceptions for the originals above.
 - Real **KFM** content (CC BY-NC 3.0, Elecbyte) is **local-only**, reached
   through the gitignored `test-assets` symlink. **Never commit or ship it.**
   Provenance/licensing is in `test-assets/SOURCES.md` (behind the symlink).
@@ -345,7 +404,7 @@ depends on `fp-core`. Full design overview: [Architecture](architecture.md).
 | `fp-character` | Implemented (largest) | `crates/fp-character/src/loader.rs` · `executor.rs` · `lib.rs` · `combat.rs` | `.def`→`LoadedCharacter` loader, live `Character` entity, per-tick MUGEN-order executor (~40 controllers), cross-entity `EvalCtx` keystone, and the `resolve_attack` hit-application bridge. |
 | `fp-vm` | Implemented | `crates/fp-vm/src/lexer.rs` · `parser.rs` · `evaluator.rs` · `eval.rs` | CNS trigger-expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). `Value` model + `EvalContext` trait seam. |
 | `fp-formats` | Implemented | `crates/fp-formats/src/sff/mod.rs` · `cns.rs` | Parsers: SFF v1 (PCX **+ trailing-palette extraction**) + v2 (RLE8/RLE5/LZ5/raw **+ PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, SND, **FNT v1, ACT palette**. |
-| `fp-input` | Implemented | `crates/fp-input/src/command.rs` · `buffer.rs` | 60-frame ring buffer + backward-scan command matcher (`~` `/` `$` `>` `+`). |
+| `fp-input` | Implemented | `crates/fp-input/src/command.rs` · `buffer.rs` · `synth.rs` | 60-frame ring buffer + backward-scan command matcher (`~` `/` `$` `>` `+`) + `synth::synthesize_motion` (the GUI-free behavioral test harness motion synthesizer). |
 | `fp-engine` | Implemented | `crates/fp-engine/src/lib.rs` | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op (`Target*`) application. |
 | `fp-physics` | Implemented | `crates/fp-physics/src/lib.rs` · `collision.rs` · `push.rs` | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. (No friction — that's `fp-character`.) |
 | `fp-combat` | Implemented | `crates/fp-combat/src/lib.rs` | Pure leaf: `HitDef` data model, `Clsn1`×`Clsn2` `detect_hit`, pure `resolve_hit` → `HitOutcome`. No mutation. |
@@ -382,3 +441,6 @@ depends on `fp-core`. Full design overview: [Architecture](architecture.md).
 - [Roadmap](roadmap.md) — what's planned next.
 - [knowledge-base/](knowledge-base/) — MUGEN research, execution-plan ledger,
   evaluator semantics, faithfulness audit.
+- [knowledge-base/2026-06-16-behavioral-test-harness.md](knowledge-base/2026-06-16-behavioral-test-harness.md)
+  — design doc for the GUI-free behavioral test harness (motion synthesizer, range-of-motion table,
+  evilken move-execution test, headless render readback proposal).

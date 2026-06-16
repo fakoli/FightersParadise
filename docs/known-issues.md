@@ -8,8 +8,9 @@ plan, this is the current honest state.
 ## v1.0 follow-ups (non-blocking)
 
 The v1.0 build (full front-end + directory discovery + HUD customization) is
-feature-complete and green (~2621 tests). These rough edges were surfaced by the
-final-review pass and live validation; none crash the engine:
+feature-complete and green (~2644 tests as of the behavioral-test-harness run).
+These rough edges were surfaced by the final-review pass and live validation;
+none crash the engine:
 
 - **`stages/` under a game-root directory argument is not yet auto-discovered.**
   Pointing `fp-app` at a game root resolves `chars/` and `data/` (motifs), but
