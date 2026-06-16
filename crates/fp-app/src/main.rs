@@ -276,10 +276,10 @@ fn run_import(args: &[String]) -> i32 {
             }
             for repair in &overlay.repairs {
                 tracing::info!(
-                    "import: {}:{} {} — {}",
+                    "import: {}:{} {:?} — {}",
                     src.display(),
                     repair.line_no,
-                    repair.kind.label(),
+                    repair.kind,
                     repair.original.trim()
                 );
             }

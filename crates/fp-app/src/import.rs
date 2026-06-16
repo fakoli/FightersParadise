@@ -64,19 +64,6 @@ pub enum RepairKind {
     MalformedHeader,
 }
 
-impl RepairKind {
-    /// A short, stable human label for the category (used in reports).
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            RepairKind::StrayLine => "StrayLine",
-            RepairKind::EmptyKey => "EmptyKey",
-            RepairKind::ColonHeader => "ColonHeader",
-            RepairKind::MalformedHeader => "MalformedHeader",
-        }
-    }
-}
-
 /// A single repair the overlay applied, recording the source line (1-based) and
 /// the original line text for the report.
 #[derive(Debug, Clone, PartialEq, Eq)]
