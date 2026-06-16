@@ -35,8 +35,13 @@ pub struct DefFile {
 
 impl DefFile {
     /// Loads and parses a DEF file from the given path.
+    ///
+    /// The file is read with [`crate::text::read_text_file`], the same
+    /// encoding-tolerant reader the CNS/CMD loaders use, so a `.def` saved in a
+    /// legacy encoding (e.g. Shift-JIS, common in community content) is decoded
+    /// rather than rejected on its first non-UTF-8 byte.
     pub fn load(path: &Path) -> FpResult<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = crate::text::read_text_file(path)?;
         Self::from_str(&text)
     }
 
