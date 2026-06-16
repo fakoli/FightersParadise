@@ -170,6 +170,13 @@ pub struct CommandMatcher {
     active: Vec<CommandResult>,
     /// Input-leniency configuration (jump buffer). Defaults to off.
     leniency: LeniencyConfig,
+    /// Names of commands that transitioned from inactive to active on the most
+    /// recent [`check_commands`](Self::check_commands) call (i.e. were
+    /// *recognized this frame*). Rebuilt every tick; read via
+    /// [`just_matched`](Self::just_matched) to flash a command name in the
+    /// on-screen input display (T064). An already-active command that merely
+    /// stays active is **not** listed — only the frame of recognition.
+    just_matched: Vec<String>,
 }
 
 impl CommandMatcher {
@@ -182,6 +189,7 @@ impl CommandMatcher {
             commands,
             active: Vec::new(),
             leniency: LeniencyConfig::default(),
+            just_matched: Vec::new(),
         }
     }
 
@@ -193,6 +201,7 @@ impl CommandMatcher {
             commands,
             active: Vec::new(),
             leniency,
+            just_matched: Vec::new(),
         }
     }
 
@@ -209,6 +218,9 @@ impl CommandMatcher {
     /// and only re-arms the single jump gate, so it cannot turn one motion into
     /// another (a `QCF` never becomes a `DP`).
     pub fn check_commands(&mut self, buffer: &InputBuffer, facing_right: bool) {
+        // Fresh per tick: only commands recognized *this* frame are recorded.
+        self.just_matched.clear();
+
         // Decrement active timers and remove expired
         for result in &mut self.active {
             result.remaining = result.remaining.saturating_sub(1);
@@ -225,10 +237,24 @@ impl CommandMatcher {
                     name: cmd.name.clone(),
                     remaining: cmd.buffer_time,
                 });
+                self.just_matched.push(cmd.name.clone());
             }
         }
 
         self.apply_jump_buffer(buffer);
+    }
+
+    /// Names of commands recognized on the most recent
+    /// [`check_commands`](Self::check_commands) call — the commands that
+    /// transitioned from inactive to active *this frame*.
+    ///
+    /// Used by the on-screen input display (T064) to flash a special-move name
+    /// the instant its motion completes. A command that was already active and
+    /// merely stayed active is **not** included; the list is rebuilt every tick
+    /// (empty on a frame with no new recognition).
+    #[must_use]
+    pub fn just_matched(&self) -> &[String] {
+        &self.just_matched
     }
 
     /// Re-arms the configured jump command from a buffered up-press (T075).
@@ -262,6 +288,7 @@ impl CommandMatcher {
             // (KFM's instantaneous holds) is still observable this tick.
             let remaining = cmd.buffer_time.max(1);
             let name = cmd.name.clone();
+            self.just_matched.push(name.clone());
             self.active.push(CommandResult { name, remaining });
         }
     }
@@ -1890,6 +1917,80 @@ mod tests {
         let buffer = InputBuffer::new();
         matcher.check_commands(&buffer, true);
         assert!(!matcher.command_active("qcf"));
+    }
+
+    #[test]
+    fn just_matched_reports_only_the_recognition_frame() {
+        // T064: a special recognized *this* frame appears in `just_matched`;
+        // on the next tick (while still active but not freshly matched) it does
+        // not. This is what lets the input display flash a name once.
+        let cmd = CommandDef {
+            name: "qcf".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 8,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        // Feed D, DF, F, +x.
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[Button::X],
+        ));
+        matcher.check_commands(&buffer, true);
+        assert!(matcher.command_active("qcf"));
+        assert_eq!(
+            matcher.just_matched(),
+            ["qcf"],
+            "the move is recognized on this frame"
+        );
+
+        // Next tick: still active (buffer_time not expired) but NOT freshly
+        // matched, so `just_matched` is empty.
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        matcher.check_commands(&buffer, true);
+        assert!(matcher.command_active("qcf"), "still buffered");
+        assert!(
+            matcher.just_matched().is_empty(),
+            "not recognized again this frame"
+        );
+    }
+
+    #[test]
+    fn just_matched_empty_before_any_check() {
+        let matcher = CommandMatcher::new(vec![]);
+        assert!(matcher.just_matched().is_empty());
     }
 
     #[test]
