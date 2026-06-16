@@ -2575,6 +2575,122 @@ impl TrainingOverlay {
     }
 }
 
+/// The three player-facing match overlays, bundled so the match draw path takes
+/// one argument instead of three (the F1 dev Clsn toggle, the T063 training
+/// hitbox overlay, and the T064 input display). All default to off.
+#[derive(Debug, Clone, Copy, Default)]
+struct MatchOverlays {
+    /// Raw F1 dev Clsn overlay (both sides or nothing).
+    dev_clsn: bool,
+    /// T063 player-facing, per-side hitbox/hurtbox overlay.
+    training: TrainingOverlay,
+    /// T064 player-facing, per-side input-history display.
+    input_display: InputDisplay,
+}
+
+// ---------------------------------------------------------------------------
+// On-screen input display (T064)
+// ---------------------------------------------------------------------------
+
+/// The player-facing input-history display (T064): a vertical strip per side of
+/// the last ~16 frames of input — coalesced into numpad direction glyphs + lit
+/// button letters with a `*N` repeat count — newest at the top, plus a flash of
+/// any special command name the instant its motion completes.
+///
+/// Toggled with F3 (`Off → P1 → P2 → Both → Off`, reusing [`OverlayScope`]) and
+/// **off by default**. The strip reads each player's
+/// rolling [`fp_input::InputBuffer`] (via `Player::input_buffer`) and folds the
+/// absolute directions to facing-relative numpad notation; the command flash
+/// reads `Player::just_matched_commands`. Pure draw — no game state mutated.
+#[derive(Debug, Clone, Copy, Default)]
+struct InputDisplay {
+    /// Which side(s) to draw; `Off` disables the strip entirely.
+    scope: OverlayScope,
+}
+
+impl InputDisplay {
+    /// Number of coalesced rows shown (~16 frames of history once collapsed).
+    const ROWS: usize = fp_input::DEFAULT_DISPLAY_ROWS;
+    /// Row pitch in pixels (one coalesced input per line).
+    const LINE_H: f32 = 12.0;
+    /// Vertical anchor of the strip's top row.
+    const TOP: f32 = 96.0;
+    /// Inset of P1's strip from the left edge.
+    const P1_X: f32 = 8.0;
+    /// Inset of P2's strip from the right edge (the strip is right-aligned by
+    /// drawing at `win_w - P2_INSET`).
+    const P2_INSET: f32 = 64.0;
+
+    /// Cycles the scope one step (`Off → P1 → P2 → Both → Off`); the F3 toggle
+    /// key calls this so a single key walks every per-side state.
+    fn cycle(&mut self) {
+        self.scope = self.scope.next();
+    }
+
+    /// Draws the in-scope side strips. A `None` font omits all text (no panic,
+    /// no regression); `Off` scope draws nothing.
+    fn draw(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        m: &Match,
+        font: Option<&GlyphFont>,
+        win_w: f32,
+    ) {
+        let Some(font) = font else { return };
+        if self.scope.shows_p1() {
+            Self::draw_side(frame, font, m.p1(), Self::P1_X);
+        }
+        if self.scope.shows_p2() {
+            Self::draw_side(frame, font, m.p2(), win_w - Self::P2_INSET);
+        }
+    }
+
+    /// Draws one player's input strip anchored at `x`: newest run on top, each as
+    /// its numpad-direction + button label, then a one-line command flash under
+    /// the strip naming any special recognized this frame.
+    fn draw_side(
+        frame: &mut fp_render::RenderFrame<'_>,
+        font: &GlyphFont,
+        player: &fp_engine::Player,
+        x: f32,
+    ) {
+        let facing_right = player.facing() == fp_character::Facing::Right;
+        let rows = fp_input::input_display_rows(player.input_buffer(), Self::ROWS);
+        for (i, row) in rows.iter().enumerate() {
+            let y = Self::TOP + i as f32 * Self::LINE_H;
+            frame.draw_text(
+                font,
+                &row.label(facing_right),
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: 1.0,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
+        // Command flash: the first command recognized this frame, drawn under the
+        // strip. Only the recognition frame lists it (see `just_matched`), so it
+        // naturally flashes for `buffer_time`-independent single frames as inputs
+        // continue. Empty on a no-recognition frame.
+        if let Some(name) = player.just_matched_commands().first() {
+            let y = Self::TOP + Self::ROWS as f32 * Self::LINE_H;
+            frame.draw_text(
+                font,
+                name,
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: 1.0,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stage background rendering (audit #29)
 // ---------------------------------------------------------------------------
@@ -5034,8 +5150,7 @@ fn draw_match_run(
     frame: &mut fp_render::RenderFrame<'_>,
     run: &MatchRun,
     hud: &Hud,
-    overlay_enabled: bool,
-    training_overlay: TrainingOverlay,
+    overlays: MatchOverlays,
     win_wf: f32,
     win_hf: f32,
 ) {
@@ -5140,7 +5255,7 @@ fn draw_match_run(
     }
 
     // Optional Clsn debug overlay (F1) — the raw dev toggle, always both sides.
-    if overlay_enabled {
+    if overlays.dev_clsn {
         draw_player_clsn(frame, run.m().p1(), camera_x, win_wf, win_hf);
         draw_player_clsn(frame, run.m().p2(), camera_x, win_wf, win_hf);
     }
@@ -5148,7 +5263,16 @@ fn draw_match_run(
     // Player-facing training overlay (T063): styled, per-side-scopable, with a
     // legend. Independent of the raw F1 dev toggle above; reuses the same box
     // math. Drawn under the HUD so the legend text reads over the boxes.
-    training_overlay.draw(frame, run.m(), hud.font(), camera_x, win_wf, win_hf);
+    overlays
+        .training
+        .draw(frame, run.m(), hud.font(), camera_x, win_wf, win_hf);
+
+    // Player-facing input display (T064): per-side input-history strip + command
+    // flash. Off by default; toggled with F3. Drawn under
+    // the HUD so the strip text reads over the stage but below lifebars.
+    overlays
+        .input_display
+        .draw(frame, run.m(), hud.font(), win_wf);
 
     // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
     match run.screenpack.as_ref() {
@@ -5279,14 +5403,12 @@ fn run() -> fp_core::FpResult<()> {
     let mut previous = Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut running = true;
-    // Clsn hitbox/hurtbox debug overlay (audit #34), toggled with F1. Off by
-    // default; when on, both fighters' current-frame Clsn1 (red) and Clsn2
-    // (blue) boxes are drawn over the sprites in the two-player match mode.
-    let mut overlay_enabled = false;
-    // Player-facing training overlay (T063), toggled with F2: a styled, per-side
-    // (Off → P1 → P2 → Both) view of the Clsn/push boxes with a legend. Distinct
-    // from the F1 dev toggle above; persists for the session.
-    let mut training_overlay = TrainingOverlay::default();
+    // Player-facing match overlays, all off by default and persisting for the
+    // session:
+    //   - `dev_clsn` (F1, audit #34): raw both-sides Clsn1/Clsn2 debug boxes.
+    //   - `training` (F2, T063): styled per-side (Off → P1 → P2 → Both) hitbox view.
+    //   - `input_display` (F3, T064): per-side input-history strip + command flash.
+    let mut overlays = MatchOverlays::default();
 
     while running {
         // Per-frame edge flags driven from discrete key events (below).
@@ -5326,10 +5448,10 @@ fn run() -> fp_core::FpResult<()> {
                     repeat: false,
                     ..
                 } => {
-                    overlay_enabled = !overlay_enabled;
+                    overlays.dev_clsn = !overlays.dev_clsn;
                     tracing::info!(
                         "Clsn debug overlay {}",
-                        if overlay_enabled { "ON" } else { "OFF" }
+                        if overlays.dev_clsn { "ON" } else { "OFF" }
                     );
                 }
                 Event::KeyDown {
@@ -5339,8 +5461,18 @@ fn run() -> fp_core::FpResult<()> {
                 } => {
                     // Player-facing training overlay (T063): cycle Off → P1 → P2
                     // → Both → Off. Independent of the F1 dev overlay.
-                    training_overlay.cycle();
-                    tracing::info!("Training Clsn overlay: {}", training_overlay.scope.label());
+                    overlays.training.cycle();
+                    tracing::info!("Training Clsn overlay: {}", overlays.training.scope.label());
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F3),
+                    repeat: false,
+                    ..
+                } => {
+                    // Player-facing input display (T064): cycle Off → P1 → P2 →
+                    // Both → Off. Independent of the F1/F2 overlays.
+                    overlays.input_display.cycle();
+                    tracing::info!("Input display: {}", overlays.input_display.scope.label());
                 }
                 // Any other physical key press: record the first one this frame so
                 // the setup screen's remap-capture can bind it. (Esc/Return/Space/
@@ -5585,15 +5717,7 @@ fn run() -> fp_core::FpResult<()> {
         // Direct-CLI content modes render exactly as before.
         match mode.as_ref() {
             Some(Mode::Match(run)) => {
-                draw_match_run(
-                    &mut frame,
-                    run,
-                    &hud,
-                    overlay_enabled,
-                    training_overlay,
-                    win_wf,
-                    win_hf,
-                );
+                draw_match_run(&mut frame, run, &hud, overlays, win_wf, win_hf);
             }
             Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -5659,15 +5783,7 @@ fn run() -> fp_core::FpResult<()> {
                     }
                 }
                 RunScreen::Fight(run) => {
-                    draw_match_run(
-                        &mut frame,
-                        run,
-                        &hud,
-                        overlay_enabled,
-                        training_overlay,
-                        win_wf,
-                        win_hf,
-                    );
+                    draw_match_run(&mut frame, run, &hud, overlays, win_wf, win_hf);
                 }
                 RunScreen::Quit => {}
             }

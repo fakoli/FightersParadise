@@ -1430,6 +1430,27 @@ impl Player {
         self.character.facing
     }
 
+    /// This player's rolling raw-input history, for the on-screen input display
+    /// (T064).
+    ///
+    /// Index `0` of the returned [`InputBuffer`] is the input read this frame.
+    /// The buffer holds absolute directions (left/right, not facing-relative);
+    /// the display layer folds them to forward/back using [`facing`](Self::facing).
+    #[must_use]
+    pub fn input_buffer(&self) -> &InputBuffer {
+        &self.input_buffer
+    }
+
+    /// The command names this player's recognizer matched *this* frame, for the
+    /// on-screen input display's command flash (T064).
+    ///
+    /// Empty on a frame with no fresh recognition; a command that merely stays
+    /// buffered is not repeated. See [`CommandMatcher::just_matched`].
+    #[must_use]
+    pub fn just_matched_commands(&self) -> &[String] {
+        self.matcher.just_matched()
+    }
+
     /// The character's current animation (action) id.
     #[must_use]
     pub fn anim(&self) -> i32 {
