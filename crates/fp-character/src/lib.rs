@@ -1944,6 +1944,19 @@ pub struct Character {
     /// `stateno` on an attribute match and consuming the slot. See [`HitOverrides`].
     pub hit_overrides: HitOverrides,
 
+    /// `true` while this character's **current** get-hit reaction is one that a
+    /// [`HitOverride`](HitOverrides) slot redirected — the state behind the
+    /// `HitOverridden` trigger (T061).
+    ///
+    /// Set by hit resolution
+    /// ([`combat::resolve_attack`](crate::combat::resolve_attack)) on the tick an
+    /// armed slot matches and the defender is sent to the slot's `stateno` instead
+    /// of the normal get-hit. It stays `true` for the duration of that overridden
+    /// reaction and is cleared when a **normal** (non-overridden) get-hit lands —
+    /// the next hit replaces the reaction, so `HitOverridden` reverts to `0`. A
+    /// freshly-built character (no hit taken) reports `false`.
+    pub hit_overridden: bool,
+
     /// The raw Park–Miller RNG state backing the MUGEN `random` trigger
     /// (faithfulness audit #28).
     ///
@@ -2354,6 +2367,7 @@ impl Default for Character {
             cur_palfx: CurPalFx::default(),
             afterimage: AfterImageState::default(),
             hit_overrides: HitOverrides::default(),
+            hit_overridden: false,
             attack_mul: 1.0,
             defence_mul: 1.0,
             cur_sprpriority: 0,
@@ -3368,6 +3382,26 @@ impl EvalContext for Character {
             return Value::Float(Self::axis_component(self.vel, args));
         }
 
+        // `HitVel X` / `HitVel Y` (T061) — the velocity the most recent hit taken
+        // imparted, read from this character's [`GetHitVars`] (the `xvel`/`yvel`
+        // members the engine populated on the connecting hit). Per-axis, routed
+        // through the same `X = 0` / `Y = 1` axis coding as `Vel`/`Pos`; a missing
+        // or malformed axis falls back to the X component, matching the
+        // evaluator's lowering. With no hit taken the GetHitVars default to `0`,
+        // so `HitVel` reports `0` — never a panic.
+        if name.eq_ignore_ascii_case("HitVel") {
+            let hit_vel = Vec2::new(self.get_hit_vars.xvel, self.get_hit_vars.yvel);
+            return Value::Float(Self::axis_component(hit_vel, args));
+        }
+
+        // `HitOverridden` (T061) — 1 iff this character's current get-hit reaction
+        // was redirected by an active [`HitOverride`](HitOverrides) slot, else 0.
+        // The flag is set by hit resolution when a slot matches and cleared by the
+        // next normal (non-overridden) hit. See [`Character::hit_overridden`].
+        if name.eq_ignore_ascii_case("HitOverridden") {
+            return Value::from(self.hit_overridden);
+        }
+
         // Coordinate-scaling triggers (MUGEN 1.1). `Const720p(v)` / `Const1280p(v)`
         // take a value authored in a high-resolution space (720p = 1280 wide,
         // 1280p = 2560 wide) and scale it to this character's `localcoord` space
@@ -3913,6 +3947,20 @@ pub struct EntityGraph<'a> {
     /// (MUGEN's `NumProjID(id)` per-id form is not exposed by the parser today;
     /// the slice is id-keyed so it can be added without a shape change.)
     own_proj_ids: &'a [i32],
+    /// The owning player's currently-bound *target* ids — the character id of every
+    /// entity this player has hit and still holds as a `Target*` victim, for the
+    /// `NumTarget` / `NumTarget(id)` count trigger (T061).
+    ///
+    /// Built once per tick by the owner (`fp-engine`) and installed exactly as
+    /// [`own_helper_ids`](Self::own_helper_ids) / [`own_proj_ids`](Self::own_proj_ids)
+    /// are. Bare `NumTarget` reports its length (the total bound-target count);
+    /// `NumTarget(id)` counts only entries whose id matches. Empty when the owner
+    /// holds no target (and for a bare/test context); in the flat 1-v-1 model the
+    /// slice carries at most the single opponent the player most recently hit, so
+    /// `NumTarget` is `0` or `1`. When no slice is wired, the self-only fallback in
+    /// [`cross_entity_trigger`](EvalCtx::cross_entity_trigger) reads
+    /// [`Character::has_target`] instead.
+    own_target_ids: &'a [i32],
 }
 
 impl<'a> EntityGraph<'a> {
@@ -3941,6 +3989,7 @@ impl<'a> EntityGraph<'a> {
             players: &[],
             own_helper_ids: &[],
             own_proj_ids: &[],
+            own_target_ids: &[],
         }
     }
 
@@ -3997,6 +4046,51 @@ impl<'a> EntityGraph<'a> {
     pub fn with_own_proj_ids(mut self, own_proj_ids: &'a [i32]) -> Self {
         self.own_proj_ids = own_proj_ids;
         self
+    }
+
+    /// Installs the owning player's currently-bound target id list — the source for
+    /// the `NumTarget` / `NumTarget(id)` count trigger (T061), returning the updated
+    /// graph.
+    ///
+    /// The owner (`fp-engine`) builds this once per tick, exactly as
+    /// [`with_own_proj_ids`](Self::with_own_proj_ids) does for projectiles. In the
+    /// flat 1-v-1 model the slice carries at most the single opponent the player
+    /// most recently hit (its character id). The slice must outlive the [`EvalCtx`]
+    /// the graph is installed on. A builder method so existing
+    /// [`EntityGraph::new`] call sites keep working unchanged.
+    #[must_use]
+    pub fn with_own_target_ids(mut self, own_target_ids: &'a [i32]) -> Self {
+        self.own_target_ids = own_target_ids;
+        self
+    }
+
+    /// Whether a target-id list was wired on this graph (via
+    /// [`with_own_target_ids`](Self::with_own_target_ids)).
+    ///
+    /// `false` for a bare/test context whose owner installed no list — in which
+    /// case the `NumTarget` trigger falls back to [`Character::has_target`] rather
+    /// than reporting the empty-slice count.
+    #[must_use]
+    pub fn has_own_target_ids(&self) -> bool {
+        !self.own_target_ids.is_empty()
+    }
+
+    /// Counts the owning player's currently-bound targets for the `NumTarget`
+    /// trigger (T061): with `id = None` the **total** number bound; with
+    /// `id = Some(n)` the number whose target id matches `n`. Returns `0` when the
+    /// owner holds none (or wired no list — e.g. a bare/test context); never panics.
+    ///
+    /// Counts the flat [`own_target_ids`](Self::own_target_ids) slice the owner
+    /// installs (via [`with_own_target_ids`](Self::with_own_target_ids)).
+    #[must_use]
+    pub fn num_targets(&self, id: Option<i32>) -> i32 {
+        let count = match id {
+            None => self.own_target_ids.len(),
+            Some(n) => self.own_target_ids.iter().filter(|&&tid| tid == n).count(),
+        };
+        // The flat slice is bounded by the live opponent count, so this never
+        // overflows i32; saturate defensively anyway rather than risk a panic.
+        i32::try_from(count).unwrap_or(i32::MAX)
     }
 
     /// Counts the owning player's live projectiles for the `NumProj` trigger
@@ -4302,6 +4396,30 @@ impl<'a> EvalCtx<'a> {
         // or any context with no list wired — reports `0`. Never panics.
         if name.eq_ignore_ascii_case("NumProj") {
             return Some(Value::Int(self.graph.num_proj()));
+        }
+
+        // `NumTarget` / `NumTarget(id)` — the count of the owning player's
+        // currently-bound throw/hit targets (T061). Resolved here (not on the
+        // self-only `Character`) because the bound-target set lives with the entity
+        // owner (`fp-engine`), which installs its target id list on the graph each
+        // tick (see [`EntityGraph::with_own_target_ids`]). Bare `NumTarget` is the
+        // total; `NumTarget(id)` (the VM parses the parenthesized form as a
+        // function-call trigger, so `id` arrives as the first argument) counts only
+        // targets carrying that id. When the owner wired a list, the count comes
+        // from it; otherwise (a self-only / bare / test context with no list) it
+        // falls back to the entity's own [`has_target`](Character::has_target)
+        // flag, so the single 1-v-1 target is still reported as `0` or `1`. A
+        // `NumTarget(id)` with no list wired cannot match a specific id, so it
+        // reports `0`. Never panics.
+        if name.eq_ignore_ascii_case("NumTarget") {
+            let id = args.first().map(|v| v.to_int());
+            if self.graph.has_own_target_ids() {
+                return Some(Value::Int(self.graph.num_targets(id)));
+            }
+            return Some(Value::Int(match id {
+                None => i32::from(self.me.has_target),
+                Some(_) => 0,
+            }));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -8692,5 +8810,89 @@ mod tests {
                 case.name, case.expect_pos_y
             );
         }
+    }
+
+    // =====================================================================
+    // T061 — Target/hit introspection triggers: `NumTarget` / `NumTarget(id)`,
+    // `HitVel X` / `HitVel Y`, and `HitOverridden`. Each reads existing entity
+    // state (the bound-target list, GetHitVars, the override flag) and resolves
+    // through the same VM eval path the executor uses.
+    // =====================================================================
+
+    /// AC: `NumTarget` (and `NumTarget(id)`) reports the count of currently bound
+    /// targets. With a target id list wired on the graph (as `fp-engine` does each
+    /// tick), a binder with one bound target reads `1`; `NumTarget(id)` matches by
+    /// id; an unbound binder reads `0`.
+    #[test]
+    fn target_and_hit_triggers_num_target_from_graph() {
+        let me = Character::new();
+
+        // One bound target with id 2 (the 1-v-1 opponent's player id).
+        let target_ids = [2_i32];
+        let graph = EntityGraph::default().with_own_target_ids(&target_ids);
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(1));
+        // `NumTarget(id)` filters by id: 2 matches, 7 does not.
+        assert_eq!(ev_graph("NumTarget(2)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("NumTarget(7)", &me, graph), Value::Int(0));
+
+        // No target bound (empty list wired is the same as no list): 0.
+        let none = EntityGraph::default();
+        assert_eq!(ev_graph("NumTarget", &me, none), Value::Int(0));
+    }
+
+    /// AC: with no target id list wired (a bare/self-only context, e.g. before the
+    /// engine installs one), `NumTarget` falls back to the entity's own
+    /// `has_target` flag, so a binder that has connected reads `1` and one that has
+    /// not reads `0`. A specific-id query with no list cannot match → `0`.
+    #[test]
+    fn target_and_hit_triggers_num_target_self_only_fallback() {
+        let mut me = Character::new();
+        let graph = EntityGraph::default();
+
+        // No target yet → 0.
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(0));
+
+        // Connected a hit → has_target set → 1 (bare form).
+        me.has_target = true;
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(1));
+        // Without a wired id list, the id form has nothing to match → 0.
+        assert_eq!(ev_graph("NumTarget(2)", &me, graph), Value::Int(0));
+    }
+
+    /// AC: `HitVel X` / `HitVel Y` return the velocity the most recent hit taken
+    /// imparted, read from this character's GetHitVars (`xvel`/`yvel`). A
+    /// freshly-built character (no hit) reads `0` on both axes.
+    #[test]
+    fn target_and_hit_triggers_hit_vel_by_axis() {
+        let mut ch = Character::new();
+        // No hit taken yet — both axes default to 0.
+        assert_eq!(ev("HitVel X", &ch), Value::Float(0.0));
+        assert_eq!(ev("HitVel Y", &ch), Value::Float(0.0));
+
+        // Populate GetHitVars as hit resolution would.
+        ch.get_hit_vars.xvel = -4.5;
+        ch.get_hit_vars.yvel = -7.0;
+        assert_eq!(ev("HitVel X", &ch), Value::Float(-4.5));
+        assert_eq!(ev("HitVel Y", &ch), Value::Float(-7.0));
+        // A bare `HitVel` (no/garbage axis) falls back to the X component.
+        assert_eq!(ev("HitVel", &ch), Value::Float(-4.5));
+        // Threads through comparison operators like the other vel triggers.
+        assert_eq!(ev("HitVel Y < 0", &ch), Value::Int(1));
+    }
+
+    /// AC: `HitOverridden` returns 1 iff the current get-hit is redirected by an
+    /// active HitOverride slot — modeled by the `hit_overridden` flag. Default is
+    /// 0; set it and the trigger reads 1.
+    #[test]
+    fn target_and_hit_triggers_hit_overridden_flag() {
+        let mut ch = Character::new();
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(0));
+
+        ch.hit_overridden = true;
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(1));
+
+        // Cleared again → 0.
+        ch.hit_overridden = false;
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(0));
     }
 }

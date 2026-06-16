@@ -139,6 +139,10 @@ pub struct CharacterSnapshot {
     pub move_connect: MoveConnect,
     /// Whether the character has a hit-established target.
     pub has_target: bool,
+    /// Whether a `HitOverride` reaction is currently active (the
+    /// `HitOverridden` trigger), so an override armed when the snapshot was
+    /// taken stays armed across restore/replay.
+    pub hit_overridden: bool,
     /// Per-projectile-id contact/hit/guard timing (the `Proj*<id>` triggers),
     /// captured as a key-sorted `Vec` so the snapshot bytes stay deterministic
     /// (the live field is a `HashMap`).
@@ -239,6 +243,7 @@ impl CharacterSnapshot {
             shaketime: ch.shaketime,
             move_connect: ch.move_connect,
             has_target: ch.has_target,
+            hit_overridden: ch.hit_overridden,
             proj_events,
             attack_mul: ch.attack_mul,
             defence_mul: ch.defence_mul,
@@ -302,6 +307,7 @@ impl CharacterSnapshot {
         ch.shaketime = self.shaketime;
         ch.move_connect = self.move_connect;
         ch.has_target = self.has_target;
+        ch.hit_overridden = self.hit_overridden;
         ch.proj_events = self.proj_events.iter().copied().collect();
         ch.attack_mul = self.attack_mul;
         ch.defence_mul = self.defence_mul;
@@ -366,6 +372,7 @@ mod tests {
         ch.fvars[2] = 1.25;
         ch.sysvars[1] = -4;
         ch.hitpause = 6;
+        ch.hit_overridden = true;
         ch.juggle_points = 9;
         ch.attack_mul = 1.5;
         ch.set_ai_level(7);
