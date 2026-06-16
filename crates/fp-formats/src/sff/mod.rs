@@ -146,23 +146,42 @@ impl SffFile {
     }
 
     /// Parses an SFF v2 file from raw bytes already in memory.
+    ///
+    /// Robust to malformed/edge sub-headers: a single sprite whose sub-header is
+    /// out of range or otherwise unparseable is replaced by a safe placeholder
+    /// (see [`sprite::parse_all_sprites`]) so the file's *other* sprites still
+    /// load and decode instead of the whole character degrading to a garbled
+    /// block. A bad per-sprite **data** offset is likewise non-fatal — it surfaces
+    /// as a recoverable error from [`Self::decode_sprite`]/[`Self::decode_sprite_rgba`]
+    /// for that one sprite only.
     fn from_bytes_v2(data: &[u8]) -> FpResult<Self> {
         let file_header = header::parse_header(data)?;
 
-        // Parse sprite sub-headers
+        // Parse sprite sub-headers. The declared count can be larger than the
+        // sub-header block actually holds (truncated/garbage table); clamp the
+        // slice to the bytes that exist and let `parse_all_sprites` substitute a
+        // placeholder for each out-of-range entry rather than aborting the whole
+        // file — the valid sprites still load.
         let sprite_start = file_header.sprite_offset as usize;
-        let sprite_end = sprite_start + file_header.sprite_length as usize;
-        if sprite_end > data.len() {
-            return Err(FpError::parse(
-                "SFF",
-                format!(
-                    "sprite sub-header block extends past end of file ({sprite_end} > {})",
-                    data.len()
-                ),
-            ));
+        let sprite_end = (sprite_start + file_header.sprite_length as usize).min(data.len());
+        let sprite_block = if sprite_start <= sprite_end {
+            &data[sprite_start..sprite_end]
+        } else {
+            tracing::warn!(
+                sprite_start,
+                file_len = data.len(),
+                "SFF v2: sprite sub-header block starts past end of file; treating as empty"
+            );
+            &[]
+        };
+        if sprite_end < sprite_start + file_header.sprite_length as usize {
+            tracing::warn!(
+                declared = file_header.num_sprites,
+                available_bytes = sprite_block.len(),
+                "SFF v2: sprite sub-header block truncated; out-of-range sprites become placeholders"
+            );
         }
-        let sprites =
-            sprite::parse_all_sprites(&data[sprite_start..sprite_end], file_header.num_sprites)?;
+        let sprites = sprite::parse_all_sprites(sprite_block, file_header.num_sprites)?;
 
         // Determine number of palettes from the palette block size
         let pal_start = file_header.palette_offset as usize;
@@ -302,19 +321,23 @@ impl SffFile {
             &self.ldata
         };
 
+        // Use checked arithmetic for the end offset: a garbage `data_offset`
+        // near `u32::MAX` plus a large `data_length` would otherwise overflow on
+        // 32-bit targets. An overflow is treated the same as out-of-range — a
+        // recoverable per-sprite error the caller skips, never a panic.
         let start = data_sprite.data_offset as usize;
-        let end = start + data_sprite.data_length as usize;
-        if end > data_block.len() {
-            return Err(FpError::parse(
+        let end = start.checked_add(data_sprite.data_length as usize);
+        match end {
+            Some(end) if end <= data_block.len() => Ok((data_sprite, &data_block[start..end])),
+            _ => Err(FpError::parse(
                 "SFF",
                 format!(
-                    "sprite data [{start}..{end}] out of range for data block ({} bytes)",
+                    "sprite data [{start}..+{}] out of range for data block ({} bytes)",
+                    data_sprite.data_length,
                     data_block.len()
                 ),
-            ));
+            )),
         }
-
-        Ok((data_sprite, &data_block[start..end]))
     }
 
     /// Decodes the sprite at `index` to flat RGBA pixels (`width * height * 4`).
@@ -830,6 +853,176 @@ mod tests {
         // the external palette did not mutate or shadow the file's own table.
         let default_rgba = sff.decode_sprite_rgba(0).unwrap();
         assert_eq!(&default_rgba[0..4], &[255, 0, 0, 255]);
+    }
+
+    /// Builds a synthetic SFF v2 file with TWO sprites that share one palette,
+    /// where the **second** sprite's `data_offset` is deliberately out of range
+    /// for the TData block. Sprite 0 is a valid 2x2 RLE8 sprite; sprite 1 points
+    /// past the end of TData and must therefore be skipped, not garble the set.
+    ///
+    /// Layout:
+    /// ```text
+    /// [0..512)      header
+    /// [512..540)    sprite 0 sub-header (28 bytes)  -> valid, TData offset 0
+    /// [540..568)    sprite 1 sub-header (28 bytes)  -> bad, TData offset 0xFF00
+    /// [568..584)    palette sub-header (16 bytes)
+    /// [584..1608)   LData: 1024 bytes RGBA palette
+    /// [1608..1614)  TData: RLE8 data for sprite 0 only
+    /// ```
+    fn make_sff_with_bad_offset_sprite() -> Vec<u8> {
+        let sprite_offset: u32 = 512;
+        let palette_offset: u32 = 568;
+        let ldata_offset: u32 = 584;
+        let ldata_length: u32 = 1024;
+        let tdata_offset: u32 = 584 + 1024; // 1608
+        let tdata_length: u32 = 6;
+
+        let total = tdata_offset as usize + tdata_length as usize;
+        let mut buf = vec![0u8; total];
+
+        // --- Header ---
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[14] = 1;
+        buf[15] = 2; // version 2.1.0.0
+        buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
+        buf[40..44].copy_from_slice(&2u32.to_le_bytes()); // num_sprites = 2
+        buf[44..48].copy_from_slice(&palette_offset.to_le_bytes());
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // num_palettes = 1
+        buf[52..56].copy_from_slice(&ldata_offset.to_le_bytes());
+        buf[56..60].copy_from_slice(&ldata_length.to_le_bytes());
+        buf[60..64].copy_from_slice(&tdata_offset.to_le_bytes());
+        buf[64..68].copy_from_slice(&tdata_length.to_le_bytes());
+
+        // Helper to write one sprite sub-header at byte offset `s`.
+        let write_sprite = |buf: &mut [u8], s: usize, group: u16, data_off: u32| {
+            buf[s..s + 2].copy_from_slice(&group.to_le_bytes()); // group
+            buf[s + 2..s + 4].copy_from_slice(&0u16.to_le_bytes()); // image
+            buf[s + 4..s + 6].copy_from_slice(&2u16.to_le_bytes()); // width = 2
+            buf[s + 6..s + 8].copy_from_slice(&2u16.to_le_bytes()); // height = 2
+            buf[s + 8..s + 10].copy_from_slice(&0i16.to_le_bytes()); // axis_x
+            buf[s + 10..s + 12].copy_from_slice(&0i16.to_le_bytes()); // axis_y
+            buf[s + 12..s + 14].copy_from_slice(&(((s - 512) / 28) as u16).to_le_bytes()); // linked = self
+            buf[s + 14] = 2; // format = RLE8
+            buf[s + 15] = 8; // color_depth
+            buf[s + 16..s + 20].copy_from_slice(&data_off.to_le_bytes()); // data_offset in TData
+            buf[s + 20..s + 24].copy_from_slice(&6u32.to_le_bytes()); // data_length
+            buf[s + 24..s + 26].copy_from_slice(&0u16.to_le_bytes()); // palette_index
+            buf[s + 26..s + 28].copy_from_slice(&1u16.to_le_bytes()); // flags: bit0 -> TData
+        };
+
+        // Sprite 0: valid, TData offset 0.
+        write_sprite(&mut buf, sprite_offset as usize, 0, 0);
+        // Sprite 1: data_offset 0xFF00 is way past the 6-byte TData block.
+        write_sprite(&mut buf, sprite_offset as usize + 28, 1, 0xFF00);
+
+        // --- Palette sub-header ---
+        let p = palette_offset as usize;
+        buf[p..p + 2].copy_from_slice(&1u16.to_le_bytes()); // group
+        buf[p + 2..p + 4].copy_from_slice(&1u16.to_le_bytes()); // item
+        buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes()); // num_colors
+        buf[p + 6..p + 8].copy_from_slice(&0u16.to_le_bytes()); // linked = self
+        buf[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes()); // data_offset in LData
+        buf[p + 12..p + 16].copy_from_slice(&1024u32.to_le_bytes()); // data_length
+
+        // --- LData: palette (color 1 = red, opaque after decode) ---
+        let l = ldata_offset as usize;
+        buf[l + 4] = 255; // color 1 R
+
+        // --- TData: RLE8 run of 4 x color 1 (decompresses to a 2x2 sprite) ---
+        let t = tdata_offset as usize;
+        buf[t..t + 4].copy_from_slice(&4u32.to_le_bytes()); // decompressed size = 4
+        buf[t + 4] = 0x44; // bit6 set, lower 6 bits = 4 -> run of 4
+        buf[t + 5] = 0x01; // color = 1
+
+        buf
+    }
+
+    /// T037 acceptance #1 & #2: an SFF v2 file whose one sprite has an
+    /// out-of-range data offset must still load, decode its *valid* sprites, and
+    /// only fail (recoverably, never panicking) on the single bad sprite.
+    #[test]
+    fn v2_out_of_range_sprite_offset_skips_only_bad_one() {
+        let data = make_sff_with_bad_offset_sprite();
+        let sff = SffFile::from_bytes(&data).expect("file must still load with one bad sprite");
+
+        // Both sub-headers parsed (positions preserved), so the count is intact.
+        assert_eq!(sff.sprites.len(), 2);
+
+        // The valid sprite (index 0) decodes to its 2x2 red pixels.
+        let pixels = sff.decode_sprite(0).expect("valid sprite must decode");
+        assert_eq!(pixels.len(), 4);
+        assert!(pixels.iter().all(|&p| p == 1));
+
+        let rgba = sff
+            .decode_sprite_rgba(0)
+            .expect("valid sprite must resolve to RGBA");
+        assert_eq!(&rgba[0..4], &[255, 0, 0, 255]);
+
+        // The bad sprite (index 1) returns a recoverable error — NOT a panic, and
+        // NOT corrupted garbage that aliases another sprite's pixels.
+        let bad = sff.decode_sprite(1);
+        assert!(
+            bad.is_err(),
+            "out-of-range data offset must be a clean error"
+        );
+        assert!(sff.decode_sprite_rgba(1).is_err());
+    }
+
+    /// T037: a declared sprite count larger than the sub-header block the file
+    /// can physically hold (the sprite table runs past EOF) loads the in-range
+    /// sprites and fills the rest with placeholders rather than failing the whole
+    /// file. This is the path that previously returned a hard "sprite sub-header
+    /// block extends past end of file" error and degraded the entire character.
+    #[test]
+    fn v2_truncated_sprite_table_loads_valid_sprites() {
+        // Build a minimal file whose body ends right after sprite 0's 28-byte
+        // sub-header, then claim THREE sprites in the header. Sprites 1 and 2's
+        // bytes do not exist in the file at all.
+        let sprite_offset: u32 = 512;
+        // File ends immediately after one sub-header: no palette/LData/TData.
+        let total = sprite_offset as usize + sprite::SPRITE_SUBHEADER_SIZE;
+        let mut buf = vec![0u8; total];
+
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[14] = 1;
+        buf[15] = 2; // version 2.1.0.0
+        buf[36..40].copy_from_slice(&sprite_offset.to_le_bytes());
+        buf[40..44].copy_from_slice(&3u32.to_le_bytes()); // claim 3 sprites
+        buf[44..48].copy_from_slice(&0u32.to_le_bytes()); // palette_offset
+        buf[48..52].copy_from_slice(&0u32.to_le_bytes()); // num_palettes = 0
+        buf[52..56].copy_from_slice(&(total as u32).to_le_bytes()); // ldata_offset (empty)
+        buf[56..60].copy_from_slice(&0u32.to_le_bytes()); // ldata_length = 0
+        buf[60..64].copy_from_slice(&(total as u32).to_le_bytes()); // tdata_offset (empty)
+        buf[64..68].copy_from_slice(&0u32.to_le_bytes()); // tdata_length = 0
+
+        // Sprite 0 sub-header: a self-linked, zero-data sprite (decodes to empty
+        // without needing any data block — the file has none).
+        let s = sprite_offset as usize;
+        buf[s + 4..s + 6].copy_from_slice(&8u16.to_le_bytes()); // width = 8
+        buf[s + 6..s + 8].copy_from_slice(&8u16.to_le_bytes()); // height = 8
+        buf[s + 12..s + 14].copy_from_slice(&0u16.to_le_bytes()); // linked = self
+        buf[s + 14] = 0; // format = Raw
+        buf[s + 15] = 8; // color_depth
+                         // data_offset = 0, data_length = 0 (empty payload)
+
+        let sff = SffFile::from_bytes(&buf).expect("truncated table must not abort the load");
+        assert_eq!(sff.sprites.len(), 3);
+
+        // Sprite 0 is the genuine one and decodes (to an empty Raw payload).
+        assert_eq!(sff.sprites[0].width, 8);
+        assert_eq!(
+            sff.decode_sprite(0).expect("real sprite must decode").len(),
+            0
+        );
+
+        // Sprites 1 and 2 are safe placeholders (zero-sized, self-linked, no data).
+        assert_eq!(sff.sprites[1].width, 0);
+        assert_eq!(sff.sprites[1].linked_index, 1);
+        assert_eq!(sff.sprites[2].width, 0);
+        assert_eq!(sff.sprites[2].linked_index, 2);
+        // A placeholder decodes to an empty buffer — never panics.
+        assert_eq!(sff.decode_sprite(1).unwrap().len(), 0);
+        assert_eq!(sff.decode_sprite(2).unwrap().len(), 0);
     }
 
     /// A short external palette must not panic: out-of-range indices fall back
