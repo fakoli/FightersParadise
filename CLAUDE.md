@@ -28,6 +28,8 @@ characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 cargo build --workspace                              # Build everything
 cargo run -p fp-app                                  # Default: two-KFM match (test-assets/kfm/kfm.def)
 cargo run -p fp-app -- p1.def [p2.def]               # Two-character match (one .def = same char both sides)
+cargo run -p fp-app -- chars/                         # Discover a roster from a directory (T043) -> Title menu
+cargo run -p fp-app -- --motif <name|path> [args]    # Pick a discovered/explicit motif (T045; falls back to default)
 cargo run -p fp-app -- file.sff [file.air]           # Legacy sprite/animation viewer
 cargo test --workspace                               # Run all tests (~2045 pass incl. doc tests)
 cargo run -p fp-app -- validate char.def             # Character validator (lints a .def's assets/states)

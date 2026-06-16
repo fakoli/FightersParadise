@@ -982,6 +982,143 @@ fn parse_bg(section: &Section) -> Option<BgElement> {
     Some(bg)
 }
 
+// ---------------------------------------------------------------------------
+// Directory-based stage discovery (T044)
+// ---------------------------------------------------------------------------
+
+/// One stage discovered by scanning a `stages/` directory: a display name and
+/// the `.def` path the match loads.
+///
+/// Produced by [`discover_stages`]. The name comes from the stage's `[Info]
+/// name`, falling back to the `.def`'s file stem when the stage authors no name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredStage {
+    /// The stage's display name (`[Info] name`, or the file stem as a fallback).
+    pub name: String,
+    /// The resolved path of the stage's `.def` file.
+    pub def_path: PathBuf,
+}
+
+/// Scans `dir` for stage definitions and returns the discovered stage list.
+///
+/// Each `*.def` file directly under `dir` is read and parsed as a stage. A file
+/// is accepted only when it actually looks like a MUGEN stage — i.e. it carries
+/// at least one of the stage-defining sections (`[BGdef]`, `[Camera]`,
+/// `[StageInfo]`, or `[PlayerInfo]`). This filters out a stray character `.def`
+/// or other unrelated `.def` that happens to sit in the folder, which is skipped
+/// with a `tracing::warn!` (never a panic). A `.def` that cannot be read is also
+/// warned-and-skipped.
+///
+/// Following the workspace contract, an unreadable `dir` yields an empty list
+/// with a `tracing::warn!` rather than an error. The result is sorted
+/// case-insensitively by name (then by path) so discovery order is stable
+/// regardless of the filesystem's listing order.
+#[must_use]
+pub fn discover_stages(dir: &Path) -> Vec<DiscoveredStage> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!("stage discovery: cannot read {}: {e}", dir.display());
+            return Vec::new();
+        }
+    };
+
+    let mut stages: Vec<DiscoveredStage> = Vec::new();
+
+    for item in read {
+        let item = match item {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(
+                    "stage discovery: skipping unreadable entry in {}: {e}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        let path = item.path();
+        if !item.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let is_def = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("def"));
+        if !is_def {
+            continue;
+        }
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("stage discovery: cannot read {}: {e}", path.display());
+                continue;
+            }
+        };
+        if !looks_like_stage(&text) {
+            tracing::warn!(
+                "stage discovery: {} is not a stage (.def has no stage section); skipping",
+                path.display()
+            );
+            continue;
+        }
+
+        let stage = Stage::parse(&text, path.parent());
+        let name = if stage.info.name.trim().is_empty() {
+            stage_def_label(&path)
+        } else {
+            stage.info.name.clone()
+        };
+        stages.push(DiscoveredStage {
+            name,
+            def_path: path,
+        });
+    }
+
+    stages.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.def_path.cmp(&b.def_path))
+    });
+    tracing::info!(
+        "stage discovery: {} stage(s) under {}",
+        stages.len(),
+        dir.display()
+    );
+    stages
+}
+
+/// Whether raw `.def` text carries at least one stage-defining section header,
+/// distinguishing a stage `.def` from a character (or other) `.def`. Looks for a
+/// case-insensitive `[bgdef]`, `[camera]`, `[stageinfo]`, or `[playerinfo]`
+/// header on its own line (after BOM/comment stripping).
+fn looks_like_stage(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for raw_line in text.lines() {
+        let line = strip_comment(raw_line).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "bgdef" | "camera" | "stageinfo" | "playerinfo"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A display label for a stage `.def` whose `[Info] name` is absent: its file
+/// stem, or the whole file name when it has no stem.
+fn stage_def_label(path: &Path) -> String {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +1837,100 @@ delta = notanumber, 1.0     ; malformed → keep default delta.x
         // A non-finite verticalfollow disables follow (offset 0) rather than NaN.
         stage.camera.vertical_follow = f32::NAN;
         assert_eq!(stage.camera_follow_y(-40.0, -40.0), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // T044 — directory-based stage discovery
+    // -----------------------------------------------------------------------
+
+    /// A unique scratch directory for one test (OS temp + pid + label), removed
+    /// up-front so a leaked prior run is clean.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fp_stage_discovery_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn discovers_two_stages_with_names_and_paths() {
+        let dir = scratch("two_stages");
+        // A named stage.
+        std::fs::write(
+            dir.join("dojo.def"),
+            "[Info]\nname = \"Training Dojo\"\n[BGdef]\nspr = dojo.sff\n",
+        )
+        .unwrap();
+        // A stage with no [Info] name -> name falls back to the file stem.
+        std::fs::write(
+            dir.join("arena.def"),
+            "[Camera]\nboundleft = -200\nboundright = 200\n",
+        )
+        .unwrap();
+
+        let stages = discover_stages(&dir);
+        assert_eq!(stages.len(), 2, "both stage .defs discovered");
+        // Sorted case-insensitively by name: "arena" (stem) before "Training Dojo".
+        assert_eq!(stages[0].name, "arena");
+        assert_eq!(stages[0].def_path, dir.join("arena.def"));
+        assert_eq!(stages[1].name, "Training Dojo");
+        assert_eq!(stages[1].def_path, dir.join("dojo.def"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_stage_def_is_skipped_with_warning_not_panicked() {
+        let dir = scratch("skip_nonstage");
+        // A valid stage.
+        std::fs::write(
+            dir.join("good.def"),
+            "[Info]\nname = Good\n[StageInfo]\nzoffset = 192\n",
+        )
+        .unwrap();
+        // A character-shaped .def (no stage section) must be skipped.
+        std::fs::write(
+            dir.join("kfm.def"),
+            "[Info]\nname = KFM\n[Files]\ncmd = kfm.cmd\nsprite = kfm.sff\n",
+        )
+        .unwrap();
+        // A non-.def file is ignored entirely.
+        std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let stages = discover_stages(&dir);
+        assert_eq!(stages.len(), 1, "only the real stage is kept");
+        assert_eq!(stages[0].name, "Good");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_stages_dir_yields_empty_list_no_panic() {
+        let missing = std::env::temp_dir().join(format!(
+            "fp_stage_discovery_{}_does_not_exist",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(
+            discover_stages(&missing).is_empty(),
+            "unreadable dir -> empty list, no panic"
+        );
+    }
+
+    #[test]
+    fn looks_like_stage_distinguishes_stage_from_character() {
+        assert!(looks_like_stage("[BGdef]\nspr = x.sff\n"));
+        assert!(looks_like_stage("[Camera]\nboundleft = 0\n"));
+        assert!(looks_like_stage("[StageInfo]\nzoffset = 1\n"));
+        assert!(looks_like_stage("[PlayerInfo]\np1startx = 0\n"));
+        // A character .def (no stage section) is not a stage.
+        assert!(!looks_like_stage(
+            "[Info]\nname = x\n[Files]\ncmd = x.cmd\n"
+        ));
+        // BOM + comment tolerant.
+        assert!(looks_like_stage(
+            "\u{feff}; a stage\n[Camera] ; cam\nboundleft = 0\n"
+        ));
     }
 }

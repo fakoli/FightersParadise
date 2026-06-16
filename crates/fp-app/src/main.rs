@@ -134,6 +134,12 @@ const DEFAULT_SYSTEM_DEF: &str = "assets/data/system.def";
 /// points its `select` at this same file.
 const DEFAULT_SELECT_DEF: &str = "assets/data/select.def";
 
+/// The directory scanned for motif/screenpack sets (T045): each subfolder
+/// holding a `system.def` is a selectable motif. The `--motif <name>` flag picks
+/// one by its subfolder name; an absent/invalid selection falls back to
+/// [`DEFAULT_SYSTEM_DEF`].
+const DEFAULT_MOTIF_DIR: &str = "assets/data";
+
 /// MUGEN common stand (idle) state number.
 const STATE_STAND: i32 = 0;
 /// MUGEN common walk state number. Only referenced by the single-character CNS
@@ -2820,29 +2826,65 @@ fn is_def_path(p: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("def"))
 }
 
+/// Resolves `path` to an absolute path so paths discovered under a **relative**
+/// directory argument do not get re-rooted when later joined against another
+/// base (e.g. `SelectScreen::build_pick`'s `base_dir.join(def_path)`).
+///
+/// Prefers [`std::fs::canonicalize`] (which also resolves `..`/symlinks and
+/// confirms the file exists); when that fails (the file is gone, or the platform
+/// rejects it) it falls back to joining the current working directory, and as a
+/// last resort returns the input unchanged. Never panics — a `current_dir`
+/// failure simply degrades to the relative path. An already-absolute path
+/// canonicalizes (or cwd-joins) to itself.
+fn absolutize(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// The top-level launch route chosen from the (palette-flag-stripped) positional
 /// CLI args. See [`cli_route`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliRoute {
     /// Launch the in-app Title menu (no file args, or an explicit `menu`).
     Menu,
     /// A direct content path (`p1.def [p2.def]`, `file.sff [file.air]`, ...)
     /// handled by [`select_mode`] exactly as before — the menu is skipped.
     Direct,
+    /// A directory argument (T043): scan it for characters (the MUGEN-standard
+    /// `chars/<name>/<name>.def` layout, or a flat dir of `*.def`) and launch the
+    /// menu over the discovered roster augmenting the motif's `select.def`.
+    Directory(PathBuf),
 }
 
 /// Decides whether the (palette-flag-stripped) positional `args` launch the
-/// in-app Title menu or a direct content view.
+/// in-app Title menu, a direct content view, or a directory-discovery menu.
 ///
 /// `args[0]` is the program name. The Title menu launches when there is **no**
 /// file argument (a fresh clean-room run) or the first argument is an explicit
-/// `menu` token; any other first argument (a `.def`/`.sff`/...) routes to the
-/// legacy direct path so the existing CLI is preserved exactly. Pure and
-/// unit-tested.
+/// `menu` token. A first argument that is an existing **directory** routes to
+/// [`CliRoute::Directory`] (T043: scan it for a character roster). Any other
+/// first argument (a `.def`/`.sff`/...) routes to the legacy direct path so the
+/// existing single-`.def` CLI is preserved exactly. Pure given the filesystem
+/// (only an `is_dir` probe) and unit-tested.
 fn cli_route(args: &[String]) -> CliRoute {
     match args.get(1) {
         None => CliRoute::Menu,
         Some(a) if a.eq_ignore_ascii_case("menu") => CliRoute::Menu,
+        // Absolutize the directory up-front so the discovered character `.def`s
+        // are absolute paths. `SelectScreen::build_pick` later resolves a roster
+        // entry via `base_dir.join(def_path)` (base = the motif's `select.def`
+        // dir); a RELATIVE dir arg (e.g. `fp-app chars/`) would otherwise yield
+        // relative discovered paths that get re-rooted under the motif dir and
+        // fail to load. `absolutize` also defends `augment_roster`'s dedup.
+        Some(a) if Path::new(a).is_dir() => CliRoute::Directory(absolutize(Path::new(a))),
         Some(_) => CliRoute::Direct,
     }
 }
@@ -2907,6 +2949,39 @@ fn parse_pal_flags(args: &[String]) -> (PalSelection, Vec<String>) {
         }
     }
     (sel, rest)
+}
+
+/// Parses (and strips) the `--motif <name|path>` flag from `args` (T045),
+/// returning the requested motif selector plus the remaining positional args.
+///
+/// The value is either a discovered motif name (matched against the motifs found
+/// under [`DEFAULT_MOTIF_DIR`]) or a direct path to a `system.def` / a motif
+/// directory. A missing value (`--motif` at the end) drops the flag with a
+/// warning (the selection stays `None`, so the default motif loads). Unknown
+/// `--…` tokens pass through untouched. Pure — unit-tested without a window.
+fn parse_motif_flag(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut motif: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.eq_ignore_ascii_case("--motif") {
+            match args.get(i + 1) {
+                Some(value) => {
+                    motif = Some(value.clone());
+                    i += 2;
+                }
+                None => {
+                    tracing::warn!("--motif expects a motif name or path; ignoring");
+                    i += 1;
+                }
+            }
+        } else {
+            rest.push(arg.clone());
+            i += 1;
+        }
+    }
+    (motif, rest)
 }
 
 /// The two-player [`Match`] run state: the match plus the per-run rendering and
@@ -3528,6 +3603,86 @@ impl Motif {
         Self::load_from(Path::new(DEFAULT_SYSTEM_DEF), Path::new(DEFAULT_SELECT_DEF))
     }
 
+    /// Loads the motif chosen by the optional `--motif <name|path>` selector
+    /// (T045), falling back to [`Motif::load_default`] when the selector is absent
+    /// or cannot be resolved. Never panics.
+    ///
+    /// A selector is resolved by [`resolve_motif_system_def`]: a discovered motif
+    /// name (under [`DEFAULT_MOTIF_DIR`]), a direct `system.def` path, or a motif
+    /// directory. An unresolvable selector logs a warning and uses the default
+    /// motif — so a typo in `--motif` never crashes the app.
+    fn load_selected(selector: Option<&str>) -> Self {
+        match selector.and_then(resolve_motif_system_def) {
+            Some(system_path) => {
+                tracing::info!("Loading selected motif: {}", system_path.display());
+                Self::load_from(&system_path, Path::new(DEFAULT_SELECT_DEF))
+            }
+            None => {
+                if let Some(sel) = selector {
+                    tracing::warn!("motif {sel:?} not found; using default motif");
+                }
+                Self::load_default()
+            }
+        }
+    }
+
+    /// Augments this motif's roster with directory-discovered characters (T043),
+    /// appending each [`fp_ui::CharEntry`] not already present (by resolved `.def`
+    /// path) as a new `[Characters]` slot. The existing `select.def` roster is
+    /// **augmented, not replaced** — the motif's own characters stay first, the
+    /// discovered ones follow in scan order.
+    fn augment_roster(&mut self, discovered: &[fp_ui::CharEntry]) {
+        if discovered.is_empty() {
+            return;
+        }
+        // The motif's own roster `.def`s resolve relative to the `select.def`
+        // directory (matching `SelectScreen::build_pick`), so compute that base to
+        // dedup the motif's existing characters against the discovered ones.
+        let base_dir = self
+            .select_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Existing resolved def paths, ABSOLUTIZED so the dedup compares in the
+        // same path space as the (also-absolutized) discovered paths below — a
+        // relative CLI dir arg would otherwise never compare equal to a motif's
+        // resolved path and the dedup would silently miss.
+        let mut have: Vec<PathBuf> = self
+            .select
+            .slots
+            .iter()
+            .filter_map(|s| match s {
+                fp_ui::SelectSlot::Character(e) => Some(absolutize(&base_dir.join(&e.def_path))),
+                _ => None,
+            })
+            .collect();
+
+        let mut added = 0;
+        for c in discovered {
+            // Absolutize the discovered path BEFORE storing it: `SelectScreen`
+            // resolves a roster entry via `base_dir.join(def_path)`, where
+            // `base_dir` is the motif's `select.def` directory. A relative
+            // discovered path (from a relative CLI dir arg, e.g. `fp-app chars/`)
+            // would be re-rooted under that dir and fail to load; an absolute path
+            // joins to itself, so the character loads from where it was found.
+            let resolved = absolutize(&c.def_path);
+            if have.iter().any(|p| p == &resolved) {
+                continue;
+            }
+            have.push(resolved.clone());
+            self.select
+                .slots
+                .push(fp_ui::SelectSlot::Character(fp_ui::RosterEntry {
+                    name: c.name.clone(),
+                    def_path: resolved.to_string_lossy().into_owned(),
+                    include_stage: true,
+                    ..Default::default()
+                }));
+            added += 1;
+        }
+        tracing::info!("augmented roster with {added} discovered character(s)");
+    }
+
     /// Loads a motif from an explicit `system.def` path, falling back to
     /// `fallback_select` when the motif declares/has no usable `select.def`. Split
     /// from [`Motif::load_default`] so the resolution logic is unit-testable by
@@ -3575,14 +3730,18 @@ impl Motif {
     }
 }
 
-/// Builds the menu's stage list (T041): the always-present dojo backdrop plus
+/// Builds the menu's stage list (T041 + T044): the always-present dojo backdrop,
 /// every stage `.def` declared by the roster (`[Characters]` stages with
-/// `includestage` + `[ExtraStages]`) that actually exists on disk.
+/// `includestage` + `[ExtraStages]`) that actually exists on disk, plus every
+/// stage discovered by scanning a sibling `stages/` directory (T044).
 ///
-/// The candidate list comes from the pure [`screens::stage_entries_from_roster`];
-/// this is the impure step that drops `.def` candidates whose file is missing (so
-/// the player can't pick a stage that fails to load), keeping the backdrop
-/// regardless. The result is never empty.
+/// The roster-derived candidate list comes from the pure
+/// [`screens::stage_entries_from_roster`]; this is the impure step that drops
+/// `.def` candidates whose file is missing (so the player can't pick a stage that
+/// fails to load), keeping the backdrop regardless. It then appends the
+/// directory-discovered stages (via [`fp_stage::discover_stages`] over
+/// `<select.def dir>/stages/`), de-duplicated against the roster ones by path.
+/// The result is never empty.
 fn discover_stages(select: &SelectDef, select_path: &Path) -> Vec<screens::StageEntry> {
     let base_dir = select_path.parent().unwrap_or_else(|| Path::new("."));
     let candidates = screens::stage_entries_from_roster(
@@ -3591,7 +3750,7 @@ fn discover_stages(select: &SelectDef, select_path: &Path) -> Vec<screens::Stage
         DEFAULT_STAGE_NAME,
         Path::new(DEFAULT_STAGE_BG),
     );
-    let stages: Vec<screens::StageEntry> = candidates
+    let mut stages: Vec<screens::StageEntry> = candidates
         .into_iter()
         .filter(|e| match e.kind {
             // The backdrop is always kept (it is the guaranteed default even if
@@ -3612,8 +3771,66 @@ fn discover_stages(select: &SelectDef, select_path: &Path) -> Vec<screens::Stage
             }
         })
         .collect();
+
+    // T044: directory-discovered stages under <select.def dir>/stages/. Each is a
+    // real stage `.def` (already validated by the scanner) so it loads; append the
+    // ones not already offered by the roster.
+    let stages_dir = base_dir.join("stages");
+    for found in fp_stage::discover_stages(&stages_dir) {
+        if stages.iter().any(|e| e.path == found.def_path) {
+            continue;
+        }
+        stages.push(screens::StageEntry::def(found.name, found.def_path));
+    }
+
     tracing::info!("stage select: {} stage(s) available", stages.len());
     stages
+}
+
+/// Resolves a `--motif <name|path>` selector (T045) to a concrete `system.def`
+/// path, or `None` when it cannot be resolved (the caller then uses the default
+/// motif). Pure given the filesystem. Three forms are accepted, in order:
+///
+/// 1. a direct `.def` path that exists (used verbatim);
+/// 2. a directory path holding a `system.def` (resolves to `<dir>/system.def`);
+/// 3. a discovered motif **name** matched (case-insensitively) against the
+///    motifs found under [`DEFAULT_MOTIF_DIR`].
+fn resolve_motif_system_def(selector: &str) -> Option<PathBuf> {
+    resolve_motif_system_def_in(selector, Path::new(DEFAULT_MOTIF_DIR))
+}
+
+/// Resolves a `--motif` selector against a specific motif directory (the form-3
+/// search root). Split from [`resolve_motif_system_def`] so the discovered-name
+/// path can be unit-tested against a synthetic motif dir without touching the
+/// shipped [`DEFAULT_MOTIF_DIR`]. Pure given the filesystem.
+fn resolve_motif_system_def_in(selector: &str, motif_dir: &Path) -> Option<PathBuf> {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return None;
+    }
+    let as_path = Path::new(sel);
+
+    // (1) A direct system.def (or any .def) path.
+    if as_path.is_file()
+        && as_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("def"))
+    {
+        return Some(as_path.to_path_buf());
+    }
+    // (2) A motif directory holding a system.def.
+    if as_path.is_dir() {
+        let candidate = as_path.join("system.def");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // (3) A discovered motif name under the motif dir.
+    fp_ui::discover_motifs(motif_dir)
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(sel))
+        .map(|m| m.system_def_path)
 }
 
 /// Resolves the roster `select.def` path for a motif: the motif's `[Files]
@@ -3679,10 +3896,32 @@ struct MenuApp {
 }
 
 impl MenuApp {
-    /// Builds the menu runtime: loads the default motif + menu font and starts on
-    /// the Title screen built from the motif (or its built-in fallback).
-    fn new(renderer: &Renderer) -> Self {
-        let motif = Motif::load_default();
+    /// Builds the menu runtime with an optional `--motif` selector (T045) and an
+    /// optional characters directory to discover a roster from (T043).
+    ///
+    /// Loads the (default or selected) motif + menu font and starts on the Title
+    /// screen built from the motif (or its built-in fallback).
+    ///
+    /// The motif is resolved by [`Motif::load_selected`] (default motif on an
+    /// absent/invalid selector). When `chars_dir` is given, every character found
+    /// there ([`fp_ui::discover_chars`]) augments the motif's roster — the
+    /// existing `select.def` roster is kept and the discovered characters are
+    /// appended. Never panics.
+    fn with_options(
+        renderer: &Renderer,
+        motif_selector: Option<&str>,
+        chars_dir: Option<&Path>,
+    ) -> Self {
+        let mut motif = Motif::load_selected(motif_selector);
+        if let Some(dir) = chars_dir {
+            let discovered = fp_ui::discover_chars(dir);
+            tracing::info!(
+                "discovered {} character(s) under {}",
+                discovered.len(),
+                dir.display()
+            );
+            motif.augment_roster(&discovered);
+        }
         let title = screens::TitleMenu::from_system(&motif.system);
         Self {
             motif,
@@ -4252,24 +4491,37 @@ fn run() -> fp_core::FpResult<()> {
 
     // --- Load content based on CLI args ---
     // Strip the per-player `.act` palette flags (`--p1-pal N` / `--p2-pal N`,
-    // FL2b) first; the remaining positional args drive file routing as before.
+    // FL2b) first, then the `--motif <name|path>` flag (T045); the remaining
+    // positional args drive file routing as before.
     let raw_args: Vec<String> = std::env::args().collect();
     let (pal, args) = parse_pal_flags(&raw_args);
+    let (motif_selector, args) = parse_motif_flag(&args);
 
     // The top-level launch route: no file args (or an explicit `menu`) launches
-    // the in-app Title menu; any direct content path (p1.def/sff/...) keeps the
-    // legacy direct view exactly as before. This REPLACES the old no-args default
-    // (a two-KFM match) with the menu, so a fresh clean-room checkout boots into
-    // the title screen over the shipped trainingdummy roster (no KFM needed).
+    // the in-app Title menu; a directory argument scans it for a character roster
+    // (T043) and launches the menu over it; any direct content path
+    // (p1.def/sff/...) keeps the legacy direct view exactly as before. This
+    // REPLACES the old no-args default (a two-KFM match) with the menu, so a fresh
+    // clean-room checkout boots into the title screen over the shipped
+    // trainingdummy roster (no KFM needed).
     let route = cli_route(&args);
-    let mut menu_app = match route {
-        CliRoute::Menu => Some(MenuApp::new(&renderer)),
+    let mut menu_app = match &route {
+        CliRoute::Menu => Some(MenuApp::with_options(
+            &renderer,
+            motif_selector.as_deref(),
+            None,
+        )),
+        CliRoute::Directory(dir) => Some(MenuApp::with_options(
+            &renderer,
+            motif_selector.as_deref(),
+            Some(dir.as_path()),
+        )),
         CliRoute::Direct => None,
     };
     // The direct-CLI content mode, only built on the Direct route.
-    let mut mode = match route {
+    let mut mode = match &route {
         CliRoute::Direct => Some(select_mode(&args, pal, &renderer)),
-        CliRoute::Menu => None,
+        CliRoute::Menu | CliRoute::Directory(_) => None,
     };
 
     // The minimal match HUD (life bars + KO marker). Built once; drawn in the
@@ -7982,6 +8234,299 @@ mod tests {
             cli_route(&["fp-app".to_string(), "kfm.sff".to_string()]),
             CliRoute::Direct
         );
+    }
+
+    /// A unique scratch directory for one test (OS temp + pid + label), removed
+    /// up-front so a leaked prior run is clean.
+    fn discovery_scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fp_app_discovery_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// T043: an existing directory argument routes to `Directory` (scan for a
+    /// roster), while a single `.def` still routes to `Direct` (legacy CLI intact).
+    #[test]
+    fn cli_route_directory_vs_single_def() {
+        let dir = discovery_scratch("route_dir");
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), dir.to_string_lossy().into_owned()]),
+            // `cli_route` absolutizes (canonicalizes) the dir, which on macOS
+            // resolves `/var` -> `/private/var`, so compare against the same.
+            CliRoute::Directory(absolutize(&dir)),
+            "an existing directory routes to Directory (absolutized)"
+        );
+        // A single .def still routes to Direct unchanged.
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "chars/kfm/kfm.def".to_string()]),
+            CliRoute::Direct,
+            "a single .def keeps the legacy direct route"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T045: `--motif <value>` is stripped from the args and returned as the
+    /// selector; the remaining positional args are preserved. A missing value is
+    /// tolerated (selector stays None).
+    #[test]
+    fn parse_motif_flag_strips_and_returns_selector() {
+        let (sel, rest) = parse_motif_flag(&[
+            "fp-app".to_string(),
+            "--motif".to_string(),
+            "dark".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(sel.as_deref(), Some("dark"));
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // No flag -> None, args untouched.
+        let (sel, rest) = parse_motif_flag(&["fp-app".to_string(), "kfm.def".to_string()]);
+        assert_eq!(sel, None);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // Dangling --motif (no value) -> None, no panic.
+        let (sel, rest) = parse_motif_flag(&["fp-app".to_string(), "--motif".to_string()]);
+        assert_eq!(sel, None);
+        assert_eq!(rest, vec!["fp-app".to_string()]);
+    }
+
+    /// T045: `resolve_motif_system_def` resolves a directory holding a
+    /// `system.def`, a direct `.def` path, and returns `None` for an unresolvable
+    /// selector (the caller then falls back to the default motif — no panic).
+    #[test]
+    fn resolve_motif_system_def_handles_dir_path_and_missing() {
+        let dir = discovery_scratch("motif_resolve");
+        let motif_dir = dir.join("dark");
+        std::fs::create_dir_all(&motif_dir).unwrap();
+        let sysdef = motif_dir.join("system.def");
+        std::fs::write(&sysdef, "[Info]\nname = Dark\n").unwrap();
+
+        // (1) A directory holding system.def -> <dir>/system.def.
+        assert_eq!(
+            resolve_motif_system_def(&motif_dir.to_string_lossy()),
+            Some(sysdef.clone())
+        );
+        // (2) A direct .def path -> used verbatim.
+        assert_eq!(
+            resolve_motif_system_def(&sysdef.to_string_lossy()),
+            Some(sysdef.clone())
+        );
+        // (3) An unresolvable selector -> None (default-motif fallback).
+        assert_eq!(resolve_motif_system_def("nonexistent-motif-xyz"), None);
+        assert_eq!(resolve_motif_system_def(""), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T045 (review fix): form (3) — a discovered motif NAME resolves against the
+    /// motif dir (case-insensitively), locking acceptance criterion 3's
+    /// name-selection path against a synthetic motif tree (no shipped asset).
+    #[test]
+    fn resolve_motif_system_def_matches_discovered_name() {
+        // A motif dir holding `<dir>/dark/system.def`, the stand-in for
+        // DEFAULT_MOTIF_DIR's discovered-motif layout.
+        let dir = discovery_scratch("motif_name");
+        let motif_dir = dir.join("dark");
+        std::fs::create_dir_all(&motif_dir).unwrap();
+        let sysdef = motif_dir.join("system.def");
+        std::fs::write(&sysdef, "[Info]\nname = Dark\n").unwrap();
+
+        // The bare name resolves to the discovered motif's system.def.
+        assert_eq!(
+            resolve_motif_system_def_in("dark", &dir),
+            Some(sysdef.clone()),
+            "a discovered motif name resolves to its system.def"
+        );
+        // Matching is case-insensitive.
+        assert_eq!(
+            resolve_motif_system_def_in("DARK", &dir),
+            Some(sysdef),
+            "name matching is case-insensitive"
+        );
+        // An unknown name still yields None (default-motif fallback, no panic).
+        assert_eq!(resolve_motif_system_def_in("missing", &dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T043: `Motif::augment_roster` appends discovered characters as new roster
+    /// slots without dropping the motif's existing roster, and de-duplicates a
+    /// character already listed.
+    #[test]
+    fn augment_roster_appends_discovered_without_replacing() {
+        // A motif with one existing roster character. The explicit-def form
+        // (`display name, path.def`) keeps the def path verbatim, so the resolved
+        // path is exactly dir/existing.def — making the dedup check unambiguous.
+        let dir = discovery_scratch("augment");
+        let select_path = dir.join("select.def");
+        std::fs::write(
+            &select_path,
+            "[Characters]\nThe Existing One, existing.def\n",
+        )
+        .unwrap();
+        // load_from reads select_path as both the system.def (no [Files] select ->
+        // falls back) and the roster source, yielding the one Existing character.
+        let mut motif = Motif::load_from(&select_path, &select_path);
+        let before = motif.select.slots.len();
+        assert_eq!(before, 1, "motif starts with its one declared character");
+
+        // Two discovered characters: one brand new, one that duplicates the
+        // existing entry's resolved path (dir/existing.def) and must be skipped.
+        let discovered = vec![
+            fp_ui::CharEntry {
+                name: "Newbie".to_string(),
+                def_path: dir.join("newbie").join("newbie.def"),
+            },
+            fp_ui::CharEntry {
+                name: "The Existing One".to_string(),
+                def_path: dir.join("existing.def"),
+            },
+        ];
+        motif.augment_roster(&discovered);
+
+        // Existing roster kept; exactly one new slot added (the duplicate skipped).
+        assert_eq!(
+            motif.select.slots.len(),
+            before + 1,
+            "only the new character is appended; the duplicate is skipped"
+        );
+        let names: Vec<String> = motif
+            .select
+            .slots
+            .iter()
+            .filter_map(|s| match s {
+                fp_ui::SelectSlot::Character(e) => Some(e.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "The Existing One"),
+            "existing kept"
+        );
+        assert!(names.iter().any(|n| n == "Newbie"), "discovered appended");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T043 (review fix): the realistic invocation — a **relative** characters
+    /// directory whose `select.def` motif lives elsewhere. `discover_chars` over a
+    /// relative dir yields relative `def_path`s; `augment_roster` must absolutize
+    /// them so `SelectScreen::build_pick` (`base_dir.join(def_path)`, base = the
+    /// motif's `select.def` dir) resolves to the REAL on-disk file rather than
+    /// re-rooting `chars/foo/foo.def` under the motif dir.
+    #[test]
+    fn relative_dir_discovered_pick_resolves_to_real_file() {
+        // A unique RELATIVE characters tree under cwd (the crate root in tests),
+        // plus a SEPARATE motif select.def dir — so a re-rooting bug would point
+        // the pick at <motif_dir>/<relative path>, a non-existent location.
+        let rel_root = PathBuf::from(format!("fp_app_reldir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rel_root);
+        let chars_dir = rel_root.join("chars");
+        let foo = chars_dir.join("foo");
+        std::fs::create_dir_all(&foo).unwrap();
+        let foo_def = foo.join("foo.def");
+        std::fs::write(&foo_def, "[Info]\nname = Foo\n").unwrap();
+
+        // The motif's select.def lives in a different subdir (stand-in for
+        // assets/data) with no roster of its own.
+        let motif_dir = rel_root.join("motif");
+        std::fs::create_dir_all(&motif_dir).unwrap();
+        let select_path = motif_dir.join("select.def");
+        std::fs::write(&select_path, "[Characters]\n").unwrap();
+
+        // Discover over the RELATIVE chars dir -> relative def_paths.
+        let discovered = fp_ui::discover_chars(&chars_dir);
+        assert_eq!(discovered.len(), 1, "the one character is discovered");
+        // (Sanity: discovery produced a relative path, exercising the bug case.)
+        assert!(
+            discovered[0].def_path.is_relative(),
+            "discovered path is relative (the failing case)"
+        );
+
+        let mut motif = Motif::load_from(&select_path, &select_path);
+        motif.augment_roster(&discovered);
+
+        // Drive a Training select: P1 picks cell 0, P2 mirrors -> a MatchPick.
+        let mut screen = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        let confirm = screens::MenuInput {
+            confirm: true,
+            ..Default::default()
+        };
+        let outcome = screen.update(confirm, 0);
+        let pick = match outcome {
+            screens::SelectOutcome::Done(p) => p,
+            other => panic!("expected a completed pick, got {other:?}"),
+        };
+
+        // The resolved pick MUST point at the real on-disk file, NOT the
+        // motif-dir-rebased wrong location.
+        let wrong = motif_dir.join("chars").join("foo").join("foo.def");
+        assert_ne!(
+            pick.p1_def, wrong,
+            "pick must not be re-rooted under the motif dir"
+        );
+        assert!(
+            pick.p1_def.is_file(),
+            "resolved pick {} must exist on disk",
+            pick.p1_def.display()
+        );
+        // Same canonical file as the discovered .def.
+        assert_eq!(
+            std::fs::canonicalize(&pick.p1_def).unwrap(),
+            std::fs::canonicalize(&foo_def).unwrap(),
+            "pick resolves to the discovered character file"
+        );
+
+        let _ = std::fs::remove_dir_all(&rel_root);
+    }
+
+    /// T044: `discover_stages` merges stages found by scanning a sibling `stages/`
+    /// directory into the menu's stage list (in addition to the always-present
+    /// dojo backdrop), using a synthetic tree — no shipped asset needed.
+    #[test]
+    fn discover_stages_merges_stages_directory() {
+        let dir = discovery_scratch("stages_dir");
+        let select_path = dir.join("select.def");
+        std::fs::write(&select_path, "[Characters]\nAlpha, a/a.def\n").unwrap();
+        // A sibling stages/ directory holding two real stage .defs.
+        let stages_dir = dir.join("stages");
+        std::fs::create_dir_all(&stages_dir).unwrap();
+        std::fs::write(
+            stages_dir.join("dojo.def"),
+            "[Info]\nname = Dojo\n[BGdef]\nspr = dojo.sff\n",
+        )
+        .unwrap();
+        std::fs::write(
+            stages_dir.join("arena.def"),
+            "[Info]\nname = Arena\n[Camera]\nboundleft = -200\n",
+        )
+        .unwrap();
+
+        let select = SelectDef::parse("[Characters]\nAlpha, a/a.def\n");
+        let stages = discover_stages(&select, &select_path);
+        // Backdrop (always) + the two discovered stage .defs.
+        assert_eq!(
+            stages.len(),
+            3,
+            "dojo backdrop + two discovered stages: {stages:?}"
+        );
+        assert_eq!(stages[0].kind, screens::StageKind::Backdrop);
+        let def_names: Vec<String> = stages
+            .iter()
+            .filter(|e| e.kind == screens::StageKind::Def)
+            .map(|e| e.name.clone())
+            .collect();
+        assert!(def_names.iter().any(|n| n == "Dojo"));
+        assert!(def_names.iter().any(|n| n == "Arena"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The default motif loads its declared roster (the shipped `select.def`,
