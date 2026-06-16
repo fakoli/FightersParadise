@@ -1204,18 +1204,21 @@ pub fn detect_hit_contact(
 pub enum SparkSource {
     /// No spark at all (the `-1` sentinel, or any value MUGEN treats as "none").
     None,
-    /// Play action `anim` from the **attacker's own** SFF/AIR. Reached by a
-    /// *literal* negative `sparkno` (e.g. `-2` → own action `2`); the `S`-prefixed
-    /// authoring form does **not** reach here today (the parser strips the `S` and
-    /// keeps a positive id — see the type-level note). `anim` is the non-negative
-    /// action id.
+    /// Play action `anim` from the **attacker's own** SFF/AIR. Reached by any
+    /// **negative** `sparkno` other than the `-1` sentinel — i.e. both a *literal*
+    /// negative (`-2` → own action `2`) and the `S`-prefixed authoring form, which
+    /// `fp-character`'s `parse_sparkno` encodes as a negative id (`S2` → `-2`) so
+    /// the sign carries the own-vs-common marker (see the type-level note). `anim`
+    /// is the non-negative action id (the magnitude). The lone exception is `S0`,
+    /// which can't be negated distinctly and falls through to
+    /// [`Common`](Self::Common)`{ anim: 0 }`.
     Own {
         /// The attacker-own animation (action) id to play.
         anim: i32,
     },
     /// Play action `anim` from the **common** `fightfx` set (any non-negative
-    /// `sparkno`, including the `S`-flattened own-spark form). `anim` is that
-    /// action id.
+    /// `sparkno` — a bare authored number `N`, plus the `S0` edge that can't carry
+    /// the negative own-marker). `anim` is that action id.
     Common {
         /// The common-`fightfx` animation (action) id to play.
         anim: i32,
