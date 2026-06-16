@@ -11,6 +11,7 @@ nom.workspace = true
 png.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+encoding_rs.workspace = true
 
 [dev-dependencies]
 # Used by tests/real_content.rs to synthesize an SFF v2 PNG8 sprite end to end.

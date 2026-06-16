@@ -30,3 +30,7 @@ serde.workspace = true
 [dev-dependencies]
 tracing-subscriber.workspace = true
 bincode.workspace = true
+# Test-only: synthesizes Shift-JIS-encoded CNS bytes from scratch (clean-room,
+# no external content) to prove a non-UTF-8 state file still feeds states into
+# the merge graph instead of being skipped (T034).
+encoding_rs.workspace = true

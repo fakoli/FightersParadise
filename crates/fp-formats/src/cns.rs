@@ -173,13 +173,19 @@ pub struct CnsFile {
 impl CnsFile {
     /// Loads and parses a CNS file from the given path.
     ///
+    /// The file is read with [`crate::text::read_text_file`], which tolerates
+    /// non-UTF-8 (e.g. Shift-JIS) content rather than failing the read — many
+    /// community characters ship Shift-JIS-encoded CNS files, and a hard UTF-8
+    /// read would skip the whole file, leaving the character with zero states.
+    ///
     /// # Errors
     ///
     /// Returns [`fp_core::FpError::Io`](fp_core::FpError) if the file cannot be
-    /// read. Malformed *content* never fails: bad lines are logged with
-    /// `tracing::warn!` and skipped, yielding a usable partial result.
+    /// read. Malformed *content* (including an unknown text encoding) never
+    /// fails: bad lines are logged with `tracing::warn!` and skipped, yielding a
+    /// usable partial result.
     pub fn load(path: &Path) -> FpResult<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = crate::text::read_text_file(path)?;
         Self::from_str(&text)
     }
 
@@ -1295,6 +1301,88 @@ hitcountpersist = 1
         assert_eq!(d.hitdefpersist.as_deref(), Some("1"));
         assert_eq!(d.movehitpersist.as_deref(), Some("1"));
         assert_eq!(d.hitcountpersist.as_deref(), Some("1"));
+    }
+
+    // --- Shift-JIS / non-UTF-8 loading (synthetic fixtures, T034) ---
+
+    /// Writes `bytes` to a unique temp file with the given extension and returns
+    /// the path. Synthetic only — never touches `test-assets/`.
+    fn write_temp(bytes: &[u8], ext: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("fp_cns_sjis_{}_{}.{}", std::process::id(), n, ext));
+        std::fs::write(&path, bytes).expect("temp write should succeed");
+        path
+    }
+
+    #[test]
+    fn shift_jis_cns_loads_states_instead_of_being_skipped() {
+        // A CNS file authored in Shift-JIS (Japanese comments + labels) must load
+        // its statedefs through the public `load` path, not fail the UTF-8 read.
+        // The bytes are synthesized here (clean-room: no external content).
+        let utf8 = "\
+; 波動拳ステート
+[Statedef 1000]
+type = S
+movetype = A
+physics = S
+anim = 1000
+
+[State 1000, 必殺技]
+type = HitDef
+trigger1 = AnimElem = 3
+damage = 50, 0
+";
+        let (sjis, _enc, had_errors) = encoding_rs::SHIFT_JIS.encode(utf8);
+        assert!(!had_errors, "fixture must be Shift-JIS-encodable");
+        // The fixture must be genuinely non-UTF-8 so it exercises the fallback
+        // (a hard `read_to_string` would have errored on these bytes).
+        assert!(
+            std::str::from_utf8(&sjis).is_err(),
+            "Shift-JIS fixture should be invalid UTF-8"
+        );
+
+        let path = write_temp(&sjis, "cns");
+        let cns = CnsFile::load(&path).expect("Shift-JIS CNS should load, not error");
+        let _ = std::fs::remove_file(&path);
+
+        // The state and its controller must be present (states were NOT skipped).
+        assert_eq!(
+            cns.statedefs.len(),
+            1,
+            "Shift-JIS CNS should yield its state"
+        );
+        let def = cns
+            .statedef(1000)
+            .expect("[Statedef 1000] should be present");
+        assert_eq!(def.state_type.as_deref(), Some("S"));
+        assert_eq!(def.anim.as_deref(), Some("1000"));
+        assert_eq!(def.controllers.len(), 1);
+        let c = &def.controllers[0];
+        assert_eq!(c.controller_type.as_deref(), Some("HitDef"));
+        // The Japanese label transcoded correctly (ASCII keywords stayed intact).
+        assert_eq!(c.label, "必殺技");
+        assert_eq!(c.trigger_group(1).unwrap(), &["AnimElem = 3"]);
+        assert_eq!(c.params.get("damage").map(String::as_str), Some("50, 0"));
+    }
+
+    #[test]
+    fn invalid_encoding_cns_degrades_gracefully() {
+        // Bytes that are neither valid UTF-8 nor cleanly Shift-JIS must still
+        // load (lossily) rather than panicking or failing — the ASCII structure
+        // is recovered and the undecodable bytes become replacement chars.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"[Statedef 1]\ntype = S\nanim = ");
+        bytes.extend_from_slice(&[0x80, 0xFF, 0xFD]); // undecodable run
+        bytes.extend_from_slice(b"\n");
+        let path = write_temp(&bytes, "cns");
+        let cns = CnsFile::load(&path).expect("garbage-encoded CNS must not error");
+        let _ = std::fs::remove_file(&path);
+        // The well-formed structure was still recovered.
+        assert_eq!(cns.statedefs.len(), 1);
+        assert_eq!(cns.statedefs[0].state_type.as_deref(), Some("S"));
     }
 
     // --- Real-fixture tests (skipped when test-assets/ is absent) ---

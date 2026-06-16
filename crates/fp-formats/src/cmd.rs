@@ -125,8 +125,13 @@ impl CommandBuilder {
 
 impl CmdFile {
     /// Loads and parses a CMD file from the given path.
+    ///
+    /// The file is read with [`crate::text::read_text_file`], which tolerates
+    /// non-UTF-8 (e.g. Shift-JIS) content rather than failing the read — many
+    /// community characters ship Shift-JIS-encoded CMD files, and a hard UTF-8
+    /// read would skip the whole file, leaving the character with no commands.
     pub fn load(path: &Path) -> FpResult<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = crate::text::read_text_file(path)?;
         Self::from_str(&text)
     }
 
@@ -407,6 +412,42 @@ command = y
         let cmd = CmdFile::from_str(text).unwrap();
         assert_eq!(cmd.commands.len(), 1);
         assert_eq!(cmd.commands[0].name, "valid");
+    }
+
+    #[test]
+    fn shift_jis_cmd_loads_commands_instead_of_being_skipped() {
+        // A CMD file authored in Shift-JIS (Japanese comment) must load its
+        // commands through the public `load` path, not fail the UTF-8 read.
+        // Synthesized here (clean-room: no external content).
+        let utf8 = "\
+; 必殺技コマンド
+[Command]
+name = \"QCF_x\"
+command = ~D, DF, F, x
+";
+        let (sjis, _enc, had_errors) = encoding_rs::SHIFT_JIS.encode(utf8);
+        assert!(!had_errors, "fixture must be Shift-JIS-encodable");
+        assert!(
+            std::str::from_utf8(&sjis).is_err(),
+            "Shift-JIS fixture should be invalid UTF-8"
+        );
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("fp_cmd_sjis_{}_{}.cmd", std::process::id(), n));
+        std::fs::write(&path, &sjis).expect("temp write should succeed");
+        let cmd = CmdFile::load(&path).expect("Shift-JIS CMD should load, not error");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            cmd.commands.len(),
+            1,
+            "Shift-JIS CMD should yield its command"
+        );
+        assert_eq!(cmd.commands[0].name, "QCF_x");
+        assert_eq!(cmd.commands[0].command, "~D, DF, F, x");
     }
 
     #[test]

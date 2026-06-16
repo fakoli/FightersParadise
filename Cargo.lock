@@ -479,6 +479,7 @@ name = "fp-character"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "encoding_rs",
  "fp-combat",
  "fp-core",
  "fp-formats",
@@ -528,6 +529,7 @@ dependencies = [
 name = "fp-formats"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "fp-core",
  "nom",
  "png",
