@@ -694,6 +694,13 @@ impl Character {
     ) -> TickReport {
         let mut report = TickReport::default();
 
+        // T036: drain any in-expression assignment (`var(n) := e`) buffered during
+        // a prior eval into the real variable banks before this tick reads them, so
+        // the banks are authoritative at the tick boundary. In normal flow the
+        // overlay is already empty (each tick flushes at its end below); this is the
+        // defensive drain for any out-of-tick eval (e.g. `change_state` entry exprs).
+        self.flush_var_assignments();
+
         // Per-tick `AssertSpecial` flags (#13) and the `Width` push override (#10)
         // are TRANSIENT: they hold only for the tick that (re-)asserts them, so
         // clear them at the very top — before any branch — and let this tick's
@@ -774,6 +781,9 @@ impl Character {
             // special-state-then-current-state order as a normal tick. Everything
             // else (anim/time/physics advance, non-flagged controllers) is frozen.
             self.run_ignorehitpause_only(states, env, &mut report);
+            // Flush any `:=` writes made by the ignorehitpause controllers (T036)
+            // so the banks are current when this frozen tick returns.
+            self.flush_var_assignments();
             return report;
         }
         if self.shaketime > 0 {
@@ -827,6 +837,11 @@ impl Character {
         self.integrate_position();
         self.advance_time();
         self.advance_animation(air);
+
+        // T036: flush this tick's in-expression assignments (`var(n) := e`) into
+        // the real banks so they are authoritative when the tick returns (the HUD,
+        // AI, snapshot, and the next tick all read the bank arrays directly).
+        self.flush_var_assignments();
 
         report
     }
@@ -11011,6 +11026,93 @@ mod tests {
         assert_eq!(ch.vars[4], 9, "VarSet var(4)");
         assert_eq!(ch.facing, Facing::Left, "Turn");
         assert_eq!(ch.move_type, MoveType::Attack, "StateTypeSet movetype");
+    }
+
+    // ---- T036: in-expression assignment (`:=`) through the live executor ----
+
+    #[test]
+    fn assign_in_trigger_expression_persists_to_var_bank_after_tick() {
+        // A `:=` embedded in a trigger fires the write as a side effect; the live
+        // executor must flush the overlay into the real bank so `ch.vars` reflects
+        // it after the tick. `var(5) := 8000` is truthy (8000), so the controller
+        // (a no-op `Null`) fires — and the assignment lands. Reads of `var(5)`
+        // afterward return 8000 (AC1 + AC3 through the real engine).
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\nanim = 0\n\
+             [State 0, set]\ntype = Null\ntrigger1 = var(5) := 8000\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        assert_eq!(ch.vars[5], 0, "var(5) starts at 0");
+        let _ = lc.tick(&mut ch);
+        assert_eq!(ch.vars[5], 8000, "`:=` in a trigger set var(5) to 8000");
+        // And the EvalContext read path returns the assigned value too.
+        assert_eq!(ch.var(5), Value::Int(8000));
+    }
+
+    #[test]
+    fn assign_embedded_in_arithmetic_sets_var_without_breaking_expression() {
+        // AC2 through the live engine: `-1 + 0 * (var(31) := 2)` parses (no
+        // fallback-to-0) and sets var(31). The whole expression is `-1` (truthy),
+        // so the no-op controller fires and the side-effect write persists.
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\nanim = 0\n\
+             [State 0, set]\ntype = Null\ntrigger1 = -1 + 0 * (var(31) := 2)\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let _ = lc.tick(&mut ch);
+        assert_eq!(ch.vars[31], 2, "embedded `:=` set var(31) to 2");
+    }
+
+    #[test]
+    fn assign_covers_var_fvar_sysvar_banks_through_tick() {
+        // AC3: var / fvar / sysvar assignments all flush to their bank after a tick.
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\nanim = 0\n\
+             [State 0, a]\ntype = Null\ntrigger1 = var(0) := 42\n\
+             [State 0, b]\ntype = Null\ntrigger1 = fvar(1) := 3.5\n\
+             [State 0, c]\ntype = Null\ntrigger1 = sysvar(2) := 7\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let _ = lc.tick(&mut ch);
+        assert_eq!(ch.vars[0], 42, "var(0)");
+        assert!((ch.fvars[1] - 3.5).abs() < 1e-6, "fvar(1)");
+        assert_eq!(ch.sysvars[2], 7, "sysvar(2)");
+    }
+
+    #[test]
+    fn assign_overlay_visible_to_same_expression_read_then_flushed() {
+        // Within one expression, a read AFTER the `:=` sees the assigned value via
+        // the interior-mutable overlay, and the bank is flushed after the tick.
+        // `(var(0) := 9) = var(0)` is true iff the later read sees 9.
+        let cns = CnsFile::from_str(
+            "[Statedef 0]\ntype = S\nphysics = N\nanim = 0\n\
+             [State 0, set]\ntype = VarSet\ntrigger1 = (var(0) := 9) = var(0)\nvar(1) = 1\n",
+        )
+        .unwrap();
+        let st = CompiledState::from_parsed(&cns.statedefs[0]);
+        let lc = loaded(vec![st], tiny_air(0, &[5]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.physics = Physics::None;
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.controllers_fired, 1, "trigger fired → read saw 9");
+        assert_eq!(ch.vars[0], 9, "`:=` write flushed to var(0)");
+        assert_eq!(ch.vars[1], 1, "VarSet ran because the trigger was true");
     }
 
     // ---- AC1: PlaySnd via real CNS text (the `value = g, i` pair form) ----

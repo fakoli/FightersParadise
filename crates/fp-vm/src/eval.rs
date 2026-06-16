@@ -335,6 +335,37 @@ impl fmt::Display for Redirect {
     }
 }
 
+/// Which variable bank an in-expression assignment (`:=`) writes to.
+///
+/// MUGEN's assignment-in-expression operator targets one of the four indexed
+/// variable banks — `var(n) := e`, `fvar(n) := e`, `sysvar(n) := e`, and
+/// `sysfvar(n) := e` (see [`EvalContext::assign`] and
+/// [`Expr::Assign`](crate::parser::Expr::Assign)). The bank fixes the element
+/// type the assigned value is coerced to: the integer banks store an `i32`, the
+/// float banks an `f32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignBank {
+    /// `var(n)` — the integer variable bank.
+    Var,
+    /// `fvar(n)` — the float variable bank.
+    FVar,
+    /// `sysvar(n)` — the system integer variable bank.
+    SysVar,
+    /// `sysfvar(n)` — the system float variable bank.
+    SysFVar,
+}
+
+impl fmt::Display for AssignBank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AssignBank::Var => "var",
+            AssignBank::FVar => "fvar",
+            AssignBank::SysVar => "sysvar",
+            AssignBank::SysFVar => "sysfvar",
+        })
+    }
+}
+
 /// The interface the tree-walk evaluator (task 4.4) queries to read values from
 /// a live game entity.
 ///
@@ -548,11 +579,52 @@ pub trait EvalContext {
     fn random(&self) -> i32 {
         0
     }
+
+    /// Performs MUGEN's in-expression assignment `var(n) := e` (and the `fvar` /
+    /// `sysvar` / `sysfvar` bank variants), writing `value` to slot `index` of
+    /// `bank` and returning the value the *assignment expression* evaluates to.
+    ///
+    /// This is the **assignment hook** that makes the otherwise read-only
+    /// `EvalContext` trigger interface able to back MUGEN's `:=` operator (see
+    /// [`Expr::Assign`](crate::parser::Expr::Assign) and its evaluation in the
+    /// [`evaluator`](crate::evaluator)). The evaluator routes a parsed
+    /// `var(5) := 8000` here as `assign(AssignBank::Var, 5, Value::Int(8000))`,
+    /// and the returned [`Value`] becomes the value of the whole assignment
+    /// sub-expression — so `-1 + 0 * (var(31) := 2)` both sets `var(31)` and
+    /// evaluates the surrounding arithmetic.
+    ///
+    /// Because the trait is queried through a shared `&self`, a concrete entity
+    /// that actually persists the write must do so through interior mutability
+    /// (or buffer it and flush after the eval). The method returns the value that
+    /// a subsequent read of the same slot would yield, so the integer banks
+    /// return the narrowed [`Value::Int`] and the float banks the widened
+    /// [`Value::Float`].
+    ///
+    /// ## Contract
+    ///
+    /// Like every other method here it is infallible and must never panic. The
+    /// default implementation is a **no-op write** that returns the value coerced
+    /// to the bank's element type, so a context that does not model variables
+    /// (a leaf entity, a read-only test double) still lets a `:=` expression parse
+    /// and evaluate to a sensible value without storing anything. A concrete
+    /// entity overrides this to write its variable arrays. An out-of-range
+    /// `index` should be a silent no-op (returning the would-be value), matching
+    /// the engine-wide "bad input → safe default, never crash" rule.
+    fn assign(&self, bank: AssignBank, index: i32, value: Value) -> Value {
+        let _ = index;
+        // Coerce to the bank's element type so the returned value matches a later
+        // read, even though this default does not persist the write.
+        match bank {
+            AssignBank::Var | AssignBank::SysVar => Value::Int(value.to_int()),
+            AssignBank::FVar | AssignBank::SysFVar => Value::Float(value.to_float()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
     // ---- Value::as_bool — nonzero is true ----
@@ -713,12 +785,17 @@ mod tests {
         /// Member-keyed trigger values (e.g. `GetHitVar(member)`), keyed by the
         /// rendered `(lowercased name, lowercased member)` string.
         member_triggers: HashMap<String, Value>,
-        /// Integer variable bank (`var(i)`).
-        vars: HashMap<i32, i32>,
-        /// Float variable bank (`fvar(i)`).
-        fvars: HashMap<i32, f32>,
-        /// System integer variable bank (`sysvar(i)`).
-        sysvars: HashMap<i32, i32>,
+        /// Integer variable bank (`var(i)`). Interior-mutable so the assignment
+        /// hook (`var(i) := e`) can persist a write through the shared `&self`.
+        vars: RefCell<HashMap<i32, i32>>,
+        /// Float variable bank (`fvar(i)`), interior-mutable for assignment.
+        fvars: RefCell<HashMap<i32, f32>>,
+        /// System integer variable bank (`sysvar(i)`), interior-mutable for
+        /// assignment.
+        sysvars: RefCell<HashMap<i32, i32>>,
+        /// System float variable bank (`sysfvar(i)`), interior-mutable for
+        /// assignment.
+        sysfvars: RefCell<HashMap<i32, f32>>,
         /// Redirection targets.
         redirects: HashMap<Redirect, Box<MockContext>>,
     }
@@ -741,18 +818,18 @@ mod tests {
             self
         }
 
-        fn with_var(mut self, index: i32, value: i32) -> Self {
-            self.vars.insert(index, value);
+        fn with_var(self, index: i32, value: i32) -> Self {
+            self.vars.borrow_mut().insert(index, value);
             self
         }
 
-        fn with_fvar(mut self, index: i32, value: f32) -> Self {
-            self.fvars.insert(index, value);
+        fn with_fvar(self, index: i32, value: f32) -> Self {
+            self.fvars.borrow_mut().insert(index, value);
             self
         }
 
-        fn with_sysvar(mut self, index: i32, value: i32) -> Self {
-            self.sysvars.insert(index, value);
+        fn with_sysvar(self, index: i32, value: i32) -> Self {
+            self.sysvars.borrow_mut().insert(index, value);
             self
         }
 
@@ -779,6 +856,7 @@ mod tests {
 
         fn var(&self, index: i32) -> Value {
             self.vars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Int)
@@ -786,6 +864,7 @@ mod tests {
 
         fn fvar(&self, index: i32) -> Value {
             self.fvars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Float)
@@ -793,9 +872,37 @@ mod tests {
 
         fn sysvar(&self, index: i32) -> Value {
             self.sysvars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Int)
+        }
+
+        fn assign(&self, bank: AssignBank, index: i32, value: Value) -> Value {
+            // Persist the write through interior mutability and return the value
+            // the bank would read back (narrowed/widened to the bank type).
+            match bank {
+                AssignBank::Var => {
+                    let v = value.to_int();
+                    self.vars.borrow_mut().insert(index, v);
+                    Value::Int(v)
+                }
+                AssignBank::FVar => {
+                    let v = value.to_float();
+                    self.fvars.borrow_mut().insert(index, v);
+                    Value::Float(v)
+                }
+                AssignBank::SysVar => {
+                    let v = value.to_int();
+                    self.sysvars.borrow_mut().insert(index, v);
+                    Value::Int(v)
+                }
+                AssignBank::SysFVar => {
+                    let v = value.to_float();
+                    self.sysfvars.borrow_mut().insert(index, v);
+                    Value::Float(v)
+                }
+            }
         }
 
         fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
@@ -1455,6 +1562,80 @@ mod tests {
         );
         eprintln!(
             "real-fixture: probed {names_seen} trigger-like names; all resolved to safe default 0"
+        );
+    }
+
+    // ---- T036: the in-expression assignment (`:=`) hook ----
+
+    #[test]
+    fn assign_bank_display() {
+        assert_eq!(AssignBank::Var.to_string(), "var");
+        assert_eq!(AssignBank::FVar.to_string(), "fvar");
+        assert_eq!(AssignBank::SysVar.to_string(), "sysvar");
+        assert_eq!(AssignBank::SysFVar.to_string(), "sysfvar");
+    }
+
+    #[test]
+    fn default_assign_hook_is_noop_but_coerces_return() {
+        // A context that does not model variables inherits the default `assign`,
+        // which does NOT persist but still returns the value coerced to the bank's
+        // element type (so a `:=` expression evaluates sensibly).
+        struct ReadOnly;
+        impl EvalContext for ReadOnly {
+            fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+                Value::DEFAULT
+            }
+        }
+        let ctx = ReadOnly;
+        // Integer banks narrow the return value.
+        assert_eq!(
+            ctx.assign(AssignBank::Var, 0, Value::Float(3.9)),
+            Value::Int(3)
+        );
+        assert_eq!(
+            ctx.assign(AssignBank::SysVar, 0, Value::Int(7)),
+            Value::Int(7)
+        );
+        // Float banks widen the return value.
+        assert_eq!(
+            ctx.assign(AssignBank::FVar, 0, Value::Int(2)),
+            Value::Float(2.0)
+        );
+        assert_eq!(
+            ctx.assign(AssignBank::SysFVar, 0, Value::Float(1.5)),
+            Value::Float(1.5)
+        );
+        // The write did not persist (read still default), and it did not panic.
+        assert_eq!(ctx.var(0), Value::DEFAULT);
+    }
+
+    #[test]
+    fn mock_assign_persists_and_is_read_back_per_bank() {
+        // The interior-mutable MockContext actually stores the write, so a later
+        // read returns the assigned value — covering var/fvar/sysvar/sysfvar.
+        let ctx = MockContext::new();
+        assert_eq!(
+            ctx.assign(AssignBank::Var, 5, Value::Int(8000)),
+            Value::Int(8000)
+        );
+        assert_eq!(ctx.var(5), Value::Int(8000));
+
+        assert_eq!(
+            ctx.assign(AssignBank::FVar, 2, Value::Float(1.25)),
+            Value::Float(1.25)
+        );
+        assert_eq!(ctx.fvar(2), Value::Float(1.25));
+
+        assert_eq!(
+            ctx.assign(AssignBank::SysVar, 1, Value::Int(-3)),
+            Value::Int(-3)
+        );
+        assert_eq!(ctx.sysvar(1), Value::Int(-3));
+
+        // sysfvar has no typed read method on the trait; assign coerces & stores.
+        assert_eq!(
+            ctx.assign(AssignBank::SysFVar, 0, Value::Int(4)),
+            Value::Float(4.0)
         );
     }
 }

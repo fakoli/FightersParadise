@@ -112,18 +112,15 @@ fn load_all_triggers(dir: &Path) -> Vec<RawTrigger> {
 /// axis-suffixed component triggers (`Vel Y`, `Pos X`, `P2BodyDist X`,
 /// `ScreenPos Y`), the `AnimElem = N, op M` comparison tail,
 /// dotted call arguments (`GetHitVar(fall.yvel)`), and `command = "name"`
-/// string equality — so **none of those forms is unsupported any more**. The
-/// only remaining deferred form is:
-///
-/// - `:=` — variable assignment inside an expression, explicitly deferred to
-///   task 4.9. (Not present in these particular fixtures, but listed so the
-///   guard stays correct once assignment-bearing content is added.)
-const KNOWN_UNSUPPORTED_SUBSTR: &[&str] = &[":="];
+/// string equality — and T036 added the `:=` in-expression assignment operator.
+/// So **no known real-content form is unsupported any more**; this set is empty
+/// and any parse failure is treated as a genuine regression.
+const KNOWN_UNSUPPORTED_SUBSTR: &[&str] = &[];
 
 /// Returns `true` if `expr` (matched case-insensitively) contains a known
-/// unsupported form. After task 4.10 this is just the deferred `:=` assignment
-/// operator; the previously-listed axis / dotted / comma-tail / command forms
-/// now all parse.
+/// unsupported form. The set is now empty (after task 4.10 + T036 every
+/// real-content form parses), so this always returns `false` — a parse failure
+/// is never excused and surfaces as a regression.
 fn is_known_unsupported(expr: &str) -> bool {
     let lower = expr.to_ascii_lowercase();
     KNOWN_UNSUPPORTED_SUBSTR.iter().any(|s| lower.contains(s))
@@ -560,7 +557,7 @@ fn tokenize_and_parse_never_panic_on_adversarial_input() {
         "enemy,",                            // redirect with no target expr
         "helper(,",                          // malformed redirect id
         "\"unterminated string",             // unterminated string literal
-        ":= 5",                              // deferred assignment form (4.9)
+        ":= 5",                              // assignment with no LHS (recoverable)
         "Vel Y",                             // space-separated component trigger
         "GetHitVar(fall.yvel)",              // dotted member in call args
         "AnimElem = 2, >= 0",                // extended trailing-comma comparison
@@ -603,24 +600,35 @@ fn tokenize_and_parse_never_panic_on_adversarial_input() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn deferred_assignment_form_is_a_recoverable_parse_error() {
-    // `:=` (variable assignment) is explicitly deferred to task 4.9. It must
-    // NOT panic and must NOT silently parse — it has to be a clean ParseError.
-    for src in ["var(0) := 5", "x := 1", "fvar(2):=3.0"] {
+fn assignment_form_parses_for_bank_targets_and_errors_otherwise() {
+    // T036: `:=` (in-expression variable assignment) is now SUPPORTED for the
+    // four indexed banks. A bank-target assignment parses to `Expr::Assign`; a
+    // non-bank left-hand side is a recoverable `InvalidAssignTarget` error
+    // (never a panic, never a silent wrong parse).
+    use fp_vm::eval::AssignBank;
+    use fp_vm::Expr;
+
+    // Valid bank assignments parse.
+    for (src, bank) in [
+        ("var(0) := 5", AssignBank::Var),
+        ("fvar(2):=3.0", AssignBank::FVar),
+        ("sysvar(1) := 7", AssignBank::SysVar),
+    ] {
         let _ = tokenize(src); // never panics
-        let err = parse_str(src).expect_err("`:=` assignment is deferred; must be a ParseError");
-        // Any recoverable variant is acceptable; the contract is "recoverable,
-        // not panic". The `:` makes it an UnknownToken or an UnexpectedToken.
-        assert!(
-            matches!(
-                err,
-                ParseError::UnknownToken { .. }
-                    | ParseError::UnexpectedToken { .. }
-                    | ParseError::ExpectedDelimiter { .. }
-            ),
-            "`:=` should be a recoverable parse error, got {err:?}"
-        );
+        let ast = parse_str(src).unwrap_or_else(|e| panic!("{src:?} should parse: {e}"));
+        match ast {
+            Expr::Assign { bank: b, .. } => assert_eq!(b, bank, "{src:?} bank"),
+            other => panic!("{src:?} should parse to Expr::Assign, got {other:?}"),
+        }
     }
+
+    // A non-bank LHS (`x := 1`) is a recoverable error, not a panic.
+    let _ = tokenize("x := 1");
+    let err = parse_str("x := 1").expect_err("non-bank `:=` LHS must be a ParseError");
+    assert!(
+        matches!(err, ParseError::InvalidAssignTarget { .. }),
+        "non-bank `:=` LHS should be InvalidAssignTarget, got {err:?}"
+    );
 }
 
 #[test]
