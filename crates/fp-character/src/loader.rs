@@ -91,18 +91,6 @@ impl CompiledExpr {
     /// [`is_fallback`](CompiledExpr::is_fallback) is `true`.
     #[must_use]
     pub fn compile(source: &str) -> Self {
-        // An empty / whitespace-only value (e.g. a community-content `guardflag =`
-        // line with no right-hand side) is a legitimately-empty parameter, not a
-        // malformed expression. Fall back to const-0 *silently* — warning on it
-        // floods the load log with noise (real evilken has many such lines) for no
-        // diagnostic value.
-        if source.trim().is_empty() {
-            return Self {
-                expr: Expr::Int(0),
-                source: source.to_string(),
-                is_fallback: true,
-            };
-        }
         match fp_vm::parse_str(source) {
             Ok(expr) => Self {
                 expr,
@@ -1476,17 +1464,10 @@ mod tests {
     #[test]
     fn compile_empty_expression_is_fallback() {
         // An empty trigger value (real MUGEN content can produce these) must not
-        // panic; it becomes the const-0 fallback. T056: whitespace-only values
-        // (e.g. a `guardflag =` line with no right-hand side) are likewise a
-        // legitimately-empty parameter handled as a *silent* fallback — they take
-        // the early-return path and never emit a "bad expression" warning, which
-        // would otherwise flood the load log (real evilken has many such lines).
-        for src in ["", "   ", "\t"] {
-            let c = CompiledExpr::compile(src);
-            assert!(c.is_fallback, "empty/blank {src:?} must be a fallback");
-            assert_eq!(c.expr, Expr::Int(0));
-            assert_eq!(c.source, src, "the raw (untrimmed) source is preserved");
-        }
+        // panic; it becomes the const-0 fallback.
+        let c = CompiledExpr::compile("");
+        assert!(c.is_fallback);
+        assert_eq!(c.expr, Expr::Int(0));
     }
 
     #[test]
