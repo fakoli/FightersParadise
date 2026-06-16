@@ -17,7 +17,7 @@ pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
 pub use command::{
     compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,
-    InputModifier,
+    InputModifier, LeniencyConfig, DEFAULT_JUMP_BUFFER_FRAMES,
 };
 pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
 pub use state::{

@@ -118,6 +118,40 @@ impl InputBuffer {
             self.push(*frame);
         }
     }
+
+    /// Returns `true` if a **fresh up-press** (the rising edge of the up
+    /// direction) occurred within the last `window` frames — the input-layer
+    /// primitive behind the jump buffer (T075).
+    ///
+    /// A jump should still come out if the player tapped up a few frames *before*
+    /// they could act (e.g. during landing recovery). Rather than require up to be
+    /// held on the exact actionable frame, the command matcher scans this short
+    /// window for an unconsumed up-press. The edge (a frame whose `up` is set while
+    /// the immediately preceding frame's `up` was not) is detected so a single tap
+    /// counts once and a continuously-held up does not silently re-arm forever.
+    ///
+    /// `window` is clamped to the number of stored frames; `0` always returns
+    /// `false`. The scan is over the most-recent `window` frames (offsets
+    /// `0..window`), so it is independent of the ring's internal layout and is
+    /// fully deterministic.
+    #[must_use]
+    pub fn up_pressed_within(&self, window: usize) -> bool {
+        for ago in 0..window.min(self.count) {
+            let Some(frame) = self.get(ago) else { break };
+            if !frame.direction.up {
+                continue;
+            }
+            // `up` is held at this frame; it is a *fresh* press only if the
+            // immediately older frame did not also hold up. A missing older
+            // frame (the oldest stored input) counts as a press, matching the
+            // matcher's first-frame press convention.
+            match self.get(ago + 1) {
+                Some(prev) if prev.direction.up => continue,
+                _ => return true,
+            }
+        }
+        false
+    }
 }
 
 impl Default for InputBuffer {
@@ -260,5 +294,83 @@ mod tests {
             "oldest frame i=0 must have been evicted"
         );
         assert!(buf.get(60).is_none());
+    }
+
+    // -- T075: jump-buffer primitive --------------------------------------
+
+    /// Helper: push an up-held or neutral frame.
+    fn push_up(buf: &mut InputBuffer, up: bool) {
+        buf.push(InputState {
+            direction: Direction {
+                up,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn up_pressed_within_detects_recent_edge() {
+        let mut buf = InputBuffer::new();
+        // up-press 3 frames ago, then released and neutral since.
+        push_up(&mut buf, false); // older
+        push_up(&mut buf, true); // <- the fresh press (rising edge)
+        push_up(&mut buf, false);
+        push_up(&mut buf, false); // most recent (offset 0)
+
+        // The press sits at offset 2; a 4-frame window catches it.
+        assert!(buf.up_pressed_within(4));
+        // A window too short to reach offset 2 must miss it.
+        assert!(!buf.up_pressed_within(2));
+    }
+
+    #[test]
+    fn up_pressed_within_zero_window_is_false() {
+        let mut buf = InputBuffer::new();
+        push_up(&mut buf, true);
+        assert!(!buf.up_pressed_within(0), "zero window never fires");
+    }
+
+    #[test]
+    fn up_pressed_within_requires_rising_edge_not_sustained_hold() {
+        // A continuously-held up across the whole window is a single press at its
+        // start: still detected (the start IS a rising edge), but a hold that
+        // began *before* the window does not count as a fresh press inside it.
+        let mut buf = InputBuffer::new();
+        // Many neutral frames, then up held for a long time starting well before
+        // the scan window.
+        for _ in 0..10 {
+            push_up(&mut buf, false);
+        }
+        push_up(&mut buf, true); // edge, far in the past
+        for _ in 0..6 {
+            push_up(&mut buf, true); // sustained hold up to and including now
+        }
+        // The edge is 6 frames ago; a 3-frame window sees only sustained hold
+        // (no edge inside it) => false.
+        assert!(
+            !buf.up_pressed_within(3),
+            "a hold that began before the window is not a fresh press"
+        );
+        // A window long enough to reach the edge does fire.
+        assert!(buf.up_pressed_within(8));
+    }
+
+    #[test]
+    fn up_pressed_within_no_up_is_false() {
+        let mut buf = InputBuffer::new();
+        for _ in 0..5 {
+            push_up(&mut buf, false);
+        }
+        assert!(!buf.up_pressed_within(60));
+    }
+
+    #[test]
+    fn up_pressed_within_clamps_to_stored_frames() {
+        // Asking for a window larger than the buffer must not panic and must
+        // still find an edge within the stored frames.
+        let mut buf = InputBuffer::new();
+        push_up(&mut buf, true);
+        assert!(buf.up_pressed_within(usize::MAX));
     }
 }

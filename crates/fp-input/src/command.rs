@@ -116,6 +116,55 @@ pub struct CommandMatcherSnapshot {
     active: Vec<(String, u32)>,
 }
 
+/// Default jump-buffer window, in frames (T075).
+///
+/// At 60Hz this is ~3 frames (50ms) — the small leniency window the player
+/// deep-dive (§1.3) calls for: a jump tapped this many frames before the player
+/// becomes actionable still comes out on the first actionable frame. Chosen
+/// short enough that it never lets an unrelated stale up-press resurrect a jump.
+pub const DEFAULT_JUMP_BUFFER_FRAMES: u32 = 3;
+
+/// Input-leniency configuration for a [`CommandMatcher`] (T075).
+///
+/// Buffering is a deterministic, input-layer concern: the same inputs always
+/// produce the same buffered commands, so versus determinism is unchanged. All
+/// fields default to *off* (`jump_buffer_frames = 0`) so the matcher behaves
+/// exactly as before unless leniency is explicitly enabled — existing content,
+/// replays, and tests are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeniencyConfig {
+    /// How many frames before the actionable frame an up-press is buffered so a
+    /// jump still fires. `0` disables the jump buffer entirely.
+    pub jump_buffer_frames: u32,
+    /// The command name kept active by a buffered up-press. This is the engine's
+    /// built-in jump gate (`holdup`); a buffered jump is intentionally applied
+    /// only to that built-in locomotion command, never to authored content
+    /// motions (the variable jump height of an authored arc stays the
+    /// character's concern).
+    pub jump_command: String,
+}
+
+impl Default for LeniencyConfig {
+    fn default() -> Self {
+        Self {
+            jump_buffer_frames: 0,
+            jump_command: "holdup".to_string(),
+        }
+    }
+}
+
+impl LeniencyConfig {
+    /// A leniency config with the jump buffer enabled at the default
+    /// [`DEFAULT_JUMP_BUFFER_FRAMES`] window over the standard `holdup` gate.
+    #[must_use]
+    pub fn with_jump_buffer() -> Self {
+        Self {
+            jump_buffer_frames: DEFAULT_JUMP_BUFFER_FRAMES,
+            ..Self::default()
+        }
+    }
+}
+
 /// Matches input buffer contents against command definitions.
 ///
 /// Call [`CommandMatcher::check_commands`] once per tick to scan for newly
@@ -126,21 +175,58 @@ pub struct CommandMatcher {
     commands: Vec<CommandDef>,
     /// Currently active (matched and not yet expired) commands.
     active: Vec<CommandResult>,
+    /// Input-leniency configuration (jump buffer). Defaults to off.
+    leniency: LeniencyConfig,
 }
 
 impl CommandMatcher {
     /// Creates a new matcher with the given command definitions.
+    ///
+    /// Input leniency is **off** by default ([`LeniencyConfig::default`]); enable
+    /// the jump buffer with [`with_leniency`](Self::with_leniency) or
+    /// [`set_leniency`](Self::set_leniency).
     pub fn new(commands: Vec<CommandDef>) -> Self {
         Self {
             commands,
             active: Vec::new(),
+            leniency: LeniencyConfig::default(),
         }
+    }
+
+    /// Builder variant of [`new`](Self::new) that also installs a
+    /// [`LeniencyConfig`] (e.g. [`LeniencyConfig::with_jump_buffer`]).
+    #[must_use]
+    pub fn with_leniency(commands: Vec<CommandDef>, leniency: LeniencyConfig) -> Self {
+        Self {
+            commands,
+            active: Vec::new(),
+            leniency,
+        }
+    }
+
+    /// Replaces this matcher's input-leniency configuration.
+    pub fn set_leniency(&mut self, leniency: LeniencyConfig) {
+        self.leniency = leniency;
+    }
+
+    /// Returns the matcher's current input-leniency configuration.
+    #[must_use]
+    pub fn leniency(&self) -> &LeniencyConfig {
+        &self.leniency
     }
 
     /// Checks all commands against the input buffer. Call once per tick.
     ///
     /// Decrements active command timers, removes expired ones, then attempts
     /// to match each command definition by scanning backward through the buffer.
+    ///
+    /// Finally, when the jump buffer is enabled ([`LeniencyConfig`]), a fresh
+    /// up-press within the leniency window keeps the configured `jump_command`
+    /// (the engine built-in `holdup` gate) active even if up is no longer held
+    /// this exact frame — so a jump tapped a few frames before the player became
+    /// actionable still comes out (T075). This is applied *after* normal matching
+    /// and only re-arms the single jump gate, so it cannot turn one motion into
+    /// another (a `QCF` never becomes a `DP`).
     pub fn check_commands(&mut self, buffer: &InputBuffer, facing_right: bool) {
         // Decrement active timers and remove expired
         for result in &mut self.active {
@@ -159,6 +245,43 @@ impl CommandMatcher {
                     remaining: cmd.buffer_time,
                 });
             }
+        }
+
+        self.apply_jump_buffer(buffer);
+    }
+
+    /// Re-arms the configured jump command from a buffered up-press (T075).
+    ///
+    /// No-op when the jump buffer is disabled (`jump_buffer_frames == 0`), when
+    /// the jump command is not in this matcher's vocabulary, or when it is
+    /// already active this tick. Otherwise, if [`InputBuffer::up_pressed_within`]
+    /// finds a fresh up-press inside the window, the jump command is activated
+    /// with its own `buffer_time` so downstream code reads it exactly as a
+    /// freshly-matched `holdup`.
+    fn apply_jump_buffer(&mut self, buffer: &InputBuffer) {
+        let window = self.leniency.jump_buffer_frames;
+        if window == 0 {
+            return;
+        }
+        // Bound the scan to the configured jump gate only — never authored motions.
+        let Some(cmd) = self
+            .commands
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&self.leniency.jump_command))
+        else {
+            return;
+        };
+        if self.active.iter().any(|r| r.name == cmd.name) {
+            return; // already live this tick (real hold or prior buffer)
+        }
+        if buffer.up_pressed_within(window as usize) {
+            // Keep the jump alive for the gate command's own buffer_time so the
+            // engine's `command = "holdup"` ChangeState can fire on the first
+            // actionable frame. A minimum of 1 ensures a `buffer_time = 0` gate
+            // (KFM's instantaneous holds) is still observable this tick.
+            let remaining = cmd.buffer_time.max(1);
+            let name = cmd.name.clone();
+            self.active.push(CommandResult { name, remaining });
         }
     }
 
@@ -2816,5 +2939,244 @@ mod tests {
             },
             "element 3 must be the A button"
         );
+    }
+
+    // ====================================================================
+    // T075: input leniency — jump buffer + command-window regression
+    // ====================================================================
+
+    /// Builds the engine `holdup` jump gate as authored by trainingdummy/KFM:
+    /// hold + direction-detect up (`/$U`), instantaneous window.
+    fn holdup_cmd() -> CommandDef {
+        CommandDef {
+            name: "holdup".into(),
+            elements: compile_command("/$U").unwrap(),
+            time: 1,
+            buffer_time: 1,
+        }
+    }
+
+    /// Push an up-held or neutral (default) frame.
+    fn push_up(buffer: &mut InputBuffer, up: bool) {
+        buffer.push(make_state(
+            Direction {
+                up,
+                ..Default::default()
+            },
+            &[],
+        ));
+    }
+
+    #[test]
+    fn leniency_defaults_to_off() {
+        // Default matcher must be byte-for-byte the old behavior: no jump buffer.
+        let m = CommandMatcher::new(vec![holdup_cmd()]);
+        assert_eq!(m.leniency().jump_buffer_frames, 0);
+        assert_eq!(m.leniency().jump_command, "holdup");
+        assert_eq!(LeniencyConfig::with_jump_buffer().jump_buffer_frames, 3);
+    }
+
+    #[test]
+    fn jump_buffer_fires_on_actionable_frame_after_release() {
+        // Player taps up, then RELEASES it 2 frames before becoming actionable
+        // (the actionable frame is the most recent / offset 0, where up is no
+        // longer held). With the jump buffer on, `holdup` must still be active on
+        // that frame.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false); // neutral
+        push_up(&mut buffer, true); // <- up pressed (the buffered tap)
+        push_up(&mut buffer, false); // released, still in recovery
+        push_up(&mut buffer, false); // actionable frame, up no longer held
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("holdup"),
+            "a jump tapped 2 frames before the actionable frame must still fire"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_off_does_not_revive_released_jump() {
+        // Same input, jump buffer DISABLED (default matcher): on the actionable
+        // frame up is not held, so plain `holdup` is NOT active — proving the new
+        // behavior is opt-in and the baseline is unchanged.
+        let mut matcher = CommandMatcher::new(vec![holdup_cmd()]);
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, true);
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, false);
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("holdup"),
+            "without the jump buffer, a released up-press must not fire holdup"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_respects_window_size() {
+        // An up-press OLDER than the window must not be buffered.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, true); // up press, far back
+        for _ in 0..5 {
+            push_up(&mut buffer, false); // 5 neutral frames (> 3-frame window)
+        }
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("holdup"),
+            "an up-press older than the buffer window must not fire holdup"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_does_not_invent_jump_without_press() {
+        // No up at all => no buffered jump, even with the buffer enabled.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        for _ in 0..6 {
+            push_up(&mut buffer, false);
+        }
+        matcher.check_commands(&buffer, true);
+        assert!(!matcher.command_active("holdup"));
+    }
+
+    #[test]
+    fn jump_buffer_only_touches_its_own_command_not_qcf_or_dp() {
+        // REGRESSION (task gotcha): the jump buffer must re-arm ONLY `holdup`.
+        // It must never cause an unrelated motion to misfire — a QCF must not eat
+        // a DP, and a stray up-press must not conjure either. We register holdup,
+        // a QCF, and a DP; feed only a buffered up-press; and assert holdup fires
+        // while QCF and DP stay silent.
+        let qcf = CommandDef {
+            name: "fireball".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 3,
+        };
+        let dp = CommandDef {
+            name: "dp".into(),
+            elements: compile_command("F, D, DF, a").unwrap(),
+            time: 20,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::with_leniency(
+            vec![holdup_cmd(), qcf, dp],
+            LeniencyConfig::with_jump_buffer(),
+        );
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, true); // the only meaningful input: an up tap
+        push_up(&mut buffer, false);
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("holdup"),
+            "buffered up must fire jump"
+        );
+        assert!(
+            !matcher.command_active("fireball"),
+            "the jump buffer must NOT make a QCF misfire"
+        );
+        assert!(
+            !matcher.command_active("dp"),
+            "the jump buffer must NOT make a DP misfire"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_no_false_positives_for_real_motions() {
+        // Replay a genuine QCF+x with the jump buffer ON over a matcher that knows
+        // QCF, DP and holdup. The buffer must not add spurious commands: exactly
+        // the QCF should fire (no up was pressed, so holdup stays off; DP stays
+        // off). This is the "no new false matches" acceptance check against a
+        // real-shaped motion.
+        let qcf = CommandDef {
+            name: "fireball".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 3,
+        };
+        let dp = CommandDef {
+            name: "dp".into(),
+            elements: compile_command("F, D, DF, a").unwrap(),
+            time: 20,
+            buffer_time: 3,
+        };
+        let mut lenient = CommandMatcher::with_leniency(
+            vec![holdup_cmd(), qcf.clone(), dp.clone()],
+            LeniencyConfig::with_jump_buffer(),
+        );
+        let mut strict = CommandMatcher::new(vec![holdup_cmd(), qcf, dp]);
+
+        let mut buffer = InputBuffer::new();
+        for _ in 0..5 {
+            buffer.push(InputState::default());
+        }
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(Direction::default(), &[Button::X]));
+
+        lenient.check_commands(&buffer, true);
+        strict.check_commands(&buffer, true);
+
+        // The lenient matcher matches exactly what the strict one does for this
+        // up-free motion: the QCF and nothing else.
+        assert!(lenient.command_active("fireball"));
+        assert!(strict.command_active("fireball"));
+        assert!(
+            !lenient.command_active("holdup"),
+            "no up pressed => no jump"
+        );
+        assert!(!lenient.command_active("dp"), "QCF must not become a DP");
+        assert_eq!(
+            lenient.active_command_names().len(),
+            strict.active_command_names().len(),
+            "jump buffer added no extra command matches for a real QCF"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_is_deterministic() {
+        // Determinism: identical input sequences yield identical active sets.
+        let build = || {
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer())
+        };
+        let mut a = build();
+        let mut b = build();
+        let mut buf_a = InputBuffer::new();
+        let mut buf_b = InputBuffer::new();
+        for up in [false, true, false, false, false] {
+            push_up(&mut buf_a, up);
+            push_up(&mut buf_b, up);
+            a.check_commands(&buf_a, true);
+            b.check_commands(&buf_b, true);
+            assert_eq!(a.active_command_names(), b.active_command_names());
+        }
     }
 }

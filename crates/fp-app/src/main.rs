@@ -315,7 +315,12 @@ impl CnsCharacter {
             loaded,
             entity,
             input_buffer: InputBuffer::new(),
-            matcher: CommandMatcher::new(command_defs.clone()),
+            // Input leniency (T075): small jump buffer over the built-in `holdup`
+            // gate, matching the two-player engine path.
+            matcher: CommandMatcher::with_leniency(
+                command_defs.clone(),
+                fp_input::LeniencyConfig::with_jump_buffer(),
+            ),
             command_defs,
         }
     }
