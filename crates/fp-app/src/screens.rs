@@ -45,6 +45,11 @@ use std::path::{Path, PathBuf};
 
 use fp_ui::{MenuItemKind, RosterEntry, SelectDef, SelectInfo, SelectSlot, SystemDef};
 
+// Re-export the HUD-customization model (T046) so the rest of the app can refer
+// to it as `screens::HudConfig` / `screens::BarColor` / `screens::HudElement`,
+// matching how `InputConfig` and friends are namespaced under `screens`.
+pub use fp_ui::{BarColor, HudConfig, HudElement};
+
 // `SelectSlot` is used both in `SelectScreen::new` and `stage_entries_from_roster`.
 
 /// An edge-detected, source-agnostic menu input for one frame.
@@ -888,6 +893,9 @@ pub enum SetupOutcome {
     Pending,
     /// The player left the setup screen (back/cancel): return to the title menu.
     Exit,
+    /// The player chose the HUD-customization row: open the
+    /// [`HudCustomizeScreen`] (T046).
+    OpenHudCustomize,
 }
 
 /// One selectable row on the setup screen.
@@ -895,7 +903,22 @@ pub enum SetupOutcome {
 enum SetupRow {
     /// The input-device preference toggle (Keyboard / Controller).
     Device,
+    /// Opens the HUD-customization screen (T046).
+    HudCustomize,
     /// A remappable action's key binding.
+    Action(InputAction),
+}
+
+/// What one setup-screen row represents, for the renderer to label/walk each row
+/// unambiguously (the device toggle, the HUD-customization entry, or a remappable
+/// action's key binding). See [`SetupScreen::row_kinds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupRowKind {
+    /// The input-device preference toggle row.
+    Device,
+    /// The HUD-customization entry row (T046).
+    HudCustomize,
+    /// A remappable action's key-binding row.
     Action(InputAction),
 }
 
@@ -931,9 +954,12 @@ impl Default for SetupScreen {
 
 impl SetupScreen {
     /// Builds the setup screen: cursor on the first row, not capturing.
+    ///
+    /// Rows, in display order: the input-device toggle, the HUD-customization
+    /// entry (T046), then one key-binding row per [`InputAction`].
     #[must_use]
     pub fn new() -> Self {
-        let mut rows = vec![SetupRow::Device];
+        let mut rows = vec![SetupRow::Device, SetupRow::HudCustomize];
         rows.extend(InputAction::ALL.iter().map(|&a| SetupRow::Action(a)));
         Self {
             cursor: 0,
@@ -960,6 +986,27 @@ impl SetupScreen {
         matches!(self.rows.get(self.cursor), Some(SetupRow::Device))
     }
 
+    /// Whether the HUD-customization row is highlighted (T046).
+    #[must_use]
+    pub fn on_hud_row(&self) -> bool {
+        matches!(self.rows.get(self.cursor), Some(SetupRow::HudCustomize))
+    }
+
+    /// What each row represents, in display order, for the renderer to label and
+    /// walk each row unambiguously (the device toggle, the HUD-customization
+    /// entry, or an action's key binding). Parallel to [`SetupScreen::row_count`].
+    #[must_use]
+    pub fn row_kinds(&self) -> Vec<SetupRowKind> {
+        self.rows
+            .iter()
+            .map(|r| match r {
+                SetupRow::Device => SetupRowKind::Device,
+                SetupRow::HudCustomize => SetupRowKind::HudCustomize,
+                SetupRow::Action(a) => SetupRowKind::Action(*a),
+            })
+            .collect()
+    }
+
     /// The [`InputAction`] of the highlighted row, or `None` on the device row.
     #[must_use]
     pub fn selected_action(&self) -> Option<InputAction> {
@@ -967,19 +1014,6 @@ impl SetupScreen {
             Some(SetupRow::Action(a)) => Some(*a),
             _ => None,
         }
-    }
-
-    /// The action each row represents, in display order (`None` = the device
-    /// row), for the renderer to walk alongside the cursor.
-    #[must_use]
-    pub fn row_actions(&self) -> Vec<Option<InputAction>> {
-        self.rows
-            .iter()
-            .map(|r| match r {
-                SetupRow::Device => None,
-                SetupRow::Action(a) => Some(*a),
-            })
-            .collect()
     }
 
     /// Applies one frame of menu input, editing `config` in place.
@@ -1022,6 +1056,10 @@ impl SetupScreen {
             Some(SetupRow::Device) if input.left || input.right || input.confirm => {
                 config.device = config.device.toggled();
             }
+            // HUD-customization row + confirm: open the HUD-customization screen.
+            Some(SetupRow::HudCustomize) if input.confirm => {
+                return SetupOutcome::OpenHudCustomize;
+            }
             // Action row + confirm: arm capture so the next key press rebinds it.
             Some(SetupRow::Action(action)) if input.confirm => {
                 self.capturing = Some(action);
@@ -1047,6 +1085,144 @@ impl SetupScreen {
         let action = self.capturing.take()?;
         let displaced = config.rebind(action, key);
         Some((action, displaced))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HUD-customization screen (T046)
+// ---------------------------------------------------------------------------
+
+/// What one frame of HUD-customization-screen input produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudCustomizeOutcome {
+    /// Still on the HUD-customization screen.
+    Pending,
+    /// The player left the screen (back/cancel): return to the setup screen.
+    Exit,
+}
+
+/// One selectable row on the HUD-customization screen.
+///
+/// The first two rows cycle the life- and power-bar colors; the rest toggle one
+/// [`HudElement`]'s visibility each. Used both by [`HudCustomizeScreen::update`]
+/// and by the renderer to label each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudRow {
+    /// Cycle the life-bar color through [`BarColor::PRESETS`].
+    LifeColor,
+    /// Cycle the power-bar color through [`BarColor::PRESETS`].
+    PowerColor,
+    /// Toggle the given element's visibility.
+    Visibility(HudElement),
+}
+
+impl HudRow {
+    /// A short uppercase label (matching the HUD font's glyph set) for the row,
+    /// for the customization-screen renderer.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            HudRow::LifeColor => "LIFE BAR COLOR",
+            HudRow::PowerColor => "POWER BAR COLOR",
+            HudRow::Visibility(e) => e.label(),
+        }
+    }
+}
+
+/// The in-game HUD-customization screen (T046): edits a live [`HudConfig`].
+///
+/// Reachable from the setup/options screen (a `SetupRow::HudCustomize` row →
+/// [`SetupOutcome::OpenHudCustomize`]). A single vertical cursor walks the rows:
+/// the life-bar color, the power-bar color, then one row per [`HudElement`].
+/// Up/Down move the cursor (wrapping); Left/Right/Confirm on a color row cycle
+/// that bar's color through [`BarColor::PRESETS`]; Confirm on an element row
+/// toggles that element's visibility. Back/cancel returns to the setup screen.
+///
+/// Edits are applied in place to the [`HudConfig`] the app holds (and hands to the
+/// [`ScreenpackHud`](fp_ui::ScreenpackHud) renderer), so a change is reflected in
+/// the model the renderer reads immediately. Navigation is source-agnostic
+/// ([`MenuInput`]), so a controller and the keyboard drive it identically. Nothing
+/// here panics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HudCustomizeScreen {
+    /// The highlighted row index into [`HudCustomizeScreen::rows`].
+    pub cursor: usize,
+    /// The selectable rows (two color rows + one per element), in display order.
+    rows: Vec<HudRow>,
+}
+
+impl Default for HudCustomizeScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HudCustomizeScreen {
+    /// Builds the HUD-customization screen: cursor on the first row.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut rows = vec![HudRow::LifeColor, HudRow::PowerColor];
+        rows.extend(HudElement::ALL.iter().map(|&e| HudRow::Visibility(e)));
+        Self { cursor: 0, rows }
+    }
+
+    /// The number of selectable rows (two color rows + one per element).
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The rows in display order, for the renderer to walk alongside the cursor.
+    #[must_use]
+    pub fn rows(&self) -> &[HudRow] {
+        &self.rows
+    }
+
+    /// The highlighted row.
+    #[must_use]
+    pub fn selected_row(&self) -> Option<HudRow> {
+        self.rows.get(self.cursor).copied()
+    }
+
+    /// Applies one frame of menu input, editing `config` in place.
+    ///
+    /// - Up/Down move the cursor (wrapping);
+    /// - Left/Right/Confirm on a color row cycle that bar's color through
+    ///   [`BarColor::PRESETS`];
+    /// - Confirm on an element row toggles that element's visibility;
+    /// - Back returns [`HudCustomizeOutcome::Exit`] (to the setup screen).
+    ///
+    /// Any edit takes effect immediately in `config` — the same [`HudConfig`] the
+    /// renderer reads — so the HUD changes on the next frame.
+    pub fn update(&mut self, input: MenuInput, config: &mut HudConfig) -> HudCustomizeOutcome {
+        if input.back {
+            return HudCustomizeOutcome::Exit;
+        }
+        let len = self.rows.len();
+        if len == 0 {
+            return HudCustomizeOutcome::Pending;
+        }
+        if input.up {
+            self.cursor = wrap_dec(self.cursor, len);
+        }
+        if input.down {
+            self.cursor = wrap_inc(self.cursor, len);
+        }
+        match self.rows.get(self.cursor).copied() {
+            // A color row: any horizontal step or confirm cycles the next preset.
+            Some(HudRow::LifeColor) if input.left || input.right || input.confirm => {
+                config.set_life_color(config.life_color().next_preset());
+            }
+            Some(HudRow::PowerColor) if input.left || input.right || input.confirm => {
+                config.set_power_color(config.power_color().next_preset());
+            }
+            // An element row + confirm: flip its visibility.
+            Some(HudRow::Visibility(element)) if input.confirm => {
+                config.toggle_visible(element);
+            }
+            _ => {}
+        }
+        HudCustomizeOutcome::Pending
     }
 }
 
@@ -1751,8 +1927,8 @@ mod tests {
         assert_eq!(s.cursor, 0);
         assert!(s.on_device_row());
         assert!(!s.awaiting_key());
-        // Rows = device + one per action.
-        assert_eq!(s.row_count(), 1 + InputAction::ALL.len());
+        // Rows = device + HUD-customization (T046) + one per action.
+        assert_eq!(s.row_count(), 2 + InputAction::ALL.len());
     }
 
     #[test]
@@ -1765,7 +1941,11 @@ mod tests {
         s.update(down(), &mut cfg);
         assert_eq!(s.cursor, 0, "down from the last row wraps to the first");
         s.update(down(), &mut cfg);
-        assert_eq!(s.cursor, 1);
+        assert_eq!(s.cursor, 1, "row 1 is the HUD-customization row");
+        assert!(s.on_hud_row());
+        assert_eq!(s.selected_action(), None, "the HUD row is not an action");
+        s.update(down(), &mut cfg);
+        assert_eq!(s.cursor, 2);
         assert_eq!(s.selected_action(), Some(InputAction::Up));
     }
 
@@ -1801,9 +1981,9 @@ mod tests {
         let mut s = SetupScreen::new();
         let mut cfg = config_with_index_keys();
 
-        // Walk down to the `A` action row: device(0), Up(1), Down(2), Left(3),
-        // Right(4), A(5).
-        for _ in 0..5 {
+        // Walk down to the `A` action row: device(0), HudCustomize(1), Up(2),
+        // Down(3), Left(4), Right(5), A(6).
+        for _ in 0..6 {
             s.update(down(), &mut cfg);
         }
         assert_eq!(s.selected_action(), Some(InputAction::A));
@@ -1832,7 +2012,8 @@ mod tests {
     fn setup_capture_ignores_navigation_until_key_or_cancel() {
         let mut s = SetupScreen::new();
         let mut cfg = config_with_index_keys();
-        // Arm capture on the Up action (row 1).
+        // Arm capture on the Up action (row 2: device(0), HudCustomize(1), Up(2)).
+        s.update(down(), &mut cfg);
         s.update(down(), &mut cfg);
         assert_eq!(s.selected_action(), Some(InputAction::Up));
         s.update(confirm(), &mut cfg);
@@ -1841,7 +2022,7 @@ mod tests {
         // Navigation is suspended while capturing: the cursor must not move.
         s.update(down(), &mut cfg);
         s.update(up(), &mut cfg);
-        assert_eq!(s.cursor, 1, "cursor frozen during capture");
+        assert_eq!(s.cursor, 2, "cursor frozen during capture");
         assert!(s.awaiting_key(), "still capturing");
 
         // Back cancels the capture without binding and without leaving the screen.
@@ -1880,5 +2061,161 @@ mod tests {
             );
         }
         assert_eq!(cfg.device, InputDevice::Keyboard);
+    }
+
+    // ---- HUD-customization screen (T046) --------------------------------
+
+    #[test]
+    fn setup_has_a_hud_customization_row_reachable_from_options() {
+        // Acceptance #2: the HUD-customization screen is reachable from the
+        // setup/options screen. Row 1 is the HUD row; confirming it opens it.
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        s.update(down(), &mut cfg); // device(0) -> HudCustomize(1)
+        assert!(s.on_hud_row());
+        assert_eq!(
+            s.update(confirm(), &mut cfg),
+            SetupOutcome::OpenHudCustomize,
+            "confirming the HUD row opens the HUD-customization screen"
+        );
+        // The other rows do NOT open it (regression: device toggle still toggles).
+        let mut s2 = SetupScreen::new();
+        assert_ne!(
+            s2.update(confirm(), &mut cfg),
+            SetupOutcome::OpenHudCustomize,
+            "confirming the device row toggles the device, not the HUD screen"
+        );
+    }
+
+    #[test]
+    fn hud_screen_starts_on_life_color_and_lists_every_element() {
+        let s = HudCustomizeScreen::new();
+        assert_eq!(s.cursor, 0);
+        assert_eq!(s.selected_row(), Some(HudRow::LifeColor));
+        // Two color rows + one per HudElement.
+        assert_eq!(s.row_count(), 2 + HudElement::ALL.len());
+        // Each element has exactly one visibility row.
+        for e in HudElement::ALL {
+            assert!(
+                s.rows().contains(&HudRow::Visibility(e)),
+                "{e:?} has a visibility row"
+            );
+        }
+    }
+
+    #[test]
+    fn hud_screen_cursor_moves_and_wraps() {
+        let mut s = HudCustomizeScreen::new();
+        let mut cfg = HudConfig::default();
+        let last = s.row_count() - 1;
+        assert_eq!(s.update(up(), &mut cfg), HudCustomizeOutcome::Pending);
+        assert_eq!(s.cursor, last, "up from the first row wraps to the last");
+        s.update(down(), &mut cfg);
+        assert_eq!(s.cursor, 0, "down from the last row wraps to the first");
+    }
+
+    #[test]
+    fn hud_screen_back_exits_to_setup() {
+        let mut s = HudCustomizeScreen::new();
+        let mut cfg = HudConfig::default();
+        assert_eq!(s.update(back(), &mut cfg), HudCustomizeOutcome::Exit);
+    }
+
+    #[test]
+    fn hud_screen_cycles_life_bar_color_into_the_config_the_renderer_reads() {
+        // Acceptance #2/#3: changing the life-bar color on the screen is reflected
+        // in the HudConfig the renderer reads. The default is the neutral no-op
+        // color; confirming on the life-color row steps to the next preset (red).
+        let mut s = HudCustomizeScreen::new();
+        let mut cfg = HudConfig::default();
+        assert!(cfg.is_default(), "starts as the no-op config");
+        assert_eq!(s.selected_row(), Some(HudRow::LifeColor));
+
+        assert_eq!(s.update(confirm(), &mut cfg), HudCustomizeOutcome::Pending);
+        assert_eq!(
+            cfg.life_color(),
+            BarColor::RED,
+            "the life-bar color advanced to the next preset"
+        );
+        assert!(!cfg.is_default(), "the config now carries an override");
+        // The renderer reads this exact color; a real (non-neutral) tint applies.
+        assert!(!fp_ui::bar_tint_palfx(cfg.life_color()).is_identity());
+        // Power bar is untouched by editing the life-bar row.
+        assert!(cfg.power_color().is_neutral());
+    }
+
+    #[test]
+    fn hud_screen_left_right_also_cycle_color() {
+        let mut s = HudCustomizeScreen::new();
+        let mut cfg = HudConfig::default();
+        // Right steps the life color forward.
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.life_color(), BarColor::RED);
+        // Left also advances (the screen cycles in one direction for simplicity).
+        s.update(left(), &mut cfg);
+        assert_eq!(cfg.life_color(), BarColor::GREEN);
+    }
+
+    #[test]
+    fn hud_screen_toggles_an_element_visibility() {
+        // Acceptance #2/#3: toggling an element on the screen flips its visibility
+        // in the HudConfig the renderer reads.
+        let mut s = HudCustomizeScreen::new();
+        let mut cfg = HudConfig::default();
+        // Walk to the POWER visibility row: LifeColor(0), PowerColor(1),
+        // Visibility(Life)(2), Visibility(Power)(3).
+        for _ in 0..3 {
+            s.update(down(), &mut cfg);
+        }
+        assert_eq!(
+            s.selected_row(),
+            Some(HudRow::Visibility(HudElement::Power))
+        );
+        assert!(cfg.is_visible(HudElement::Power), "visible by default");
+        s.update(confirm(), &mut cfg);
+        assert!(
+            !cfg.is_visible(HudElement::Power),
+            "the renderer now hides the power bar"
+        );
+        // Other elements stay visible.
+        assert!(cfg.is_visible(HudElement::Life));
+        // Toggling back restores the no-op config.
+        s.update(confirm(), &mut cfg);
+        assert!(cfg.is_visible(HudElement::Power));
+        assert!(cfg.is_default());
+    }
+
+    #[test]
+    fn setup_to_hud_screen_round_trip_drives_a_change() {
+        // End-to-end (pure): from the setup screen, open the HUD-customization
+        // screen, change a value, and confirm the change lives in the HudConfig
+        // the renderer consumes — then exit back to setup.
+        let mut setup = SetupScreen::new();
+        let mut input_cfg = config_with_index_keys();
+        let mut hud_cfg = HudConfig::default();
+
+        // Open the HUD screen from setup.
+        setup.update(down(), &mut input_cfg); // -> HUD row
+        assert_eq!(
+            setup.update(confirm(), &mut input_cfg),
+            SetupOutcome::OpenHudCustomize
+        );
+
+        // Edit the HUD config on the now-open screen.
+        let mut hud = HudCustomizeScreen::new();
+        hud.update(confirm(), &mut hud_cfg); // cycle life color off neutral
+        assert_eq!(hud_cfg.life_color(), BarColor::RED);
+
+        // Back returns to setup; the change persists in the shared config.
+        assert_eq!(hud.update(back(), &mut hud_cfg), HudCustomizeOutcome::Exit);
+        assert_eq!(hud_cfg.life_color(), BarColor::RED);
+        assert!(!hud_cfg.is_default());
+    }
+
+    #[test]
+    fn hud_row_labels_are_present() {
+        assert_eq!(HudRow::LifeColor.label(), "LIFE BAR COLOR");
+        assert_eq!(HudRow::PowerColor.label(), "POWER BAR COLOR");
+        assert_eq!(HudRow::Visibility(HudElement::Combo).label(), "COMBO");
     }
 }

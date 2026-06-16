@@ -4007,6 +4007,13 @@ enum RunScreen {
     /// The setup / options screen (T042): input device + key remapping. Reached
     /// from the title menu; back returns to Title.
     Setup(screens::SetupScreen),
+    /// The HUD-customization screen (T046): bar colors + per-element visibility.
+    /// Reached from the setup screen; back returns to Setup. Edits mutate the
+    /// app's [`MenuApp::hud_config`], which is snapshotted onto the screenpack HUD
+    /// at the **next** match start (`enter_fight` -> `set_hud_config`); they do
+    /// not retro-apply to an already-running match (this screen is only reachable
+    /// out of a fight, so that never arises).
+    HudCustomize(screens::HudCustomizeScreen),
     /// A running two-player match. On match-over the flow returns to Title.
     Fight(Box<MatchRun>),
     /// Leave the application.
@@ -4022,6 +4029,11 @@ struct MenuApp {
     /// `None` when the font is absent — the menus then draw nothing but the flow
     /// still works (and logs), so a missing font never traps the app.
     font: Option<GlyphFont>,
+    /// The player's live HUD-customization overrides (T046), edited on the
+    /// HUD-customization screen and applied to a match's screenpack HUD when a
+    /// fight starts. Defaults to the no-op [`fp_ui::HudConfig::default`] (HUD
+    /// unchanged).
+    hud_config: screens::HudConfig,
     /// The current screen.
     screen: RunScreen,
 }
@@ -4057,6 +4069,7 @@ impl MenuApp {
         Self {
             motif,
             font: load_hud_font(renderer),
+            hud_config: screens::HudConfig::default(),
             screen: RunScreen::Title(title),
         }
     }
@@ -4115,10 +4128,43 @@ impl MenuApp {
             stage.path.display(),
         );
         match build_match_run(&pick.p1_def, &pick.p2_def, stage, renderer) {
-            Some(run) => self.screen = RunScreen::Fight(Box::new(run)),
+            Some(mut run) => {
+                // Apply the player's HUD-customization overrides (T046) to the
+                // match's screenpack HUD, if one loaded. With the default (no-op)
+                // config this leaves the HUD byte-for-byte unchanged.
+                if let Some(screenpack) = run.screenpack.as_mut() {
+                    screenpack.set_hud_config(self.hud_config.clone());
+                }
+                self.screen = RunScreen::Fight(Box::new(run));
+            }
             None => {
                 tracing::warn!("could not start match; returning to title");
                 self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+            }
+        }
+    }
+
+    /// Enters the HUD-customization screen (T046), reachable from the setup
+    /// screen. The screen edits [`MenuApp::hud_config`] in place; the change is
+    /// applied to a match's screenpack HUD the next time a fight starts.
+    fn enter_hud_customize(&mut self) {
+        self.screen = RunScreen::HudCustomize(screens::HudCustomizeScreen::new());
+    }
+
+    /// Drives one frame of the HUD-customization screen (T046), editing the live
+    /// [`MenuApp::hud_config`] in place. On back/cancel returns to the setup
+    /// screen. A no-op when the active screen isn't the HUD-customization screen.
+    ///
+    /// Kept as a method so the borrow checker can split-borrow `self.screen` and
+    /// `self.hud_config` (two disjoint fields) — the caller can't borrow both at
+    /// once through `&mut app.screen`.
+    fn tick_hud_customize(&mut self, input: screens::MenuInput) {
+        if let RunScreen::HudCustomize(ref mut hud) = self.screen {
+            match hud.update(input, &mut self.hud_config) {
+                screens::HudCustomizeOutcome::Pending => {}
+                screens::HudCustomizeOutcome::Exit => {
+                    self.screen = RunScreen::Setup(screens::SetupScreen::new());
+                }
             }
         }
     }
@@ -4322,9 +4368,12 @@ fn draw_setup_screen(
 
     draw_centered_text(frame, font, "SETUP", win_w, 40.0, 3.0, 1.0);
 
-    // A short header noting the highlighted target (the device row, or an action).
+    // A short header noting the highlighted target (the device row, the HUD
+    // customization row, or an action).
     let focus = if setup.on_device_row() {
         "DEVICE".to_string()
+    } else if setup.on_hud_row() {
+        "HUD".to_string()
     } else {
         setup
             .selected_action()
@@ -4334,19 +4383,23 @@ fn draw_setup_screen(
     draw_centered_text(frame, font, &format!("> {focus}"), win_w, 84.0, 2.0, 0.7);
 
     let mut y = 120.0;
-    // Row 0 is the device toggle; the rest are one per action (in ALL order).
-    // `row_count` is the count this loop draws.
-    let actions = setup.row_actions();
-    debug_assert_eq!(actions.len(), setup.row_count());
-    for (i, action) in actions.iter().enumerate() {
+    // Row 0 is the device toggle, row 1 opens HUD customization (T046); the rest
+    // are one per action (in ALL order). `row_count` is the count this loop draws.
+    let kinds = setup.row_kinds();
+    debug_assert_eq!(kinds.len(), setup.row_count());
+    for (i, kind) in kinds.iter().enumerate() {
         let selected = i == setup.cursor;
         let marker = if selected { ">" } else { " " };
-        let line = match action {
+        let line = match kind {
             // The device-preference row.
-            None => format!("{marker} DEVICE: {}", config.device.label()),
+            screens::SetupRowKind::Device => {
+                format!("{marker} DEVICE: {}", config.device.label())
+            }
+            // The HUD-customization entry row (T046).
+            screens::SetupRowKind::HudCustomize => format!("{marker} HUD CUSTOMIZE..."),
             // An action's binding row: label + the bound key's name (or PRESS A
             // KEY while this action is being captured).
-            Some(act) => {
+            screens::SetupRowKind::Action(act) => {
                 let capturing = setup.capturing == Some(*act);
                 if capturing {
                     format!("{marker} {}: PRESS A KEY", act.label())
@@ -4371,6 +4424,79 @@ fn draw_setup_screen(
         "ENTER REMAP  ESC BACK"
     };
     draw_centered_text(frame, font, hint, win_w, y + 16.0, 2.0, 0.8);
+}
+
+/// Draws the HUD-customization screen (T046): the life/power bar color rows and
+/// the per-element visibility toggles, with a cursor and the values from the live
+/// [`fp_ui::HudConfig`]. Pure presentation over the already-edited config; no
+/// gameplay effect here (the renderer reads the config at match time).
+fn draw_hud_customize_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    hud: &screens::HudCustomizeScreen,
+    config: &screens::HudConfig,
+    win_w: f32,
+) {
+    /// HUD-customization list text scale.
+    const SCALE: f32 = 2.5;
+    let line_h = font.line_height() as f32 * SCALE;
+
+    draw_centered_text(frame, font, "HUD CUSTOMIZE", win_w, 40.0, 3.0, 1.0);
+
+    // A short header noting the highlighted row.
+    let focus = hud.selected_row().map(|r| r.label()).unwrap_or("");
+    draw_centered_text(frame, font, &format!("> {focus}"), win_w, 84.0, 2.0, 0.7);
+
+    let rows = hud.rows();
+    debug_assert_eq!(rows.len(), hud.row_count());
+    let mut y = 120.0;
+    for (i, row) in rows.iter().enumerate() {
+        let selected = i == hud.cursor;
+        let marker = if selected { ">" } else { " " };
+        let line = match row {
+            screens::HudRow::LifeColor => {
+                format!(
+                    "{marker} {}: {}",
+                    row.label(),
+                    color_label(config.life_color())
+                )
+            }
+            screens::HudRow::PowerColor => {
+                format!(
+                    "{marker} {}: {}",
+                    row.label(),
+                    color_label(config.power_color())
+                )
+            }
+            screens::HudRow::Visibility(element) => {
+                let state = if config.is_visible(*element) {
+                    "ON"
+                } else {
+                    "OFF"
+                };
+                format!("{marker} {}: {state}", row.label())
+            }
+        };
+        let alpha = if selected { 1.0 } else { 0.6 };
+        draw_centered_text(frame, font, &to_menu_text(&line), win_w, y, SCALE, alpha);
+        y += line_h + 4.0;
+    }
+
+    draw_centered_text(
+        frame,
+        font,
+        "ENTER CHANGE  ESC BACK",
+        win_w,
+        y + 16.0,
+        2.0,
+        0.8,
+    );
+}
+
+/// A short uppercase label for a [`screens::BarColor`] used on the
+/// HUD-customization screen, falling back to `CUSTOM` for a non-preset color.
+fn color_label(color: screens::BarColor) -> &'static str {
+    color.label().unwrap_or("CUSTOM")
 }
 
 /// Upcases `s` into the menu font's supported glyph set (the shipped FNT covers
@@ -4910,8 +5036,17 @@ fn run() -> fp_core::FpResult<()> {
                         match setup.update(menu_in, &mut input_config) {
                             screens::SetupOutcome::Pending => {}
                             screens::SetupOutcome::Exit => app.return_to_title(),
+                            // Open the HUD-customization screen (T046).
+                            screens::SetupOutcome::OpenHudCustomize => app.enter_hud_customize(),
                         }
                     }
+                }
+                RunScreen::HudCustomize(_) => {
+                    // Edit the live HUD-customization config (T046); back returns to
+                    // the setup screen. The edited config is applied to a match's
+                    // screenpack HUD when the next fight starts. The method
+                    // split-borrows the screen + the hud_config off the app.
+                    app.tick_hud_customize(menu_in);
                 }
                 RunScreen::Select(ref mut select) => {
                     let mode = select.mode;
@@ -5068,6 +5203,11 @@ fn run() -> fp_core::FpResult<()> {
                 RunScreen::Setup(setup) => {
                     if let Some(font) = app.font.as_ref() {
                         draw_setup_screen(&mut frame, font, setup, &input_config, win_wf);
+                    }
+                }
+                RunScreen::HudCustomize(hud) => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_hud_customize_screen(&mut frame, font, hud, &app.hud_config, win_wf);
                     }
                 }
                 RunScreen::Fight(run) => {
@@ -5566,8 +5706,9 @@ mod tests {
 
         // Rebind `a` to `P` through the setup screen's capture path.
         let mut setup = screens::SetupScreen::new();
-        // Walk to the `A` action row (device, Up, Down, Left, Right, A).
-        for _ in 0..5 {
+        // Walk to the `A` action row (device, HUD-customize, Up, Down, Left,
+        // Right, A — the HUD-customization row (T046) sits between device and Up).
+        for _ in 0..6 {
             setup.update(
                 screens::MenuInput {
                     down: true,

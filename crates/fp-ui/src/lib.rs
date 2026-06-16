@@ -10,6 +10,11 @@
 //! - [`screenpack`] — a pure parser turning a `fight.def` ([`fp_formats::def::DefFile`])
 //!   into a typed [`ScreenpackLayout`] (which sprites/fonts to load and where every
 //!   HUD element sits). No GPU, fully unit-tested, never panics on bad content.
+//! - [`hud_config`] — [`HudConfig`], the player-facing HUD customization overrides
+//!   (T046): bar colors, a global offset/scale, and per-element visibility, layered
+//!   over the screenpack-authored layout. The [default](HudConfig::default) is a
+//!   guaranteed no-op (the HUD renders unchanged); the in-game customization screen
+//!   and any config loader mutate it. Pure, no GPU.
 //! - [`renderer`] — [`ScreenpackHud`], the GPU-resident HUD: it uploads the
 //!   layout's `fight.sff` sprites + fonts once, then each frame draws the bars and
 //!   text via `fp-render`'s existing `draw_sprite`/`draw_text`, clipping each bar's
@@ -27,14 +32,17 @@
 #![warn(missing_docs)]
 
 pub mod discovery;
+pub mod hud_config;
 pub mod renderer;
 pub mod screenpack;
 pub mod select_def;
 pub mod system_def;
 
 pub use discovery::{discover_chars, discover_motifs, CharEntry, MotifEntry};
+pub use hud_config::{BarColor, HudConfig, HudElement};
 pub use renderer::{
-    bar_fill_uv, clamp_fraction, combo_text, face_draw_pos, MatchHudState, ScreenpackHud,
+    bar_fill_uv, bar_tint_palfx, clamp_fraction, combo_text, face_draw_pos, MatchHudState,
+    ScreenpackHud,
 };
 pub use screenpack::{
     ComboLayout, FaceSide, LifebarSide, NameSide, Pos, PowerbarSide, RoundLayout, ScreenpackLayout,
