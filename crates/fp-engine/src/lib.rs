@@ -11563,6 +11563,83 @@ time = 1
         );
     }
 
+    /// T056b stuck-punch repro (asset-gated): evilken's ground punch runs a
+    /// *finite looping* attack animation and exits on `trigger = AnimTime = 0`.
+    /// Before the fix, `AnimTime` never observably reached `0` for a looping anim
+    /// (the per-tick advance consumed the final element's last tick in the same
+    /// call that looped to `loopstart`), so the exit trigger never fired and the
+    /// punch looped FOREVER with `ctrl = false` — the character was permanently
+    /// stuck mid-punch. This drives a real evilken match, presses the punch
+    /// button, then ticks well past any reasonable attack duration and asserts P1
+    /// regains control and returns to a neutral non-attack state (it is NOT stuck).
+    ///
+    /// Skips cleanly when `test-assets/evilken/` is absent (evilken is local-only
+    /// behind the gitignored `test-assets` symlink; never committed).
+    #[test]
+    fn evilken_ground_punch_is_not_stuck_after_animation_loops() {
+        let Some(mut m) = build_evilken_match() else {
+            return; // fixture absent -> skip cleanly
+        };
+        evilken_into_fight(&mut m);
+
+        // Put P1 in a neutral controllable standing state, then press a button.
+        {
+            let c = &mut m.p1.character;
+            c.state_no = 0;
+            c.state_type = StateType::Standing;
+            c.move_type = MoveType::Idle;
+            c.ctrl = true;
+        }
+
+        // Press the light-punch button (rising edge), then release. A single
+        // button press is the universal "basic attack" input.
+        let press = MatchInput {
+            a: true,
+            ..MatchInput::none()
+        };
+        m.tick(press, MatchInput::none());
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // Record whether P1 ever left neutral into an attack (so the test is
+        // meaningful: if the punch never fired there is nothing to be stuck in,
+        // and we skip rather than false-pass).
+        let mut attacked =
+            m.p1().character.move_type == MoveType::Attack || m.p1().character.state_no != 0;
+
+        // Tick well past any plausible attack+recovery duration. A finite looping
+        // attack that never reports AnimTime = 0 would loop here forever; with the
+        // fix it completes and the standard `AnimTime = 0` exit returns control.
+        let mut regained_control = false;
+        for _ in 0..600 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p1().character.move_type == MoveType::Attack || m.p1().character.state_no != 0 {
+                attacked = true;
+            }
+            // Neutral + controllable again == not stuck mid-attack.
+            if m.p1().character.state_no == 0 && m.p1().character.ctrl {
+                regained_control = true;
+                break;
+            }
+        }
+
+        if !attacked {
+            // The punch button did not start any move on this build of the
+            // fixture; nothing to be stuck in, so there is nothing to assert.
+            eprintln!(
+                "skipping evilken stuck-punch assertion: the `a` press did not enter an attack"
+            );
+            return;
+        }
+        assert!(
+            regained_control,
+            "evilken got stuck mid-punch: P1 never returned to a neutral controllable \
+             state within 600 ticks (state_no = {}, ctrl = {}). A finite looping attack \
+             animation that never reports AnimTime = 0 hangs its `AnimTime = 0` exit forever.",
+            m.p1().character.state_no,
+            m.p1().character.ctrl,
+        );
+    }
+
     /// General harness (so it can later point at other characters): enumerate
     /// evilken's *declared* commands, synthesize each, and confirm a representative
     /// share of its real special/super vocabulary is performable end-to-end. This

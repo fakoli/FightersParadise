@@ -4161,6 +4161,23 @@ impl Character {
             // A new animation restarts at the first element.
             self.anim_elem = 0;
             self.anim_elem_time = 0;
+            // Seed `AnimTime` from the NEW action right now, so the previous
+            // animation's `anim_time` cannot leak into this state's first-tick
+            // trigger evaluation (controllers run BEFORE `advance_animation`).
+            // Without this, a state entered on the same tick a looping anim
+            // wrapped (where `advance_animation` forced `AnimTime = 0`) would see
+            // that stale `0` and a `trigger = AnimTime = 0` exit would fire
+            // immediately — skipping the new animation entirely (e.g. jump-start
+            // state 40 jumping straight to the air state before anim 40 plays).
+            //
+            // Only re-seed when the action is actually resolvable in the current
+            // animation view: the in-tick executor path always carries the loaded
+            // `AnimSet`, but the out-of-tick `change_state` seam uses an empty one.
+            // There we leave `anim_time` for the next tick's `advance_animation` to
+            // compute rather than clobbering it with a misleading `0`.
+            if let Some(action) = env.anim.action(self.anim) {
+                self.anim_time = remaining_anim_time(action, 0, 0);
+            }
         }
         if let Some(ctrl_expr) = &state.ctrl {
             self.ctrl = self.eval_value(ctrl_expr, env).as_bool();
@@ -4346,6 +4363,7 @@ impl Character {
         // Advance through as many elements as this tick's elapsed time allows.
         // A hold-forever frame (ticks <= 0) never advances; a frame whose time
         // is not yet up stops the loop.
+        let mut wrapped = false;
         while let Some(frame) = action.frames.get(elem) {
             let dur = frame.ticks;
             // Hold-forever element, or this element's time not yet up: stop.
@@ -4357,11 +4375,16 @@ impl Character {
             elem += 1;
             if elem >= action.frames.len() {
                 elem = clamp_index_usize(action.loopstart, action.frames.len());
+                wrapped = true;
             }
         }
 
         self.anim_elem = i32::try_from(elem).unwrap_or(0);
-        self.anim_time = remaining_anim_time(action, elem, self.anim_elem_time);
+        self.anim_time = if wrapped {
+            0
+        } else {
+            remaining_anim_time(action, elem, self.anim_elem_time)
+        };
     }
 
     /// Builds the per-element cumulative start-offset table on the character from
@@ -8849,6 +8872,215 @@ mod tests {
             ch.anim_time, -4,
             "AnimTime counts down negatively; got {}",
             ch.anim_time
+        );
+    }
+
+    /// T056b regression (the real engine bug): a *finite looping* animation (no
+    /// hold-forever final frame) must report `AnimTime = 0` for exactly one tick,
+    /// and only AFTER its full authored duration has elapsed (on the tick the
+    /// loop wraps). Countless states exit on `trigger = AnimTime = 0`; before the
+    /// fix the per-tick advance consumed the final element's last tick in the same
+    /// call that looped back to `loopstart`, so `AnimTime` jumped straight from a
+    /// negative value into the next cycle's negative span and `0` was never
+    /// observable — silently hanging every state that exits on `AnimTime = 0` for
+    /// a looping anim (exactly how evilken's punch, state 206 / anim 206, stuck).
+    #[test]
+    fn finite_looping_anim_reports_animtime_zero_once_after_full_duration() {
+        // Action 0: two frames (durations 2 and 3 → total 5), loops at 0.
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[2, 3]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+
+        // Tick through one full 5-tick cycle and record AnimTime each tick.
+        // Expected per-tick AnimTime: -4, -3, -2, -1, 0 — `0` exactly once, on
+        // the 5th tick (the full authored duration), never before.
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            lc.tick(&mut ch);
+            times.push(ch.anim_time);
+        }
+        assert_eq!(
+            times,
+            vec![-4, -3, -2, -1, 0],
+            "AnimTime must count down then hit 0 once after the full duration"
+        );
+        assert_eq!(
+            times.iter().filter(|&&t| t == 0).count(),
+            1,
+            "AnimTime = 0 should occur exactly once per loop cycle (saw {times:?})"
+        );
+    }
+
+    /// T056b non-regression (this is why PR #107 was reverted): a *3-tick
+    /// single-element looping* animation — exactly the trainingdummy jump-start
+    /// (state 40 / anim 40 = one 3-tick element) — must stay in its state for its
+    /// full 3 ticks before an `AnimTime = 0` exit fires. The fix forces
+    /// `AnimTime = 0` on the wrap tick AND re-seeds `AnimTime` from the new action
+    /// on state entry, so the previous state's (possibly just-wrapped) `AnimTime`
+    /// cannot leak into the new state's first-tick trigger and fire the exit too
+    /// early (which would skip anim 40 entirely — the reverted regression).
+    #[test]
+    fn three_tick_single_element_loop_holds_state_before_animtime_exit() {
+        // Build a two-action AIR: action 9 (the "prior" anim) and action 40 (the
+        // jump-start anim: ONE element, 3 ticks, looping). Both loop at 0.
+        let frame = |ticks: i32| AnimFrame {
+            sprite: fp_core::SpriteId::new(0, 0),
+            offset: Vec2::new(0, 0),
+            ticks,
+            flip_h: false,
+            flip_v: false,
+            blend: BlendMode::Normal,
+            clsn1: Vec::new(),
+            clsn2: Vec::new(),
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        // Prior anim 9: a single 2-tick element — short enough to wrap quickly so
+        // the prior-state AnimTime is at/near the forced 0 when we change state.
+        actions.insert(
+            9,
+            AnimAction {
+                action_number: 9,
+                frames: vec![frame(2)],
+                loopstart: 0,
+            },
+        );
+        // Jump-start anim 40: ONE 3-tick element, looping (never naturally 0).
+        actions.insert(
+            40,
+            AnimAction {
+                action_number: 40,
+                frames: vec![frame(3)],
+                loopstart: 0,
+            },
+        );
+        // Destination anim 50: a plain 5-tick element.
+        actions.insert(
+            50,
+            AnimAction {
+                action_number: 50,
+                frames: vec![frame(5)],
+                loopstart: 0,
+            },
+        );
+        let air = AirFile { actions };
+
+        // State 0: prior state holding anim 9, with a controller that changes to
+        // jump-start (state 40) on `StateTime = 3` — driving the entry IN-TICK,
+        // exactly like the engine's locomotion `[State -1]` does (so the entry
+        // sees the real AnimSet and can re-seed AnimTime from anim 40). By tick 3
+        // anim 9 (a 2-tick element) has wrapped and its AnimTime is the forced 0 —
+        // the precise stale value the reverted fix leaked into the next state.
+        let to_jump = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["Time = 3"])],
+            None,
+            &[("value", "40")],
+        );
+        let st0 = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("9"),
+                ..Entry::default()
+            },
+            vec![to_jump],
+        );
+        // State 40 (jump-start): anim 40, exits to 50 on `AnimTime = 0`.
+        let to_air = ctrl(
+            40,
+            "ChangeState",
+            &[],
+            &[(1, &["AnimTime = 0"])],
+            None,
+            &[("value", "50")],
+        );
+        let st40 = state(
+            40,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("40"),
+                ..Entry::default()
+            },
+            vec![to_air],
+        );
+        let st50 = state(
+            50,
+            Entry {
+                st: Some("A"),
+                ph: Some("A"),
+                anim: Some("50"),
+                ..Entry::default()
+            },
+            vec![],
+        );
+        let lc = loaded(vec![st0, st40, st50], air);
+
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 9;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+
+        // Drive the engine tick-by-tick and record (state_no, anim) AFTER each
+        // tick. State 0 changes to 40 on Time = 3 (in-tick), then jump-start must
+        // hold anim 40 for its full 3-tick duration before exiting to 50.
+        let mut trace = Vec::new();
+        for _ in 0..9 {
+            lc.tick(&mut ch);
+            trace.push((ch.state_no, ch.anim));
+        }
+
+        // Ticks 1-3 in state 0 (anim 9, which wraps with AnimTime forced to 0 on
+        // the way). On tick 4 (Time = 3) it changes to jump-start: anim 40 shows.
+        // The entry re-seeds AnimTime from anim 40 (NOT the leaked 0 from anim 9),
+        // so the `AnimTime = 0` exit does NOT fire early. Anim 40 must therefore
+        // remain visible for its full 3 ticks (ticks 4, 5, 6) before exiting to
+        // state 50 on tick 7.
+        assert_eq!(trace[0].0, 0, "tick 1: prior state");
+        assert_eq!(
+            trace[3],
+            (40, 40),
+            "tick 4: jump-start entered, anim 40 shows"
+        );
+        assert_eq!(
+            trace[4],
+            (40, 40),
+            "tick 5: anim 40 still visible (2nd tick)"
+        );
+        assert_eq!(
+            trace[5],
+            (40, 40),
+            "tick 6: anim 40 still visible (3rd tick)"
+        );
+        assert_eq!(
+            trace[6].0, 50,
+            "tick 7: jump-start exits to the air state ONLY after anim 40's full \
+             3-tick duration (trace: {trace:?})"
+        );
+        // anim 40 must have been visible for exactly 3 ticks — never skipped.
+        assert_eq!(
+            trace.iter().filter(|&&(s, _)| s == 40).count(),
+            3,
+            "jump-start (anim 40) must stay in-state for its full 3 ticks \
+             (trace: {trace:?})"
         );
     }
 
