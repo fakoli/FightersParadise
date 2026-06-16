@@ -2909,6 +2909,8 @@ impl Character {
     /// - `velocity.run.back.x` / `velocity.run.back.y`
     /// - `velocity.jump.neu.x` / `velocity.jump.y`
     /// - `velocity.jump.fwd.x` / `velocity.jump.back.x`
+    /// - `velocity.jump.neu.y` / `velocity.jump.fwd.y` / `velocity.jump.back.y`
+    ///   (all alias the single upward jump speed `velocity.jump.y`)
     /// - `velocity.runjump.fwd.x` / `velocity.runjump.fwd.y`
     /// - `velocity.runjump.back.x` / `velocity.runjump.back.y`
     /// - `velocity.airjump.neu.x` / `velocity.airjump.fwd.x` /
@@ -3000,6 +3002,18 @@ impl Character {
             || m.eq_ignore_ascii_case("velocity.jump.back")
         {
             return Value::Float(c.velocity.jump_back.x);
+        }
+        // The neutral/forward/back jump y-components all alias the single
+        // upward jump speed (`velocity.jump.y` == `jump_up`): MUGEN authors a
+        // jump y once and reuses it across directions, and the shipped
+        // trainingdummy jumpstart writes `y = const(velocity.jump.neu.y)`.
+        // Without these arms the neutral-jump UP velocity fell through to
+        // `Value::DEFAULT` (0) and the character "jumped in place".
+        if m.eq_ignore_ascii_case("velocity.jump.neu.y")
+            || m.eq_ignore_ascii_case("velocity.jump.fwd.y")
+            || m.eq_ignore_ascii_case("velocity.jump.back.y")
+        {
+            return Value::Float(c.velocity.jump_up);
         }
         if m.eq_ignore_ascii_case("velocity.jump.y") {
             return Value::Float(c.velocity.jump_up);
@@ -5164,6 +5178,88 @@ mod tests {
         );
     }
 
+    /// T052 behavioral regression: load the shipped (non-asset-gated) Training
+    /// Dummy, drive it with a held-up `holdup` command via the executor, and
+    /// assert it (a) enters a jump state (40 jumpstart and/or 50 air) and (b) its
+    /// world `pos.y` leaves the ground (departs from 0 / becomes negative,
+    /// Y-up = negative). Also asserts `const(velocity.jump.neu.y) == -8.4`.
+    ///
+    /// This FAILS on pre-fix code: state 40's `VelSet y = const(velocity.jump.neu.y)`
+    /// resolved to 0 (no `.neu.y` resolver arm), so the dummy entered the jump
+    /// states but had zero upward velocity and never left the ground ("jumped in
+    /// place"). The shipped dummy authors `jump.neu = 0, -8.4` (trainingdummy.cns
+    /// [Velocity]), so the neutral-jump y must be -8.4.
+    #[test]
+    fn training_dummy_jumps_and_leaves_ground_via_const_velocity() {
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/trainingdummy/trainingdummy.def");
+        // The dummy is shippable content (not asset-gated); it must be present.
+        assert!(
+            def.exists(),
+            "shipped Training Dummy missing: {}",
+            def.display()
+        );
+        let loaded = LoadedCharacter::load(&def).expect("trainingdummy.def should load");
+
+        // The shipped dummy authors jump.neu = 0, -8.4 (trainingdummy.cns
+        // [Velocity]); const(velocity.jump.neu.y) must resolve to the authored
+        // upward jump speed. Pre-fix this fell through to 0.
+        let probe = Character::with_constants(loaded.constants);
+        assert_eq!(
+            ev("const(velocity.jump.neu.y) = -8.4", &probe),
+            Value::Int(1),
+            "shipped Training Dummy const(velocity.jump.neu.y) must be -8.4"
+        );
+        // The forward/back y-components alias the same upward jump speed.
+        assert_eq!(
+            ev("const(velocity.jump.fwd.y) = -8.4", &probe),
+            Value::Int(1),
+            "const(velocity.jump.fwd.y) must alias velocity.jump.y (-8.4)"
+        );
+        assert_eq!(
+            ev("const(velocity.jump.back.y) = -8.4", &probe),
+            Value::Int(1),
+            "const(velocity.jump.back.y) must alias velocity.jump.y (-8.4)"
+        );
+
+        // Drive a fresh entity directly through the executor with `holdup` held.
+        // The engine built-in `[State -1]` bridges stand(0) + holdup -> 40
+        // (jumpstart); state 40's `VelSet y = const(velocity.jump.neu.y)` then
+        // sets the upward velocity, and 40 -> 50 (air) on animtime.
+        let mut ch = Character::with_constants(loaded.constants);
+        ch.pos = Vec2::new(0.0, 0.0);
+        ch.facing = Facing::Right;
+        ch.state_no = 0;
+        ch.ctrl = true;
+        ch.anim = 0;
+        ch.set_command_source(Box::new(ActiveCommands::from_names(["holdup"])));
+
+        let start_y = ch.pos.y;
+        let mut reached_jump_state = false;
+        let mut min_y = start_y; // most-negative (highest) y reached
+        for _ in 0..30 {
+            ch.tick(&loaded, None, StageView::default());
+            if ch.state_no == 40 || ch.state_no == 50 {
+                reached_jump_state = true;
+            }
+            if ch.pos.y < min_y {
+                min_y = ch.pos.y;
+            }
+        }
+
+        assert!(
+            reached_jump_state,
+            "held up must enter a jump state (40 jumpstart and/or 50 air); \
+             stuck in state {}",
+            ch.state_no
+        );
+        assert!(
+            min_y < start_y,
+            "held up must leave the ground (pos.y departs from {start_y}, \
+             min reached {min_y}) — pre-fix this stayed 0 (\"jumped in place\")"
+        );
+    }
+
     // ---- A.P4 (Proctor): edge cases, error paths, MUGEN semantics ----------
 
     #[test]
@@ -5173,11 +5269,12 @@ mod tests {
         // const still returns 0" requirement applied to the new surface.
         let ch = const_sample();
         for m in [
-            // `.y` of the bare-x ground/air jumps is intentionally NOT a const
-            // member (common1 reads the shared velocity.jump.y / velocity.airjump.y
-            // for the vertical component, never a per-direction `.y`).
-            "velocity.jump.fwd.y",
-            "velocity.jump.back.y",
+            // `.y` of the bare-x AIR jumps is intentionally NOT a const member
+            // (common1 reads the shared velocity.airjump.y for the vertical
+            // component, never a per-direction airjump `.y`). NOTE: the GROUND
+            // jump's `.neu.y`/`.fwd.y`/`.back.y` ARE valid members (T052: they
+            // alias the shared velocity.jump.y), so they are asserted nonzero in
+            // the jump-y alias test, not here.
             "velocity.airjump.fwd.y",
             "velocity.airjump.back.y",
             // Bogus axis suffix / nonexistent group. (NOTE: the bare
@@ -5211,12 +5308,16 @@ mod tests {
             ch.trigger_str("const", "velocity.jump.y"),
             Value::Float(-8.6)
         );
-        // The bare-x jump's own `.y` is unmapped (defaults to 0), proving the
-        // vertical speed never leaks through the directional member.
+        // T052: the directional jump's `.y` aliases the SHARED upward jump speed
+        // (velocity.jump.y -> jump_up), not the directional member's stored `y`
+        // (which is 0 for jump_fwd = (2.6, 0)). This proves the horizontal speed
+        // (2.6) and the vertical speed (-8.6) stay independent: `.fwd.y` reads the
+        // vertical, never leaking the directional horizontal.
         assert_eq!(
             ch.trigger_str("const", "velocity.jump.fwd.y"),
-            Value::DEFAULT
+            Value::Float(-8.6)
         );
+        // The AIR jump's directional `.y` remains unmapped (defaults to 0).
         assert_eq!(
             ch.trigger_str("const", "velocity.airjump.fwd.y"),
             Value::DEFAULT
