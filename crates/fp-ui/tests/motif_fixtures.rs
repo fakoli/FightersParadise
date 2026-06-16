@@ -153,18 +153,21 @@ fn shipped_default_system_def_parses() {
     // Points at the shipped bitmap font.
     assert_eq!(sys.fonts, vec!["font.fnt".to_string()]);
 
-    // Exactly the three enabled items, in canonical order.
+    // Exactly the four enabled items, in canonical order. The `options` item
+    // ("SETUP") was enabled in the shipped motif so the title menu reaches the
+    // in-app setup / input-configuration (key-remap) screen.
     let kinds: Vec<_> = sys.title.items.iter().map(|i| i.kind).collect();
     assert_eq!(
         kinds,
         vec![
             MenuItemKind::Versus,
             MenuItemKind::Training,
+            MenuItemKind::Options,
             MenuItemKind::Exit
         ]
     );
     let labels: Vec<_> = sys.title.items.iter().map(|i| i.label.as_str()).collect();
-    assert_eq!(labels, vec!["VS MODE", "TRAINING", "EXIT"]);
+    assert_eq!(labels, vec!["VS MODE", "TRAINING", "SETUP", "EXIT"]);
 
     // A 1x4 grid geometry is present.
     assert_eq!(sys.select_info.rows, 1);
