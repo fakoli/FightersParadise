@@ -91,6 +91,21 @@ impl CompiledExpr {
     /// [`is_fallback`](CompiledExpr::is_fallback) is `true`.
     #[must_use]
     pub fn compile(source: &str) -> Self {
+        // An empty / whitespace-only value (e.g. a community `guardflag =` line
+        // with nothing after the `=`) is a *legitimately empty* parameter, not a
+        // malformed expression. The VM parser rejects the empty string, so
+        // routing it through `parse_str` would emit a misleading "bad expression"
+        // warning for every such line — and a controller in a persistent state
+        // (e.g. `[State -2]`) is compiled once at load, but a flood of these at
+        // load time still spams the log for messy content. Treat it as a silent
+        // const-`0` fallback instead.
+        if source.trim().is_empty() {
+            return Self {
+                expr: Expr::Int(0),
+                source: source.to_string(),
+                is_fallback: true,
+            };
+        }
         match fp_vm::parse_str(source) {
             Ok(expr) => Self {
                 expr,
@@ -1464,10 +1479,16 @@ mod tests {
     #[test]
     fn compile_empty_expression_is_fallback() {
         // An empty trigger value (real MUGEN content can produce these) must not
-        // panic; it becomes the const-0 fallback.
-        let c = CompiledExpr::compile("");
-        assert!(c.is_fallback);
-        assert_eq!(c.expr, Expr::Int(0));
+        // panic; it becomes the const-0 fallback. Whitespace-only values (e.g. a
+        // community `guardflag =   ` line) take the same SILENT const-0 path —
+        // they are a legitimately empty param, not a malformed expression, so
+        // they must not be routed through the parser's "bad expression" warning.
+        for src in ["", "   ", "\t", " \t "] {
+            let c = CompiledExpr::compile(src);
+            assert!(c.is_fallback, "empty/whitespace {src:?} is a fallback");
+            assert_eq!(c.expr, Expr::Int(0));
+            assert_eq!(c.source, src, "raw source preserved verbatim");
+        }
     }
 
     #[test]

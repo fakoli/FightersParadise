@@ -3731,6 +3731,15 @@ impl<'a> AnimSet<'a> {
     pub fn contains(&self, n: i32) -> bool {
         self.actions.is_some_and(|a| a.contains_key(&n))
     }
+
+    /// Looks up animation action `n`, or `None` when the set is empty / the
+    /// action is absent. Lets a state entry seed `AnimTime` from the new action
+    /// the moment the anim changes (so the previous anim's `AnimTime` cannot
+    /// leak into the new state's first-tick trigger evaluation). Never panics.
+    #[must_use]
+    pub fn action(&self, n: i32) -> Option<&'a AnimAction> {
+        self.actions.and_then(|a| a.get(&n))
+    }
 }
 
 /// A per-tick **cross-entity** evaluation context: a [`Character`] (`me`) viewed
