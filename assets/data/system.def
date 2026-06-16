@@ -27,7 +27,8 @@ menu.item.font        = 1, 0, 0
 menu.item.active.font = 1, 5, 0
 menu.item.spacing     = 0, 13
 menu.window.visibleitems = 5
-; Enabled menu items. A "" value disables an item; only these three ship.
+; Enabled menu items. A "" value disables an item; these four ship.
+; "options" opens the in-app setup / input-configuration screen (key remapping).
 menu.itemname.arcade     = ""
 menu.itemname.versus     = "VS MODE"
 menu.itemname.teamarcade = ""
@@ -37,7 +38,7 @@ menu.itemname.survival   = ""
 menu.itemname.survivalcoop = ""
 menu.itemname.training   = "TRAINING"
 menu.itemname.watch      = ""
-menu.itemname.options    = ""
+menu.itemname.options    = "SETUP"
 menu.itemname.exit       = "EXIT"
 ; Cursor movement sounds (unused by the text menu, kept for parity).
 cursor.move.snd = 0, 0
