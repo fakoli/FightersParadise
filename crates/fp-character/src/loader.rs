@@ -4931,4 +4931,50 @@ damage = 60, 0
             "KFM's own common get-hit 5000 loads"
         );
     }
+
+    // ====================================================================
+    // T049: trainingdummy special-move statedef presence (loader test).
+    //
+    // The shipped `assets/trainingdummy` is original clean-room content that
+    // ships in the repo (not under `test-assets/`), so this test is NOT
+    // asset-gated and must pass on every machine and on CI.
+    // ====================================================================
+
+    /// Resolves a path relative to the workspace `assets/trainingdummy/` dir.
+    ///
+    /// `CARGO_MANIFEST_DIR` for this crate is `crates/fp-character`; go up two
+    /// levels to reach the workspace root.
+    fn dummy_asset(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/trainingdummy")
+            .join(rel)
+    }
+
+    #[test]
+    fn trainingdummy_loads_with_special_move_statedefs() {
+        // Verify that the trainingdummy's two new motion-command statedefs (1000
+        // and 1100, added in T049) are present in the compiled state table after
+        // a full LoadedCharacter::load.  These states are the ChangeState targets
+        // for the QCF+a (fireball) and DP+a (dragon-punch) commands defined in
+        // trainingdummy.cmd.
+        let def = dummy_asset("trainingdummy.def");
+        let loaded = LoadedCharacter::load(&def)
+            .unwrap_or_else(|e| panic!("Training Dummy failed to load: {e}"));
+
+        assert!(
+            loaded.state(1000).is_some(),
+            "fireball [Statedef 1000] must be present in the compiled state table"
+        );
+        assert!(
+            loaded.state(1100).is_some(),
+            "dragon-punch [Statedef 1100] must be present in the compiled state table"
+        );
+        // The existing locomotion/attack states must still be intact.
+        for required in [0, 20, 200, 5000] {
+            assert!(
+                loaded.state(required).is_some(),
+                "pre-existing state {required} must still be present after T049 changes"
+            );
+        }
+    }
 }
