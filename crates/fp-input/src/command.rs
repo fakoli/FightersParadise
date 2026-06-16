@@ -116,14 +116,6 @@ pub struct CommandMatcherSnapshot {
     active: Vec<(String, u32)>,
 }
 
-/// Default jump-buffer window, in frames (T075).
-///
-/// At 60Hz this is ~3 frames (50ms) — the small leniency window the player
-/// deep-dive (§1.3) calls for: a jump tapped this many frames before the player
-/// becomes actionable still comes out on the first actionable frame. Chosen
-/// short enough that it never lets an unrelated stale up-press resurrect a jump.
-pub const DEFAULT_JUMP_BUFFER_FRAMES: u32 = 3;
-
 /// Input-leniency configuration for a [`CommandMatcher`] (T075).
 ///
 /// Buffering is a deterministic, input-layer concern: the same inputs always
@@ -154,12 +146,13 @@ impl Default for LeniencyConfig {
 }
 
 impl LeniencyConfig {
-    /// A leniency config with the jump buffer enabled at the default
-    /// [`DEFAULT_JUMP_BUFFER_FRAMES`] window over the standard `holdup` gate.
+    /// A leniency config with the jump buffer enabled over the standard `holdup`
+    /// gate, using a 3-frame (~50ms at 60Hz) window — short enough that a stale
+    /// up-press never resurrects a jump.
     #[must_use]
     pub fn with_jump_buffer() -> Self {
         Self {
-            jump_buffer_frames: DEFAULT_JUMP_BUFFER_FRAMES,
+            jump_buffer_frames: 3,
             ..Self::default()
         }
     }
@@ -183,8 +176,7 @@ impl CommandMatcher {
     /// Creates a new matcher with the given command definitions.
     ///
     /// Input leniency is **off** by default ([`LeniencyConfig::default`]); enable
-    /// the jump buffer with [`with_leniency`](Self::with_leniency) or
-    /// [`set_leniency`](Self::set_leniency).
+    /// the jump buffer with [`with_leniency`](Self::with_leniency).
     pub fn new(commands: Vec<CommandDef>) -> Self {
         Self {
             commands,
@@ -202,17 +194,6 @@ impl CommandMatcher {
             active: Vec::new(),
             leniency,
         }
-    }
-
-    /// Replaces this matcher's input-leniency configuration.
-    pub fn set_leniency(&mut self, leniency: LeniencyConfig) {
-        self.leniency = leniency;
-    }
-
-    /// Returns the matcher's current input-leniency configuration.
-    #[must_use]
-    pub fn leniency(&self) -> &LeniencyConfig {
-        &self.leniency
     }
 
     /// Checks all commands against the input buffer. Call once per tick.
@@ -2969,10 +2950,10 @@ mod tests {
 
     #[test]
     fn leniency_defaults_to_off() {
-        // Default matcher must be byte-for-byte the old behavior: no jump buffer.
-        let m = CommandMatcher::new(vec![holdup_cmd()]);
-        assert_eq!(m.leniency().jump_buffer_frames, 0);
-        assert_eq!(m.leniency().jump_command, "holdup");
+        // Default leniency must be the old behavior: no jump buffer.
+        let def = LeniencyConfig::default();
+        assert_eq!(def.jump_buffer_frames, 0);
+        assert_eq!(def.jump_command, "holdup");
         assert_eq!(LeniencyConfig::with_jump_buffer().jump_buffer_frames, 3);
     }
 
