@@ -11,12 +11,15 @@ character bundle is made of, how each file maps to our parsers, exactly how to l
 one with `cargo run`, what works versus what is still missing, and how to debug a
 character that loads wrong.
 
-> **Status (2026-06-14):** Fighters Paradise is a playable two-character fighter
+> **Status (2026-06-15):** Fighters Paradise is a playable two-character fighter
 > driven by real Kung Fu Man (KFM) data. **No crate is a stub anymore** — stages,
 > screenpacks, and storyboards all render now, and SFF v1 + PNG sprites decode.
-> What's left is mostly *fidelity sub-features* on those newly-landed paths
-> (called out plainly below) and the forward-looking modes — all tracked in
-> [Known Issues](known-issues.md).
+> The app also now **discovers content from directories** (a `chars/` roster, a
+> `stages/` folder, and `data/<motif>/` screenpack sets) and supports
+> **HUD/life-power-bar customization** and **key remapping** from an in-game
+> options screen — all documented in §8 below. What's left is mostly *fidelity
+> sub-features* on the newly-landed presentation paths (called out plainly below)
+> and the forward-looking modes — all tracked in [Known Issues](known-issues.md).
 
 See also: [Architecture](architecture.md) · [MUGEN Compatibility Matrix](mugen-compatibility.md) · [Roadmap](roadmap.md) · [Known Issues](known-issues.md) · [Development](development.md) · root [README](../README.md)
 
@@ -164,19 +167,36 @@ a real match; a bare `.sff`/`.air` opens a legacy viewer.**
 
 | Command                                            | What it does                                          |
 | -------------------------------------------------- | ----------------------------------------------------- |
-| `cargo run -p fp-app`                              | Default: a two-KFM match from `test-assets/kfm/kfm.def`. Falls back to a checkerboard test pattern if KFM is absent. |
-| `cargo run -p fp-app -- p1.def`                    | Two-player match, **same** character on both sides.   |
-| `cargo run -p fp-app -- p1.def p2.def`             | Two-player match, **two different** characters.        |
+| `cargo run -p fp-app`                              | **No args → the in-app Title menu** over the shipped clean-room motif (`assets/data/{system,select}.def`, a roster pointing at `assets/trainingdummy`). No KFM needed. |
+| `cargo run -p fp-app -- <dir>/`                    | **Directory discovery** — scan a folder for a character roster (`chars/<name>/<name>.def` layout, or a flat dir of `*.def`) and launch the Title menu over the discovered roster. See §8. |
+| `cargo run -p fp-app -- p1.def`                    | Direct two-player match, **same** character on both sides (skips the menu). |
+| `cargo run -p fp-app -- p1.def p2.def`             | Direct two-player match, **two different** characters.        |
 | `cargo run -p fp-app -- char.sff char.air`         | **Legacy animation viewer** — plays the `.sff` sprites through the `.air` timeline. No states, no combat. |
 | `cargo run -p fp-app -- char.sff`                  | **Legacy static viewer** — shows the first sprite.    |
 | `cargo run -p fp-app -- validate char.def`         | **Headless validator / linter** — loads the `.def` and prints actionable author problems (missing sprites/animations, unresolved state refs, expressions that failed to compile, no-op controllers). No window. |
 
+Two **flags** layer on top of any of the launch modes above (both are parsed and
+*stripped* before file routing, so they compose with every command):
+
+| Flag                       | What it does                                                       |
+| -------------------------- | ----------------------------------------------------------------- |
+| `--motif <name\|path>`     | Pick a discovered/explicit screenpack motif (see §8.3). Resolves a discovered motif **name** under `assets/data/`, a `system.def` path, or a motif **directory** holding a `system.def`. An unresolvable value warns and falls back to the default motif — a typo never crashes the app. |
+| `--simul`                  | Launch a **Simul** team match (both sides field all fighters at once). Default is the classic 1v1. See §8.4. |
+| `--turns`                  | Launch a **Turns** team match (sequential KO hand-off). The last team flag wins if both `--simul` and `--turns` are given. |
+
 What each combo *enables*:
 
-- **`.def` (match modes)** are the real engine: full state machine, commands,
-  combat, hitpause, throws, super meter, best-of-3 rounds. **This is how you play
-  a character.** P1 is keyboard-driven; P2 is a stationary dummy in this milestone
-  (no second-player input map and no AI yet).
+- **No-arg / directory (menu modes)** boot the in-app **Title menu**
+  (`cli_route` → `CliRoute::Menu` for no args, `CliRoute::Directory` for a folder;
+  `crates/fp-app/src/main.rs`). The menu walks Title → character-select →
+  stage-select → fight over the shipped clean-room motif's roster, augmented with
+  any characters discovered from the directory argument (§8). The setup/options
+  screen (key remap + HUD customization, §8.5) hangs off the Title menu.
+- **`.def` (direct match modes)** are the real engine: full state machine,
+  commands, combat, hitpause, throws, super meter, best-of-3 rounds. **This is the
+  fast path to play a single character** — it bypasses the menu
+  (`CliRoute::Direct`). P1 is keyboard-driven; P2 is the baseline CPU AI (or a
+  second keyboard).
 - **`.sff` + `.air` (viewer)** is a quick visual sanity check for your sprites and
   animations *before* wiring up states — no `.cns`/`.cmd` needed.
 - **`.sff` (static)** verifies the sprite archive decodes at all.
@@ -386,3 +406,175 @@ screenpack combo/face, true afterimage ghosts). Track that progress in the
 **[Roadmap](roadmap.md)** and **[Known Issues](known-issues.md)**, and check the
 **[Compatibility Matrix](mugen-compatibility.md)** before porting a specific
 character.
+
+---
+
+## 8. The 1.0 content model — directory discovery, motifs, teams & HUD
+
+Beyond pointing the app at a single `.def`, Fighters Paradise now reads a whole
+**content tree** the way MUGEN organizes one — by directory convention. Point the
+app at a folder and it auto-discovers a character roster; drop in a `stages/`
+folder and stages appear in the stage-select; drop in `data/<motif>/` folders and
+each becomes a selectable screenpack. None of this needs a single index file, and
+every scan is **never-crash**: a missing or malformed directory yields an empty
+list with a `tracing::warn!`, not a panic.
+
+> All examples below reference only the **shipped clean-room content**
+> (`assets/data/`, `assets/trainingdummy/`, `assets/stages/dojo/`). Bring-your-own
+> bundles (KFM, third-party characters, …) live anywhere on disk and are passed by
+> path — never committed into this tree (see §6).
+
+### 8.1 The character roster — `chars/<name>/<name>.def`
+
+Pass a **directory** instead of a `.def` and the app scans it for characters via
+`fp_ui::discovery::discover_chars` (`crates/fp-ui/src/discovery.rs`), then boots
+the Title menu over the discovered roster (`CliRoute::Directory`,
+`crates/fp-app/src/main.rs`):
+
+```sh
+cargo run -p fp-app -- /path/to/content/chars/
+```
+
+Two layouts are recognized (they may coexist in one folder):
+
+1. **Nested (the MUGEN-standard layout).** Each immediate subfolder `<name>/` that
+   contains a same-named `<name>.def` is one character:
+
+   ```
+   chars/
+   ├── trainingdummy/
+   │   └── trainingdummy.def      ; discovered as "trainingdummy"
+   └── my-fighter/
+       └── my-fighter.def         ; discovered as "my-fighter"
+   ```
+
+2. **Flat.** Any loose `<dir>/<file>.def` is a character whose name is the file
+   stem — a convenience for a scratch folder of bare `.def`s.
+
+Discovery is deterministic: results are sorted **case-insensitively by name**
+(then by path) so the roster order is stable regardless of the filesystem's
+listing order, and duplicates are collapsed. A subfolder with no matching `.def`
+is **skipped** (`tracing::debug!`), never fatal — an asset-less folder is normal,
+not an error. The directory argument is absolutized up-front so the discovered
+`.def` paths resolve correctly when the menu loads a pick.
+
+### 8.2 Stages — a sibling `stages/` directory
+
+Stages are discovered by `fp_stage::discover_stages` (`crates/fp-stage/src/lib.rs`)
+scanning a `stages/` folder (in the app, the directory sibling to the motif's
+`select.def`). Every `*.def` directly under it is read and accepted **only if it
+actually looks like a stage** — i.e. it carries at least one stage-defining
+section (`[BGdef]`, `[Camera]`, `[StageInfo]`, or `[PlayerInfo]`). A stray
+character `.def` or other unrelated `.def` in the folder is warn-and-skipped, so
+the stage-select never offers a non-stage by mistake:
+
+```
+content/
+├── chars/…
+└── stages/
+    ├── dojo.def                   ; a real stage -> offered in stage-select
+    └── arena.def
+```
+
+Each discovered stage's display name is its `[Info] name`, falling back to the
+`.def` file stem when the stage authors no name. The shipped clean-room backdrop
+(`assets/stages/dojo/bg.png`, drawn as a full-window image when no `[BGdef]`
+stage is loaded) is always available as a fallback entry.
+
+### 8.3 Motif / screenpack sets — `data/<motif>/` + the `--motif` flag
+
+A **motif** (screenpack set) is a folder under a `data/` directory holding a
+`system.def`. They are discovered by `fp_ui::discovery::discover_motifs`
+(`crates/fp-ui/src/discovery.rs`), which scans the motif directory
+(`DEFAULT_MOTIF_DIR = "assets/data"`) and returns each subfolder that contains a
+`system.def`:
+
+```
+data/
+├── default/
+│   └── system.def                ; the shipped clean-room motif (= assets/data/)
+└── neon/
+    └── system.def
+```
+
+Pick one with the **`--motif <name|path>`** flag, parsed by `parse_motif_flag` and
+resolved by `resolve_motif_system_def` (`crates/fp-app/src/main.rs`). The selector
+is resolved in three forms, in order:
+
+1. a **direct `.def` path** that exists (used verbatim — e.g. `--motif
+   assets/data/system.def`);
+2. a **directory path** holding a `system.def` (resolves to `<dir>/system.def`);
+3. a **discovered motif name** matched case-insensitively against the motifs found
+   under `assets/data/` (e.g. `--motif neon`).
+
+An unresolvable selector (a typo, a missing folder, a dangling `--motif` with no
+value) drops with a `tracing::warn!` and the app loads the **default motif**
+(`assets/data/system.def`) — so a bad `--motif` never crashes the app. The motif's
+`select.def` (its `[Files] select`, resolved relative to `system.def`) supplies
+the roster; if it's missing the shipped `assets/data/select.def` is used as the
+fallback roster.
+
+### 8.4 Team modes — `--simul` / `--turns`
+
+The direct-CLI match path runs a `TeamMatch` whose mode comes from
+`parse_team_flag` (`crates/fp-app/src/main.rs`):
+
+| Flag        | `TeamMode` | Meaning                                          |
+| ----------- | ---------- | ------------------------------------------------ |
+| *(none)*    | `Single`   | The classic 1v1 — byte-identical to before the flag existed. |
+| `--simul`   | `Simul`    | Both sides field all their fighters at once.     |
+| `--turns`   | `Turns`    | Sequential KO hand-off (one fighter at a time per side). |
+
+Both flags take **no value** and are stripped before file routing; an unknown
+`--…` token passes through untouched. If both are given, the **last one wins**.
+
+```sh
+# A simul team match of the shipped trainingdummy on both sides:
+cargo run -p fp-app -- --simul assets/trainingdummy/trainingdummy.def
+```
+
+### 8.5 HUD customization & key remapping (the options screen)
+
+From the Title menu, **`SETUP` / `OPTIONS`** opens the setup screen
+(`screens::SetupScreen`, `crates/fp-app/src/screens.rs`), which edits the live
+input/HUD config in place — a change takes effect immediately, no restart.
+
+**Key remapping (T042).** The setup screen lists the input-device preference
+(Keyboard / Controller) and one row per remappable action. The remappable actions
+are the four absolute screen directions (`UP DOWN LEFT RIGHT`) and the six MUGEN
+attack buttons (`A B C` punches, `X Y Z` kicks) — `screens::InputAction`. Confirm
+on an action row enters *capture* mode ("PRESS A KEY"); the next key you press is
+bound to that action. The default keyboard map (`crates/fp-app/src/main.rs`) is:
+
+| Action            | Default key       | MUGEN button |
+| ----------------- | ----------------- | ------------ |
+| Up / Down / Left / Right | `W` / `S` / `A` / `D` | directions |
+| A / B / C         | `U` / `I` / `O`   | a / b / c (punches) |
+| X / Y / Z         | `J` / `K` / `L`   | x / y / z (kicks)   |
+
+(The arrow keys remain wired alongside `WASD` for movement; remapping rebinds the
+configurable action keys.)
+
+**HUD customization (T046).** A `HUD CUSTOMIZATION` row on the setup screen opens
+the HUD-customization screen (`screens::HudCustomizeScreen`), which edits an
+`fp_ui::HudConfig` (`crates/fp-ui/src/hud_config.rs`) layered **on top of** the
+screenpack-authored layout. The override model is deliberately *additive* — its
+default is a guaranteed no-op (the HUD draws exactly as the `fight.def` authored
+it), and the renderer (`crates/fp-ui/src/renderer.rs`) reads it each frame. The
+options exposed are:
+
+- **Life-bar color** and **power-bar color** — cycle each bar's front-fill tint
+  through a preset palette: `WHITE` (the neutral no-op) → `RED` → `GREEN` →
+  `BLUE` → `YELLOW` → `CYAN`, wrapping. The tint is applied as a `PalFX`-style
+  per-channel multiply, so `WHITE` leaves the bar exactly as drawn.
+- **Per-element visibility** — toggle each of `LIFE`, `POWER`, `NAME`, `TIMER`,
+  and `COMBO` on/off independently (`fp_ui::HudElement`). Hidden elements simply
+  aren't drawn.
+
+Two further knobs exist in the `HudConfig` **model** and are honored by the
+renderer but are **not yet surfaced** on the in-game screen (they are intended for
+a future config-file loader): a global `(dx, dy)` **position offset** that nudges
+every HUD element's anchor, and a global **scale** multiplier (clamped to
+`0.1..=4.0`) applied to the HUD bars. A bad value can never collapse or explode
+the HUD — out-of-range colors are clamped into gamut and a non-finite scale falls
+back to `1.0`.
