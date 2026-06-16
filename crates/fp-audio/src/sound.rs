@@ -14,6 +14,37 @@ use rodio::{Decoder, Source};
 /// 44.1 kHz mono), so legitimate content is never truncated.
 const MAX_DECODED_SAMPLES: usize = 64 * 1024 * 1024;
 
+/// The ASCII copyright marker every CRI ADX stream carries in its header.
+///
+/// It sits a few bytes past the leading `0x80` sync byte. ADX is a codec
+/// occasionally embedded in console-MUGEN `.snd` ports; this crate cannot
+/// decode it, so [`Sound::decode`] recognises it up front and returns an
+/// [`FpError::Unsupported`] the caller can warn-and-skip — rather than letting
+/// the WAV decoder reject the bytes with a misleading "not RIFF/WAVE" message.
+const ADX_COPYRIGHT_MARKER: &[u8] = b"(c)CRI";
+
+/// How far into a payload [`looks_like_adx`] scans for [`ADX_COPYRIGHT_MARKER`].
+const ADX_MARKER_SCAN_LEN: usize = 32;
+
+/// Returns `true` if `bytes` look like a CRI ADX stream.
+///
+/// ADX begins with the `0x80` sync byte (the high bit of the copyright-offset
+/// field) and carries the `(c)CRI` marker a few bytes in. Matching either signal
+/// flags ADX; the marker is the stronger one. This is a cheap, bounded,
+/// allocation-free header check — it never decodes audio.
+fn looks_like_adx(bytes: &[u8]) -> bool {
+    let scan = &bytes[..bytes.len().min(ADX_MARKER_SCAN_LEN)];
+    if scan
+        .windows(ADX_COPYRIGHT_MARKER.len())
+        .any(|w| w == ADX_COPYRIGHT_MARKER)
+    {
+        return true;
+    }
+    // A bare 0x80 sync byte is a weaker signal, but only worth honouring when the
+    // bytes are clearly not a RIFF/WAVE stream (which never starts with 0x80).
+    bytes.first() == Some(&0x80)
+}
+
 /// Validates that `bytes` is a RIFF/WAVE stream whose `fmt ` chunk declares a
 /// sample format the decoder handles **without panicking**.
 ///
@@ -111,11 +142,18 @@ impl Sound {
     ///
     /// # Errors
     ///
-    /// Returns an [`FpError`] (never panics) when the bytes are empty, are not a
-    /// RIFF/WAVE stream `rodio` can decode, declare an unsupported sample format
-    /// (see below), claim more samples than the decode budget allows, or are
-    /// otherwise malformed. Garbage and hostile input yield an error rather than a
-    /// crash, in keeping with the engine's "never crash on bad content" philosophy.
+    /// Returns an [`FpError`] (never panics) when the bytes are empty, are a
+    /// recognised-but-unsupported codec (see ADX below), are not a RIFF/WAVE
+    /// stream `rodio` can decode, declare an unsupported sample format (see
+    /// below), claim more samples than the decode budget allows, or are otherwise
+    /// malformed. Garbage and hostile input yield an error rather than a crash, in
+    /// keeping with the engine's "never crash on bad content" philosophy.
+    ///
+    /// **ADX:** classic console-MUGEN `.snd` ports occasionally embed CRI ADX
+    /// audio. This crate cannot decode ADX, so a payload that looks like ADX is
+    /// rejected up front with [`FpError::Unsupported`] (a distinct variant from
+    /// the WAV [`FpError::Parse`] errors) — letting a caller warn-and-skip the
+    /// unsupported codec specifically instead of feeding it to the WAV decoder.
     ///
     /// Two robustness guards run *before* the bytes are drained, because `rodio`'s
     /// WAV path can crash or exhaust memory on adversarial-but-structurally-valid
@@ -133,6 +171,15 @@ impl Sound {
     pub fn decode(bytes: &[u8]) -> FpResult<Sound> {
         if bytes.is_empty() {
             return Err(FpError::parse("WAV", "cannot decode empty sound data"));
+        }
+
+        // Recognise CRI ADX before the WAV path so an undecodable-but-known codec
+        // surfaces as a clear Unsupported error a caller can warn-and-skip, rather
+        // than a misleading "not RIFF/WAVE" parse error.
+        if looks_like_adx(bytes) {
+            return Err(FpError::Unsupported(
+                "CRI ADX sound payload is recognised but not decodable; skipping".to_string(),
+            ));
         }
 
         // Reject sample formats rodio's WAV iterator would panic on, up front
@@ -430,6 +477,53 @@ mod tests {
             Sound::decode(&bytes).is_err(),
             "oversized declared data length must error, not OOM"
         );
+    }
+
+    /// Builds a synthetic CRI-ADX header: the `0x80` sync byte, a copyright-offset
+    /// field, the `(c)CRI` marker, and a short trailing body. Authored from the
+    /// public ADX format description (clean-room), not copied from any asset/tool.
+    fn make_adx_header() -> Vec<u8> {
+        let mut v = vec![0x80, 0x00, 0x00, 0x02];
+        v.extend_from_slice(ADX_COPYRIGHT_MARKER); // marker at offset 4
+        v.extend_from_slice(&[0x00, 0x03, 0x12, 0x04]); // arbitrary trailing header bytes
+        v
+    }
+
+    #[test]
+    fn decode_adx_is_unsupported_not_a_crash() {
+        // AC#1: an ADX-encoded payload is recognised and skipped (warn-and-continue
+        // at the caller) without panic. It must surface as Unsupported — a distinct
+        // variant from the WAV Parse errors — so a consumer can route it specially.
+        let adx = make_adx_header();
+        let err = Sound::decode(&adx).expect_err("ADX must not decode to a Sound");
+        match err {
+            FpError::Unsupported(msg) => {
+                assert!(msg.contains("ADX"), "message should name ADX, got: {msg}");
+            }
+            other => panic!("expected Unsupported for ADX, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_adx_sync_byte_only_is_unsupported() {
+        // Even without the `(c)CRI` marker, the bare 0x80 sync byte (a payload that
+        // is clearly not RIFF/WAVE) is treated as the recognised-but-unsupported
+        // ADX codec rather than a generic parse failure.
+        let adx: &[u8] = &[0x80, 0x00, 0x00, 0x20, 0xAA, 0xBB, 0xCC, 0xDD];
+        assert!(looks_like_adx(adx));
+        assert!(matches!(Sound::decode(adx), Err(FpError::Unsupported(_))));
+    }
+
+    #[test]
+    fn looks_like_adx_does_not_flag_wav_or_garbage() {
+        // A real WAV (starts with RIFF, never 0x80) and arbitrary non-ADX garbage
+        // must NOT be misclassified as ADX, so WAV decoding is never short-circuited.
+        let wav = make_wav(1, 8_000, &[1, 2, 3, 4]);
+        assert!(!looks_like_adx(&wav));
+        assert!(!looks_like_adx(b"OggS not adx"));
+        assert!(!looks_like_adx(&[]));
+        // A WAV still decodes normally with the ADX guard in place.
+        assert!(Sound::decode(&wav).is_ok());
     }
 
     #[test]
