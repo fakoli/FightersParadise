@@ -11322,4 +11322,308 @@ time = 1
         );
         assert_eq!(m.winner(), None, "a drawn team match has no winning side");
     }
+
+    // ---------------------------------------------------------------------
+    // T055: every declared move is performable — evilken specials/supers fire
+    // (asset-gated; skips cleanly when `test-assets/evilken/` is absent, like the
+    // KFM tests above — evilken is local-only behind the gitignored `test-assets`
+    // symlink and is NEVER committed/shipped).
+    //
+    // This is the capstone of the GUI-free behavioral test harness: it proves a
+    // character's declared special/super moves can actually be *performed*
+    // end-to-end and headlessly. For each target command it synthesizes the
+    // command's MUGEN motion with `fp_input::synth_command` (the T053 synthesizer),
+    // adapts the synthesized `InputState` frames to the `Match` input path through
+    // the existing `MatchInput: From<InputState>` seam, drives a real evilken-vs-
+    // evilken `Match` from a neutral controllable state, and asserts the move
+    // actually FIRES (the character's `move_type` becomes `Attack`). For
+    // power-gated supers it first grants P1 full meter (`power = power_max`).
+    // ---------------------------------------------------------------------
+
+    /// Loads the genuine evilken fixture on both sides and builds a fresh, unseeded
+    /// evilken-vs-evilken [`Match`], or `None` (after logging the skip reason) when
+    /// the fixture is absent or fails to load, so callers skip cleanly. evilken is
+    /// SFF v1 and loads in full color.
+    fn build_evilken_match() -> Option<Match> {
+        let def = test_asset("evilken/evilken.def");
+        if !def.exists() {
+            eprintln!(
+                "skipping evilken move-execution test: {} not present",
+                def.display()
+            );
+            return None;
+        }
+        let load = || match LoadedCharacter::load(&def) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("skipping evilken move-execution test: evilken.def failed to load: {e}");
+                None
+            }
+        };
+        let (lc1, lc2) = (load()?, load()?);
+        let mut p1c = Character::with_constants(lc1.constants);
+        p1c.pos = Vec2::new(-60.0, 0.0);
+        p1c.state_no = 0;
+        p1c.anim = 0;
+        p1c.ctrl = true;
+        let mut p2c = Character::with_constants(lc2.constants);
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.state_no = 0;
+        p2c.anim = 0;
+        p2c.ctrl = true;
+        Some(Match::new(
+            Player::new(p1c, lc1),
+            Player::new(p2c, lc2),
+            StageBounds::new(-220.0, 220.0),
+        ))
+    }
+
+    /// Drives `m` through the intro until it enters [`RoundState::Fight`] (feeding
+    /// neutral inputs), so the subsequent move-synthesis runs against a live,
+    /// controllable fighter.
+    fn evilken_into_fight(m: &mut Match) {
+        for _ in 0..(INTRO_FRAMES + 1) {
+            if m.round_state() == RoundState::Fight {
+                break;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+    }
+
+    /// Attempts to perform the named command on a *fresh* evilken match and reports
+    /// whether the move fires (P1's `move_type` becomes [`MoveType::Attack`]).
+    ///
+    /// The observed result of attempting one synthesized move on a fresh evilken
+    /// match: whether P1's `move_type` ever became [`MoveType::Attack`], and the set
+    /// of (non-neutral) `state_no`s P1 passed through while the motion was fed.
+    struct MoveOutcome {
+        /// `move_type` became [`MoveType::Attack`] at some point.
+        attacked: bool,
+        /// Every non-zero `state_no` P1 entered during the feed (state 0 is the
+        /// neutral stand the motion is launched from and is excluded).
+        states: std::collections::BTreeSet<i32>,
+    }
+
+    impl MoveOutcome {
+        /// Whether P1 entered any of the given target state numbers.
+        fn entered_any(&self, targets: &[i32]) -> bool {
+            targets.iter().any(|s| self.states.contains(s))
+        }
+    }
+
+    /// Synthesizes a named command's motion and feeds it through a fresh evilken
+    /// match, returning what P1 did (or `None` to skip when the fixture is absent or
+    /// the command is not declared).
+    ///
+    /// Builds a clean match per attempt so moves never contaminate each other,
+    /// advances to [`RoundState::Fight`], puts P1 into a neutral controllable
+    /// standing state, optionally grants full meter (for power-gated supers), then
+    /// synthesizes the command's motion and feeds it through the *real* engine
+    /// input path (`MatchInput::from(InputState)` → `Match::tick` → the engine's own
+    /// `CommandMatcher`).
+    fn evilken_perform(name: &str, max_power: bool) -> Option<MoveOutcome> {
+        let mut m = build_evilken_match()?;
+        evilken_into_fight(&mut m);
+
+        // Look up the command's parsed motion from the character's own `.cmd`.
+        let defs = m.p1().loaded.command_defs();
+        let def = defs.iter().find(|d| d.name.eq_ignore_ascii_case(name))?;
+
+        // Put P1 into a neutral controllable standing state and (for supers) max meter.
+        {
+            let c = &mut m.p1.character;
+            c.state_no = 0;
+            c.state_type = StateType::Standing;
+            c.move_type = MoveType::Idle;
+            c.ctrl = true;
+            if max_power {
+                c.power = c.power_max;
+            }
+        }
+        let facing_right = m.p1().character.facing == Facing::Right;
+
+        // Synthesize the motion (T053) and adapt each absolute `InputState` to a
+        // `MatchInput` via the existing `From<InputState>` seam. A few trailing
+        // neutral frames give the buffered match time to fire the state.
+        let mut frames: Vec<MatchInput> = fp_input::synth_command(&def.elements, facing_right)
+            .into_iter()
+            .map(MatchInput::from)
+            .collect();
+        frames.extend(std::iter::repeat_n(MatchInput::none(), 6));
+
+        // Feed the motion immediately (before the AI-detect helper can flip the
+        // character's internal AI var), keeping P1 controllable in neutral each frame,
+        // and record what it does.
+        let mut outcome = MoveOutcome {
+            attacked: false,
+            states: std::collections::BTreeSet::new(),
+        };
+        for f in frames {
+            // The move-change controllers live in `[Statedef -1]` and only run while
+            // the fighter has control in the neutral state; keep it controllable
+            // until the move actually takes over.
+            if m.p1().character.state_no == 0 {
+                m.p1.character.ctrl = true;
+                if max_power {
+                    m.p1.character.power = m.p1().character.power_max;
+                }
+            }
+            m.tick(f, MatchInput::none());
+            let st = m.p1().character.state_no;
+            if st != 0 {
+                outcome.states.insert(st);
+            }
+            if m.p1().character.move_type == MoveType::Attack {
+                outcome.attacked = true;
+            }
+        }
+        Some(outcome)
+    }
+
+    /// Convenience: did the named command produce an attack (`move_type == Attack`)?
+    fn evilken_move_fires(name: &str, max_power: bool) -> Option<bool> {
+        Some(evilken_perform(name, max_power)?.attacked)
+    }
+
+    /// evilken's dedicated special-move state for the `DP_a` Dragon-Punch
+    /// (`[Statedef -1]` change `command = "DP_a"` → `value = 270`).
+    const EVILKEN_DP_STATE: i32 = 270;
+    /// evilken's dedicated level-3 super states for the `cz` (`c+z`) super
+    /// (`[Statedef -1]` changes → 3910 ground / 3911 air, both gated on
+    /// `power >= 3000`).
+    const EVILKEN_CZ_SUPER_STATES: &[i32] = &[3910, 3911];
+
+    /// REQUIRED bar (AC2): evilken's signature ground special — the Dragon-Punch
+    /// `DP_a` (`F, D, DF, a`) — fires from a neutral controllable state when its
+    /// synthesized motion is fed through the real `Match` input path. No meter is
+    /// needed for the special. The assertion is meaningful: P1 must both become
+    /// attacking AND actually enter the special's dedicated state 270 (not merely a
+    /// normal). Skips cleanly when the fixture is absent.
+    #[test]
+    fn evilken_signature_special_fires_from_synthesized_input() {
+        let Some(outcome) = evilken_perform("DP_a", false) else {
+            return; // fixture absent or command not declared -> skip cleanly
+        };
+        assert!(
+            outcome.attacked,
+            "evilken signature special `DP_a` never produced an attack from its synthesized \
+             motion fed through the real Match input path (states seen: {:?})",
+            outcome.states
+        );
+        assert!(
+            outcome.entered_any(&[EVILKEN_DP_STATE]),
+            "evilken `DP_a` attacked but did not enter its dedicated special state \
+             {EVILKEN_DP_STATE} (states seen: {:?}) — the special motion was not recognized",
+            outcome.states
+        );
+    }
+
+    /// REQUIRED bar (AC2): a power-gated super — the `cz` (`c+z`) level-3 super,
+    /// whose `[Statedef -1]` change to state 3910 is gated strictly on
+    /// `power >= 3000` (the character's full meter, with no alternate non-meter
+    /// escape) — fires once P1 is granted full meter (`power = power_max`) and the
+    /// synthesized motion is fed through the real `Match` input path.
+    ///
+    /// The assertion is *doubly* meaningful: the move must fire WITH full meter
+    /// (the positive bar this test asserts), and it must NOT fire WITHOUT meter
+    /// (the negative control below), which proves the power gate is real and the
+    /// positive result is not a tautology.
+    #[test]
+    fn evilken_power_gated_super_fires_with_full_meter() {
+        let Some(outcome) = evilken_perform("cz", true) else {
+            return; // fixture absent or command not declared -> skip cleanly
+        };
+        assert!(
+            outcome.entered_any(EVILKEN_CZ_SUPER_STATES),
+            "evilken power-gated super `cz` did not enter its level-3 super state \
+             {EVILKEN_CZ_SUPER_STATES:?} (gated on power >= 3000) with full meter \
+             (states seen: {:?})",
+            outcome.states
+        );
+    }
+
+    /// Negative control for the power gate (AC2 meaningfulness): the same `cz`
+    /// level-3 super must NOT fire with zero meter, since its only meter gate is
+    /// `power >= 3000`. This guards against the positive test above being a
+    /// tautology — if the gate ever stopped being enforced, the super would fire
+    /// from neutral with no power and this test would fail. Skips cleanly when the
+    /// fixture is absent.
+    #[test]
+    fn evilken_power_gated_super_does_not_fire_without_meter() {
+        let Some(outcome) = evilken_perform("cz", false) else {
+            return; // fixture absent or command not declared -> skip cleanly
+        };
+        assert!(
+            !outcome.entered_any(EVILKEN_CZ_SUPER_STATES),
+            "evilken power-gated super `cz` reached its level-3 super state \
+             {EVILKEN_CZ_SUPER_STATES:?} with ZERO meter — the `power >= 3000` gate was not \
+             enforced, so the positive power-gated-super test would be a tautology \
+             (states seen: {:?})",
+            outcome.states
+        );
+    }
+
+    /// General harness (so it can later point at other characters): enumerate
+    /// evilken's *declared* commands, synthesize each, and confirm a representative
+    /// share of its real special/super vocabulary is performable end-to-end. This
+    /// proves the harness iterates over a character's commands rather than being
+    /// hand-wired to two moves, while staying robust to a boss character's heavy,
+    /// state-dependent move gating (many moves only chain from other moves, so we
+    /// require a meaningful subset of the from-neutral specials/supers to fire, not
+    /// literally all of them). Skips cleanly when the fixture is absent.
+    #[test]
+    fn evilken_declared_moves_are_broadly_performable() {
+        // Probe match purely to enumerate the declared command vocabulary.
+        let Some(m) = build_evilken_match() else {
+            return; // fixture absent -> skip cleanly
+        };
+        let names: Vec<String> = m
+            .p1()
+            .loaded
+            .command_defs()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        drop(m);
+
+        // The from-neutral special/super families evilken declares. We skip the
+        // AI-probe `CPU*` commands and the bare single-direction / single-button
+        // `hold*`/recovery entries (which are not standalone moves), and treat any
+        // `*2*` name as a (power-gated) super.
+        let is_super = |n: &str| n.contains('2');
+        let mut attempted = 0usize;
+        let mut fired = 0usize;
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &names {
+            let lower = name.to_ascii_lowercase();
+            let looks_like_move = lower.starts_with("qcf")
+                || lower.starts_with("qcb")
+                || lower.starts_with("dp")
+                || lower.starts_with("rdp")
+                || lower.starts_with("hcf")
+                || lower.starts_with("hcb")
+                || lower.starts_with("asura")
+                || lower.starts_with("dest")
+                || lower.starts_with("bust");
+            if !looks_like_move || !seen.insert(lower.clone()) {
+                continue;
+            }
+            attempted += 1;
+            if let Some(true) = evilken_move_fires(name, is_super(&lower)) {
+                fired += 1;
+            }
+        }
+
+        // We must have found and attempted a real vocabulary, and a solid share of
+        // the from-neutral specials/supers must actually be performable.
+        assert!(
+            attempted >= 4,
+            "expected to enumerate several declared special/super commands, found {attempted}"
+        );
+        assert!(
+            fired * 2 >= attempted,
+            "fewer than half of evilken's from-neutral declared moves were performable \
+             ({fired}/{attempted}); the synthesizer→Match move-execution path regressed"
+        );
+    }
 }
