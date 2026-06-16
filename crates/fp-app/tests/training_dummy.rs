@@ -268,6 +268,28 @@ fn keyboard_input_trace_fighter_responds_to_movement_and_attack() {
     eprintln!("[input-trace] === fighter responded to walk, jump, crouch AND attack ===");
 }
 
+// T049: assert the two new QCF/DP special-move statedefs exist after load.
+#[test]
+fn training_dummy_has_special_move_statedefs() {
+    // The Training Dummy (T049) ships two motion-command special-move states:
+    //   1000 — fireball (QCF+a)
+    //   1100 — dragon-punch (DP+a)
+    // Both must be present in the compiled state table after a full load so
+    // that the [Statedef -1] ChangeState bridges can route to them.
+    let def = dummy_asset("trainingdummy.def");
+    let loaded = LoadedCharacter::load(&def)
+        .unwrap_or_else(|e| panic!("Training Dummy failed to load: {e}"));
+
+    assert!(
+        loaded.state(1000).is_some(),
+        "fireball state [Statedef 1000] must be present after load"
+    );
+    assert!(
+        loaded.state(1100).is_some(),
+        "dragon-punch state [Statedef 1100] must be present after load"
+    );
+}
+
 // NOTE: the validator itself lives in the `fp-app` *binary* crate's `validate`
 // module, which integration tests cannot import (a `bin` crate exposes no lib
 // target). The "the shipped fixture validates clean" assertion therefore lives

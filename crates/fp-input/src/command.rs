@@ -2705,4 +2705,116 @@ mod tests {
             }
         );
     }
+
+    // ====================================================================
+    // T049: trainingdummy special-move command compile tests
+    // ====================================================================
+
+    #[test]
+    fn trainingdummy_fireball_command_compiles() {
+        // The trainingdummy QCF+a fireball: `~D, DF, F, a` (4 elements).
+        // Must compile without error — every token must be recognised.
+        let elements = compile_command("~D, DF, F, a").unwrap();
+        assert_eq!(
+            elements.len(),
+            4,
+            "QCF fireball must parse as 4 elements, got {}",
+            elements.len()
+        );
+        // First element: ~D (release Down).
+        assert_eq!(
+            elements[0],
+            CommandElement::Dir {
+                token: DirToken::D,
+                modifier: InputModifier::Release,
+                detect: false,
+                strict: false,
+            },
+            "element 0 must be ~D (release Down)"
+        );
+        // Second: DF.
+        assert_eq!(
+            elements[1],
+            CommandElement::Dir {
+                token: DirToken::DF,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "element 1 must be DF"
+        );
+        // Third: F.
+        assert_eq!(
+            elements[2],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "element 2 must be F"
+        );
+        // Fourth: a button.
+        assert_eq!(
+            elements[3],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Press,
+                strict: false,
+            },
+            "element 3 must be the A button"
+        );
+    }
+
+    #[test]
+    fn trainingdummy_dp_command_compiles() {
+        // The trainingdummy DP+a dragon-punch: `F, D, DF, a` (4 elements).
+        // Must compile without error — every token must be recognised.
+        let elements = compile_command("F, D, DF, a").unwrap();
+        assert_eq!(
+            elements.len(),
+            4,
+            "DP dragon-punch must parse as 4 elements, got {}",
+            elements.len()
+        );
+        assert_eq!(
+            elements[0],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "element 0 must be F"
+        );
+        assert_eq!(
+            elements[1],
+            CommandElement::Dir {
+                token: DirToken::D,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "element 1 must be D"
+        );
+        assert_eq!(
+            elements[2],
+            CommandElement::Dir {
+                token: DirToken::DF,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "element 2 must be DF"
+        );
+        assert_eq!(
+            elements[3],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Press,
+                strict: false,
+            },
+            "element 3 must be the A button"
+        );
+    }
 }

@@ -202,6 +202,39 @@ value = 0
 ctrl = 1
 
 ; ---------------------------------------------------------------------------
+; Fireball (QCF+a) — motion-command state 1000.
+; Reuses anim 200 (no new sprite needed).  No projectile; the state just
+; demonstrates that a QCF motion correctly routes to a dedicated statedef.
+[Statedef 1000]
+type = S
+movetype = A
+physics = S
+anim = 200
+ctrl = 0
+
+[State 1000, end]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
+
+; ---------------------------------------------------------------------------
+; Dragon punch (F,D,DF+a) — motion-command state 1100.
+; Reuses anim 200.  Same purpose as 1000: validates DP motion recognition.
+[Statedef 1100]
+type = S
+movetype = A
+physics = S
+anim = 200
+ctrl = 0
+
+[State 1100, end]
+type = ChangeState
+trigger1 = animtime = 0
+value = 0
+ctrl = 1
+
+; ---------------------------------------------------------------------------
 ; Get-hit: standing reaction
 [Statedef 5000]
 type = S
