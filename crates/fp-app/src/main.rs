@@ -1333,6 +1333,13 @@ impl Hud {
         }
     }
 
+    /// The loaded HUD font, if any. `None` when `assets/data/font.fnt` is missing
+    /// or failed to load. Shared with overlays (e.g. the T063 training overlay's
+    /// legend) so they reuse the one loaded font rather than reloading it.
+    fn font(&self) -> Option<&GlyphFont> {
+        self.font.as_ref()
+    }
+
     /// Draws a solid-color filled `rect` by drawing the given color's 1x1 quad
     /// scaled up.
     fn fill(&self, frame: &mut fp_render::RenderFrame<'_>, color: &HudColor, rect: HudRect) {
@@ -2200,11 +2207,110 @@ fn clsn_to_screen_box(
 const CLSN1_COLOR: [f32; 4] = [1.0, 0.25, 0.25, 1.0];
 /// Blue (Clsn2 = hurt/collision box), MUGEN debug convention. RGBA in 0.0–1.0.
 const CLSN2_COLOR: [f32; 4] = [0.3, 0.55, 1.0, 1.0];
+/// Green (player push / `Width` box), the third overlay color. RGBA in 0.0–1.0.
+const PUSH_COLOR: [f32; 4] = [0.3, 0.95, 0.4, 1.0];
+
+/// Which kind of collision box a [`collect_clsn_boxes`] entry represents, so a
+/// caller can style each independently. `Hurt` is Clsn2 (blue), `Hit` is Clsn1
+/// (red), and `Push` is the player-push / `Width` box (green).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClsnKind {
+    /// Clsn1 — the attack / hit box (red).
+    Hit,
+    /// Clsn2 — the hurt / collision box (blue).
+    Hurt,
+    /// The player-push / `Width` box (green), derived from the size half-widths
+    /// rather than from the AIR frame.
+    Push,
+}
+
+impl ClsnKind {
+    /// The MUGEN-convention overlay color for this kind, RGBA in 0.0–1.0.
+    fn color(self) -> [f32; 4] {
+        match self {
+            ClsnKind::Hit => CLSN1_COLOR,
+            ClsnKind::Hurt => CLSN2_COLOR,
+            ClsnKind::Push => PUSH_COLOR,
+        }
+    }
+}
+
+/// Maps the player-push half-widths into a character-local Clsn-style rect (the
+/// same Y-down, axis-relative convention as an AIR frame's Clsn rects), so the
+/// push box flows through the *same* [`clsn_to_screen_box`] facing-mirror path as
+/// the hit/hurt boxes.
+///
+/// `front`/`back` are the facing-relative half-widths from
+/// [`Player::push_widths`](fp_engine::Player::push_widths): `front` extends toward
+/// the facing direction (local +X before mirroring), `back` the other way. The
+/// box stands on the axis and is given a small fixed visual height so it reads as
+/// a footprint band at the fighter's feet; push collision itself is width-only.
+fn push_box_local(front: f32, back: f32) -> fp_core::Rect {
+    // Local +X is "forward"; clsn_to_screen_box mirrors it for left-facing.
+    // Height is purely cosmetic — a thin band just above the ground line.
+    const PUSH_BOX_HEIGHT: f32 = 14.0;
+    fp_core::Rect::new(-back, -PUSH_BOX_HEIGHT, front + back, PUSH_BOX_HEIGHT)
+}
+
+/// Collects one fighter's current-frame collision boxes as screen-space
+/// [`fp_render::DebugBox`]es tagged with their [`ClsnKind`], in draw order: every
+/// Clsn2 (hurt) first, then every Clsn1 (hit), then the single push/`Width` box
+/// last so it reads over the others. The boxes are facing-mirrored exactly like
+/// the rendered sprite (via [`clsn_to_screen_box`], which mirrors
+/// `fp_physics::place_clsn`). A missing/empty current frame yields only the push
+/// box (which has no AIR dependency); a `None` would never be a panic.
+///
+/// This is the single box-mapping math shared by **both** the raw F1 dev overlay
+/// and the player-facing [`TrainingOverlay`] — they differ only in styling and
+/// toggle scope, never in geometry.
+fn collect_clsn_boxes(
+    player: &Player,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
+) -> Vec<(fp_render::DebugBox, ClsnKind)> {
+    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), camera_x, win_w, win_h);
+    let facing = player.facing();
+    let mut boxes = Vec::new();
+
+    if let Some(anim_frame) = player_current_frame(player) {
+        for hurt in &anim_frame.clsn2 {
+            boxes.push((
+                clsn_to_screen_box(hurt, anchor_x, anchor_y, facing, ClsnKind::Hurt.color()),
+                ClsnKind::Hurt,
+            ));
+        }
+        for attack in &anim_frame.clsn1 {
+            boxes.push((
+                clsn_to_screen_box(attack, anchor_x, anchor_y, facing, ClsnKind::Hit.color()),
+                ClsnKind::Hit,
+            ));
+        }
+    }
+
+    // Push/Width box: derived from the player half-widths (not the AIR frame), so
+    // it is always available even on a frame with no Clsn data.
+    let (front, back) = player.push_widths();
+    let push_local = push_box_local(front, back);
+    boxes.push((
+        clsn_to_screen_box(
+            &push_local,
+            anchor_x,
+            anchor_y,
+            facing,
+            ClsnKind::Push.color(),
+        ),
+        ClsnKind::Push,
+    ));
+
+    boxes
+}
 
 /// Draws one fighter's current-frame collision boxes when the debug overlay is
-/// on: every Clsn2 (hurtbox, blue) first, then every Clsn1 (attack box, red) on
-/// top so attack boxes read clearly where the two overlap. A missing frame draws
-/// nothing.
+/// on, in [`collect_clsn_boxes`] order (Clsn2 hurt, then Clsn1 hit, then the
+/// push/`Width` box). A missing frame still draws the push box. This is the raw
+/// F1 dev overlay; the player-facing [`TrainingOverlay`] reuses the same
+/// `collect_clsn_boxes` math with its own scoping/legend.
 fn draw_player_clsn(
     frame: &mut fp_render::RenderFrame<'_>,
     player: &Player,
@@ -2212,29 +2318,164 @@ fn draw_player_clsn(
     win_w: f32,
     win_h: f32,
 ) {
-    let Some(anim_frame) = player_current_frame(player) else {
-        return;
-    };
-    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), camera_x, win_w, win_h);
-    let facing = player.facing();
-
-    for hurt in &anim_frame.clsn2 {
-        frame.draw_debug_box(&clsn_to_screen_box(
-            hurt,
-            anchor_x,
-            anchor_y,
-            facing,
-            CLSN2_COLOR,
-        ));
+    for (b, _kind) in collect_clsn_boxes(player, camera_x, win_w, win_h) {
+        frame.draw_debug_box(&b);
     }
-    for attack in &anim_frame.clsn1 {
-        frame.draw_debug_box(&clsn_to_screen_box(
-            attack,
-            anchor_x,
-            anchor_y,
-            facing,
-            CLSN1_COLOR,
-        ));
+}
+
+// ---------------------------------------------------------------------------
+// Player-facing training overlay (T063)
+// ---------------------------------------------------------------------------
+
+/// Which fighter(s) the player-facing [`TrainingOverlay`] draws Clsn boxes for.
+///
+/// Distinct from the raw F1 dev overlay (which is always both-or-nothing): the
+/// training overlay can scope to a single side so a player can study just their
+/// own hurtboxes or just the opponent's hit reach. Cycled with the
+/// [`TrainingOverlay`] toggle key; the order is `Off → P1 → P2 → Both → Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OverlayScope {
+    /// No boxes drawn (overlay disabled).
+    #[default]
+    Off,
+    /// Player 1's boxes only.
+    P1,
+    /// Player 2's boxes only.
+    P2,
+    /// Both fighters' boxes.
+    Both,
+}
+
+impl OverlayScope {
+    /// The next scope in the cycle `Off → P1 → P2 → Both → Off`, used by the
+    /// toggle key so one key walks every per-side state and back to off.
+    fn next(self) -> Self {
+        match self {
+            OverlayScope::Off => OverlayScope::P1,
+            OverlayScope::P1 => OverlayScope::P2,
+            OverlayScope::P2 => OverlayScope::Both,
+            OverlayScope::Both => OverlayScope::Off,
+        }
+    }
+
+    /// Whether player 1's boxes should be drawn under this scope.
+    fn shows_p1(self) -> bool {
+        matches!(self, OverlayScope::P1 | OverlayScope::Both)
+    }
+
+    /// Whether player 2's boxes should be drawn under this scope.
+    fn shows_p2(self) -> bool {
+        matches!(self, OverlayScope::P2 | OverlayScope::Both)
+    }
+
+    /// A short human label for the legend / logs.
+    fn label(self) -> &'static str {
+        match self {
+            OverlayScope::Off => "OFF",
+            OverlayScope::P1 => "P1",
+            OverlayScope::P2 => "P2",
+            OverlayScope::Both => "BOTH",
+        }
+    }
+}
+
+/// The player-facing hitbox/hurtbox training overlay (T063): a styled,
+/// per-side-scopable view of each fighter's Clsn1 (hit, red), Clsn2 (hurt, blue),
+/// and push/`Width` (green) boxes, plus a small on-screen legend.
+///
+/// It reuses the exact same box-mapping math as the raw F1 dev overlay
+/// ([`collect_clsn_boxes`]); only the scope (per-side, via [`OverlayScope`]) and
+/// the legend differ. State persists for the session in the run loop. The dev F1
+/// overlay is unaffected and keeps drawing both sides whenever it is on.
+#[derive(Debug, Clone, Copy, Default)]
+struct TrainingOverlay {
+    /// Which side(s) to draw; `Off` disables the overlay entirely.
+    scope: OverlayScope,
+}
+
+impl TrainingOverlay {
+    /// Cycles the scope one step (`Off → P1 → P2 → Both → Off`); the toggle key
+    /// calls this so a single key walks every per-side state.
+    fn cycle(&mut self) {
+        self.scope = self.scope.next();
+    }
+
+    /// Whether the overlay is currently drawing anything.
+    fn is_active(&self) -> bool {
+        self.scope != OverlayScope::Off
+    }
+
+    /// Draws the in-scope fighters' Clsn boxes (reusing [`collect_clsn_boxes`])
+    /// plus, when a HUD font is available, a small top-left legend. A `None` font
+    /// simply omits the text (no regression, no panic). Nothing is drawn when the
+    /// scope is `Off`.
+    fn draw(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        m: &Match,
+        font: Option<&GlyphFont>,
+        camera_x: f32,
+        win_w: f32,
+        win_h: f32,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        if self.scope.shows_p1() {
+            for (b, _kind) in collect_clsn_boxes(m.p1(), camera_x, win_w, win_h) {
+                frame.draw_debug_box(&b);
+            }
+        }
+        if self.scope.shows_p2() {
+            for (b, _kind) in collect_clsn_boxes(m.p2(), camera_x, win_w, win_h) {
+                frame.draw_debug_box(&b);
+            }
+        }
+        if let Some(font) = font {
+            self.draw_legend(frame, font);
+        }
+    }
+
+    /// Draws the color legend: a labeled line per box kind plus the current scope.
+    /// Each line is prefixed with a small solid swatch in that kind's color so the
+    /// mapping reads at a glance. Top-left, under the lifebars.
+    fn draw_legend(&self, frame: &mut fp_render::RenderFrame<'_>, font: &GlyphFont) {
+        const LEGEND_X: f32 = 8.0;
+        const LEGEND_TOP: f32 = 64.0;
+        const LINE_H: f32 = 14.0;
+        const SCALE: f32 = 1.0;
+        const SWATCH: f32 = 10.0;
+        // Order matches collect_clsn_boxes draw order, then the scope.
+        let rows: [(&str, [f32; 4]); 4] = [
+            ("HURT", ClsnKind::Hurt.color()),
+            ("HIT", ClsnKind::Hit.color()),
+            ("PUSH", ClsnKind::Push.color()),
+            (self.scope.label(), [1.0, 1.0, 1.0, 1.0]),
+        ];
+        for (i, (text, color)) in rows.iter().enumerate() {
+            let y = LEGEND_TOP + i as f32 * LINE_H;
+            // Color swatch (skip for the scope row, which uses white text only).
+            if i < 3 {
+                frame.draw_debug_box(&fp_render::DebugBox {
+                    x: LEGEND_X,
+                    y,
+                    w: SWATCH,
+                    h: SWATCH,
+                    color: *color,
+                });
+            }
+            frame.draw_text(
+                font,
+                text,
+                &TextDrawParams {
+                    x: LEGEND_X + SWATCH + 4.0,
+                    y,
+                    scale: SCALE,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
     }
 }
 
@@ -4698,6 +4939,7 @@ fn draw_match_run(
     run: &MatchRun,
     hud: &Hud,
     overlay_enabled: bool,
+    training_overlay: TrainingOverlay,
     win_wf: f32,
     win_hf: f32,
 ) {
@@ -4801,11 +5043,16 @@ fn draw_match_run(
         stage.draw_layer(frame, BgLayer::Front, camera_x, camera_y, win_wf, win_hf);
     }
 
-    // Optional Clsn debug overlay (F1).
+    // Optional Clsn debug overlay (F1) — the raw dev toggle, always both sides.
     if overlay_enabled {
         draw_player_clsn(frame, run.m().p1(), camera_x, win_wf, win_hf);
         draw_player_clsn(frame, run.m().p2(), camera_x, win_wf, win_hf);
     }
+
+    // Player-facing training overlay (T063): styled, per-side-scopable, with a
+    // legend. Independent of the raw F1 dev toggle above; reuses the same box
+    // math. Drawn under the HUD so the legend text reads over the boxes.
+    training_overlay.draw(frame, run.m(), hud.font(), camera_x, win_wf, win_hf);
 
     // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
     match run.screenpack.as_ref() {
@@ -4940,6 +5187,10 @@ fn run() -> fp_core::FpResult<()> {
     // default; when on, both fighters' current-frame Clsn1 (red) and Clsn2
     // (blue) boxes are drawn over the sprites in the two-player match mode.
     let mut overlay_enabled = false;
+    // Player-facing training overlay (T063), toggled with F2: a styled, per-side
+    // (Off → P1 → P2 → Both) view of the Clsn/push boxes with a legend. Distinct
+    // from the F1 dev toggle above; persists for the session.
+    let mut training_overlay = TrainingOverlay::default();
 
     while running {
         // Per-frame edge flags driven from discrete key events (below).
@@ -4985,10 +5236,20 @@ fn run() -> fp_core::FpResult<()> {
                         if overlay_enabled { "ON" } else { "OFF" }
                     );
                 }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F2),
+                    repeat: false,
+                    ..
+                } => {
+                    // Player-facing training overlay (T063): cycle Off → P1 → P2
+                    // → Both → Off. Independent of the F1 dev overlay.
+                    training_overlay.cycle();
+                    tracing::info!("Training Clsn overlay: {}", training_overlay.scope.label());
+                }
                 // Any other physical key press: record the first one this frame so
                 // the setup screen's remap-capture can bind it. (Esc/Return/Space/
-                // F1 are handled above; this catches the rest, e.g. a new key for
-                // an action.) Only the first press per frame is kept.
+                // F1/F2 are handled above; this catches the rest, e.g. a new key
+                // for an action.) Only the first press per frame is kept.
                 Event::KeyDown {
                     scancode: Some(scancode),
                     repeat: false,
@@ -5228,7 +5489,15 @@ fn run() -> fp_core::FpResult<()> {
         // Direct-CLI content modes render exactly as before.
         match mode.as_ref() {
             Some(Mode::Match(run)) => {
-                draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
+                draw_match_run(
+                    &mut frame,
+                    run,
+                    &hud,
+                    overlay_enabled,
+                    training_overlay,
+                    win_wf,
+                    win_hf,
+                );
             }
             Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -5294,7 +5563,15 @@ fn run() -> fp_core::FpResult<()> {
                     }
                 }
                 RunScreen::Fight(run) => {
-                    draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
+                    draw_match_run(
+                        &mut frame,
+                        run,
+                        &hud,
+                        overlay_enabled,
+                        training_overlay,
+                        win_wf,
+                        win_hf,
+                    );
                 }
                 RunScreen::Quit => {}
             }
@@ -8088,6 +8365,208 @@ mod tests {
         assert!((b.w - 30.0).abs() < 1e-4, "width magnitude preserved");
         // Mirrored edges: anchor - 15 .. anchor + 15 => 35..65, so x = 35.
         assert!((b.x - 35.0).abs() < 1e-4);
+    }
+
+    // ---- T063: collect_clsn_boxes — shared box math + push box + facing. ----
+
+    /// A synthetic, asset-free [`SffFile`] (one empty SFF v1 sprite). Mirrors the
+    /// fp-engine test helper so these tests need no `test-assets/`.
+    fn synth_sff() -> SffFile {
+        const SUBHEADER_OFFSET: usize = 64;
+        let mut buf = vec![0u8; SUBHEADER_OFFSET + 32];
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[15] = 1; // SFF v1
+        buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // num_groups
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // num_images
+        buf[24..28].copy_from_slice(&(SUBHEADER_OFFSET as u32).to_le_bytes());
+        SffFile::from_bytes(&buf).expect("synthetic SFF v1 must parse")
+    }
+
+    /// Builds a headless [`Player`] whose action 0 has exactly one frame with one
+    /// known Clsn1 (hit) and one known Clsn2 (hurt) box, positioned at the axis,
+    /// facing `facing`, with the default `[Size]` push half-widths. Asset-free —
+    /// no `test-assets/` required — so the T063 verification runs on CI.
+    fn synth_clsn_player(facing: fp_character::Facing) -> Player {
+        let hurt = fp_core::Rect::new(-10.0, -60.0, 20.0, 60.0); // centered hurtbox
+        let hit = fp_core::Rect::new(20.0, -50.0, 30.0, 10.0); // forward attack box
+        let frame = fp_formats::air::AnimFrame {
+            sprite: SpriteId::new(0, 0),
+            ticks: -1,
+            clsn1: vec![hit],
+            clsn2: vec![hurt],
+            ..Default::default()
+        };
+        let action = AnimAction {
+            action_number: 0,
+            frames: vec![frame],
+            loopstart: 0,
+        };
+        let mut actions = HashMap::new();
+        actions.insert(0, action);
+        let loaded = LoadedCharacter {
+            name: "synth".to_string(),
+            localcoord: (320, 240),
+            constants: fp_character::CharacterConstants::default(),
+            states: HashMap::new(),
+            sff: synth_sff(),
+            air: AirFile { actions },
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        };
+        let mut c = Character::new();
+        c.pos = Vec2::new(0.0, 0.0);
+        c.facing = facing;
+        c.anim = 0;
+        c.anim_elem = 0;
+        Player::new(c, loaded)
+    }
+
+    #[test]
+    fn collect_clsn_boxes_tags_hit_hurt_and_push_kinds() {
+        // Facing right, axis at screen x=160 (win_w=320 -> world_to_screen_x(0)).
+        let player = synth_clsn_player(fp_character::Facing::Right);
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        // Exactly one of each kind: one Clsn2, one Clsn1, one push box.
+        let hurts = boxes.iter().filter(|(_, k)| *k == ClsnKind::Hurt).count();
+        let hits = boxes.iter().filter(|(_, k)| *k == ClsnKind::Hit).count();
+        let pushes = boxes.iter().filter(|(_, k)| *k == ClsnKind::Push).count();
+        assert_eq!(hurts, 1, "one hurtbox (Clsn2)");
+        assert_eq!(hits, 1, "one hitbox (Clsn1)");
+        assert_eq!(pushes, 1, "one push/Width box");
+        assert_eq!(boxes.len(), 3, "exactly hurt + hit + push");
+        // Draw order: hurt first, then hit, then push (push reads over the rest).
+        assert_eq!(boxes[0].1, ClsnKind::Hurt);
+        assert_eq!(boxes[1].1, ClsnKind::Hit);
+        assert_eq!(boxes[2].1, ClsnKind::Push);
+        // Colors are the per-kind constants (red hit, blue hurt, green push).
+        assert_eq!(boxes[0].0.color, CLSN2_COLOR);
+        assert_eq!(boxes[1].0.color, CLSN1_COLOR);
+        assert_eq!(boxes[2].0.color, PUSH_COLOR);
+    }
+
+    #[test]
+    fn collect_clsn_boxes_mirrors_hitbox_when_facing_left() {
+        // The forward hitbox (local x in 20..50) lands on the +X side when facing
+        // right and the -X side when facing left, mirrored about the axis.
+        let right = collect_clsn_boxes(
+            &synth_clsn_player(fp_character::Facing::Right),
+            0.0,
+            320.0,
+            240.0,
+        );
+        let left = collect_clsn_boxes(
+            &synth_clsn_player(fp_character::Facing::Left),
+            0.0,
+            320.0,
+            240.0,
+        );
+        let rhit = right.iter().find(|(_, k)| *k == ClsnKind::Hit).unwrap().0;
+        let lhit = left.iter().find(|(_, k)| *k == ClsnKind::Hit).unwrap().0;
+        // Axis maps to the same screen X for both (facing doesn't move the axis).
+        let axis = world_to_screen_x(0.0, 320.0);
+        // Facing right: hitbox to the right of the axis. Facing left: to the left.
+        assert!(
+            rhit.x >= axis,
+            "right-facing hitbox is forward (+X) of the axis"
+        );
+        assert!(
+            lhit.x + lhit.w <= axis,
+            "left-facing hitbox is forward (-X) of the axis"
+        );
+        // Widths are preserved under the mirror; the two are reflections about the
+        // axis (their centers are equidistant from it).
+        assert!(
+            (rhit.w - lhit.w).abs() < 1e-4,
+            "width preserved under mirror"
+        );
+        let rc = rhit.x + rhit.w / 2.0;
+        let lc = lhit.x + lhit.w / 2.0;
+        assert!(
+            ((rc - axis) - (axis - lc)).abs() < 1e-4,
+            "hitbox is mirrored about the axis between facings"
+        );
+    }
+
+    #[test]
+    fn collect_clsn_boxes_push_box_reflects_facing_relative_widths() {
+        // The default [Size] half-widths are front=16, back=15 (asymmetric), so the
+        // push box is NOT centered: it must reflect when facing flips.
+        let player = synth_clsn_player(fp_character::Facing::Right);
+        let (front, back) = player.push_widths();
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        let push = boxes.iter().find(|(_, k)| *k == ClsnKind::Push).unwrap().0;
+        let axis = world_to_screen_x(0.0, 320.0);
+        // Total width spans front + back regardless of facing.
+        assert!(
+            (push.w - (front + back)).abs() < 1e-4,
+            "push box spans front+back half-widths"
+        );
+        // Facing right: front extends to +X. Right edge = axis + front.
+        assert!(
+            (push.x + push.w - (axis + front)).abs() < 1e-4,
+            "right-facing push box extends `front` toward +X"
+        );
+        assert!(
+            (push.x - (axis - back)).abs() < 1e-4,
+            "right-facing push box extends `back` toward -X"
+        );
+        // Facing left: the front/back swap sides (mirror about the axis).
+        let lplayer = synth_clsn_player(fp_character::Facing::Left);
+        let lboxes = collect_clsn_boxes(&lplayer, 0.0, 320.0, 240.0);
+        let lpush = lboxes.iter().find(|(_, k)| *k == ClsnKind::Push).unwrap().0;
+        assert!(
+            (lpush.x - (axis - front)).abs() < 1e-4,
+            "left-facing push box extends `front` toward -X"
+        );
+    }
+
+    #[test]
+    fn collect_clsn_boxes_yields_push_box_even_with_no_anim_frame() {
+        // A player pointed at a nonexistent anim has no Clsn frame, but the push
+        // box (derived from size, not AIR) is still produced — never a panic.
+        let mut player = synth_clsn_player(fp_character::Facing::Right);
+        player.character.anim = 987_654; // no such action
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        assert_eq!(
+            boxes.len(),
+            1,
+            "only the push box when no Clsn frame resolves"
+        );
+        assert_eq!(boxes[0].1, ClsnKind::Push);
+    }
+
+    // ---- T063: TrainingOverlay scope cycling + per-side selection. ----
+
+    #[test]
+    fn overlay_scope_cycles_off_p1_p2_both_and_back() {
+        assert_eq!(OverlayScope::Off.next(), OverlayScope::P1);
+        assert_eq!(OverlayScope::P1.next(), OverlayScope::P2);
+        assert_eq!(OverlayScope::P2.next(), OverlayScope::Both);
+        assert_eq!(OverlayScope::Both.next(), OverlayScope::Off);
+    }
+
+    #[test]
+    fn overlay_scope_per_side_visibility() {
+        assert!(!OverlayScope::Off.shows_p1() && !OverlayScope::Off.shows_p2());
+        assert!(OverlayScope::P1.shows_p1() && !OverlayScope::P1.shows_p2());
+        assert!(!OverlayScope::P2.shows_p1() && OverlayScope::P2.shows_p2());
+        assert!(OverlayScope::Both.shows_p1() && OverlayScope::Both.shows_p2());
+    }
+
+    #[test]
+    fn training_overlay_cycle_and_active_track_scope() {
+        let mut ov = TrainingOverlay::default();
+        assert!(!ov.is_active(), "default overlay is off");
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::P1);
+        assert!(ov.is_active());
+        ov.cycle();
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::Both);
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::Off);
+        assert!(!ov.is_active());
     }
 
     // ---- #16: two-fighter draw-order decision from `sprpriority` ----
