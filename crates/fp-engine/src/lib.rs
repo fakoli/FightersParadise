@@ -1252,12 +1252,30 @@ impl Player {
         // `NumProj` trigger — built from the projectile slot-map, an id-only slice
         // threaded through the `Copy` graph exactly like `own_helper_ids`.
         let own_proj_ids: Vec<i32> = self.projectiles.iter().map(|p| p.proj_id).collect();
+        // (T061) The owning player's currently-bound target ids, for the root's
+        // `NumTarget` / `NumTarget(id)` triggers. In this flat 1-v-1 model the only
+        // bound target is the opponent the player most recently hit
+        // (`relations.target`); its id is its MUGEN player id, recovered from the
+        // `playerid` lookup table (which carries the opponent by id). An empty list
+        // means "no target bound", so bare `NumTarget` reports `0`.
+        let own_target_ids: Vec<i32> = relations
+            .target
+            .and_then(|t| {
+                relations
+                    .players
+                    .iter()
+                    .find(|(_, c)| std::ptr::eq(*c, t))
+                    .map(|(id, _)| *id)
+            })
+            .into_iter()
+            .collect();
         let graph = EntityGraph::new(None, None, &lookup)
             .with_target(relations.target)
             .with_partner(relations.partner)
             .with_players(relations.players)
             .with_own_helper_ids(&own_helper_ids)
-            .with_own_proj_ids(&own_proj_ids);
+            .with_own_proj_ids(&own_proj_ids)
+            .with_own_target_ids(&own_target_ids);
         self.character
             .tick_as_helper(&self.loaded, opponent, stage, graph)
     }

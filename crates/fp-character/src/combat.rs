@@ -193,6 +193,10 @@ pub fn resolve_attack(
     if let Some((slot, override_state)) = defender.hit_overrides.matching(&hitdef.attr) {
         defender.hit_overrides.consume(slot);
         defender.change_state(defender_states, override_state);
+        // T061: the defender's current get-hit reaction is now an override-redirected
+        // one, so `HitOverridden` reads 1 for the duration of that reaction. A later
+        // *normal* get-hit (below) clears the flag again.
+        defender.hit_overridden = true;
         // The attacker still connected: flag move-contact + target and consume
         // hitonce so the same HitDef cannot fire the override again.
         attacker.move_connect.hit = true;
@@ -273,6 +277,9 @@ pub fn resolve_attack(
 
     defender.life = (defender.life - applied_damage).max(0);
     defender.vel = knockback;
+    // T061: a normal (non-overridden) hit landed and now drives the reaction, so
+    // any prior `HitOverridden` state is no longer current.
+    defender.hit_overridden = false;
 
     // Populate the defender's GetHitVars from the resolved outcome before the
     // ChangeState, so the get-hit state's entry expressions can read them.
@@ -1552,6 +1559,36 @@ mod tests {
             "inactive override slot is ignored"
         );
         assert_eq!(d.life, 1000 - 30, "normal damage applied");
+    }
+
+    // ---- T061: HitOverride sets/clears the `hit_overridden` flag (HitOverridden) -
+
+    /// T061: a matching `HitOverride` sets the defender's `hit_overridden` flag (the
+    /// state behind the `HitOverridden` trigger); a subsequent normal
+    /// (non-overridden) hit clears it. This is the `HitOverridden` acceptance
+    /// criterion exercised through the real `resolve_attack` pipeline.
+    #[test]
+    fn target_and_hit_triggers_hit_overridden_set_then_cleared() {
+        use crate::invuln::AttackAttrSet;
+        let (mut a, a_air) = make_attacker(); // HitDef attr defaults to S, NA
+        let (mut d, d_air) = make_defender();
+        assert!(!d.hit_overridden, "no hit taken yet → flag clear");
+
+        // Arm a matching override and connect: the flag latches on.
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        let states = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("override fires");
+        assert!(
+            d.hit_overridden,
+            "an override-redirected get-hit sets HitOverridden"
+        );
+
+        // A second, normal (non-overridden) hit replaces the reaction and clears
+        // the flag — the slot was consumed, so this hit is no longer overridden.
+        let (mut a2, a_air2) = make_attacker();
+        resolve_attack(&mut a2, &a_air2, &mut d, &d_air, &states).expect("normal hit");
+        assert!(!d.hit_overridden, "a normal get-hit clears HitOverridden");
     }
 
     // ---- #23: fall.damage / fall.xvelocity flow from HitDef -> GetHitVars --
