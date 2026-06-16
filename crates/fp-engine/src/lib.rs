@@ -92,30 +92,77 @@ pub struct StageBounds {
     pub left: f32,
     /// Rightmost world X a character body may reach.
     pub right: f32,
+    /// `GameWidth` — the stage's logical screen width in localcoord units (the
+    /// 320×240-class space the edge / `ScreenPos` triggers measure in, T060).
+    /// Threaded onto the [`StageView`] for `GameWidth`/`LeftEdge`/`RightEdge`.
+    /// Defaults to MUGEN's classic `320`; `#[serde(default)]` keeps older
+    /// serialized bounds (which lacked this field) loadable.
+    #[serde(default = "default_game_width")]
+    pub game_width: f32,
+    /// `GameHeight` — the stage's logical screen height in localcoord units
+    /// (T060). Threaded onto the [`StageView`] for `GameHeight`/`TopEdge`/
+    /// `BottomEdge`. Defaults to `240`; `#[serde(default)]` keeps older
+    /// serialized bounds loadable.
+    #[serde(default = "default_game_height")]
+    pub game_height: f32,
+}
+
+/// serde default for [`StageBounds::game_width`] — MUGEN's classic `320`.
+fn default_game_width() -> f32 {
+    StageView::DEFAULT_GAME_WIDTH
+}
+
+/// serde default for [`StageBounds::game_height`] — MUGEN's classic `240`.
+fn default_game_height() -> f32 {
+    StageView::DEFAULT_GAME_HEIGHT
 }
 
 impl StageBounds {
-    /// Creates stage bounds from a left and right world X.
+    /// Creates stage bounds from a left and right world X, using MUGEN's classic
+    /// `320×240` logical screen dimensions for `GameWidth`/`GameHeight`.
     #[must_use]
     pub const fn new(left: f32, right: f32) -> Self {
-        Self { left, right }
+        Self {
+            left,
+            right,
+            game_width: StageView::DEFAULT_GAME_WIDTH,
+            game_height: StageView::DEFAULT_GAME_HEIGHT,
+        }
+    }
+
+    /// Creates stage bounds with explicit left/right world-X limits **and**
+    /// logical `GameWidth`/`GameHeight` (localcoord) dimensions, so the
+    /// game-dimension and screen-edge triggers (T060) report the stage's real
+    /// `[StageInfo] localcoord` instead of the `320×240` default.
+    #[must_use]
+    pub const fn with_dims(left: f32, right: f32, game_width: f32, game_height: f32) -> Self {
+        Self {
+            left,
+            right,
+            game_width,
+            game_height,
+        }
     }
 
     /// Converts these bounds into the [`StageView`] the character executor's
-    /// cross-entity eval context consumes for the screen-edge distance triggers.
+    /// cross-entity eval context consumes for the screen-edge distance and
+    /// game-dimension triggers (carrying `GameWidth`/`GameHeight` through).
     #[must_use]
     pub const fn view(self) -> StageView {
-        StageView::new(self.left, self.right)
+        StageView::with_dims(self.left, self.right, self.game_width, self.game_height)
     }
 }
 
 impl Default for StageBounds {
     /// A symmetric default playfield centered on the origin, wide enough that two
-    /// default-sized characters start comfortably inside it.
+    /// default-sized characters start comfortably inside it, with the classic
+    /// `320×240` logical screen.
     fn default() -> Self {
         Self {
             left: -200.0,
             right: 200.0,
+            game_width: StageView::DEFAULT_GAME_WIDTH,
+            game_height: StageView::DEFAULT_GAME_HEIGHT,
         }
     }
 }

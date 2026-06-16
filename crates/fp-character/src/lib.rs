@@ -3741,23 +3741,106 @@ pub struct StageView {
     pub left: f32,
     /// World X of the right playfield edge (currently the stage `boundright`).
     pub right: f32,
+    /// `GameWidth` — the stage's logical screen **width** in localcoord units
+    /// (the 320×240-class space the edge / `ScreenPos` triggers measure in).
+    /// Set from the stage's `[StageInfo] localcoord` width; defaults to MUGEN's
+    /// classic `320` for the no-stage driver paths. See [`StageView::DEFAULT_GAME_WIDTH`].
+    pub game_width: f32,
+    /// `GameHeight` — the stage's logical screen **height** in localcoord units.
+    /// Set from the stage's `[StageInfo] localcoord` height; defaults to `240`.
+    /// See [`StageView::DEFAULT_GAME_HEIGHT`].
+    pub game_height: f32,
 }
 
 impl StageView {
-    /// Creates a stage view from the left and right screen-edge world X values.
+    /// MUGEN's classic logical screen width (`320`), used when no stage
+    /// `localcoord` is in hand.
+    pub const DEFAULT_GAME_WIDTH: f32 = 320.0;
+    /// MUGEN's classic logical screen height (`240`), used when no stage
+    /// `localcoord` is in hand.
+    pub const DEFAULT_GAME_HEIGHT: f32 = 240.0;
+
+    /// Creates a stage view from the left and right screen-edge world X values,
+    /// using the classic `320×240` logical screen dimensions for
+    /// `GameWidth`/`GameHeight`.
     #[must_use]
     pub const fn new(left: f32, right: f32) -> Self {
-        Self { left, right }
+        Self {
+            left,
+            right,
+            game_width: Self::DEFAULT_GAME_WIDTH,
+            game_height: Self::DEFAULT_GAME_HEIGHT,
+        }
+    }
+
+    /// Creates a stage view with explicit left/right world-X edges **and**
+    /// logical `GameWidth`/`GameHeight` (localcoord) dimensions. Used by
+    /// `fp-engine` to thread a stage's parsed `localcoord` onto the view that
+    /// answers the game-dimension and screen-edge triggers (T060).
+    #[must_use]
+    pub const fn with_dims(left: f32, right: f32, game_width: f32, game_height: f32) -> Self {
+        Self {
+            left,
+            right,
+            game_width,
+            game_height,
+        }
+    }
+
+    /// The world X of the **visible left screen edge**, camera-relative.
+    ///
+    /// The visible window is the logical [`game_width`](Self::game_width) span
+    /// centered on the playfield midpoint `(left + right) / 2` (the camera is
+    /// modelled as centred — the only case modelled today). This keeps
+    /// `right_edge() - left_edge() == game_width` exactly, in the same world-X
+    /// convention the edge-distance triggers use.
+    #[must_use]
+    pub fn left_edge(&self) -> f32 {
+        self.center_x() - self.game_width / 2.0
+    }
+
+    /// The world X of the **visible right screen edge**, camera-relative.
+    /// See [`left_edge`](Self::left_edge).
+    #[must_use]
+    pub fn right_edge(&self) -> f32 {
+        self.center_x() + self.game_width / 2.0
+    }
+
+    /// The world Y of the **visible top screen edge**.
+    ///
+    /// World Y increases downward with the ground plane at `Y = 0` (up is
+    /// negative Y), so the top of the visible window sits `game_height` units
+    /// **above** the floor: `top_edge() == -game_height`, `bottom_edge() == 0`.
+    /// This keeps `bottom_edge() - top_edge() == game_height`.
+    #[must_use]
+    pub fn top_edge(&self) -> f32 {
+        -self.game_height
+    }
+
+    /// The world Y of the **visible bottom screen edge** (the ground plane,
+    /// `Y = 0`). See [`top_edge`](Self::top_edge).
+    #[must_use]
+    pub fn bottom_edge(&self) -> f32 {
+        0.0
+    }
+
+    /// The world X midpoint of the playfield — the modelled (centred) camera
+    /// center used to anchor the visible screen edges.
+    fn center_x(&self) -> f32 {
+        (self.left + self.right) / 2.0
     }
 }
 
 impl Default for StageView {
     /// A symmetric default view matching `fp-engine`'s default stage bounds
-    /// (`[-200, 200]`), used by the single-character / no-stage driver paths.
+    /// (`[-200, 200]`) with the classic `320×240` logical screen, used by the
+    /// single-character / no-stage driver paths.
     fn default() -> Self {
         Self {
             left: -200.0,
             right: 200.0,
+            game_width: Self::DEFAULT_GAME_WIDTH,
+            game_height: Self::DEFAULT_GAME_HEIGHT,
         }
     }
 }
@@ -4357,6 +4440,38 @@ impl<'a> EvalCtx<'a> {
             } else {
                 self.me.pos.x - self.stage.left
             }));
+        }
+
+        // `GameWidth` / `GameHeight` (T060) — the stage's logical screen
+        // dimensions in localcoord units (the 320×240-class space the
+        // `ScreenPos` / edge math already lives in). Zero-arg constants threaded
+        // from the stage's `[StageInfo] localcoord` onto the `StageView`; the
+        // no-stage driver paths report the classic `320×240`. Never panics.
+        if name.eq_ignore_ascii_case("GameWidth") {
+            return Some(Value::Float(self.stage.game_width));
+        }
+        if name.eq_ignore_ascii_case("GameHeight") {
+            return Some(Value::Float(self.stage.game_height));
+        }
+
+        // `LeftEdge` / `RightEdge` / `TopEdge` / `BottomEdge` (T060) — the
+        // camera-relative world coords of the visible screen edges, in the same
+        // coordinate convention `FrontEdgeDist`/`BackEdgeDist` measure against.
+        // The visible window is the `GameWidth × GameHeight` logical span
+        // centred on the playfield (the camera is modelled centred), so
+        // `RightEdge - LeftEdge == GameWidth` and (world Y down, floor at Y=0)
+        // `BottomEdge - TopEdge == GameHeight`. Zero-arg; never panics.
+        if name.eq_ignore_ascii_case("LeftEdge") {
+            return Some(Value::Float(self.stage.left_edge()));
+        }
+        if name.eq_ignore_ascii_case("RightEdge") {
+            return Some(Value::Float(self.stage.right_edge()));
+        }
+        if name.eq_ignore_ascii_case("TopEdge") {
+            return Some(Value::Float(self.stage.top_edge()));
+        }
+        if name.eq_ignore_ascii_case("BottomEdge") {
+            return Some(Value::Float(self.stage.bottom_edge()));
         }
 
         // `SelfAnimExist(n)` — does action number `n` exist in `me`'s loaded
@@ -8023,6 +8138,70 @@ mod tests {
             ev_cross("ScreenPos Y", &me, None, stage),
             Value::Float(me.pos.y)
         );
+    }
+
+    /// T060: `GameWidth`/`GameHeight` report the stage's localcoord dimensions
+    /// and `LeftEdge`/`RightEdge`/`TopEdge`/`BottomEdge` report the
+    /// camera-relative world coords of the visible screen edges, with the
+    /// invariant `RightEdge - LeftEdge == GameWidth` (and
+    /// `BottomEdge - TopEdge == GameHeight`).
+    #[test]
+    fn edge_and_game_dim_triggers() {
+        let me = Character::new();
+
+        // A stage whose body-clamp bounds [-300, 300] are WIDER than its logical
+        // screen (GameWidth = 320, GameHeight = 240), centred on the origin:
+        // visible edges = origin ± GameWidth/2 = ±160, independent of the wider
+        // playfield bounds. Position/facing must not affect these (screen edges,
+        // not body distances).
+        let stage = StageView::with_dims(-300.0, 300.0, 320.0, 240.0);
+
+        // Game dimensions are the localcoord constants verbatim.
+        assert_eq!(ev_cross("GameWidth", &me, None, stage), Value::Float(320.0));
+        assert_eq!(
+            ev_cross("GameHeight", &me, None, stage),
+            Value::Float(240.0)
+        );
+
+        // Visible screen edges: centred on (left+right)/2 = 0, spanning GameWidth.
+        assert_eq!(ev_cross("LeftEdge", &me, None, stage), Value::Float(-160.0));
+        assert_eq!(ev_cross("RightEdge", &me, None, stage), Value::Float(160.0));
+        // World Y is down with the floor at Y=0, so the top edge is GameHeight
+        // above the floor and the bottom edge is the floor.
+        assert_eq!(ev_cross("TopEdge", &me, None, stage), Value::Float(-240.0));
+        assert_eq!(ev_cross("BottomEdge", &me, None, stage), Value::Float(0.0));
+
+        // The pinned invariants the AC names.
+        let left = ev_cross("LeftEdge", &me, None, stage).to_float();
+        let right = ev_cross("RightEdge", &me, None, stage).to_float();
+        let gw = ev_cross("GameWidth", &me, None, stage).to_float();
+        assert_eq!(right - left, gw, "RightEdge - LeftEdge == GameWidth");
+        let top = ev_cross("TopEdge", &me, None, stage).to_float();
+        let bottom = ev_cross("BottomEdge", &me, None, stage).to_float();
+        let gh = ev_cross("GameHeight", &me, None, stage).to_float();
+        assert_eq!(bottom - top, gh, "BottomEdge - TopEdge == GameHeight");
+
+        // An off-centre camera window: bounds centred at x=100 shift both X edges
+        // by +100 but keep the GameWidth span (consistent, single coord space).
+        let off = StageView::with_dims(0.0, 200.0, 320.0, 240.0);
+        assert_eq!(
+            ev_cross("LeftEdge", &me, None, off),
+            Value::Float(100.0 - 160.0)
+        );
+        assert_eq!(
+            ev_cross("RightEdge", &me, None, off),
+            Value::Float(100.0 + 160.0)
+        );
+        assert_eq!(
+            ev_cross("RightEdge", &me, None, off).to_float()
+                - ev_cross("LeftEdge", &me, None, off).to_float(),
+            320.0
+        );
+
+        // The classic `StageView::new` / default carry the 320×240 localcoord.
+        let dflt = StageView::default();
+        assert_eq!(ev_cross("GameWidth", &me, None, dflt), Value::Float(320.0));
+        assert_eq!(ev_cross("GameHeight", &me, None, dflt), Value::Float(240.0));
     }
 
     #[test]
