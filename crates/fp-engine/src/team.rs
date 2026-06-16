@@ -37,6 +37,7 @@
 //! degrades safely on bad content.
 
 use fp_character::StageView;
+use fp_formats::air::AirFile;
 use serde::{Deserialize, Serialize};
 
 use crate::{Match, MatchInput, Player, StageBounds, Winner};
@@ -71,8 +72,35 @@ pub enum Side {
 pub enum TeamMatchState {
     /// At least one fighter remains on each side; the match continues.
     InProgress,
-    /// One side has no fighters left standing; see [`TeamMatch::winner`].
+    /// The match has been decided; see [`TeamMatch::outcome`] / [`TeamMatch::winner`].
     Over,
+}
+
+/// The decided result of a [`TeamMatch`] (T028).
+///
+/// Unlike [`TeamMatch::winner`] (which is `Option<Side>` and is `None` on a draw),
+/// this captures the genuine three-way outcome — including a **double-KO draw**,
+/// where both sides are wiped out on the same frame and neither is awarded the win.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TeamOutcome {
+    /// The left / player-1 side won.
+    P1,
+    /// The right / player-2 side won.
+    P2,
+    /// A genuine draw — both sides were eliminated together (e.g. a double-KO).
+    Draw,
+}
+
+impl TeamOutcome {
+    /// The winning [`Side`] this outcome favours, or [`None`] for a [`TeamOutcome::Draw`].
+    #[must_use]
+    pub fn winning_side(self) -> Option<Side> {
+        match self {
+            TeamOutcome::P1 => Some(Side::P1),
+            TeamOutcome::P2 => Some(Side::P2),
+            TeamOutcome::Draw => None,
+        }
+    }
 }
 
 /// A hard ceiling on how many fighters a single side's roster may hold, so a
@@ -122,8 +150,16 @@ pub struct TeamMatch {
     bounds: StageBounds,
     /// Whether the team match is still in progress or decided.
     state: TeamMatchState,
-    /// The winning side once [`state`](Self::state) is [`TeamMatchState::Over`].
-    winner: Option<Side>,
+    /// The decided outcome once [`state`](Self::state) is [`TeamMatchState::Over`]
+    /// (T028): the winning [`Side`], or a genuine [`TeamOutcome::Draw`] on a
+    /// double-elimination. [`TeamMatch::winner`] projects this onto `Option<Side>`.
+    outcome: Option<TeamOutcome>,
+    /// The shared common-effects (`fightfx`) animation set to install on the inner
+    /// [`Match`], if any. Kept here so it survives a Turns hand-off rebuild (the
+    /// rebuilt inner match is re-seeded with it). Installed via
+    /// [`TeamMatch::set_common_fx`]; `None` means the inner match has no common set
+    /// (the pre-asset behaviour — common sparks are a best-effort skip).
+    common_fx: Option<AirFile>,
 }
 
 impl TeamMatch {
@@ -171,7 +207,14 @@ impl TeamMatch {
         let (p1_lead, p1_reserves) = split_lead(p1_roster);
         let (p2_lead, p2_reserves) = split_lead(p2_roster);
 
-        let inner = Match::new(p1_lead, p2_lead, bounds);
+        let mut inner = Match::new(p1_lead, p2_lead, bounds);
+        // (T028) In a multi-fighter mode the inner 1v1 match must NOT run its own
+        // best-of-N round flow: a decided inner round would heal a knocked-out
+        // fighter and start a fresh round, masking the team-level KO the team flow
+        // decides eliminations from. Single-round mode makes the first decided round
+        // final (no life restore) and surfaces a genuine double-KO as a draw. Single
+        // mode keeps the normal 1v1 round flow so 1v1 behaviour is unchanged.
+        inner.set_single_round(mode != TeamMode::Single);
 
         Self {
             reserves: (p1_reserves, p2_reserves),
@@ -180,8 +223,20 @@ impl TeamMatch {
             mode,
             bounds,
             state: TeamMatchState::InProgress,
-            winner: None,
+            outcome: None,
+            common_fx: None,
         }
+    }
+
+    /// Installs the shared common-effects (`fightfx`) animation set on the inner
+    /// [`Match`] (see [`Match::set_common_fx`]).
+    ///
+    /// Stored on the team match so a Turns hand-off rebuild re-seeds the new inner
+    /// match with the same set; calling it is optional and best-effort, exactly like
+    /// the 1v1 path. Replaces any previously installed set.
+    pub fn set_common_fx(&mut self, air: AirFile) {
+        self.inner_mut().set_common_fx(air.clone());
+        self.common_fx = Some(air);
     }
 
     /// The inner 1v1 [`Match`] (always present between ticks). Panics only if the
@@ -286,10 +341,22 @@ impl TeamMatch {
         self.state
     }
 
-    /// The side that won the whole team match, or [`None`] until it is decided.
+    /// The side that won the whole team match, or [`None`] until it is decided **or**
+    /// when it ended in a genuine [`TeamOutcome::Draw`] (a double-KO).
+    ///
+    /// To distinguish "still in progress" from "ended in a draw" use
+    /// [`TeamMatch::outcome`] (which returns `Some(TeamOutcome::Draw)` for a draw).
     #[must_use]
     pub fn winner(&self) -> Option<Side> {
-        self.winner
+        self.outcome.and_then(TeamOutcome::winning_side)
+    }
+
+    /// The decided three-way outcome of the team match (T028), or [`None`] until it
+    /// is decided. Unlike [`TeamMatch::winner`] this reports a genuine double-KO as
+    /// [`TeamOutcome::Draw`] rather than collapsing it to a side.
+    #[must_use]
+    pub fn outcome(&self) -> Option<TeamOutcome> {
+        self.outcome
     }
 
     /// Advances the team match by one 60Hz frame.
@@ -313,16 +380,33 @@ impl TeamMatch {
             return;
         }
 
-        // (1) Drive the active pair through the full 1v1 pipeline.
-        self.inner_mut().tick(p1_input, p2_input);
-
+        // (1) Drive the active pair through the full 1v1 pipeline. In Simul each
+        //     active fighter's live teammate (its side's lead reserve) is supplied
+        //     so the `partner` redirect resolves to a real ally instead of `0`
+        //     (T027). The reserve rosters are separate storage from the inner
+        //     match's two players, so borrowing a reserve immutably while ticking
+        //     the inner match mutably does not alias.
         match self.mode {
-            TeamMode::Single => self.sync_single_result(),
             TeamMode::Simul => {
+                let p1_partner = self.reserves.0.first().map(|p| &p.character);
+                let p2_partner = self.reserves.1.first().map(|p| &p.character);
+                self.inner
+                    .as_mut()
+                    .expect("inner match is always present between ticks")
+                    .tick_with_partners(p1_input, p2_input, p1_partner, p2_partner);
                 self.tick_reserves();
                 self.resolve_simul();
             }
-            TeamMode::Turns => self.resolve_turns(),
+            TeamMode::Turns => {
+                // One active fighter per side at a time — no simultaneous teammate,
+                // so `partner` stays unset.
+                self.inner_mut().tick(p1_input, p2_input);
+                self.resolve_turns();
+            }
+            TeamMode::Single => {
+                self.inner_mut().tick(p1_input, p2_input);
+                self.sync_single_result();
+            }
         }
     }
 
@@ -359,9 +443,10 @@ impl TeamMatch {
         if !p1_down && !p2_down {
             // Nobody was knocked out this frame. In Turns we only hand off on an
             // actual KO, so a non-KO inner decision (e.g. a time-over life
-            // comparison) ends the team match by the inner verdict.
+            // comparison) ends the team match by the inner verdict — including a
+            // genuine equal-life time-over draw (the inner match is single-round).
             if let Some(w) = self.inner_ref().match_winner() {
-                self.declare_winner(side_of(w));
+                self.declare_outcome(outcome_of(w));
             }
             return;
         }
@@ -420,7 +505,17 @@ impl TeamMatch {
             }
         }
 
-        self.inner = Some(Match::new(p1_active, p2_active, bounds));
+        // (T028) The rebuilt inner match keeps single-round / no-life-restore mode:
+        // Turns is never `TeamMode::Single`, so a decided inner round must again end
+        // it (and the survivor must not be healed) rather than restart a 1v1 round.
+        let mut rebuilt = Match::new(p1_active, p2_active, bounds);
+        rebuilt.set_single_round(true);
+        // Re-seed the shared common-effects set so hit-sparks keep rendering after a
+        // hand-off (the old inner match is consumed; this set is owned by the team).
+        if let Some(air) = self.common_fx.clone() {
+            rebuilt.set_common_fx(air);
+        }
+        self.inner = Some(rebuilt);
     }
 
     /// Mirrors a decided inner [`Match`] result onto the team result in
@@ -428,32 +523,42 @@ impl TeamMatch {
     /// underlying 1v1 match does.
     fn sync_single_result(&mut self) {
         if let Some(w) = self.inner_ref().match_winner() {
-            self.declare_winner(side_of(w));
+            self.declare_outcome(outcome_of(w));
         }
     }
 
-    /// Declares `side` the team-match winner and marks the match over (idempotent —
-    /// a second call after the match is already over is ignored).
+    /// Declares `side` the team-match winner and marks the match over.
     fn declare_winner(&mut self, side: Side) {
+        self.declare_outcome(match side {
+            Side::P1 => TeamOutcome::P1,
+            Side::P2 => TeamOutcome::P2,
+        });
+    }
+
+    /// Records the team match's decided `outcome` and marks it over (idempotent —
+    /// a second call after the match is already over is ignored).
+    fn declare_outcome(&mut self, outcome: TeamOutcome) {
         if self.state == TeamMatchState::Over {
             return;
         }
         self.state = TeamMatchState::Over;
-        self.winner = Some(side);
-        tracing::info!(?side, "team match over");
+        self.outcome = Some(outcome);
+        tracing::info!(?outcome, "team match over");
     }
 
-    /// Declares the winner from the inner [`Match`]'s verdict (used for a
-    /// simultaneous double-elimination); falls back to [`Side::P1`] only if the
-    /// inner match recorded no winner at all.
+    /// Declares the outcome from the inner [`Match`]'s verdict, used when **both**
+    /// sides are eliminated together (a double-elimination). The inner match runs in
+    /// single-round mode here (Simul/Turns), so its [`Match::match_winner`] is the
+    /// genuine round verdict — a true double-KO surfaces as [`Winner::Draw`], which
+    /// is recorded as a real [`TeamOutcome::Draw`] rather than a P1-biased tiebreak.
     fn declare_winner_from_inner(&mut self) {
         let inner = self.inner_ref();
-        let side = inner
+        let outcome = inner
             .match_winner()
             .or_else(|| inner.winner())
-            .map(side_of)
-            .unwrap_or(Side::P1);
-        self.declare_winner(side);
+            .map(outcome_of)
+            .unwrap_or(TeamOutcome::Draw);
+        self.declare_outcome(outcome);
     }
 
     /// Mutable access to the inner [`Match`] (test-only).
@@ -494,13 +599,15 @@ fn pop_front(reserves: &mut Vec<Player>) -> Option<Player> {
     }
 }
 
-/// Maps a 1v1 [`Winner`] onto the team [`Side`] it favours. A draw is mapped to
-/// [`Side::P1`] only as a last-resort tiebreak; the team flow avoids relying on
-/// this by deciding eliminations from remaining-fighter counts.
-fn side_of(winner: Winner) -> Side {
+/// Maps a 1v1 [`Winner`] onto the corresponding [`TeamOutcome`] (T028). A 1v1
+/// [`Winner::Draw`] — which a single-round inner match yields on a genuine
+/// double-KO / equal-life time over — maps to a real [`TeamOutcome::Draw`] rather
+/// than a P1-biased tiebreak, so a drawn team match is reported honestly.
+fn outcome_of(winner: Winner) -> TeamOutcome {
     match winner {
-        Winner::P1 | Winner::Draw => Side::P1,
-        Winner::P2 => Side::P2,
+        Winner::P1 => TeamOutcome::P1,
+        Winner::P2 => TeamOutcome::P2,
+        Winner::Draw => TeamOutcome::Draw,
     }
 }
 
