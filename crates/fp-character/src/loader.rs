@@ -5067,4 +5067,281 @@ damage = 60, 0
             );
         }
     }
+
+    // ====================================================================
+    // T055: common1.cns movement / idle states (0, 10-12, 20, 40/45/50/52,
+    // 100, 105/106). These states are the engine-default LOCOMOTION fallback a
+    // character (e.g. evilken) inherits when it ships none of its own. The
+    // tests below build the state graph from the SHIPPED `assets/data/common1.cns`
+    // (the real fallback content) and drive `Character::tick_with` to prove the
+    // states (a) exist, (b) are data-driven via the character's own
+    // `const(velocity.*)`, and (c) animate when entered directly via
+    // `change_state` (not only via the engine `[Statedef -1]`).
+    // ====================================================================
+
+    /// Loads the shipped engine-default `assets/data/common1.cns` and compiles
+    /// it into a state graph keyed by statedef number, exactly as the loader's
+    /// fallback merge does. Locates the file via the same ancestor-walking
+    /// resolver the loader uses ([`engine_default_common1_path`]), so the test
+    /// passes regardless of the working directory `cargo test` runs from.
+    fn shipped_common1_graph() -> HashMap<i32, CompiledState> {
+        let path = engine_default_common1_path()
+            .expect("shipped assets/data/common1.cns must be resolvable from the workspace");
+        let cns = CnsFile::load(&path).expect("shipped common1.cns must parse");
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        for d in &cns.statedefs {
+            states.insert(d.number, CompiledState::from_parsed(d));
+        }
+        states
+    }
+
+    /// A one-action AIR file whose single action is numbered `action` (a single
+    /// 1-tick frame). Lets the direct-animate test give a state's `ChangeAnim`
+    /// target an action that actually exists, so the anim resolves.
+    fn tiny_air_action(action: i32) -> AirFile {
+        let mut actions = HashMap::new();
+        actions.insert(
+            action,
+            AnimAction {
+                action_number: action,
+                frames: vec![AnimFrame {
+                    sprite: fp_core::SpriteId::new(0, 0),
+                    offset: Vec2::new(0, 0),
+                    ticks: 1,
+                    flip_h: false,
+                    flip_v: false,
+                    blend: BlendMode::Normal,
+                    clsn1: Vec::new(),
+                    clsn2: Vec::new(),
+                    ..Default::default()
+                }],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// A jumpy test character: distinctive, non-default velocity constants so a
+    /// data-driven `const(velocity.*)` read is provably the CHARACTER's value
+    /// (not a hard-coded engine number or the default). The values below are all
+    /// off the [`CharacterConstants::default`] speeds.
+    fn jumpy_character() -> Character {
+        let mut consts = CharacterConstants::default();
+        consts.velocity.walk_fwd = Vec2::new(3.0, 0.0);
+        consts.velocity.walk_back = Vec2::new(-2.0, 0.0);
+        consts.velocity.run_fwd = Vec2::new(7.0, 0.0);
+        consts.velocity.run_back = Vec2::new(-5.0, -3.0);
+        // `velocity.jump.neu.y` resolves to the single upward jump speed
+        // (`jump_up`), so the test's expected -9.5 must live there.
+        consts.velocity.jump_neu = Vec2::new(0.0, -9.5);
+        consts.velocity.jump_up = -9.5;
+        consts.velocity.jump_fwd = Vec2::new(2.7, 0.0);
+        consts.velocity.jump_back = Vec2::new(-2.7, 0.0);
+        Character::with_constants(consts)
+    }
+
+    /// Enters a state directly (not via the engine `[Statedef -1]`) and seeds
+    /// `anim_time` to reflect the freshly-entered single-tick animation.
+    ///
+    /// The out-of-tick [`Character::change_state`] seam uses an empty `AnimSet`,
+    /// so it deliberately does NOT seed `anim_time` (it leaves the next tick's
+    /// `advance_animation` to compute it). In-engine, a state entered MID-tick is
+    /// seeded immediately, so a `trigger = AnimTime = 0` exit waits for the anim
+    /// to finish. The tests here enter from out-of-tick, so they replicate that
+    /// seeding manually: a 1-tick action reports `AnimTime = -1` on its first
+    /// tick (one tick remaining), reaching `0` after one advance.
+    fn enter_state_seeded(ch: &mut Character, states: &HashMap<i32, CompiledState>, state: i32) {
+        ch.change_state(states, state);
+        ch.anim_time = -1;
+    }
+
+    #[test]
+    fn common1_movement_states_all_present_in_fallback() {
+        // AC1: every movement/idle state exists in the shipped fallback graph.
+        let states = shipped_common1_graph();
+        for n in [0, 10, 11, 12, 20, 40, 45, 50, 52, 100, 105, 106] {
+            assert!(
+                states.contains_key(&n),
+                "movement state {n} must exist in the engine-default common1 fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn common1_movement_states_are_data_driven_not_hardcoded() {
+        // AC1: the velocity-bearing states read the character's OWN constants via
+        // `const(velocity.*)` (not a hard-coded literal). Assert the controller
+        // source mentions `const(velocity.` in 20 (walk), 40 (jump), 100 (run).
+        let states = shipped_common1_graph();
+        let mentions_const_velocity = |state: i32| -> bool {
+            states.get(&state).is_some_and(|s| {
+                s.controllers.iter().any(|c| {
+                    c.params.values().any(|p| {
+                        p.components
+                            .iter()
+                            .any(|e| e.source.to_ascii_lowercase().contains("const(velocity."))
+                    })
+                })
+            })
+        };
+        for state in [20, 40, 100] {
+            assert!(
+                mentions_const_velocity(state),
+                "state {state} must read the character's own const(velocity.*), not a hard-coded speed"
+            );
+        }
+    }
+
+    #[test]
+    fn common1_movement_states_jumpstart_40_launches_with_character_jump_velocity() {
+        // AC2: state 40 (jumpstart) launches with the CHARACTER's own jump
+        // velocity at the end of the jump-start anim (`AnimTime = 0`), then goes
+        // airborne (50). The jumpy fixture authors jump.neu.y = -9.5 (upward).
+        let states = shipped_common1_graph();
+        // Action 40 is a single 1-tick frame: AnimTime is -1 on entry and reaches
+        // 0 after one advance, so the `AnimTime = 0` launch fires on the 2nd tick.
+        let air = tiny_air_action(40);
+        let mut ch = jumpy_character();
+        enter_state_seeded(&mut ch, &states, 40);
+        ch.vel = Vec2::new(0.0, 0.0);
+        // Tick 1: AnimTime advances from -1 to 0 (no launch yet). Tick 2: the
+        // `AnimTime = 0` launch fires VelSet y = const(velocity.jump.neu.y) and
+        // transitions to the airborne jump (50). Entering 50 sets `physics = A`,
+        // so exactly one Air-gravity step (`yaccel`) is applied that same tick,
+        // after the controller — the faithful post-launch velocity is therefore
+        // `jump.neu.y + yaccel`.
+        ch.tick_with(&states, &air, None, StageView::default());
+        ch.tick_with(&states, &air, None, StageView::default());
+        let expected = -9.5 + ch.constants.movement.yaccel;
+        assert!(
+            (ch.vel.y - expected).abs() < 1e-4,
+            "state 40 must launch with y = const(velocity.jump.neu.y) (-9.5), \
+             observed (after one Air-gravity step) {} vs expected {expected}",
+            ch.vel.y
+        );
+        // Clearly the character's OWN -9.5, not the default jump speed (-8.4 would
+        // land at -7.96 after the same gravity step).
+        assert!(
+            ch.vel.y < -8.5,
+            "jump velocity must be the character's data-driven speed, got {}",
+            ch.vel.y
+        );
+        assert_eq!(
+            ch.state_no, 50,
+            "state 40 must transition to the airborne jump (50) once jump-start finishes"
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_jumpstart_40_resets_air_jump_counter_at_time_0() {
+        // AC2: entering state 40 (jumpstart) resets the air-jump counter. State 40
+        // is authored `type = S` (grounded) precisely so the engine's grounded
+        // air-jump-counter reset fires on entry — restoring the full air-jump
+        // allowance before the character leaves the ground.
+        let states = shipped_common1_graph();
+        let air = tiny_air_action(40);
+        let mut ch = jumpy_character();
+        ch.air_jump_count = 3; // pretend air jumps were spent earlier
+        enter_state_seeded(&mut ch, &states, 40);
+        ch.physics = Physics::None;
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.air_jump_count, 0,
+            "jumpstart (40, type S) must reset the air-jump counter at time=0"
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_walk_20_picks_direction_by_held_command() {
+        // AC2: state 20 (walk) chooses walk.fwd vs walk.back by the held
+        // direction, each read from the character's own constants.
+        let states = shipped_common1_graph();
+        let air = tiny_air_action(20);
+
+        // holdfwd -> walk.fwd (+3.0).
+        let mut fwd = jumpy_character();
+        fwd.set_command_source(Box::new(crate::ActiveCommands::from_names(["holdfwd"])));
+        fwd.change_state(&states, 20);
+        fwd.physics = Physics::None;
+        fwd.tick_with(&states, &air, None, StageView::default());
+        assert!(
+            (fwd.vel.x - 3.0).abs() < 1e-4,
+            "holdfwd walk must set x = const(velocity.walk.fwd) (3.0), got {}",
+            fwd.vel.x
+        );
+
+        // holdback -> walk.back (-2.0).
+        let mut back = jumpy_character();
+        back.set_command_source(Box::new(crate::ActiveCommands::from_names(["holdback"])));
+        back.change_state(&states, 20);
+        back.physics = Physics::None;
+        back.tick_with(&states, &air, None, StageView::default());
+        assert!(
+            (back.vel.x - (-2.0)).abs() < 1e-4,
+            "holdback walk must set x = const(velocity.walk.back) (-2.0), got {}",
+            back.vel.x
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_land_50_to_52_to_0_via_engine_builtin() {
+        // AC2: a character in the airborne jump (50) that hits the floor
+        // (`Vel Y > 0 && Pos Y >= 0`) lands. The 50/51->52 transition is the
+        // engine `[Statedef -1]` auto-land built-in; common1's state 52 then
+        // carries 52 -> 0 once the land anim finishes. Build the graph WITH the
+        // built-in injected so the full land chain is exercised.
+        let mut states = shipped_common1_graph();
+        append_builtin_ground_locomotion(&mut states);
+        // Provide the anims the land chain touches (41 for state 50, 52 for the
+        // jump-land) so their `AnimTime` advances predictably.
+        let mut air = tiny_air_action(41);
+        air.actions.extend(tiny_air_action(52).actions);
+        let mut ch = jumpy_character();
+        ch.change_state(&states, 50);
+        ch.pos = Vec2::new(0.0, FLOOR_Y);
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 1.0); // descending, at the floor
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.state_no, 52,
+            "airborne jump (50) at the floor descending must land to 52"
+        );
+        // 52 snaps to ground and zeroes velocity on entry; the 1-tick land anim
+        // then carries 52 -> 0 (stand) on the next tick.
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(ch.state_no, 0, "jump land (52) must return to stand (0)");
+    }
+
+    #[test]
+    fn common1_movement_states_animate_when_entered_directly() {
+        // AC3: a character that `ChangeState`s DIRECTLY into 0/20/40 (not via the
+        // engine `[Statedef -1]`) animates — i.e. each state's `ChangeAnim` fires
+        // and sets the expected anim number on entry. This proves the state
+        // BODIES (not just the -1 transitions) are present and run.
+        let states = shipped_common1_graph();
+        // `(state, anim, held)` — state 20's body anim is direction-gated, so it
+        // is driven with `holdfwd` (the forward walk anim is 20); 0 and 40 need no
+        // held direction.
+        for (state, expected_anim, held) in
+            [(0, 0, None), (20, 20, Some("holdfwd")), (40, 40, None)]
+        {
+            let air = tiny_air_action(expected_anim);
+            let mut ch = jumpy_character();
+            if let Some(cmd) = held {
+                ch.set_command_source(Box::new(crate::ActiveCommands::from_names([cmd])));
+            }
+            // Enter the state directly (not via the engine `[Statedef -1]`), then
+            // force a WRONG anim: the state's guarded body `ChangeAnim` must drive
+            // the character back onto the expected anim — proving the state BODY
+            // (not just the header) runs when entered directly.
+            enter_state_seeded(&mut ch, &states, state);
+            ch.anim = 999;
+            ch.physics = Physics::None;
+            ch.tick_with(&states, &air, None, StageView::default());
+            assert_eq!(
+                ch.anim, expected_anim,
+                "entering state {state} directly must animate to anim {expected_anim}"
+            );
+        }
+    }
 }
