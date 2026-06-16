@@ -1,18 +1,25 @@
 //! In-app screen state machine: Title menu -> Character-Select -> Stage-Select
-//! -> Fight -> Title.
+//! -> Fight -> Title, plus a Title -> Setup -> Title side branch.
 //!
 //! This module owns the **pure** menu/cursor/transition logic for the app's
 //! out-of-fight flow (the [`Screen`] state machine, the title menu, the select
-//! grid, the stage-select list, and the roster-pick -> which-`.def`-to-load
-//! decision), kept free of SDL2 and the GPU so it is unit-testable headlessly.
-//! The SDL2 window, 60Hz accumulator loop, and GPU rendering that drives it
-//! live in `main.rs`.
+//! grid, the stage-select list, the setup/options screen, and the roster-pick ->
+//! which-`.def`-to-load decision), kept free of SDL2 and the GPU so it is
+//! unit-testable headlessly. The SDL2 window, 60Hz accumulator loop, and GPU
+//! rendering that drives it live in `main.rs`.
+//!
+//! Every screen is driven by a single source-agnostic [`MenuInput`] (built in
+//! `main.rs` from the keyboard **or** a game controller via the existing
+//! `controller_to_match_input`/`merge_match_input` plumbing), so controller and
+//! keyboard navigation are identical at this layer and the same unit tests cover
+//! both sources (a controller D-pad is just another way to set `MenuInput::up`).
 //!
 //! The flow:
 //! - **Title** ([`TitleMenu`]) renders the enabled motif menu items as text with
 //!   a highlighted cursor. `VS MODE` -> Select (both players pick); `TRAINING`
-//!   -> Select (P1 picks, P2 mirrors); `EXIT`/quit leaves the app. A missing
-//!   motif falls back to a built-in minimal menu (`VS` / `TRAINING` / `EXIT`).
+//!   -> Select (P1 picks, P2 mirrors); `SETUP`/`OPTIONS` -> Setup; `EXIT`/quit
+//!   leaves the app. A missing motif falls back to a built-in minimal menu
+//!   (`VS` / `TRAINING` / `SETUP` / `EXIT`).
 //! - **Select** ([`SelectScreen`]) renders the `select.def` roster as a text
 //!   grid with a P1 cursor (and a P2 cursor in VS). Confirming P1 (then P2 in
 //!   VS) yields a [`MatchPick`] naming the character `.def`(s) to load.
@@ -20,6 +27,12 @@
 //!   dojo backdrop plus any discovered stage `.def`) as a vertical list with one
 //!   cursor. Confirming yields a [`StageChoice`] naming the stage the match
 //!   loads; cancelling returns to character-select.
+//! - **Setup** ([`SetupScreen`]) is the options screen (T042): it edits the live
+//!   [`InputConfig`] — the input device choice plus the player-1 keyboard
+//!   binding for each [`InputAction`] — navigable by controller and keyboard.
+//!   Selecting an action enters a "press a key" capture mode; the next key the
+//!   player presses (delivered via [`SetupScreen::capture_key`]) is bound to that
+//!   action and immediately takes effect in-match. Back returns to Title.
 //! - **Fight** runs the existing two-player [`fp_engine::Match`] over the chosen
 //!   stage; on match-over it returns to Title.
 //!
@@ -120,10 +133,12 @@ pub struct TitleEntry {
 pub enum TitleAction {
     /// Go to the character-select screen in the given mode.
     Select(SelectMode),
+    /// Open the setup / options screen (T042: input configuration + remapping).
+    Setup,
     /// Quit the application.
     Quit,
-    /// A recognised-but-unimplemented item (Arcade/Options/...): selectable but a
-    /// no-op (stays on the title screen) so the menu still reads completely.
+    /// A recognised-but-unimplemented item (Arcade/Survival/Watch/...): selectable
+    /// but a no-op (stays on the title screen) so the menu still reads completely.
     NoOp,
 }
 
@@ -146,8 +161,9 @@ impl TitleMenu {
     ///
     /// - `Versus`/`TeamVersus` -> Select(Versus),
     /// - `Training` -> Select(Training),
+    /// - `Options` -> Setup (the input-configuration screen, T042),
     /// - `Exit` -> Quit,
-    /// - everything else (Arcade, Survival, Watch, Options, ...) -> a selectable
+    /// - everything else (Arcade, Survival, Watch, ...) -> a selectable
     ///   no-op so it still appears but does nothing yet.
     ///
     /// When the motif enables no usable items at all, falls back to
@@ -170,7 +186,7 @@ impl TitleMenu {
     }
 
     /// The built-in minimal menu used when no motif (or an item-less motif) is
-    /// available: `VS MODE` / `TRAINING` / `EXIT`.
+    /// available: `VS MODE` / `TRAINING` / `SETUP` / `EXIT`.
     #[must_use]
     pub fn fallback() -> Self {
         Self {
@@ -182,6 +198,10 @@ impl TitleMenu {
                 TitleEntry {
                     label: "TRAINING".to_string(),
                     action: TitleAction::Select(SelectMode::Training),
+                },
+                TitleEntry {
+                    label: "SETUP".to_string(),
+                    action: TitleAction::Setup,
                 },
                 TitleEntry {
                     label: "EXIT".to_string(),
@@ -223,6 +243,8 @@ fn title_action_for(kind: MenuItemKind) -> TitleAction {
     match kind {
         MenuItemKind::Versus | MenuItemKind::TeamVersus => TitleAction::Select(SelectMode::Versus),
         MenuItemKind::Training => TitleAction::Select(SelectMode::Training),
+        // Options opens the setup / input-configuration screen (T042).
+        MenuItemKind::Options => TitleAction::Setup,
         MenuItemKind::Exit => TitleAction::Quit,
         // Recognised but not yet implemented: keep them visible but inert.
         MenuItemKind::Arcade
@@ -230,8 +252,7 @@ fn title_action_for(kind: MenuItemKind) -> TitleAction {
         | MenuItemKind::TeamCoop
         | MenuItemKind::Survival
         | MenuItemKind::SurvivalCoop
-        | MenuItemKind::Watch
-        | MenuItemKind::Options => TitleAction::NoOp,
+        | MenuItemKind::Watch => TitleAction::NoOp,
     }
 }
 
@@ -676,6 +697,359 @@ fn stage_label(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+// ---------------------------------------------------------------------------
+// Setup / Options screen + input configuration (T042)
+// ---------------------------------------------------------------------------
+
+/// One remappable in-match input: the four absolute screen directions plus the
+/// six MUGEN attack buttons (`a b c x y z`).
+///
+/// This is the engine-facing action a physical key drives; the setup screen lets
+/// the player rebind which keyboard key produces each one (see [`InputConfig`]).
+/// It is deliberately backend-free (no SDL `Scancode`): the keyboard key bound to
+/// an action is carried as an opaque [`KeyCode`], so this whole module stays
+/// unit-testable without a window. `main.rs` owns the `Scancode <-> KeyCode`
+/// adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputAction {
+    /// Absolute screen direction: up (jump).
+    Up,
+    /// Absolute screen direction: down (crouch).
+    Down,
+    /// Absolute screen direction: left.
+    Left,
+    /// Absolute screen direction: right.
+    Right,
+    /// Attack button `a` (light punch).
+    A,
+    /// Attack button `b` (medium punch).
+    B,
+    /// Attack button `c` (heavy punch).
+    C,
+    /// Attack button `x` (light kick).
+    X,
+    /// Attack button `y` (medium kick).
+    Y,
+    /// Attack button `z` (heavy kick).
+    Z,
+}
+
+impl InputAction {
+    /// Every remappable action, in the order the setup screen lists them
+    /// (directions then the punch row then the kick row).
+    pub const ALL: [InputAction; 10] = [
+        InputAction::Up,
+        InputAction::Down,
+        InputAction::Left,
+        InputAction::Right,
+        InputAction::A,
+        InputAction::B,
+        InputAction::C,
+        InputAction::X,
+        InputAction::Y,
+        InputAction::Z,
+    ];
+
+    /// A short uppercase label for the action (matches the menu font's glyph
+    /// set), used by the setup-screen renderer.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            InputAction::Up => "UP",
+            InputAction::Down => "DOWN",
+            InputAction::Left => "LEFT",
+            InputAction::Right => "RIGHT",
+            InputAction::A => "A",
+            InputAction::B => "B",
+            InputAction::C => "C",
+            InputAction::X => "X",
+            InputAction::Y => "Y",
+            InputAction::Z => "Z",
+        }
+    }
+}
+
+/// An opaque keyboard key identifier.
+///
+/// The pure setup logic never needs to know what a key *is* — only that two keys
+/// are equal — so a key is carried as a backend-neutral `i32`. `main.rs` builds
+/// these from SDL `Scancode`s (their `repr(i32)` value) and reads them back the
+/// same way, keeping every SDL type out of this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyCode(pub i32);
+
+/// Which input device the player drives the game with.
+///
+/// Both are always *available* (the keyboard never detaches and a controller is
+/// merged in when present); this is the player's stated *preference*, shown on
+/// the setup screen. The match-input path OR's keyboard and controller
+/// regardless, so this is presentational today, but it is stored on the live
+/// [`InputConfig`] so a future "controller-only" mode has a home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDevice {
+    /// Keyboard-driven (the default).
+    Keyboard,
+    /// Game-controller-driven.
+    Controller,
+}
+
+impl InputDevice {
+    /// A short uppercase label for the device, for the setup-screen renderer.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            InputDevice::Keyboard => "KEYBOARD",
+            InputDevice::Controller => "CONTROLLER",
+        }
+    }
+
+    /// The other device (used to toggle the preference left/right on the setup
+    /// screen).
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            InputDevice::Keyboard => InputDevice::Controller,
+            InputDevice::Controller => InputDevice::Keyboard,
+        }
+    }
+}
+
+/// The live input configuration the match input is sampled through: the player's
+/// device preference plus the player-1 keyboard binding for each [`InputAction`].
+///
+/// `main.rs` holds one of these and consults [`InputConfig::key_for`] when it
+/// samples the keyboard each frame, so a rebind made on the setup screen changes
+/// gameplay immediately. The bindings are an ordered list (one entry per
+/// [`InputAction::ALL`]); [`InputConfig::default_with`] seeds it from the app's
+/// default key map (`main.rs` passes the [`KeyCode`] for each action), and
+/// [`InputConfig::rebind`] replaces a single action's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputConfig {
+    /// The selected input-device preference.
+    pub device: InputDevice,
+    /// The player-1 keyboard binding for every action, in [`InputAction::ALL`]
+    /// order.
+    bindings: Vec<(InputAction, KeyCode)>,
+}
+
+impl InputConfig {
+    /// Builds the config from a per-action default key, supplied by the caller
+    /// (so `main.rs` keeps ownership of the concrete SDL `Scancode` defaults).
+    ///
+    /// `default_key(action)` returns the [`KeyCode`] each action starts bound to.
+    /// The device preference starts on [`InputDevice::Keyboard`].
+    #[must_use]
+    pub fn default_with(mut default_key: impl FnMut(InputAction) -> KeyCode) -> Self {
+        let bindings = InputAction::ALL
+            .iter()
+            .map(|&action| (action, default_key(action)))
+            .collect();
+        Self {
+            device: InputDevice::Keyboard,
+            bindings,
+        }
+    }
+
+    /// The [`KeyCode`] currently bound to `action`, or `None` if (somehow) unset.
+    #[must_use]
+    pub fn key_for(&self, action: InputAction) -> Option<KeyCode> {
+        self.bindings
+            .iter()
+            .find(|(a, _)| *a == action)
+            .map(|(_, k)| *k)
+    }
+
+    /// Rebinds `action` to `key`, replacing its previous binding.
+    ///
+    /// Returns the action whose binding was displaced if `key` was already bound
+    /// to a *different* action (so the caller can clear the stale binding to keep
+    /// keys unique), or `None` if `key` was free / already on `action`. The new
+    /// binding takes effect the next time the keyboard is sampled.
+    pub fn rebind(&mut self, action: InputAction, key: KeyCode) -> Option<InputAction> {
+        // Find any other action already holding this key, to report the clash.
+        let displaced = self
+            .bindings
+            .iter()
+            .find(|(a, k)| *a != action && *k == key)
+            .map(|(a, _)| *a);
+        for (a, k) in &mut self.bindings {
+            if *a == action {
+                *k = key;
+            }
+        }
+        displaced
+    }
+}
+
+/// What one frame of setup-screen input produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupOutcome {
+    /// Still on the setup screen.
+    Pending,
+    /// The player left the setup screen (back/cancel): return to the title menu.
+    Exit,
+}
+
+/// One selectable row on the setup screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupRow {
+    /// The input-device preference toggle (Keyboard / Controller).
+    Device,
+    /// A remappable action's key binding.
+    Action(InputAction),
+}
+
+/// The setup / options screen (T042): edits the live [`InputConfig`].
+///
+/// A single vertical cursor walks the rows: the device-preference toggle first,
+/// then one row per [`InputAction`]. Up/Down move the cursor (wrapping);
+/// Left/Right toggle the device when the device row is highlighted. Confirm on an
+/// action row enters *capture* mode ([`SetupScreen::awaiting_key`] becomes true);
+/// the next key the app delivers via [`SetupScreen::capture_key`] is bound to
+/// that action (and immediately affects in-match input). Back/cancel leaves
+/// capture mode if armed, otherwise returns to the title via [`SetupOutcome`].
+///
+/// Navigation is source-agnostic ([`MenuInput`]), so a controller and the
+/// keyboard drive it identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupScreen {
+    /// The highlighted row index into [`SetupScreen::rows`].
+    pub cursor: usize,
+    /// While `Some`, the screen is in key-capture mode for this action and the
+    /// next [`SetupScreen::capture_key`] rebinds it. Public so the renderer can
+    /// show a "PRESS A KEY" prompt.
+    pub capturing: Option<InputAction>,
+    /// The selectable rows (device toggle + one per action), in display order.
+    rows: Vec<SetupRow>,
+}
+
+impl Default for SetupScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SetupScreen {
+    /// Builds the setup screen: cursor on the first row, not capturing.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut rows = vec![SetupRow::Device];
+        rows.extend(InputAction::ALL.iter().map(|&a| SetupRow::Action(a)));
+        Self {
+            cursor: 0,
+            capturing: None,
+            rows,
+        }
+    }
+
+    /// Whether the screen is waiting for a key press to bind (capture mode).
+    #[must_use]
+    pub fn awaiting_key(&self) -> bool {
+        self.capturing.is_some()
+    }
+
+    /// The number of selectable rows (device toggle + one per action).
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the device-preference row is highlighted.
+    #[must_use]
+    pub fn on_device_row(&self) -> bool {
+        matches!(self.rows.get(self.cursor), Some(SetupRow::Device))
+    }
+
+    /// The [`InputAction`] of the highlighted row, or `None` on the device row.
+    #[must_use]
+    pub fn selected_action(&self) -> Option<InputAction> {
+        match self.rows.get(self.cursor) {
+            Some(SetupRow::Action(a)) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// The action each row represents, in display order (`None` = the device
+    /// row), for the renderer to walk alongside the cursor.
+    #[must_use]
+    pub fn row_actions(&self) -> Vec<Option<InputAction>> {
+        self.rows
+            .iter()
+            .map(|r| match r {
+                SetupRow::Device => None,
+                SetupRow::Action(a) => Some(*a),
+            })
+            .collect()
+    }
+
+    /// Applies one frame of menu input, editing `config` in place.
+    ///
+    /// While *capturing* a key, navigation is suspended and only `back` cancels
+    /// the capture (so a mis-fired confirm can't trap the player); the actual
+    /// rebind happens in [`SetupScreen::capture_key`]. Otherwise:
+    /// - Up/Down move the cursor (wrapping);
+    /// - Left/Right toggle the [`InputDevice`] preference when the device row is
+    ///   highlighted;
+    /// - Confirm on the device row toggles it too; confirm on an action row arms
+    ///   capture mode for that action;
+    /// - Back returns [`SetupOutcome::Exit`] (to the title).
+    pub fn update(&mut self, input: MenuInput, config: &mut InputConfig) -> SetupOutcome {
+        if self.capturing.is_some() {
+            // Armed: ignore navigation; back cancels the capture without binding.
+            if input.back {
+                self.capturing = None;
+            }
+            return SetupOutcome::Pending;
+        }
+
+        if input.back {
+            return SetupOutcome::Exit;
+        }
+
+        let len = self.rows.len();
+        if len == 0 {
+            return SetupOutcome::Pending;
+        }
+        if input.up {
+            self.cursor = wrap_dec(self.cursor, len);
+        }
+        if input.down {
+            self.cursor = wrap_inc(self.cursor, len);
+        }
+
+        match self.rows.get(self.cursor).copied() {
+            // Device row: either a horizontal step or confirm flips the preference.
+            Some(SetupRow::Device) if input.left || input.right || input.confirm => {
+                config.device = config.device.toggled();
+            }
+            // Action row + confirm: arm capture so the next key press rebinds it.
+            Some(SetupRow::Action(action)) if input.confirm => {
+                self.capturing = Some(action);
+            }
+            _ => {}
+        }
+        SetupOutcome::Pending
+    }
+
+    /// Binds the captured action to `key` and leaves capture mode.
+    ///
+    /// Called by the app when, after a confirm armed capture
+    /// ([`SetupScreen::awaiting_key`]), the player presses a key. A no-op (returns
+    /// `None`) when not capturing. On a successful bind returns the
+    /// `(action, displaced)` pair: `displaced` is `Some(other)` if `key` was
+    /// already bound to a different action, which the caller may clear to keep
+    /// keys unique. The rebind takes effect immediately in `config`.
+    pub fn capture_key(
+        &mut self,
+        key: KeyCode,
+        config: &mut InputConfig,
+    ) -> Option<(InputAction, Option<InputAction>)> {
+        let action = self.capturing.take()?;
+        let displaced = config.rebind(action, key);
+        Some((action, displaced))
+    }
+}
+
 /// Moves a linear grid cursor one step per asserted direction, wrapping at the
 /// grid edges. Horizontal moves wrap within the linear list; vertical moves jump
 /// by `columns`, wrapping top/bottom while staying in range.
@@ -826,24 +1200,26 @@ mod tests {
     #[test]
     fn title_empty_motif_uses_fallback() {
         let menu = TitleMenu::from_system(&SystemDef::default());
-        // Fallback ships VS / TRAINING / EXIT.
-        assert_eq!(menu.entries.len(), 3);
+        // Fallback ships VS / TRAINING / SETUP / EXIT.
+        assert_eq!(menu.entries.len(), 4);
         assert_eq!(menu.entries[0].label, "VS MODE");
-        assert_eq!(menu.entries[2].action, TitleAction::Quit);
+        assert_eq!(menu.entries[2].action, TitleAction::Setup);
+        assert_eq!(menu.entries[3].action, TitleAction::Quit);
     }
 
     #[test]
     fn title_cursor_moves_and_wraps() {
-        let mut menu = TitleMenu::fallback(); // 3 entries
+        let mut menu = TitleMenu::fallback(); // 4 entries
         assert_eq!(menu.cursor, 0);
         menu.update(down());
         assert_eq!(menu.cursor, 1);
         menu.update(down());
-        assert_eq!(menu.cursor, 2);
+        menu.update(down());
+        assert_eq!(menu.cursor, 3);
         menu.update(down());
         assert_eq!(menu.cursor, 0, "down wraps from last to first");
         menu.update(up());
-        assert_eq!(menu.cursor, 2, "up wraps from first to last");
+        assert_eq!(menu.cursor, 3, "up wraps from first to last");
     }
 
     #[test]
@@ -1307,5 +1683,202 @@ mod tests {
         );
         assert_eq!(entries.len(), 1, "no stages declared -> only the backdrop");
         assert_eq!(entries[0].kind, StageKind::Backdrop);
+    }
+
+    // ---- title -> setup mapping -----------------------------------------
+
+    #[test]
+    fn options_item_maps_to_setup_action() {
+        // A motif `Options` item opens the setup screen (T042), not a no-op.
+        let title = fp_ui::TitleInfo {
+            items: vec![mi(MenuItemKind::Options, "OPTIONS")],
+            ..fp_ui::TitleInfo::default()
+        };
+        let system = SystemDef {
+            title,
+            ..SystemDef::default()
+        };
+        let menu = TitleMenu::from_system(&system);
+        assert_eq!(menu.entries[0].action, TitleAction::Setup);
+    }
+
+    #[test]
+    fn fallback_setup_item_confirms_to_setup_action() {
+        // The built-in fallback menu offers SETUP (index 2): confirming it yields
+        // the Setup action. This is the action a controller confirm produces too,
+        // since the title consumes a source-agnostic MenuInput.
+        let mut menu = TitleMenu::fallback();
+        menu.update(down()); // -> TRAINING
+        menu.update(down()); // -> SETUP
+        assert_eq!(menu.update(confirm()), Some(TitleAction::Setup));
+    }
+
+    // ---- setup screen (T042) --------------------------------------------
+
+    fn left() -> MenuInput {
+        MenuInput {
+            left: true,
+            ..MenuInput::default()
+        }
+    }
+
+    /// A default config seeded with a deterministic synthetic key per action
+    /// (action index as the opaque KeyCode), so tests don't need SDL scancodes.
+    fn config_with_index_keys() -> InputConfig {
+        let mut next = 0i32;
+        let keys: Vec<(InputAction, KeyCode)> = InputAction::ALL
+            .iter()
+            .map(|&a| {
+                let k = (a, KeyCode(next));
+                next += 1;
+                k
+            })
+            .collect();
+        // Rebuild via default_with so the public constructor is exercised.
+        let lookup = keys.clone();
+        InputConfig::default_with(|action| {
+            lookup
+                .iter()
+                .find(|(a, _)| *a == action)
+                .map(|(_, k)| *k)
+                .unwrap_or(KeyCode(-1))
+        })
+    }
+
+    #[test]
+    fn setup_starts_on_device_row_not_capturing() {
+        let s = SetupScreen::new();
+        assert_eq!(s.cursor, 0);
+        assert!(s.on_device_row());
+        assert!(!s.awaiting_key());
+        // Rows = device + one per action.
+        assert_eq!(s.row_count(), 1 + InputAction::ALL.len());
+    }
+
+    #[test]
+    fn setup_cursor_moves_and_wraps() {
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        let last = s.row_count() - 1;
+        assert_eq!(s.update(up(), &mut cfg), SetupOutcome::Pending);
+        assert_eq!(s.cursor, last, "up from the first row wraps to the last");
+        s.update(down(), &mut cfg);
+        assert_eq!(s.cursor, 0, "down from the last row wraps to the first");
+        s.update(down(), &mut cfg);
+        assert_eq!(s.cursor, 1);
+        assert_eq!(s.selected_action(), Some(InputAction::Up));
+    }
+
+    #[test]
+    fn setup_device_row_toggles_with_horizontal_and_confirm() {
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        assert_eq!(cfg.device, InputDevice::Keyboard);
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.device, InputDevice::Controller, "right toggles device");
+        s.update(left(), &mut cfg);
+        assert_eq!(cfg.device, InputDevice::Keyboard, "left toggles back");
+        s.update(confirm(), &mut cfg);
+        assert_eq!(
+            cfg.device,
+            InputDevice::Controller,
+            "confirm toggles device"
+        );
+    }
+
+    #[test]
+    fn setup_back_exits_to_title() {
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        assert_eq!(s.update(back(), &mut cfg), SetupOutcome::Exit);
+    }
+
+    #[test]
+    fn setup_confirm_on_action_arms_capture_then_key_rebinds() {
+        // Acceptance #3: after remapping a key, the resolved in-match binding for
+        // that action changes. Navigate to the `A` action, confirm to arm
+        // capture, then press a fresh key and assert the binding moved.
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+
+        // Walk down to the `A` action row: device(0), Up(1), Down(2), Left(3),
+        // Right(4), A(5).
+        for _ in 0..5 {
+            s.update(down(), &mut cfg);
+        }
+        assert_eq!(s.selected_action(), Some(InputAction::A));
+
+        let before = cfg.key_for(InputAction::A).unwrap();
+        // Confirm arms capture mode (no rebind yet).
+        assert_eq!(s.update(confirm(), &mut cfg), SetupOutcome::Pending);
+        assert!(s.awaiting_key(), "confirm on an action arms key capture");
+        assert_eq!(cfg.key_for(InputAction::A), Some(before), "not yet rebound");
+
+        // A fresh, previously-unbound key.
+        let fresh = KeyCode(9999);
+        let (rebound, displaced) = s.capture_key(fresh, &mut cfg).expect("captured");
+        assert_eq!(rebound, InputAction::A);
+        assert_eq!(displaced, None, "the fresh key was not bound elsewhere");
+        assert!(!s.awaiting_key(), "capture mode clears after binding");
+        assert_eq!(
+            cfg.key_for(InputAction::A),
+            Some(fresh),
+            "the in-match binding for A now resolves to the remapped key"
+        );
+        assert_ne!(before, fresh, "the binding actually changed");
+    }
+
+    #[test]
+    fn setup_capture_ignores_navigation_until_key_or_cancel() {
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        // Arm capture on the Up action (row 1).
+        s.update(down(), &mut cfg);
+        assert_eq!(s.selected_action(), Some(InputAction::Up));
+        s.update(confirm(), &mut cfg);
+        assert!(s.awaiting_key());
+
+        // Navigation is suspended while capturing: the cursor must not move.
+        s.update(down(), &mut cfg);
+        s.update(up(), &mut cfg);
+        assert_eq!(s.cursor, 1, "cursor frozen during capture");
+        assert!(s.awaiting_key(), "still capturing");
+
+        // Back cancels the capture without binding and without leaving the screen.
+        let before = cfg.key_for(InputAction::Up);
+        assert_eq!(s.update(back(), &mut cfg), SetupOutcome::Pending);
+        assert!(!s.awaiting_key(), "back cancels capture");
+        assert_eq!(cfg.key_for(InputAction::Up), before, "no rebind on cancel");
+    }
+
+    #[test]
+    fn capture_key_when_not_armed_is_a_noop() {
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        assert!(!s.awaiting_key());
+        assert_eq!(s.capture_key(KeyCode(42), &mut cfg), None);
+    }
+
+    #[test]
+    fn rebind_reports_a_displaced_action_on_a_key_clash() {
+        // Binding the `B` action to the key already held by `A` reports A as the
+        // displaced action, so the app can keep keys unique if it chooses.
+        let mut cfg = config_with_index_keys();
+        let a_key = cfg.key_for(InputAction::A).unwrap();
+        let displaced = cfg.rebind(InputAction::B, a_key);
+        assert_eq!(displaced, Some(InputAction::A));
+        assert_eq!(cfg.key_for(InputAction::B), Some(a_key));
+    }
+
+    #[test]
+    fn input_config_default_with_seeds_every_action() {
+        let cfg = config_with_index_keys();
+        for action in InputAction::ALL {
+            assert!(
+                cfg.key_for(action).is_some(),
+                "every action has a default binding: {action:?}"
+            );
+        }
+        assert_eq!(cfg.device, InputDevice::Keyboard);
     }
 }

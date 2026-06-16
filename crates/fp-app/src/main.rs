@@ -740,10 +740,11 @@ fn build_player(
 
 /// One field of [`MatchInput`] that a keyboard key drives.
 ///
-/// Used by [`KEYBOARD_BINDINGS`] so the player-1 key map is a single explicit
-/// data table (each row maps physical scancodes to the engine input bit they
-/// assert) rather than scattered through the polling code, and so the table can
-/// be asserted directly in unit tests.
+/// Each remappable [`screens::InputAction`] maps 1:1 to an `InputField` (see
+/// [`InputField::action`] / [`field_for_action`]); the in-loop sampler asserts
+/// the field's bit when the action's currently-bound key is held. Keeping it a
+/// small explicit enum (rather than scattering bit-sets through the polling code)
+/// keeps the key map unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputField {
     /// Absolute screen direction: up (jump).
@@ -786,49 +787,113 @@ impl InputField {
     }
 }
 
-/// Player-1 keyboard key map: every physical [`Scancode`] that drives an engine
-/// [`InputField`], as a single explicit table.
+/// The in-loop [`InputField`] for a remappable [`screens::InputAction`] (the
+/// inverse of [`InputField::action`]).
+fn field_for_action(action: screens::InputAction) -> InputField {
+    use screens::InputAction as A;
+    match action {
+        A::Up => InputField::Up,
+        A::Down => InputField::Down,
+        A::Left => InputField::Left,
+        A::Right => InputField::Right,
+        A::A => InputField::A,
+        A::B => InputField::B,
+        A::C => InputField::C,
+        A::X => InputField::X,
+        A::Y => InputField::Y,
+        A::Z => InputField::Z,
+    }
+}
+
+/// The default keyboard [`Scancode`] each remappable [`screens::InputAction`]
+/// starts bound to, before any remap.
 ///
-/// Movement uses **WASD or the arrow keys** (either source asserts the same
-/// direction, so both bind to the same field); the six MUGEN attack buttons are
-/// the **U/I/O** (punch row: `a` `b` `c`) and **J/K/L** (kick row: `x` `y` `z`)
-/// home keys. The engine receives these as **absolute** screen directions and
+/// Movement is **WASD** and the six MUGEN attack buttons are the **U/I/O** (punch
+/// row `a` `b` `c`) and **J/K/L** (kick row `x` `y` `z`) home keys — the same
+/// defaults the old `KEYBOARD_BINDINGS` const used. The arrow keys are *also*
+/// honoured for movement as a permanent secondary binding (see
+/// [`match_input_from_held`]), independent of the remappable primary key, so the
+/// arrows keep working even after WASD is rebound.
+fn default_action_key(action: screens::InputAction) -> Scancode {
+    use screens::InputAction as A;
+    match action {
+        A::Up => Scancode::W,
+        A::Down => Scancode::S,
+        A::Left => Scancode::A,
+        A::Right => Scancode::D,
+        A::A => Scancode::U,
+        A::B => Scancode::I,
+        A::C => Scancode::O,
+        A::X => Scancode::J,
+        A::Y => Scancode::K,
+        A::Z => Scancode::L,
+    }
+}
+
+/// The permanent secondary movement keys (the arrow keys), honoured in addition
+/// to whatever the remappable primary direction key is, so arrow-key movement
+/// always works regardless of remapping.
+const ARROW_BINDINGS: &[(Scancode, InputField)] = &[
+    (Scancode::Up, InputField::Up),
+    (Scancode::Down, InputField::Down),
+    (Scancode::Left, InputField::Left),
+    (Scancode::Right, InputField::Right),
+];
+
+/// Converts a [`screens::KeyCode`] back to an SDL [`Scancode`], or `None` if the
+/// opaque code is not a valid scancode. The setup screen carries keys as the
+/// `repr(i32)` value of a `Scancode`; this is the only inverse adapter.
+fn scancode_from_keycode(key: screens::KeyCode) -> Option<Scancode> {
+    Scancode::from_i32(key.0)
+}
+
+/// Wraps an SDL [`Scancode`] as the device-neutral [`screens::KeyCode`] the
+/// setup screen stores. `Scancode` is `repr(i32)`, so this is its raw value.
+fn keycode_of(scancode: Scancode) -> screens::KeyCode {
+    screens::KeyCode(scancode as i32)
+}
+
+/// Builds the live [`screens::InputConfig`] from the app defaults
+/// ([`default_action_key`]), so the setup screen and the keyboard-sampling path
+/// share one source of truth for player-1 bindings.
+fn default_input_config() -> screens::InputConfig {
+    screens::InputConfig::default_with(|action| keycode_of(default_action_key(action)))
+}
+
+/// Builds a [`MatchInput`] from a held-key oracle, using the live remappable
+/// player-1 bindings in `config` plus the permanent arrow-key movement.
+///
+/// `is_held(scancode)` reports whether a physical key is currently held. Keeping
+/// this pure (no SDL types beyond the [`Scancode`] the oracle is keyed on) makes
+/// the player-1 key map unit-testable without a live SDL context — the live path
+/// ([`match_input_from_keyboard`]) just supplies the SDL keyboard state as the
+/// oracle.
+///
+/// Each remappable [`screens::InputAction`]'s current key (from `config`,
+/// remapped on the setup screen) asserts its [`InputField`]; the arrow keys are
+/// OR'd in as a permanent secondary movement binding so they keep working after a
+/// WASD rebind. The engine receives these as **absolute** screen directions and
 /// resolves facing internally (inside the [`fp_input::CommandMatcher`]), so this
-/// table stays a pure absolute-direction snapshot — do not pre-rotate here.
+/// stays a pure absolute-direction snapshot — do not pre-rotate here.
 ///
 /// There is intentionally **no keyboard `start`/pause binding**: the engine's
 /// `tick` takes no pause signal yet, matching the documented controller-Start
 /// drop in [`controller_to_match_input`].
-const KEYBOARD_BINDINGS: &[(Scancode, InputField)] = &[
-    // Movement: WASD and the arrow keys both drive the same direction.
-    (Scancode::W, InputField::Up),
-    (Scancode::Up, InputField::Up),
-    (Scancode::S, InputField::Down),
-    (Scancode::Down, InputField::Down),
-    (Scancode::A, InputField::Left),
-    (Scancode::Left, InputField::Left),
-    (Scancode::D, InputField::Right),
-    (Scancode::Right, InputField::Right),
-    // Punch row a/b/c.
-    (Scancode::U, InputField::A),
-    (Scancode::I, InputField::B),
-    (Scancode::O, InputField::C),
-    // Kick row x/y/z.
-    (Scancode::J, InputField::X),
-    (Scancode::K, InputField::Y),
-    (Scancode::L, InputField::Z),
-];
-
-/// Builds a [`MatchInput`] from a held-key oracle, using [`KEYBOARD_BINDINGS`].
-///
-/// `is_held(scancode)` reports whether a physical key is currently held. Keeping
-/// this pure (no SDL types) makes the player-1 key map unit-testable without a
-/// live SDL context — the live path ([`match_input_from_keyboard`]) just supplies
-/// the SDL keyboard state as the oracle. Multiple scancodes mapping to the same
-/// field (WASD vs. arrows) are OR'd, so either source asserts the direction.
-fn match_input_from_held(mut is_held: impl FnMut(Scancode) -> bool) -> MatchInput {
+fn match_input_from_held(
+    config: &screens::InputConfig,
+    mut is_held: impl FnMut(Scancode) -> bool,
+) -> MatchInput {
     let mut input = MatchInput::none();
-    for &(scancode, field) in KEYBOARD_BINDINGS {
+    // The remappable primary binding for each action.
+    for action in screens::InputAction::ALL {
+        if let Some(scancode) = config.key_for(action).and_then(scancode_from_keycode) {
+            if is_held(scancode) {
+                field_for_action(action).set(&mut input);
+            }
+        }
+    }
+    // The permanent secondary movement binding (arrow keys), OR'd in.
+    for &(scancode, field) in ARROW_BINDINGS {
         if is_held(scancode) {
             field.set(&mut input);
         }
@@ -837,11 +902,15 @@ fn match_input_from_held(mut is_held: impl FnMut(Scancode) -> bool) -> MatchInpu
 }
 
 /// Builds a [`MatchInput`] (absolute screen directions + button presses) from the
-/// current SDL2 keyboard state, using the player-1 [`KEYBOARD_BINDINGS`] key map
-/// (WASD/arrows + U/I/O/J/K/L). The engine converts these to facing-relative
-/// commands internally, so this stays a pure absolute-direction snapshot.
-fn match_input_from_keyboard(keyboard: &KeyboardState<'_>) -> MatchInput {
-    match_input_from_held(|scancode| keyboard.is_scancode_pressed(scancode))
+/// current SDL2 keyboard state, using the live player-1 [`screens::InputConfig`]
+/// (remappable on the setup screen) plus the permanent arrow-key movement. The
+/// engine converts these to facing-relative commands internally, so this stays a
+/// pure absolute-direction snapshot.
+fn match_input_from_keyboard(
+    config: &screens::InputConfig,
+    keyboard: &KeyboardState<'_>,
+) -> MatchInput {
+    match_input_from_held(config, |scancode| keyboard.is_scancode_pressed(scancode))
 }
 
 /// Number of controller slots the app tracks. Slot 0 drives player 1 (alongside
@@ -3587,6 +3656,9 @@ enum RunScreen {
         /// correct character-select screen.
         mode: screens::SelectMode,
     },
+    /// The setup / options screen (T042): input device + key remapping. Reached
+    /// from the title menu; back returns to Title.
+    Setup(screens::SetupScreen),
     /// A running two-player match. On match-over the flow returns to Title.
     Fight(Box<MatchRun>),
     /// Leave the application.
@@ -3638,6 +3710,11 @@ impl MenuApp {
         } else {
             self.screen = RunScreen::Select(screen);
         }
+    }
+
+    /// Enters the setup / options screen (T042), reachable from the title menu.
+    fn enter_setup(&mut self) {
+        self.screen = RunScreen::Setup(screens::SetupScreen::new());
     }
 
     /// Enters the stage-select screen (T041) for a completed character pick,
@@ -3852,6 +3929,75 @@ fn draw_stage_select_screen(
     }
 
     draw_centered_text(frame, font, "PICK STAGE", win_w, y + 20.0, 2.0, 0.8);
+}
+
+/// Draws the setup / options screen (T042): a header, the input-device
+/// preference row, then one row per remappable action showing its currently
+/// bound key, with the cursor marker on the highlighted row. While capturing a
+/// key it shows a "PRESS A KEY" prompt on the selected action. A no-op when no
+/// font is loaded.
+fn draw_setup_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    setup: &screens::SetupScreen,
+    config: &screens::InputConfig,
+    win_w: f32,
+) {
+    /// Setup-list text scale.
+    const SCALE: f32 = 2.5;
+    let line_h = font.line_height() as f32 * SCALE;
+
+    draw_centered_text(frame, font, "SETUP", win_w, 40.0, 3.0, 1.0);
+
+    // A short header noting the highlighted target (the device row, or an action).
+    let focus = if setup.on_device_row() {
+        "DEVICE".to_string()
+    } else {
+        setup
+            .selected_action()
+            .map(|a| a.label().to_string())
+            .unwrap_or_default()
+    };
+    draw_centered_text(frame, font, &format!("> {focus}"), win_w, 84.0, 2.0, 0.7);
+
+    let mut y = 120.0;
+    // Row 0 is the device toggle; the rest are one per action (in ALL order).
+    // `row_count` is the count this loop draws.
+    let actions = setup.row_actions();
+    debug_assert_eq!(actions.len(), setup.row_count());
+    for (i, action) in actions.iter().enumerate() {
+        let selected = i == setup.cursor;
+        let marker = if selected { ">" } else { " " };
+        let line = match action {
+            // The device-preference row.
+            None => format!("{marker} DEVICE: {}", config.device.label()),
+            // An action's binding row: label + the bound key's name (or PRESS A
+            // KEY while this action is being captured).
+            Some(act) => {
+                let capturing = setup.capturing == Some(*act);
+                if capturing {
+                    format!("{marker} {}: PRESS A KEY", act.label())
+                } else {
+                    let key_name = config
+                        .key_for(*act)
+                        .and_then(scancode_from_keycode)
+                        .map(|sc| sc.name().to_ascii_uppercase())
+                        .unwrap_or_else(|| "NONE".to_string());
+                    format!("{marker} {}: {key_name}", act.label())
+                }
+            }
+        };
+        let alpha = if selected { 1.0 } else { 0.6 };
+        draw_centered_text(frame, font, &to_menu_text(&line), win_w, y, SCALE, alpha);
+        y += line_h + 4.0;
+    }
+
+    let hint = if setup.awaiting_key() {
+        "PRESS A KEY  ESC CANCEL"
+    } else {
+        "ENTER REMAP  ESC BACK"
+    };
+    draw_centered_text(frame, font, hint, win_w, y + 16.0, 2.0, 0.8);
 }
 
 /// Upcases `s` into the menu font's supported glyph set (the shipped FNT covers
@@ -4130,6 +4276,13 @@ fn run() -> fp_core::FpResult<()> {
     // two-player match mode and the menu Fight screen.
     let hud = Hud::new(&renderer);
 
+    // The live player-1 input configuration (T042): the device preference plus
+    // the remappable keyboard binding for each action. Both the menu Fight screen
+    // and the direct-CLI match sample the keyboard through this, so a rebind made
+    // on the setup screen changes gameplay immediately. The setup screen edits it
+    // in place via `&mut`.
+    let mut input_config = default_input_config();
+
     // Edge-detection state for the text menus: last frame's held menu controls.
     // Updated once per real frame so a held key moves the cursor one cell.
     let mut prev_menu_held = screens::HeldMenuInput::default();
@@ -4158,6 +4311,10 @@ fn run() -> fp_core::FpResult<()> {
         // physical press), complementing the held-state directions sampled below.
         let mut esc_pressed = false;
         let mut confirm_key_pressed = false;
+        // The first physical key pressed this frame (its scancode), excluding
+        // Escape. Used by the setup screen's key-capture mode (T042) to bind the
+        // pressed key to the action being remapped; ignored in every other mode.
+        let mut captured_scancode: Option<Scancode> = None;
         // Poll events
         for event in event_pump.poll_iter() {
             match event {
@@ -4189,6 +4346,19 @@ fn run() -> fp_core::FpResult<()> {
                         "Clsn debug overlay {}",
                         if overlay_enabled { "ON" } else { "OFF" }
                     );
+                }
+                // Any other physical key press: record the first one this frame so
+                // the setup screen's remap-capture can bind it. (Esc/Return/Space/
+                // F1 are handled above; this catches the rest, e.g. a new key for
+                // an action.) Only the first press per frame is kept.
+                Event::KeyDown {
+                    scancode: Some(scancode),
+                    repeat: false,
+                    ..
+                } => {
+                    if captured_scancode.is_none() {
+                        captured_scancode = Some(scancode);
+                    }
                 }
                 Event::Window {
                     win_event: sdl2::event::WindowEvent::Resized(w, h),
@@ -4233,7 +4403,7 @@ fn run() -> fp_core::FpResult<()> {
         // bit). If a second controller is present, it drives P2 for a real
         // two-human match; otherwise the baseline CPU AI drives P2 (T018, resolved
         // per-frame in `tick_match_run`/`resolve_p2_input`).
-        let kbd_input = match_input_from_keyboard(&event_pump.keyboard_state());
+        let kbd_input = match_input_from_keyboard(&input_config, &event_pump.keyboard_state());
         let pad0 = controllers
             .as_ref()
             .and_then(|c| c.input(0))
@@ -4279,8 +4449,38 @@ fn run() -> fp_core::FpResult<()> {
                     if let Some(action) = menu.update(menu_in) {
                         match action {
                             screens::TitleAction::Select(mode) => app.enter_select(mode),
+                            screens::TitleAction::Setup => app.enter_setup(),
                             screens::TitleAction::Quit => app.screen = RunScreen::Quit,
                             screens::TitleAction::NoOp => {}
+                        }
+                    }
+                }
+                RunScreen::Setup(ref mut setup) => {
+                    // In key-capture mode, a fresh physical key press (collected
+                    // above, excluding Esc which cancels) rebinds the selected
+                    // action; the new binding is read by the keyboard sampler next
+                    // frame, so the remap takes effect in-match immediately. When a
+                    // key is captured this frame, navigation is NOT also run (the
+                    // capture consumes the frame), so a single press can't both
+                    // bind and re-arm/navigate.
+                    let mut captured = false;
+                    if setup.awaiting_key() {
+                        if let Some(scancode) = captured_scancode {
+                            if let Some((action, displaced)) =
+                                setup.capture_key(keycode_of(scancode), &mut input_config)
+                            {
+                                tracing::info!(
+                                    "remapped {action:?} to key {} (was on {displaced:?})",
+                                    scancode.name(),
+                                );
+                                captured = true;
+                            }
+                        }
+                    }
+                    if !captured {
+                        match setup.update(menu_in, &mut input_config) {
+                            screens::SetupOutcome::Pending => {}
+                            screens::SetupOutcome::Exit => app.return_to_title(),
                         }
                     }
                 }
@@ -4434,6 +4634,11 @@ fn run() -> fp_core::FpResult<()> {
                 RunScreen::StageSelect { stages, .. } => {
                     if let Some(font) = app.font.as_ref() {
                         draw_stage_select_screen(&mut frame, font, stages, win_wf);
+                    }
+                }
+                RunScreen::Setup(setup) => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_setup_screen(&mut frame, font, setup, &input_config, win_wf);
                     }
                 }
                 RunScreen::Fight(run) => {
@@ -4772,6 +4977,216 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Controller-driven menu navigation (T039 title nav, T040 char-select nav).
+    //
+    // The main loop builds the source-agnostic `screens::MenuInput` from the P1
+    // `MatchInput` (keyboard OR controller, see the loop): directions come from
+    // the held P1 input edges, confirm from the controller `a` button (or
+    // Enter/Space), back from the controller `b` button (or Esc). These tests
+    // drive that exact composition from a synthetic `RawController` to prove a
+    // controller alone navigates the Title menu and the Character-Select grid and
+    // can confirm — with no keyboard involved.
+    // -----------------------------------------------------------------------
+
+    /// Builds the rising-edge `MenuInput` a controller produces this frame, the
+    /// way the main loop does: map the raw pad to a P1 `MatchInput`, fold it into
+    /// a `HeldMenuInput` (a = confirm, b = back), and edge-detect against the
+    /// previous held state. With `prev = default`, every held control is a fresh
+    /// edge (one cursor step).
+    fn menu_input_from_pad(raw: RawController) -> screens::MenuInput {
+        let p1 = controller_to_match_input(&map_controller(&raw, DEADZONE_DEFAULT));
+        let held = screens::HeldMenuInput {
+            up: p1.up,
+            down: p1.down,
+            left: p1.left,
+            right: p1.right,
+            confirm: p1.a,
+            back: p1.b,
+        };
+        screens::MenuInput::from_edges(held, screens::HeldMenuInput::default())
+    }
+
+    #[test]
+    fn controller_navigates_and_confirms_title_menu() {
+        // Acceptance #1: the controller's d-pad moves the title cursor and the
+        // confirm button (mapped from face `a`) activates the highlighted item —
+        // all with no keyboard input.
+        let mut menu = screens::TitleMenu::fallback(); // VS / TRAINING / SETUP / EXIT
+        assert_eq!(menu.cursor, 0);
+
+        // D-pad down moves the highlight one item (cursor 0 -> 1 = TRAINING).
+        let down = RawController {
+            dpad_down: true,
+            ..RawController::default()
+        };
+        assert_eq!(
+            menu.update(menu_input_from_pad(down)),
+            None,
+            "move, no action"
+        );
+        assert_eq!(menu.cursor, 1);
+
+        // The left analog stick (past the deadzone) also drives the cursor: down
+        // again -> SETUP (cursor 2).
+        let stick_down = RawController {
+            stick_y: 25_000, // +Y is down (SDL convention)
+            ..RawController::default()
+        };
+        menu.update(menu_input_from_pad(stick_down));
+        assert_eq!(menu.cursor, 2);
+
+        // The confirm button (face `a`) activates the highlighted SETUP item.
+        let confirm = RawController {
+            face_west: true, // `a`
+            ..RawController::default()
+        };
+        assert_eq!(
+            menu.update(menu_input_from_pad(confirm)),
+            Some(screens::TitleAction::Setup),
+            "controller confirm activates the highlighted title item"
+        );
+    }
+
+    #[test]
+    fn controller_back_button_quits_title_menu() {
+        // Acceptance #1: the controller `b` button maps to menu back, which quits
+        // from the title (the title's documented back behaviour). MUGEN `b` is the
+        // North face button (`controller_to_match_input`/`map_controller`).
+        let mut menu = screens::TitleMenu::fallback();
+        let back = RawController {
+            face_north: true, // MUGEN `b` -> menu back
+            ..RawController::default()
+        };
+        assert_eq!(
+            menu.update(menu_input_from_pad(back)),
+            Some(screens::TitleAction::Quit)
+        );
+    }
+
+    #[test]
+    fn controller_moves_select_cursor_on_grid_and_confirms() {
+        // Acceptance #2: the controller d-pad moves the (grid-aware) select cursor
+        // and a button confirms/locks a pick — no keyboard. A 3-column grid of two
+        // characters + random; Training so a single confirm completes.
+        let select = SelectDef::parse(
+            "[Characters]\nChar Alpha, a/a.def\nChar Beta, b/b.def\nrandomselect\n",
+        );
+        let info = fp_ui::SelectInfo {
+            columns: 3,
+            rows: 1,
+            ..fp_ui::SelectInfo::default()
+        };
+        let mut screen = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &select,
+            &info,
+            Path::new("data/select.def"),
+        );
+        assert_eq!(screen.p1_cursor, 0);
+
+        // D-pad right steps the cursor along the grid row (0 -> 1 = Beta).
+        let right = RawController {
+            dpad_right: true,
+            ..RawController::default()
+        };
+        assert_eq!(
+            screen.update(menu_input_from_pad(right), 0),
+            screens::SelectOutcome::Pending
+        );
+        assert_eq!(
+            screen.p1_cursor, 1,
+            "controller d-pad moved the grid cursor"
+        );
+
+        // The confirm button (face `a`) locks the pick; Training completes.
+        let confirm = RawController {
+            face_west: true, // `a`
+            ..RawController::default()
+        };
+        let outcome = screen.update(menu_input_from_pad(confirm), 0);
+        let screens::SelectOutcome::Done(pick) = outcome else {
+            panic!("controller confirm should lock the pick and complete: {outcome:?}");
+        };
+        assert_eq!(pick.p1_def, PathBuf::from("data").join("b/b.def"));
+        assert_eq!(pick.p1_name, "Char Beta");
+    }
+
+    // -----------------------------------------------------------------------
+    // Setup screen wiring (T042): the remap must take effect on in-match input.
+    //
+    // The pure remap/navigation logic is unit-tested in `screens`; here we prove
+    // the app-level wiring — that rebinding an action through `SetupScreen` over
+    // the live `InputConfig` actually changes which physical key the keyboard
+    // sampler (`match_input_from_held`) reads for that action.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remapping_a_key_changes_the_resolved_in_match_binding() {
+        // Acceptance #3: after remapping, the in-match keyboard binding changes.
+        let mut config = default_input_config();
+
+        // By default `a` (light punch) is on `U`; pressing `U` asserts `a`.
+        assert!(
+            match_input_from_held(&config, |sc| sc == Scancode::U).a,
+            "default: U drives a"
+        );
+        assert!(
+            !match_input_from_held(&config, |sc| sc == Scancode::P).a,
+            "default: P does not drive a"
+        );
+
+        // Rebind `a` to `P` through the setup screen's capture path.
+        let mut setup = screens::SetupScreen::new();
+        // Walk to the `A` action row (device, Up, Down, Left, Right, A).
+        for _ in 0..5 {
+            setup.update(
+                screens::MenuInput {
+                    down: true,
+                    ..screens::MenuInput::default()
+                },
+                &mut config,
+            );
+        }
+        assert_eq!(setup.selected_action(), Some(screens::InputAction::A));
+        // Confirm arms capture, then the captured `P` key rebinds.
+        setup.update(
+            screens::MenuInput {
+                confirm: true,
+                ..screens::MenuInput::default()
+            },
+            &mut config,
+        );
+        assert!(setup.awaiting_key());
+        setup.capture_key(keycode_of(Scancode::P), &mut config);
+
+        // The in-match sampler now reads `P` for `a`, and `U` no longer drives it.
+        assert!(
+            match_input_from_held(&config, |sc| sc == Scancode::P).a,
+            "after remap: P drives a"
+        );
+        assert!(
+            !match_input_from_held(&config, |sc| sc == Scancode::U).a,
+            "after remap: U no longer drives a"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_keep_working_after_remapping_wasd_movement() {
+        // The arrow keys are a permanent secondary movement binding, so they keep
+        // driving directions even if the remappable primary direction key moves.
+        let mut config = default_input_config();
+        // Rebind `Left` away from `A` to `Q`.
+        config.rebind(screens::InputAction::Left, keycode_of(Scancode::Q));
+        // The arrow key still drives left.
+        assert!(
+            match_input_from_held(&config, |sc| sc == Scancode::Left).left,
+            "arrow Left still drives left after WASD remap"
+        );
+        // The new primary key drives left too.
+        assert!(match_input_from_held(&config, |sc| sc == Scancode::Q).left);
+    }
+
+    // -----------------------------------------------------------------------
     // Keyboard key map (T024): the player-1 scancode -> engine-input path.
     //
     // `match_input_from_held` is the pure core of `match_input_from_keyboard`;
@@ -4783,9 +5198,11 @@ mod tests {
     // InputState hop is covered in `fp-input` (see `playability_tests`).
     // -----------------------------------------------------------------------
 
-    /// Builds the `MatchInput` for a set of held scancodes via the pure key map.
+    /// Builds the `MatchInput` for a set of held scancodes via the pure key map,
+    /// using the default (unremapped) player-1 bindings.
     fn kbd(held: &[Scancode]) -> MatchInput {
-        match_input_from_held(|sc| held.contains(&sc))
+        let config = default_input_config();
+        match_input_from_held(&config, |sc| held.contains(&sc))
     }
 
     #[test]
@@ -4863,25 +5280,19 @@ mod tests {
 
     #[test]
     fn keyboard_bindings_cover_every_input_field() {
-        // The binding table must reach all four directions and all six attack
-        // buttons, so no documented input is unreachable from the keyboard.
-        let all: Vec<InputField> = KEYBOARD_BINDINGS.iter().map(|&(_, f)| f).collect();
-        for field in [
-            InputField::Up,
-            InputField::Down,
-            InputField::Left,
-            InputField::Right,
-            InputField::A,
-            InputField::B,
-            InputField::C,
-            InputField::X,
-            InputField::Y,
-            InputField::Z,
-        ] {
-            assert!(
-                all.contains(&field),
-                "no keyboard binding produces {field:?}"
-            );
+        // The default binding config must reach all four directions and all six
+        // attack buttons, so no documented input is unreachable from the keyboard.
+        let config = default_input_config();
+        for action in screens::InputAction::ALL {
+            let scancode = config
+                .key_for(action)
+                .and_then(scancode_from_keycode)
+                .expect("every action has a default key");
+            let mi = kbd(&[scancode]);
+            // Each default key sets exactly its action's bit.
+            let mut expected = MatchInput::none();
+            field_for_action(action).set(&mut expected);
+            assert_eq!(mi, expected, "default key for {action:?} drives its field");
         }
     }
 
@@ -7586,12 +7997,20 @@ mod tests {
             return;
         }
         let motif = Motif::load_from(&system_path, &fallback);
-        // The shipped system.def enables VS MODE / TRAINING / EXIT.
+        // The shipped system.def enables VS MODE / TRAINING / SETUP / EXIT.
         let title = screens::TitleMenu::from_system(&motif.system);
         let labels: Vec<&str> = title.entries.iter().map(|e| e.label.as_str()).collect();
         assert!(labels.contains(&"VS MODE"), "title has VS MODE: {labels:?}");
         assert!(labels.contains(&"TRAINING"), "title has TRAINING");
         assert!(labels.contains(&"EXIT"), "title has EXIT");
+        // The "options" item ships as SETUP and opens the setup screen (T042).
+        assert!(labels.contains(&"SETUP"), "title has SETUP: {labels:?}");
+        let setup_entry = title
+            .entries
+            .iter()
+            .find(|e| e.label == "SETUP")
+            .expect("SETUP entry present");
+        assert_eq!(setup_entry.action, screens::TitleAction::Setup);
         // The roster has at least one choosable character (Training Dummy).
         let select = screens::SelectScreen::new(
             screens::SelectMode::Training,
@@ -7606,8 +8025,8 @@ mod tests {
     }
 
     /// A missing motif resolves to the built-in fallback title menu (VS /
-    /// TRAINING / EXIT) over an empty roster, without panicking — the clean-room
-    /// degradation path.
+    /// TRAINING / SETUP / EXIT) over an empty roster, without panicking — the
+    /// clean-room degradation path.
     #[test]
     fn missing_motif_uses_fallback_menu() {
         let motif = Motif::load_from(
@@ -7615,9 +8034,10 @@ mod tests {
             Path::new("/no/such/select.def"),
         );
         let title = screens::TitleMenu::from_system(&motif.system);
-        // Built-in fallback ships exactly VS / TRAINING / EXIT.
-        assert_eq!(title.entries.len(), 3);
+        // Built-in fallback ships exactly VS / TRAINING / SETUP / EXIT.
+        assert_eq!(title.entries.len(), 4);
         assert_eq!(title.entries[0].label, "VS MODE");
+        assert_eq!(title.entries[2].action, screens::TitleAction::Setup);
         // Empty roster: the select screen reports empty (the app would stay on
         // title), never a panic.
         let select = screens::SelectScreen::new(
