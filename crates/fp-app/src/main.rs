@@ -4652,6 +4652,126 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Player-1 game-controller path (T038). The live loop builds P1's input as
+    //     merge_match_input(kbd_input, controller_to_match_input(&pad0))
+    // where `pad0` is the pure `map_controller` of controller slot 0's raw
+    // state. These tests exercise that exact composition with synthetic raw
+    // snapshots (no live SDL), asserting the three acceptance criteria:
+    //   1. a controller's d-pad/stick + buttons produce the correct P1
+    //      MatchInput (directions + a/b/c/x/y/z);
+    //   2. keyboard and controller both drive P1 (OR'd), neither disables the
+    //      other;
+    //   3. an absent / detached controller (modeled as a neutral pad0) leaves
+    //      the keyboard's P1 input untouched — the hot-plug-safe steady state.
+    // -----------------------------------------------------------------------
+
+    /// Builds P1's per-frame `MatchInput` the way the main loop does: the
+    /// keyboard snapshot OR'd with controller slot 0's mapped input. A `None`
+    /// pad models "no controller bound / detached" (what `Controllers::input`
+    /// returns when a slot is empty or the device silently detached).
+    fn p1_input(kbd: MatchInput, pad0_raw: Option<RawController>) -> MatchInput {
+        let pad0 = pad0_raw
+            .map(|raw| controller_to_match_input(&map_controller(&raw, DEADZONE_DEFAULT)))
+            .unwrap_or_else(MatchInput::none);
+        merge_match_input(kbd, pad0)
+    }
+
+    #[test]
+    fn p1_controller_dpad_and_all_six_buttons_reach_p1_input() {
+        // Acceptance #1: a controller alone (no keyboard input) drives P1's
+        // directions and every one of the six MUGEN attack buttons.
+        let raw = RawController {
+            dpad_left: true,
+            dpad_up: true,
+            face_west: true,      // a
+            face_north: true,     // b
+            shoulder_right: true, // c
+            face_south: true,     // x
+            face_east: true,      // y
+            shoulder_left: true,  // z
+            ..RawController::default()
+        };
+        let p1 = p1_input(MatchInput::none(), Some(raw));
+        assert!(p1.left, "d-pad left -> P1 left");
+        assert!(p1.up, "d-pad up -> P1 up");
+        assert!(!p1.right && !p1.down);
+        assert!(
+            p1.a && p1.b && p1.c && p1.x && p1.y && p1.z,
+            "all six buttons: {p1:?}"
+        );
+    }
+
+    #[test]
+    fn p1_left_stick_past_deadzone_drives_p1_directions() {
+        // Acceptance #1 (stick path): the left analog stick past the deadzone
+        // drives P1's directions (SDL convention: +X right, +Y down).
+        let raw = RawController {
+            stick_x: 25_000,
+            stick_y: 25_000,
+            ..RawController::default()
+        };
+        let p1 = p1_input(MatchInput::none(), Some(raw));
+        assert!(p1.right, "stick +X -> P1 right");
+        assert!(p1.down, "stick +Y -> P1 down");
+        assert!(!p1.left && !p1.up);
+    }
+
+    #[test]
+    fn p1_keyboard_and_controller_are_ored_neither_disables_the_other() {
+        // Acceptance #2: keyboard AND controller both drive P1. The keyboard
+        // walks back + presses `a`; the pad simultaneously holds forward +
+        // presses `c`. Every asserted bit from either source must survive.
+        let kbd = MatchInput {
+            left: true,
+            a: true,
+            ..MatchInput::none()
+        };
+        let pad = RawController {
+            dpad_right: true,
+            shoulder_right: true, // c
+            ..RawController::default()
+        };
+        let p1 = p1_input(kbd, Some(pad));
+        assert!(p1.left, "keyboard direction survives");
+        assert!(p1.a, "keyboard button survives");
+        assert!(p1.right, "controller direction survives");
+        assert!(p1.c, "controller button survives");
+        // Untouched bits stay clear.
+        assert!(!p1.up && !p1.down && !p1.b && !p1.x && !p1.y && !p1.z);
+    }
+
+    #[test]
+    fn p1_keyboard_alone_works_when_no_controller_is_bound() {
+        // Acceptance #2/#3: with no controller (pad0 = None, the steady state
+        // after a disconnect frees the slot), the keyboard alone still drives
+        // P1 unchanged — the controller never gates the keyboard.
+        let kbd = MatchInput {
+            up: true,
+            z: true,
+            ..MatchInput::none()
+        };
+        assert_eq!(p1_input(kbd, None), kbd, "keyboard-only P1 is unaffected");
+    }
+
+    #[test]
+    fn p1_neutral_controller_does_not_clobber_keyboard() {
+        // Acceptance #3: a bound-but-idle controller (neutral raw snapshot,
+        // e.g. resting analog sticks) contributes nothing — it must not clear
+        // or alter the keyboard's P1 input.
+        let kbd = MatchInput {
+            right: true,
+            x: true,
+            ..MatchInput::none()
+        };
+        let neutral_pad = RawController::default();
+        assert_eq!(
+            p1_input(kbd, Some(neutral_pad)),
+            kbd,
+            "idle controller is a no-op on P1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Keyboard key map (T024): the player-1 scancode -> engine-input path.
     //
     // `match_input_from_held` is the pure core of `match_input_from_keyboard`;
