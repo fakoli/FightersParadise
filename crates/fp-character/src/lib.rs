@@ -8428,4 +8428,220 @@ mod tests {
             "seed-0 stream must still produce nonzero draws"
         );
     }
+
+    // =========================================================================
+    // T054 — Range-of-motion (ROM) behavioral test table
+    //
+    // Table-driven: drives the shipped trainingdummy through the executor using
+    // the same synthetic held-input path as T048/T052 seed tests above.  Each
+    // row maps a held-input motion → expected state + pos/vel outcome.  Adding a
+    // new motion = adding one `RomCase` row.
+    // =========================================================================
+
+    /// One row in the ROM table: a motion (as held command names) → assertions.
+    struct RomCase {
+        /// Human-readable label printed on failure.
+        name: &'static str,
+        /// Command names installed as `ActiveCommands` every tick.
+        cmds: &'static [&'static str],
+        /// State the character starts in (0 = stand, 11 = crouching-held, …).
+        start_state: i32,
+        /// Whether the character has control at tick 0.
+        start_ctrl: bool,
+        /// How many ticks to drive before sampling.
+        ticks: u32,
+        /// The character must pass through at least one of these states within
+        /// `ticks` ticks.  Empty slice means no state requirement.
+        expect_states: &'static [i32],
+        /// `pos.x` must be strictly Greater / Less / Equal compared to the
+        /// initial value after `ticks` ticks.
+        expect_pos_x: std::cmp::Ordering,
+        /// `pos.y` must be strictly Greater / Less / Equal compared to the
+        /// initial value after `ticks` ticks. (Y-up = negative in MUGEN.)
+        expect_pos_y: std::cmp::Ordering,
+    }
+
+    /// ROM table covering idle, walk fwd/back, crouch, stand-from-crouch,
+    /// jump neutral, and basic attack.  Order follows the task description.
+    const ROM: &[RomCase] = &[
+        // ----------------------------------------------------------------
+        // Idle: no input → stays in stand state 0; pos does not drift.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "idle",
+            cmds: &[],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 30,
+            expect_states: &[0],
+            expect_pos_x: std::cmp::Ordering::Equal,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+        // ----------------------------------------------------------------
+        // Walk forward: holdfwd → enters walk state 20, pos.x increases.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "walk fwd",
+            cmds: &["holdfwd"],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 30,
+            expect_states: &[20],
+            expect_pos_x: std::cmp::Ordering::Greater,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+        // ----------------------------------------------------------------
+        // Walk back: holdback → enters walk state 20, pos.x decreases.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "walk back",
+            cmds: &["holdback"],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 30,
+            expect_states: &[20],
+            expect_pos_x: std::cmp::Ordering::Less,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+        // ----------------------------------------------------------------
+        // Crouch: holddown → enters crouch start state 10 (then 11).
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "crouch",
+            cmds: &["holddown"],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 30,
+            expect_states: &[10, 11],
+            expect_pos_x: std::cmp::Ordering::Equal,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+        // ----------------------------------------------------------------
+        // Stand from crouch: start in crouching-held (11), release input →
+        // transitions through 12 and returns to stand state 0.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "stand from crouch",
+            cmds: &[],
+            start_state: 11,
+            start_ctrl: true,
+            ticks: 40,
+            expect_states: &[0],
+            expect_pos_x: std::cmp::Ordering::Equal,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+        // ----------------------------------------------------------------
+        // Jump neutral: holdup → enters jumpstart 40 then air state 50.
+        // pos.y departs from 0 (negative = upward in MUGEN convention).
+        // The jumpstart action (40) has 3-tick duration; the character
+        // passes through state 40 and then lands in state 50 (air).
+        // Both states are accepted so the check is robust to timing.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "jump neutral",
+            cmds: &["holdup"],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 30,
+            expect_states: &[40, 50],
+            expect_pos_x: std::cmp::Ordering::Equal,
+            expect_pos_y: std::cmp::Ordering::Less,
+        },
+        // ----------------------------------------------------------------
+        // Basic attack: command "a" → enters attack state 200.
+        // pos assertions are Equal: a one-frame button press starts the
+        // attack but state 200 of the trainingdummy has no horizontal vel.
+        // ----------------------------------------------------------------
+        RomCase {
+            name: "basic attack",
+            cmds: &["a"],
+            start_state: 0,
+            start_ctrl: true,
+            ticks: 5,
+            expect_states: &[200],
+            expect_pos_x: std::cmp::Ordering::Equal,
+            expect_pos_y: std::cmp::Ordering::Equal,
+        },
+    ];
+
+    /// Drives one ROM case through the executor and returns
+    /// `(reached_expected_state, final_pos_x, final_pos_y, start_pos_x, start_pos_y)`.
+    fn run_rom_case(loaded: &LoadedCharacter, case: &RomCase) -> (bool, f32, f32, f32, f32) {
+        let mut ch = Character::with_constants(loaded.constants);
+        ch.pos = Vec2::new(0.0, 0.0);
+        ch.facing = Facing::Right; // forward = +x
+        ch.state_no = case.start_state;
+        ch.ctrl = case.start_ctrl;
+        ch.anim = 0;
+        ch.set_command_source(Box::new(ActiveCommands::from_names(
+            case.cmds.iter().copied(),
+        )));
+
+        let start_x = ch.pos.x;
+        let start_y = ch.pos.y;
+        // Track whether the character visited any of the expected states.
+        let mut reached = case.expect_states.is_empty(); // trivially true when no state required
+
+        for _ in 0..case.ticks {
+            ch.tick(loaded, None, StageView::default());
+            if !reached && case.expect_states.contains(&ch.state_no) {
+                reached = true;
+            }
+        }
+
+        (reached, ch.pos.x, ch.pos.y, start_x, start_y)
+    }
+
+    /// T054: table-driven range-of-motion test on the shipped trainingdummy.
+    ///
+    /// Drives idle, walk fwd/back, crouch, stand-from-crouch, jump neutral, and
+    /// basic attack through the executor using the synthetic `ActiveCommands`
+    /// path — the same pattern as the T048/T052 seed tests.  Asserts the
+    /// correct state is reached and pos/vel respond as expected.
+    #[test]
+    fn trainingdummy_range_of_motion_table() {
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/trainingdummy/trainingdummy.def");
+        assert!(
+            def.exists(),
+            "shipped Training Dummy missing: {}",
+            def.display()
+        );
+        let loaded = LoadedCharacter::load(&def).expect("trainingdummy.def should load");
+
+        for case in ROM {
+            let (reached, end_x, end_y, start_x, start_y) = run_rom_case(&loaded, case);
+
+            // State assertion.
+            if !case.expect_states.is_empty() {
+                assert!(
+                    reached,
+                    "[ROM: {}] expected to visit one of {:?} within {} ticks",
+                    case.name, case.expect_states, case.ticks
+                );
+            }
+
+            // pos.x ordering assertion.
+            let actual_x_ord = end_x
+                .partial_cmp(&start_x)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            assert_eq!(
+                actual_x_ord, case.expect_pos_x,
+                "[ROM: {}] pos.x ordering wrong: start={start_x}, end={end_x}, \
+                 expected {:?}",
+                case.name, case.expect_pos_x
+            );
+
+            // pos.y ordering assertion.
+            let actual_y_ord = end_y
+                .partial_cmp(&start_y)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            assert_eq!(
+                actual_y_ord, case.expect_pos_y,
+                "[ROM: {}] pos.y ordering wrong: start={start_y}, end={end_y}, \
+                 expected {:?}",
+                case.name, case.expect_pos_y
+            );
+        }
+    }
 }
