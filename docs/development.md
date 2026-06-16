@@ -51,11 +51,32 @@ There is no `xtask` or build script — every operation is plain `cargo`:
 cargo build --workspace
 cargo test  --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p fp-app                        # default two-KFM match (test pattern if assets absent)
-cargo run -p fp-app -- p1.def [p2.def]     # explicit character(s)
+cargo run -p fp-app                        # no args -> the in-app Title menu (shipped clean-room motif)
+cargo run -p fp-app -- <dir>/              # directory discovery -> Title menu over a discovered roster
+cargo run -p fp-app -- p1.def [p2.def]     # direct match: explicit character(s), skips the menu
 cargo run -p fp-app -- file.sff [file.air] # static SFF sprite / AIR viewer
 cargo run -p fp-app -- validate char.def   # character validator / linter (lints a .def's assets/states)
 ```
+
+### CLI surface — directory discovery, motifs, and team flags
+
+The app's launch route is chosen by `cli_route` (`crates/fp-app/src/main.rs`) from
+the positional args, with two flags parsed and stripped first:
+
+| Arg / flag                  | Effect |
+| --------------------------- | ------ |
+| *(no args)* or `menu`       | `CliRoute::Menu` — boot the in-app **Title menu** over the shipped clean-room motif (`assets/data/{system,select}.def`, a roster pointing at `assets/trainingdummy`). No KFM needed. |
+| an existing **directory**   | `CliRoute::Directory` — scan it for a character roster (the MUGEN-standard `chars/<name>/<name>.def` layout, or a flat dir of `*.def`, via `fp_ui::discovery::discover_chars`) and boot the menu over it. Stages are likewise discovered from a `stages/` folder via `fp_stage::discover_stages`. |
+| a `.def`/`.sff`/… path      | `CliRoute::Direct` — the legacy direct content view (match or viewer), unchanged. |
+| `--motif <name\|path>`      | Pick a screenpack motif: a discovered motif **name** under `assets/data/` (via `fp_ui::discovery::discover_motifs`), a `system.def` path, or a motif directory holding one (`parse_motif_flag` / `resolve_motif_system_def`). An unresolvable value warns and falls back to the default motif — never a panic. |
+| `--simul` / `--turns`       | Team mode on the direct-CLI match (`parse_team_flag`): `TeamMode::Simul` (all fighters at once) or `TeamMode::Turns` (sequential KO hand-off). Default `TeamMode::Single` is the classic 1v1; the last flag wins if both are given. |
+
+The setup/options screen reachable from the Title menu remaps the player-1 keys
+(`screens::SetupScreen`/`InputConfig`) and customizes the HUD (life/power-bar
+colors + per-element visibility, `fp_ui::HudConfig` via
+`screens::HudCustomizeScreen`). See the
+[Content guide](content-guide.md#8-the-10-content-model--directory-discovery-motifs-teams--hud)
+for the full content-discovery layout and HUD options.
 
 The two wrappers below (Makefile + `scripts/fp.sh`) are thin conveniences over
 exactly these commands — there's no build magic, so anything via `make` or
@@ -142,20 +163,26 @@ pattern** on missing/bad assets and **never panic** (`select_mode`,
 `crates/fp-app/src/main.rs:972`).
 
 ```sh
-make run                                    # two-KFM match if test-assets present, else test pattern
+make run                                    # no-arg default: the Title menu over the shipped motif
 cargo run -p fp-app                         # same (no-args default)
-cargo run -p fp-app -- p1.def [p2.def]      # two-character match (one .def = same char both sides)
+cargo run -p fp-app -- <dir>/               # directory discovery: Title menu over a discovered roster
+cargo run -p fp-app -- p1.def [p2.def]      # direct two-character match (one .def = same char both sides)
+cargo run -p fp-app -- --motif <name> p1.def  # pick a discovered/explicit screenpack motif
+cargo run -p fp-app -- --simul p1.def       # Simul team match (--turns for sequential KO hand-off)
 cargo run -p fp-app -- file.sff [file.air]  # legacy static sprite / animation viewer
 scripts/fp.sh start                         # launch detached, then `status` / `stop`
 ```
 
-- **No args** loads a two-character Kung Fu Man match from
-  `DEFAULT_DEF = "test-assets/kfm/kfm.def"`
-  ([`crates/fp-app/src/main.rs:71`](../crates/fp-app/src/main.rs)); if that path
-  is absent it falls back to a checkerboard test pattern.
-- **Controls this milestone:** P1 is the keyboard. **P2 is a hardcoded idle
-  dummy** (`MatchInput::none()`, `main.rs:1133`) — no second-player input map or
-  AI yet.
+- **No args** boot the in-app **Title menu** (`cli_route` → `CliRoute::Menu`) over
+  the shipped clean-room motif (`assets/data/{system,select}.def`, a roster
+  pointing at `assets/trainingdummy`) — no KFM needed.
+- **A directory argument** scans it for a character roster (`chars/<name>/<name>.def`
+  or a flat dir of `*.def`) and boots the menu over the discovered roster.
+- **A direct `.def`** boots a match and bypasses the menu (`CliRoute::Direct`);
+  bad/missing assets fall back to a checkerboard test pattern rather than panicking.
+- **Controls:** P1 is the keyboard (remappable on the setup/options screen — see
+  the [content guide](content-guide.md#85-hud-customization--key-remapping-the-options-screen)).
+  P2 is the baseline CPU AI or a second keyboard.
 - **What you'll see:** two fighters drawn from their current AIR frame, two life
   bars + a blue power bar + a KO/winner marker. By default this is the
   hand-rolled solid-quad HUD over a flat clear color (the default KFM match ships
