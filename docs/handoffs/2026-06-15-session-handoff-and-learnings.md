@@ -122,3 +122,37 @@ A running list of what made this session work — apply these next time.
   only in tests.
 - **fakoli-state is the ledger** (`git_ops_mode: record_only`); agents own all git. Lifecycle:
   `claim → submit --commands/--files-changed/--pr-url → apply --approve` (→ done).
+
+## Post-parity live-debugging (2026-06-15, cont.) — "game freezes / slow / keyboard"
+
+A user-reported "game starts but is frozen, then extremely slow" on a **KFM-vs-Evil-Ken
+(Training)** match — actually loading **CVTW2Ryu** — was diagnosed live (via `screencapture`
++ macOS `sample`) and fixed in three merged PRs:
+
+- **#71** — deferred-controller WARN flood: a controller in a persistent state (−2) logged every
+  tick (~1400 lines/s) → terminal-I/O stall. Now logs **once per kind**; slot-map-full notices
+  downgraded to `debug!`.
+- **#73** — `run_state`/`run_current_with_transitions`/`run_ignorehitpause_only` **deep-cloned every
+  controller's `Expr` AST per tick** (`let ctrl = ctrl.clone()`). The compiled graph is owned by
+  `LoadedCharacter` (a param), so controllers are now **borrowed** — the dominant cost (a `sample`
+  was ~90% `Expr::clone`/`drop_in_place<Box<Expr>>`).
+- **#74** — `NumHelper`/`NumHelper(id)` was unimplemented (always 0), so evilken's
+  `NumHelper(id)=0` spawn-once guard never latched → it spawned a helper **every tick** to the
+  56-cap. Now reads the live slot-map (via a `Copy` `own_helper_ids` slice on `EntityGraph`,
+  installed on both root and helper ticks). Measured after: slot-map-full **70→0**, sample light.
+
+**Keyboard:** confirmed working (KFM walks both ways, timer advances). The user's keyboard issue was
+**CVTW2Ryu being unloadable** in this engine, not an input bug. P1 keys: move = `WASD`/arrows,
+punches a/b/c = `U`/`I`/`O`, kicks x/y/z = `J`/`K`/`L` (`KEYBOARD_BINDINGS`, main.rs).
+
+**New learning (16):** *verify the timer advances, not just that a frame renders.* I twice declared a
+fix done after seeing the screen "render" without confirming the match actually progressed; a beachball
+renders the last frame fine. Use `sample` to tell deadlock (one hot fn) from pathological cost (alloc
+churn spread across clone/drop), and compare two timestamped frames' timers.
+
+## Next-session backlog (fakoli-state `ready`; 17 tasks)
+
+The canonical list is `fakoli-state list --status ready`. Grouped:
+- **F017 — parity polish:** T026 Proj* triggers · T027 fp-app TeamMode+partner · T028 TeamMatch round/draw · T029 `.snd` ADX · T030 doc/semantic cleanups · T031 FNT v2.
+- **F018 — community-content robustness:** T032 helper lifecycle (DestroySelf/RemoveTime) · T033 Explod subsystem · T034 Shift-JIS CNS · T035 CMD `FU`/`BU` diagonal tokens · T036 `:=` assignment operator · T037 SFF v2 sub-header robustness. *(T032/T034–T037 are what CVTW2Ryu/sf3_ryu-class community chars need to load + play.)*
+- **F019 — controller + screens:** T038 P1 gamepad in-match · T039 title-menu controller nav · T040 char-select controller nav · T041 **new** stage-select screen · T042 **new** setup/options screen. *(User will pick these up in a future session.)*
