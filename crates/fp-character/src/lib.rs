@@ -2900,7 +2900,11 @@ impl Character {
     /// case-insensitive constant lookup. The members the KFM/common states read
     /// are mapped to the sub-structs added in task 5.3:
     ///
-    /// - `velocity.walk.fwd.x` / `velocity.walk.back.x`
+    /// - `velocity.walk.fwd.x` / `velocity.walk.back.x` (and the **bare**
+    ///   forms `velocity.walk.fwd` / `velocity.walk.back`, which alias `.x` —
+    ///   standard MUGEN content writes `VelSet x = const(velocity.walk.fwd)`;
+    ///   the same bare→`.x` aliasing applies to `velocity.run.*`,
+    ///   `velocity.jump.*`, and `velocity.airjump.*`)
     /// - `velocity.run.fwd.x` / `velocity.run.fwd.y`
     /// - `velocity.run.back.x` / `velocity.run.back.y`
     /// - `velocity.jump.neu.x` / `velocity.jump.y`
@@ -2948,31 +2952,53 @@ impl Character {
         }
 
         // Float-typed members (`[Velocity]` and `[Movement]`).
-        if m.eq_ignore_ascii_case("velocity.walk.fwd.x") {
+        //
+        // Bare velocity members (no `.x`/`.y` axis suffix) alias their `.x`
+        // component: standard MUGEN content (incl. the shipped trainingdummy
+        // [Statedef 20] walk) writes `VelSet x = const(velocity.walk.fwd)`,
+        // authoring walk/run/jump x-velocity x-first (walk is x-only). Without
+        // this, the bare form fell through to `Value::DEFAULT` (0) and every
+        // character "walked in place". Each bare arm returns the same value as
+        // its corresponding `.x` arm below.
+        if m.eq_ignore_ascii_case("velocity.walk.fwd.x")
+            || m.eq_ignore_ascii_case("velocity.walk.fwd")
+        {
             return Value::Float(c.velocity.walk_fwd.x);
         }
-        if m.eq_ignore_ascii_case("velocity.walk.back.x") {
+        if m.eq_ignore_ascii_case("velocity.walk.back.x")
+            || m.eq_ignore_ascii_case("velocity.walk.back")
+        {
             return Value::Float(c.velocity.walk_back.x);
         }
-        if m.eq_ignore_ascii_case("velocity.run.fwd.x") {
+        if m.eq_ignore_ascii_case("velocity.run.fwd.x")
+            || m.eq_ignore_ascii_case("velocity.run.fwd")
+        {
             return Value::Float(c.velocity.run_fwd.x);
         }
         if m.eq_ignore_ascii_case("velocity.run.fwd.y") {
             return Value::Float(c.velocity.run_fwd.y);
         }
-        if m.eq_ignore_ascii_case("velocity.run.back.x") {
+        if m.eq_ignore_ascii_case("velocity.run.back.x")
+            || m.eq_ignore_ascii_case("velocity.run.back")
+        {
             return Value::Float(c.velocity.run_back.x);
         }
         if m.eq_ignore_ascii_case("velocity.run.back.y") {
             return Value::Float(c.velocity.run_back.y);
         }
-        if m.eq_ignore_ascii_case("velocity.jump.neu.x") {
+        if m.eq_ignore_ascii_case("velocity.jump.neu.x")
+            || m.eq_ignore_ascii_case("velocity.jump.neu")
+        {
             return Value::Float(c.velocity.jump_neu.x);
         }
-        if m.eq_ignore_ascii_case("velocity.jump.fwd.x") {
+        if m.eq_ignore_ascii_case("velocity.jump.fwd.x")
+            || m.eq_ignore_ascii_case("velocity.jump.fwd")
+        {
             return Value::Float(c.velocity.jump_fwd.x);
         }
-        if m.eq_ignore_ascii_case("velocity.jump.back.x") {
+        if m.eq_ignore_ascii_case("velocity.jump.back.x")
+            || m.eq_ignore_ascii_case("velocity.jump.back")
+        {
             return Value::Float(c.velocity.jump_back.x);
         }
         if m.eq_ignore_ascii_case("velocity.jump.y") {
@@ -2990,13 +3016,19 @@ impl Character {
         if m.eq_ignore_ascii_case("velocity.runjump.back.y") {
             return Value::Float(c.velocity.runjump_back.y);
         }
-        if m.eq_ignore_ascii_case("velocity.airjump.neu.x") {
+        if m.eq_ignore_ascii_case("velocity.airjump.neu.x")
+            || m.eq_ignore_ascii_case("velocity.airjump.neu")
+        {
             return Value::Float(c.velocity.airjump_neu.x);
         }
-        if m.eq_ignore_ascii_case("velocity.airjump.fwd.x") {
+        if m.eq_ignore_ascii_case("velocity.airjump.fwd.x")
+            || m.eq_ignore_ascii_case("velocity.airjump.fwd")
+        {
             return Value::Float(c.velocity.airjump_fwd.x);
         }
-        if m.eq_ignore_ascii_case("velocity.airjump.back.x") {
+        if m.eq_ignore_ascii_case("velocity.airjump.back.x")
+            || m.eq_ignore_ascii_case("velocity.airjump.back")
+        {
             return Value::Float(c.velocity.airjump_back.x);
         }
         if m.eq_ignore_ascii_case("velocity.airjump.y") {
@@ -5023,6 +5055,115 @@ mod tests {
         );
     }
 
+    // ---- T048: bare velocity members alias their `.x` component -----------
+
+    #[test]
+    fn const_bare_velocity_members_alias_x_component() {
+        // T048 root cause: standard MUGEN content (incl. the shipped
+        // trainingdummy [Statedef 20] walk) writes
+        // `VelSet x = const(velocity.walk.fwd)` — the BARE member with no axis
+        // suffix. Before the fix the bare form matched no arm and fell through
+        // to Value::DEFAULT (0), so every character "walked in place". Each
+        // bare member must now resolve to the SAME value as its `.x` arm.
+        let ch = const_sample();
+        for (bare, dotted) in [
+            ("velocity.walk.fwd", "velocity.walk.fwd.x"),
+            ("velocity.walk.back", "velocity.walk.back.x"),
+            ("velocity.run.fwd", "velocity.run.fwd.x"),
+            ("velocity.run.back", "velocity.run.back.x"),
+            ("velocity.jump.fwd", "velocity.jump.fwd.x"),
+            ("velocity.jump.back", "velocity.jump.back.x"),
+            ("velocity.jump.neu", "velocity.jump.neu.x"),
+            ("velocity.airjump.fwd", "velocity.airjump.fwd.x"),
+            ("velocity.airjump.back", "velocity.airjump.back.x"),
+            ("velocity.airjump.neu", "velocity.airjump.neu.x"),
+        ] {
+            let bare_val = ch.trigger_str("const", bare);
+            let dotted_val = ch.trigger_str("const", dotted);
+            assert_eq!(bare_val, dotted_val, "bare `{bare}` must alias `{dotted}`");
+            // The const_sample fixture authors a non-zero x for these, so the
+            // alias is meaningfully non-default (proving it is not just 0==0).
+            assert_ne!(
+                bare_val,
+                Value::DEFAULT,
+                "bare `{bare}` should resolve to the authored non-zero velocity"
+            );
+        }
+    }
+
+    /// T048 behavioral regression: load the shipped (non-asset-gated) Training
+    /// Dummy, drive it with a held-forward `holdfwd` command via the executor,
+    /// and assert it (a) enters walk state 20 and (b) its world `pos.x`
+    /// strictly increases (right-facing P1). Held-back must decrease `pos.x`.
+    ///
+    /// This FAILS on pre-fix code: state 20's `VelSet x = const(velocity.walk.fwd)`
+    /// resolved to 0, so the dummy entered walk state 20 but never moved
+    /// ("walked in place"). Asserts `const(velocity.walk.fwd) == 2.4` for the
+    /// shipped dummy, the authored `[Velocity] walk.fwd`.
+    #[test]
+    fn training_dummy_walks_forward_and_back_via_const_velocity() {
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/trainingdummy/trainingdummy.def");
+        // The dummy is shippable content (not asset-gated); it must be present.
+        assert!(
+            def.exists(),
+            "shipped Training Dummy missing: {}",
+            def.display()
+        );
+        let loaded = LoadedCharacter::load(&def).expect("trainingdummy.def should load");
+
+        // The shipped dummy authors walk.fwd = 2.4 (trainingdummy.cns [Velocity]).
+        // `CharacterConstants` is `Copy`, so each `with_constants` takes a copy.
+        let probe = Character::with_constants(loaded.constants);
+        assert_eq!(
+            ev("const(velocity.walk.fwd) = 2.4", &probe),
+            Value::Int(1),
+            "shipped Training Dummy const(velocity.walk.fwd) must be 2.4"
+        );
+
+        // Drive a fresh entity directly through the executor with `holdfwd`
+        // held. State -1 (engine ground locomotion) bridges held-forward into
+        // walk state 20; state 20's VelSet then sets x = const(velocity.walk.fwd).
+        let walk_player = |cmd: &str| -> (i32, f32, f32) {
+            let mut ch = Character::with_constants(loaded.constants);
+            ch.pos = Vec2::new(0.0, 0.0);
+            ch.facing = Facing::Right; // forward = +x
+            ch.state_no = 0;
+            ch.ctrl = true;
+            ch.anim = 0;
+            ch.set_command_source(Box::new(ActiveCommands::from_names([cmd])));
+            let start_x = ch.pos.x;
+            let mut reached_walk = false;
+            for _ in 0..30 {
+                ch.tick(&loaded, None, StageView::default());
+                if ch.state_no == 20 {
+                    reached_walk = true;
+                }
+            }
+            let entered = if reached_walk { 20 } else { ch.state_no };
+            (entered, start_x, ch.pos.x)
+        };
+
+        // Held FORWARD: enters walk state 20 AND pos.x strictly increases.
+        let (fwd_state, fwd_start, fwd_end) = walk_player("holdfwd");
+        assert_eq!(
+            fwd_state, 20,
+            "held forward must enter walk state 20 (got {fwd_state})"
+        );
+        assert!(
+            fwd_end > fwd_start,
+            "held forward must increase pos.x (start {fwd_start}, end {fwd_end}) \
+             — pre-fix this stayed 0 (\"walked in place\")"
+        );
+
+        // Held BACK: pos.x strictly decreases.
+        let (_back_state, back_start, back_end) = walk_player("holdback");
+        assert!(
+            back_end < back_start,
+            "held back must decrease pos.x (start {back_start}, end {back_end})"
+        );
+    }
+
     // ---- A.P4 (Proctor): edge cases, error paths, MUGEN semantics ----------
 
     #[test]
@@ -5039,9 +5180,10 @@ mod tests {
             "velocity.jump.back.y",
             "velocity.airjump.fwd.y",
             "velocity.airjump.back.y",
-            // Bogus axis suffix / missing axis / nonexistent group.
+            // Bogus axis suffix / nonexistent group. (NOTE: the bare
+            // `velocity.airjump.fwd` IS a valid member — it aliases `.x` —
+            // so it is asserted nonzero in the bare-form alias test, not here.)
             "velocity.airjump.neu.z",
-            "velocity.airjump.fwd",
             "velocity.runjump",
             "velocity.run.sideways.x",
             "velocity.jump.diag.x",
@@ -5521,7 +5663,6 @@ mod tests {
             "data",                      // group only
             "velocity",                  // group only
             "velocity.walk",             // partial
-            "velocity.walk.fwd",         // missing axis
             "size.ground",               // partial
             "movement",                  // group only
             "velocity.walk.fwd.x.extra", // trailing junk
