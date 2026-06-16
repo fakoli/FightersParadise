@@ -273,6 +273,23 @@ MUGEN community content is messy. Parsers and the evaluator must:
   (© 2025 Sekou Doumbouya); see [LICENSE](LICENSE).
 - Commit/push only when asked; if on the default branch, branch first.
 
+## Orchestration & delegation
+
+- **Use the main session sparingly — delegate by default.** This top-level session is for *coordination*,
+  diagnosis / figuring-things-out, and interacting with the operator. Do the actual work in **subagents**:
+  spawn `Workflow` waves (implement → dual-review → fix, in isolated worktrees) or `Agent` subagents for
+  research, implementation, testing, and browser tasks, and run independent jobs **in parallel** (e.g. a
+  code-fix workflow and a Chrome asset-download subagent at the same time). Keep heavy file reading and
+  long multi-step edits out of the main context.
+- **Right-size the model per agent.** Not every agent needs Opus. Use **Opus** where it counts (subtle
+  engine/eval bugs, the critical fix, the toughest reviews) and **Sonnet** for mechanical or well-scoped
+  work (content authoring, browser nav, routine reviews). The wave workflow at
+  `.fakoli-state/wave-workflow.js` takes per-task `model` / `effort` / `reviewModel` / `peerModel`.
+- **Track substantive work in the ledger** (`fakoli-state`) so status / claims / evidence stay visible
+  across sessions.
+- Live GUI validation that drives the operator's real screen (e.g. `fp-app`) and operator interaction
+  stay in the main session — those genuinely need this context.
+
 ## Documentation
 
 Authoritative project docs live in `docs/`; research/planning docs in `docs/knowledge-base/`.
