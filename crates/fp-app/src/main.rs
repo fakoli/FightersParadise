@@ -3102,6 +3102,10 @@ fn stage_arg(args: &[String], i: usize) -> Option<&Path> {
 /// when no MUGEN `[BGdef]` stage is loaded.
 const DEFAULT_STAGE_BG: &str = "assets/stages/dojo/bg.png";
 
+/// The display name of the shipped dojo backdrop on the stage-select screen
+/// (T041). The first, always-present stage in the menu's stage list.
+const DEFAULT_STAGE_NAME: &str = "DOJO";
+
 /// Loads a PNG file as a full-color [`fp_render::ImageTexture`] (decoded to RGBA),
 /// or `None` — warn/info-logged, never a panic — when the file is absent or can't
 /// be decoded, so the match simply falls back to the flat clear color.
@@ -3166,6 +3170,22 @@ fn load_match_or_fallback(
     pal: PalSelection,
     renderer: &Renderer,
 ) -> Mode {
+    load_match_with_backdrop(p1_def, p2_def, stage_def, DEFAULT_STAGE_BG, pal, renderer)
+}
+
+/// Like [`load_match_or_fallback`] but with an explicit full-window backdrop
+/// image path used when no MUGEN `[BGdef]` `stage_def` is loaded (the menu
+/// stage-select screen lets the player choose the backdrop). All the same
+/// best-effort guarantees apply: a missing/bad backdrop simply leaves the flat
+/// clear color.
+fn load_match_with_backdrop(
+    p1_def: &Path,
+    p2_def: &Path,
+    stage_def: Option<&Path>,
+    backdrop_path: &str,
+    pal: PalSelection,
+    renderer: &Renderer,
+) -> Mode {
     match build_two_player_match(p1_def, p2_def, pal) {
         Ok(mut m) => {
             // The shipped common-effects (`fightfx`) set is loaded best-effort
@@ -3189,7 +3209,7 @@ fn load_match_or_fallback(
             // so the image is skipped there. Best-effort: a missing/bad asset just
             // leaves the flat clear color (no panic, no regression).
             let background = if stage.is_none() {
-                load_background_image(DEFAULT_STAGE_BG, renderer)
+                load_background_image(backdrop_path, renderer)
             } else {
                 None
             };
@@ -3420,6 +3440,11 @@ struct Motif {
     select: SelectDef,
     /// The on-disk path of the `select.def`, used to resolve roster `.def`s.
     select_path: PathBuf,
+    /// The stages offered on the stage-select screen (T041): the shipped dojo
+    /// backdrop plus every discovered stage `.def` (roster + `[ExtraStages]`),
+    /// filtered to the entries that actually exist on disk. Never empty — the
+    /// dojo backdrop is always present.
+    stages: Vec<screens::StageEntry>,
 }
 
 impl Motif {
@@ -3470,12 +3495,56 @@ impl Motif {
             }
         };
 
+        let stages = discover_stages(&select, &select_path);
+
         Self {
             system,
             select,
             select_path,
+            stages,
         }
     }
+}
+
+/// Builds the menu's stage list (T041): the always-present dojo backdrop plus
+/// every stage `.def` declared by the roster (`[Characters]` stages with
+/// `includestage` + `[ExtraStages]`) that actually exists on disk.
+///
+/// The candidate list comes from the pure [`screens::stage_entries_from_roster`];
+/// this is the impure step that drops `.def` candidates whose file is missing (so
+/// the player can't pick a stage that fails to load), keeping the backdrop
+/// regardless. The result is never empty.
+fn discover_stages(select: &SelectDef, select_path: &Path) -> Vec<screens::StageEntry> {
+    let base_dir = select_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidates = screens::stage_entries_from_roster(
+        select,
+        base_dir,
+        DEFAULT_STAGE_NAME,
+        Path::new(DEFAULT_STAGE_BG),
+    );
+    let stages: Vec<screens::StageEntry> = candidates
+        .into_iter()
+        .filter(|e| match e.kind {
+            // The backdrop is always kept (it is the guaranteed default even if
+            // its image is later missing — `load_background_image` degrades to the
+            // flat clear color).
+            screens::StageKind::Backdrop => true,
+            // A `.def` stage is only offered when its file exists, so the player
+            // can't pick a stage that won't load.
+            screens::StageKind::Def => {
+                let exists = e.path.exists();
+                if !exists {
+                    tracing::info!(
+                        "stage {} not found on disk; omitting from stage select",
+                        e.path.display()
+                    );
+                }
+                exists
+            }
+        })
+        .collect();
+    tracing::info!("stage select: {} stage(s) available", stages.len());
+    stages
 }
 
 /// Resolves the roster `select.def` path for a motif: the motif's `[Files]
@@ -3506,6 +3575,18 @@ enum RunScreen {
     Title(screens::TitleMenu),
     /// The character-select grid.
     Select(screens::SelectScreen),
+    /// The stage-select list (T041), shown after character-select and before the
+    /// fight. Carries the already-chosen [`screens::MatchPick`] so the match can
+    /// be built once a stage is confirmed; cancelling returns to character-select.
+    StageSelect {
+        /// The stage list + cursor.
+        stages: screens::StageSelect,
+        /// The characters chosen on the previous (character-select) screen.
+        pick: screens::MatchPick,
+        /// The select mode the pick came from, so cancelling can rebuild the
+        /// correct character-select screen.
+        mode: screens::SelectMode,
+    },
     /// A running two-player match. On match-over the flow returns to Title.
     Fight(Box<MatchRun>),
     /// Leave the application.
@@ -3559,24 +3640,46 @@ impl MenuApp {
         }
     }
 
-    /// Builds the two-player match for a completed [`screens::MatchPick`] and
-    /// enters the Fight screen, or returns to Title on a load failure (so a bad
-    /// roster `.def` never crashes the flow).
-    fn enter_fight(&mut self, pick: screens::MatchPick, renderer: &Renderer) {
+    /// Enters the stage-select screen (T041) for a completed character pick,
+    /// carrying the pick forward so the match can be assembled once a stage is
+    /// confirmed. Seeds the stage list from the loaded motif (the dojo backdrop
+    /// plus discovered `.def` stages).
+    fn enter_stage_select(&mut self, pick: screens::MatchPick, mode: screens::SelectMode) {
+        let stages = screens::StageSelect::new(self.motif.stages.clone());
+        self.screen = RunScreen::StageSelect { stages, pick, mode };
+    }
+
+    /// Builds the two-player match for a completed [`screens::MatchPick`] over the
+    /// chosen [`screens::StageChoice`] and enters the Fight screen, or returns to
+    /// Title on a load failure (so a bad roster `.def` never crashes the flow).
+    fn enter_fight(
+        &mut self,
+        pick: &screens::MatchPick,
+        stage: &screens::StageChoice,
+        renderer: &Renderer,
+    ) {
         tracing::info!(
-            "Starting match: P1={} ({}) vs P2={} ({})",
+            "Starting match: P1={} ({}) vs P2={} ({}) on stage {} ({})",
             pick.p1_name,
             pick.p1_def.display(),
             pick.p2_name,
             pick.p2_def.display(),
+            stage.name,
+            stage.path.display(),
         );
-        match build_match_run(&pick.p1_def, &pick.p2_def, renderer) {
+        match build_match_run(&pick.p1_def, &pick.p2_def, stage, renderer) {
             Some(run) => self.screen = RunScreen::Fight(Box::new(run)),
             None => {
                 tracing::warn!("could not start match; returning to title");
                 self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
             }
         }
+    }
+
+    /// Returns to the character-select screen for the given mode (used when the
+    /// player cancels out of stage-select).
+    fn return_to_select(&mut self, mode: screens::SelectMode) {
+        self.enter_select(mode);
     }
 
     /// Returns to the Title screen (fresh cursor).
@@ -3586,15 +3689,37 @@ impl MenuApp {
 }
 
 /// Builds a [`MatchRun`] (match + per-run render/audio/HUD resources) for two
-/// character `.def`s, mirroring the direct-CLI match path but without a stage or
-/// screenpack search (the menu flow ships none). Returns `None` on a character
-/// load failure so the caller can fall back to the title menu. Never panics.
-fn build_match_run(p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Option<MatchRun> {
-    match load_match_or_fallback(p1_def, p2_def, None, PalSelection::default(), renderer) {
+/// character `.def`s over the player-chosen stage (T041), mirroring the
+/// direct-CLI match path. A [`screens::StageKind::Def`] stage loads its MUGEN
+/// `[BGdef]` layers; a [`screens::StageKind::Backdrop`] stage draws its image as
+/// the full-window background (the dojo default). A missing/unloadable stage
+/// degrades to the flat clear color — the match still runs. Returns `None` on a
+/// character load failure so the caller can fall back to the title menu. Never
+/// panics.
+fn build_match_run(
+    p1_def: &Path,
+    p2_def: &Path,
+    stage: &screens::StageChoice,
+    renderer: &Renderer,
+) -> Option<MatchRun> {
+    // A `.def` stage becomes a MUGEN `[BGdef]` stage; a backdrop stage has no
+    // `.def` and instead overrides the full-window background image.
+    let (stage_def, backdrop): (Option<&Path>, &str) = match stage.kind {
+        screens::StageKind::Def => (Some(stage.path.as_path()), DEFAULT_STAGE_BG),
+        screens::StageKind::Backdrop => (None, stage.path.to_str().unwrap_or(DEFAULT_STAGE_BG)),
+    };
+    match load_match_with_backdrop(
+        p1_def,
+        p2_def,
+        stage_def,
+        backdrop,
+        PalSelection::default(),
+        renderer,
+    ) {
         Mode::Match(run) => Some(*run),
         // A character that fails to load degrades to the test pattern in
-        // `load_match_or_fallback`; the menu flow treats that as "couldn't start"
-        // and returns to the title rather than showing a checkerboard.
+        // `load_match_with_backdrop`; the menu flow treats that as "couldn't
+        // start" and returns to the title rather than showing a checkerboard.
         _ => None,
     }
 }
@@ -3694,6 +3819,39 @@ fn draw_select_screen(
         screens::SelectMode::Training => "PICK FIGHTER",
     };
     draw_centered_text(frame, font, hint, win_w, y + 20.0, 2.0, 0.8);
+}
+
+/// Draws the stage-select screen (T041): a header, the available stages as a
+/// centered vertical text list (one per line) with the cursor marker on the
+/// highlighted stage, and a short navigation hint. A no-op when no font is
+/// loaded.
+fn draw_stage_select_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    stages: &screens::StageSelect,
+    win_w: f32,
+) {
+    /// Stage-list text scale.
+    const SCALE: f32 = 2.5;
+    let line_h = font.line_height() as f32 * SCALE;
+
+    draw_centered_text(frame, font, "SELECT STAGE", win_w, 40.0, 3.0, 1.0);
+
+    let mut y = 120.0;
+    for (i, entry) in stages.entries.iter().enumerate() {
+        let selected = i == stages.cursor;
+        // A leading "> " marks the highlighted stage; others align under it.
+        let line = if selected {
+            format!("> {}", to_menu_text(&entry.name))
+        } else {
+            format!("  {}", to_menu_text(&entry.name))
+        };
+        let alpha = if selected { 1.0 } else { 0.6 };
+        draw_centered_text(frame, font, &line, win_w, y, SCALE, alpha);
+        y += line_h + 6.0;
+    }
+
+    draw_centered_text(frame, font, "PICK STAGE", win_w, y + 20.0, 2.0, 0.8);
 }
 
 /// Upcases `s` into the menu font's supported glyph set (the shipped FNT covers
@@ -4126,11 +4284,35 @@ fn run() -> fp_core::FpResult<()> {
                         }
                     }
                 }
-                RunScreen::Select(ref mut select) => match select.update(menu_in, frame_counter) {
-                    screens::SelectOutcome::Pending => {}
-                    screens::SelectOutcome::Cancelled => app.return_to_title(),
-                    screens::SelectOutcome::Done(pick) => app.enter_fight(pick, &renderer),
-                },
+                RunScreen::Select(ref mut select) => {
+                    let mode = select.mode;
+                    match select.update(menu_in, frame_counter) {
+                        screens::SelectOutcome::Pending => {}
+                        screens::SelectOutcome::Cancelled => app.return_to_title(),
+                        // Characters chosen: advance to stage-select (T041), not
+                        // straight to the fight.
+                        screens::SelectOutcome::Done(pick) => app.enter_stage_select(pick, mode),
+                    }
+                }
+                RunScreen::StageSelect {
+                    ref mut stages,
+                    ref pick,
+                    mode,
+                } => {
+                    // Step the stage cursor, then clone the pick so the
+                    // `&mut app.screen` borrow ends before `enter_fight`/
+                    // `return_to_select` reassign the screen.
+                    let outcome = stages.update(menu_in);
+                    let pick = pick.clone();
+                    match outcome {
+                        screens::StageOutcome::Pending => {}
+                        // Cancel from stage-select goes back to character-select.
+                        screens::StageOutcome::Cancelled => app.return_to_select(mode),
+                        screens::StageOutcome::Done(stage) => {
+                            app.enter_fight(&pick, &stage, &renderer);
+                        }
+                    }
+                }
                 RunScreen::Fight(_) | RunScreen::Quit => {}
             }
 
@@ -4247,6 +4429,11 @@ fn run() -> fp_core::FpResult<()> {
                 RunScreen::Select(select) => {
                     if let Some(font) = app.font.as_ref() {
                         draw_select_screen(&mut frame, font, select, win_wf);
+                    }
+                }
+                RunScreen::StageSelect { stages, .. } => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_stage_select_screen(&mut frame, font, stages, win_wf);
                     }
                 }
                 RunScreen::Fight(run) => {
@@ -7375,6 +7562,95 @@ mod tests {
         // After a few ticks the match is still coherent (no panic; both alive).
         assert!(m.p1().life() >= 0);
         assert!(m.p2().life() >= 0);
+    }
+
+    /// The loaded motif always exposes at least one stage (the dojo backdrop) for
+    /// the stage-select screen (T041), and that first stage is the backdrop kind —
+    /// even with the shipped roster that declares no stages, the menu can always
+    /// offer a choice. Asset-gated on the shipped motif.
+    #[test]
+    fn motif_stage_list_always_has_the_dojo_backdrop() {
+        let system_path = shipped_asset("data/system.def");
+        let fallback = shipped_asset("data/select.def");
+        if !system_path.exists() {
+            eprintln!("skipping: {} not present", system_path.display());
+            return;
+        }
+        let motif = Motif::load_from(&system_path, &fallback);
+        assert!(
+            !motif.stages.is_empty(),
+            "stage list is never empty (the dojo backdrop is always present)"
+        );
+        assert_eq!(
+            motif.stages[0].kind,
+            screens::StageKind::Backdrop,
+            "the first stage is the dojo backdrop"
+        );
+        assert_eq!(motif.stages[0].name, DEFAULT_STAGE_NAME);
+    }
+
+    /// `discover_stages` keeps the dojo backdrop and drops `.def` stages whose
+    /// files don't exist on disk (so the player can't pick an unloadable stage),
+    /// using a synthetic roster — no shipped asset needed.
+    #[test]
+    fn discover_stages_filters_missing_def_stages_keeps_backdrop() {
+        // A synthetic roster declaring an extra stage that does NOT exist on disk.
+        let select = SelectDef::parse(
+            "[Characters]\n\
+             Alpha, a/a.def\n\
+             [ExtraStages]\n\
+             stages/does_not_exist.def\n",
+        );
+        // Resolve relative to a directory that certainly has no such stage file.
+        let select_path = Path::new("/no/such/dir/select.def");
+        let stages = discover_stages(&select, select_path);
+        // The backdrop survives; the missing .def is filtered out.
+        assert_eq!(stages.len(), 1, "only the backdrop remains");
+        assert_eq!(stages[0].kind, screens::StageKind::Backdrop);
+    }
+
+    /// Full headless menu flow without a GPU: character-select Done advances to
+    /// stage-select carrying the pick, stage-select Done resolves the chosen
+    /// stage, and the carried pick + chosen stage are exactly what the match would
+    /// load (T041). Exercises the Title->Select->StageSelect transition logic the
+    /// `enter_*` glue drives, using the shipped motif. Asset-gated.
+    #[test]
+    fn select_then_stage_select_carries_pick_and_stage() {
+        let system_path = shipped_asset("data/system.def");
+        let fallback = shipped_asset("data/select.def");
+        if !system_path.exists() {
+            eprintln!("skipping: {} not present", system_path.display());
+            return;
+        }
+        let motif = Motif::load_from(&system_path, &fallback);
+        // 1. Character-select (Training): a single confirm completes the pick.
+        let mut select = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        let confirm = screens::MenuInput {
+            confirm: true,
+            ..screens::MenuInput::default()
+        };
+        let screens::SelectOutcome::Done(pick) = select.update(confirm, 0) else {
+            panic!("character-select should complete");
+        };
+        // 2. Stage-select is seeded from the motif's discovered stage list and
+        //    confirms the highlighted (first = dojo backdrop) stage.
+        let mut stage_screen = screens::StageSelect::new(motif.stages.clone());
+        let screens::StageOutcome::Done(stage) = stage_screen.update(confirm) else {
+            panic!("stage-select should complete on confirm");
+        };
+        // The chosen stage is the dojo backdrop, and the carried pick is intact —
+        // exactly what `build_match_run` would load.
+        assert_eq!(stage.kind, screens::StageKind::Backdrop);
+        assert_eq!(stage.name, DEFAULT_STAGE_NAME);
+        assert!(
+            pick.p1_def.exists(),
+            "carried pick still resolves to a real .def"
+        );
     }
 
     /// `resolve_select_path` prefers the motif's declared `[Files] select`

@@ -1,10 +1,12 @@
-//! In-app screen state machine: Title menu -> Character-Select -> Fight -> Title.
+//! In-app screen state machine: Title menu -> Character-Select -> Stage-Select
+//! -> Fight -> Title.
 //!
 //! This module owns the **pure** menu/cursor/transition logic for the app's
-//! out-of-fight flow (the [`Screen`] state machine, the title menu and select
-//! grid navigation, and the roster-pick -> which-`.def`-to-load decision), kept
-//! free of SDL2 and the GPU so it is unit-testable headlessly. The SDL2 window,
-//! 60Hz accumulator loop, and GPU rendering that drives it live in `main.rs`.
+//! out-of-fight flow (the [`Screen`] state machine, the title menu, the select
+//! grid, the stage-select list, and the roster-pick -> which-`.def`-to-load
+//! decision), kept free of SDL2 and the GPU so it is unit-testable headlessly.
+//! The SDL2 window, 60Hz accumulator loop, and GPU rendering that drives it
+//! live in `main.rs`.
 //!
 //! The flow:
 //! - **Title** ([`TitleMenu`]) renders the enabled motif menu items as text with
@@ -14,16 +16,23 @@
 //! - **Select** ([`SelectScreen`]) renders the `select.def` roster as a text
 //!   grid with a P1 cursor (and a P2 cursor in VS). Confirming P1 (then P2 in
 //!   VS) yields a [`MatchPick`] naming the character `.def`(s) to load.
-//! - **Fight** runs the existing two-player [`fp_engine::Match`]; on match-over
-//!   it returns to Title.
+//! - **Stage-Select** ([`StageSelect`]) renders the available stages (the shipped
+//!   dojo backdrop plus any discovered stage `.def`) as a vertical list with one
+//!   cursor. Confirming yields a [`StageChoice`] naming the stage the match
+//!   loads; cancelling returns to character-select.
+//! - **Fight** runs the existing two-player [`fp_engine::Match`] over the chosen
+//!   stage; on match-over it returns to Title.
 //!
 //! Nothing here panics: a missing motif/roster degrades to a built-in fallback,
-//! an empty roster yields no pick (the caller stays on Title), and
-//! `RandomSelect` is resolved deterministically against a caller-supplied seed.
+//! an empty roster yields no pick (the caller stays on Title), the stage list is
+//! never empty (the dojo backdrop is always present), and `RandomSelect` is
+//! resolved deterministically against a caller-supplied seed.
 
 use std::path::{Path, PathBuf};
 
 use fp_ui::{MenuItemKind, RosterEntry, SelectDef, SelectInfo, SelectSlot, SystemDef};
+
+// `SelectSlot` is used both in `SelectScreen::new` and `stage_entries_from_roster`.
 
 /// An edge-detected, source-agnostic menu input for one frame.
 ///
@@ -456,6 +465,215 @@ impl SelectScreen {
         let idx = (seed % concrete.len() as u64) as usize;
         concrete.get(idx).copied()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-Select (T041)
+// ---------------------------------------------------------------------------
+
+/// How a selectable stage is realised when the match loads it.
+///
+/// Fighters Paradise has two kinds of stage background: a MUGEN `[BGdef]`-style
+/// stage `.def` (with parallax layers + a following camera) and the shipped
+/// full-window backdrop image (the default dojo). The stage-select screen offers
+/// both, and the kind tells `main.rs` which loader to drive for the pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageKind {
+    /// A MUGEN stage `.def`: parsed by `fp_stage::Stage` and rendered with its
+    /// own `[BGdef]` sprite layers and a fighter-following camera.
+    Def,
+    /// The shipped clean-room backdrop image (the default dojo): drawn as a
+    /// full-window RGBA image behind the fighters, with no camera follow.
+    Backdrop,
+}
+
+/// One selectable stage on the stage-select screen: a display name, the path the
+/// match loads, and which [`StageKind`] loader to use for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageEntry {
+    /// The name shown on the stage-select line.
+    pub name: String,
+    /// The path the match loads for this stage: a stage `.def` for
+    /// [`StageKind::Def`], or the backdrop image for [`StageKind::Backdrop`].
+    pub path: PathBuf,
+    /// Which loader realises this stage.
+    pub kind: StageKind,
+}
+
+impl StageEntry {
+    /// Builds the shipped default backdrop entry (the dojo): a
+    /// [`StageKind::Backdrop`] pointing at `backdrop_path`.
+    #[must_use]
+    pub fn backdrop(name: impl Into<String>, backdrop_path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            path: backdrop_path.into(),
+            kind: StageKind::Backdrop,
+        }
+    }
+
+    /// Builds a stage-`.def` entry ([`StageKind::Def`]) from a name and path.
+    #[must_use]
+    pub fn def(name: impl Into<String>, def_path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            path: def_path.into(),
+            kind: StageKind::Def,
+        }
+    }
+}
+
+/// The stage a completed stage-select resolved to: the path to load and how to
+/// load it (see [`StageKind`]). The match build in `main.rs` consumes this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageChoice {
+    /// The chosen stage's display name (for logging / a future VS screen).
+    pub name: String,
+    /// The chosen stage's path: a stage `.def` or the backdrop image.
+    pub path: PathBuf,
+    /// Which loader realises the chosen stage.
+    pub kind: StageKind,
+}
+
+/// What one frame of stage-select input produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// Still choosing; stay on the stage-select screen.
+    Pending,
+    /// A stage was confirmed: load it and fight.
+    Done(StageChoice),
+    /// The player cancelled back to character-select.
+    Cancelled,
+}
+
+/// The stage-select screen: the available stages plus a single cursor.
+///
+/// Built from a list of [`StageEntry`] (see [`stage_entries_from_roster`]). The
+/// list is always non-empty (the caller seeds it with at least the dojo
+/// backdrop), so navigation never has to guard an empty list, but the
+/// constructor still tolerates one (the cursor pins to 0 and confirm yields
+/// nothing) rather than panicking. Up/Down (and Left/Right) move the cursor with
+/// wrap; confirm picks the cursor's stage; back cancels to character-select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSelect {
+    /// The selectable stages, in display order.
+    pub entries: Vec<StageEntry>,
+    /// The currently highlighted entry index (`0` when empty).
+    pub cursor: usize,
+}
+
+impl StageSelect {
+    /// Builds the stage-select screen from a list of stages, starting the cursor
+    /// on the first. An empty list is tolerated (cursor `0`, confirm a no-op).
+    #[must_use]
+    pub fn new(entries: Vec<StageEntry>) -> Self {
+        Self { entries, cursor: 0 }
+    }
+
+    /// Applies one frame of input.
+    ///
+    /// Up/Down (a vertical list) move the single cursor with wrap; Left/Right are
+    /// treated as the same vertical step so either axis navigates. `back` cancels
+    /// to character-select. `confirm` resolves the highlighted stage into a
+    /// [`StageChoice`] and returns [`StageOutcome::Done`]. Returns
+    /// [`StageOutcome::Pending`] when nothing actionable happened this frame.
+    pub fn update(&mut self, input: MenuInput) -> StageOutcome {
+        if self.entries.is_empty() {
+            // Nothing to choose; only allow cancelling back so we're never stuck.
+            return if input.back {
+                StageOutcome::Cancelled
+            } else {
+                StageOutcome::Pending
+            };
+        }
+        if input.back {
+            return StageOutcome::Cancelled;
+        }
+        let len = self.entries.len();
+        // A vertical list: up/down (and left/right, for convenience) step one
+        // entry with wrap.
+        if input.up || input.left {
+            self.cursor = wrap_dec(self.cursor, len);
+        }
+        if input.down || input.right {
+            self.cursor = wrap_inc(self.cursor, len);
+        }
+        if input.confirm {
+            if let Some(entry) = self.entries.get(self.cursor) {
+                return StageOutcome::Done(StageChoice {
+                    name: entry.name.clone(),
+                    path: entry.path.clone(),
+                    kind: entry.kind,
+                });
+            }
+        }
+        StageOutcome::Pending
+    }
+}
+
+/// Builds the default stage list from a parsed roster + the dojo backdrop.
+///
+/// The list always begins with the shipped dojo `backdrop` (`backdrop_name` at
+/// `backdrop_path`) so there is always at least one stage to pick, then appends,
+/// de-duplicated and in roster order:
+/// - each `[Characters]` entry's own `stage` (when `includestage` is set), and
+/// - every `[ExtraStages]` stage `.def`,
+///
+/// each resolved relative to the `select.def` directory (`base_dir`) — matching
+/// how MUGEN resolves stage paths in a `select.def`. Pure (no filesystem access):
+/// the caller filters the result to the stages that actually exist on disk. The
+/// display name is the stage `.def`'s file stem (uppercased by the renderer),
+/// which is a reasonable label without reading the file.
+#[must_use]
+pub fn stage_entries_from_roster(
+    select: &SelectDef,
+    base_dir: &Path,
+    backdrop_name: &str,
+    backdrop_path: &Path,
+) -> Vec<StageEntry> {
+    let mut entries = vec![StageEntry::backdrop(backdrop_name, backdrop_path)];
+    let mut seen: Vec<PathBuf> = vec![entries[0].path.clone()];
+
+    let mut push_def = |raw: &str| {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("random") {
+            return;
+        }
+        let resolved = base_dir.join(raw);
+        if seen.contains(&resolved) {
+            return;
+        }
+        let name = stage_label(&resolved);
+        seen.push(resolved.clone());
+        entries.push(StageEntry::def(name, resolved));
+    };
+
+    // Per-character stages (only when the character offers its stage).
+    for slot in &select.slots {
+        if let SelectSlot::Character(e) = slot {
+            if e.include_stage {
+                if let Some(stage) = e.stage.as_deref() {
+                    push_def(stage);
+                }
+            }
+        }
+    }
+    // Then the explicit extra stages.
+    for stage in &select.extra_stages {
+        push_def(stage);
+    }
+
+    entries
+}
+
+/// A display label for a stage `.def` path: its file stem, or the whole file
+/// name when it has no stem. Used so the stage list reads names without parsing
+/// each `.def`'s `[Info]` section.
+fn stage_label(path: &Path) -> String {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 /// Moves a linear grid cursor one step per asserted direction, wrapping at the
@@ -924,5 +1142,170 @@ mod tests {
         ] {
             assert_eq!(move_cursor(0, dir, 1, 1), 0);
         }
+    }
+
+    // ---- stage select ---------------------------------------------------
+
+    fn right() -> MenuInput {
+        MenuInput {
+            right: true,
+            ..MenuInput::default()
+        }
+    }
+
+    fn three_stages() -> StageSelect {
+        StageSelect::new(vec![
+            StageEntry::backdrop("DOJO", "assets/stages/dojo/bg.png"),
+            StageEntry::def("ARENA", "stages/arena.def"),
+            StageEntry::def("TEMPLE", "stages/temple.def"),
+        ])
+    }
+
+    #[test]
+    fn stage_cursor_moves_and_wraps() {
+        let mut s = three_stages();
+        assert_eq!(s.cursor, 0);
+        assert_eq!(s.update(down()), StageOutcome::Pending);
+        assert_eq!(s.cursor, 1);
+        s.update(down());
+        assert_eq!(s.cursor, 2);
+        s.update(down());
+        assert_eq!(s.cursor, 0, "down wraps from last to first");
+        s.update(up());
+        assert_eq!(s.cursor, 2, "up wraps from first to last");
+    }
+
+    #[test]
+    fn stage_left_right_navigate_like_up_down() {
+        // Either axis steps the single cursor (a controller D-pad / stick on
+        // either axis can drive the list).
+        let mut s = three_stages();
+        s.update(right());
+        assert_eq!(s.cursor, 1);
+        let left = MenuInput {
+            left: true,
+            ..MenuInput::default()
+        };
+        s.update(left);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn stage_confirm_yields_highlighted_choice() {
+        let mut s = three_stages();
+        s.update(down()); // -> ARENA (a .def stage)
+        let StageOutcome::Done(choice) = s.update(confirm()) else {
+            panic!("confirm should complete the stage screen");
+        };
+        assert_eq!(choice.name, "ARENA");
+        assert_eq!(choice.path, PathBuf::from("stages/arena.def"));
+        assert_eq!(choice.kind, StageKind::Def);
+    }
+
+    #[test]
+    fn stage_confirm_on_default_yields_backdrop() {
+        // The first entry is the shipped dojo backdrop (a full-window image).
+        let mut s = three_stages();
+        let StageOutcome::Done(choice) = s.update(confirm()) else {
+            panic!("confirm should complete");
+        };
+        assert_eq!(choice.name, "DOJO");
+        assert_eq!(choice.kind, StageKind::Backdrop);
+        assert_eq!(choice.path, PathBuf::from("assets/stages/dojo/bg.png"));
+    }
+
+    #[test]
+    fn stage_back_cancels_to_character_select() {
+        let mut s = three_stages();
+        assert_eq!(s.update(back()), StageOutcome::Cancelled);
+    }
+
+    #[test]
+    fn stage_empty_list_only_cancels_never_panics() {
+        let mut s = StageSelect::new(vec![]);
+        assert!(s.entries.is_empty());
+        // Confirm/navigation on an empty list is inert (no panic, no pick).
+        assert_eq!(s.update(confirm()), StageOutcome::Pending);
+        assert_eq!(s.update(down()), StageOutcome::Pending);
+        assert_eq!(s.update(back()), StageOutcome::Cancelled);
+    }
+
+    #[test]
+    fn stage_entries_from_roster_starts_with_backdrop_then_def_stages() {
+        // Two characters (one offering a stage, one with includestage=0) plus an
+        // extra stage. The display names carry a space so the parser uses the
+        // explicit-def form; the stage is the third field.
+        let select = SelectDef::parse(
+            "[Characters]\n\
+             Char Alpha, a/a.def, stages/alpha.def\n\
+             Char Beta, b/b.def, stages/beta.def, includestage=0\n\
+             [ExtraStages]\n\
+             stages/extra.def\n",
+        );
+        let entries = stage_entries_from_roster(
+            &select,
+            Path::new("data"),
+            "DOJO",
+            Path::new("assets/stages/dojo/bg.png"),
+        );
+        // [0] is always the dojo backdrop.
+        assert_eq!(entries[0].kind, StageKind::Backdrop);
+        assert_eq!(entries[0].name, "DOJO");
+        // Alpha's stage is offered (includestage default true); Beta's is not
+        // (includestage=0). The extra stage follows. All resolved under data/.
+        let def_paths: Vec<&PathBuf> = entries
+            .iter()
+            .filter(|e| e.kind == StageKind::Def)
+            .map(|e| &e.path)
+            .collect();
+        assert!(def_paths.contains(&&PathBuf::from("data").join("stages/alpha.def")));
+        assert!(def_paths.contains(&&PathBuf::from("data").join("stages/extra.def")));
+        assert!(
+            !def_paths.contains(&&PathBuf::from("data").join("stages/beta.def")),
+            "includestage=0 excludes the character's stage"
+        );
+        // The .def label is the file stem.
+        let alpha = entries
+            .iter()
+            .find(|e| e.path == PathBuf::from("data").join("stages/alpha.def"))
+            .unwrap();
+        assert_eq!(alpha.name, "alpha");
+    }
+
+    #[test]
+    fn stage_entries_from_roster_dedups_repeated_stages() {
+        // The same stage named by two characters AND in extra-stages appears once.
+        let select = SelectDef::parse(
+            "[Characters]\n\
+             Char Alpha, a/a.def, stages/shared.def\n\
+             Char Beta, b/b.def, stages/shared.def\n\
+             [ExtraStages]\n\
+             stages/shared.def\n",
+        );
+        let entries = stage_entries_from_roster(
+            &select,
+            Path::new("data"),
+            "DOJO",
+            Path::new("assets/stages/dojo/bg.png"),
+        );
+        let shared = PathBuf::from("data").join("stages/shared.def");
+        let count = entries.iter().filter(|e| e.path == shared).count();
+        assert_eq!(count, 1, "a repeated stage is de-duplicated");
+    }
+
+    #[test]
+    fn stage_entries_from_roster_always_has_backdrop_when_no_stages() {
+        // A roster whose only character declares no stage (a bare classic-form
+        // name, no second field) still yields the dojo backdrop, so the stage
+        // screen always offers a choice.
+        let select = SelectDef::parse("[Characters]\nonly\n");
+        let entries = stage_entries_from_roster(
+            &select,
+            Path::new("data"),
+            "DOJO",
+            Path::new("assets/stages/dojo/bg.png"),
+        );
+        assert_eq!(entries.len(), 1, "no stages declared -> only the backdrop");
+        assert_eq!(entries[0].kind, StageKind::Backdrop);
     }
 }
