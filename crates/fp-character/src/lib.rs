@@ -77,8 +77,8 @@ pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{
-    FreezeKind, FreezeRequest, HelperPosType, HelperSpawn, ProjectileSpawn, SoundRequest, TargetOp,
-    TickReport,
+    ExplodOp, ExplodPosType, ExplodSpawn, FreezeKind, FreezeRequest, HelperPosType, HelperSpawn,
+    ProjectileSpawn, SoundRequest, TargetOp, TickReport,
 };
 pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};

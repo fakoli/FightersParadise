@@ -1637,6 +1637,25 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
     }
 }
 
+/// Ensures the GPU textures for every live explod's current sprite are cached
+/// (T033). Run once per frame **before** `begin_frame`, like
+/// [`cache_effect_sprites`], because decoding needs `&Renderer`. Each explod plays
+/// one of its owner's AIR actions, so its sprite is decoded from that owner's SFF
+/// into that owner's per-character cache. A missing/undecodable sprite is a no-op
+/// (logged once by the cache).
+fn cache_explod_sprites(run: &mut MatchRun, renderer: &Renderer) {
+    let p1: Vec<SpriteId> = run.m.p1().explods().iter().map(|e| e.sprite).collect();
+    let p2: Vec<SpriteId> = run.m.p2().explods().iter().map(|e| e.sprite).collect();
+    for sprite in p1 {
+        run.p1_render
+            .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer, None);
+    }
+    for sprite in p2 {
+        run.p2_render
+            .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer, None);
+    }
+}
+
 /// The sprite caches a hit-spark [`Effect`] may draw from, picked per effect by
 /// its [`EffectSide`] (audit #17): the two fighters' caches and the optional
 /// shared common-effects (`fightfx`) cache. Bundled so [`draw_effects`] stays a
@@ -1707,6 +1726,54 @@ fn draw_effects(
             x: draw_x,
             y: draw_y,
             blend: fp_render::BlendMode::Additive,
+            ..Default::default()
+        };
+        frame.draw_sprite(&cached.texture, &cached.palette, &params);
+    }
+}
+
+/// Draws every live explod display entity at its world position (T033).
+///
+/// Each explod is spawned by a fighter's `Explod` controller and plays one of that
+/// fighter's own AIR actions, so its frames resolve against that fighter's sprite
+/// cache ([`Explod::owner`] selects P1's or P2's). The world-to-screen mapping
+/// matches the fighters and the hit-sparks (`world_to_screen_x` + the ground
+/// plane, offset by `camera_x`); the explod is anchored by its sprite axis and the
+/// AIR frame's authored offset. Explods are drawn ordered by their `sprpriority`
+/// relative to a baseline so a higher-priority explod draws in front; a
+/// missing/uncached sprite is skipped (never a panic). Draws over the fighters,
+/// under the front BG/HUD — like [`draw_effects`].
+fn draw_explods(
+    frame: &mut fp_render::RenderFrame<'_>,
+    p1_render: &FighterRender,
+    p2_render: &FighterRender,
+    m: &Match,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
+) {
+    let ground_y = win_h * 0.8;
+    // Gather (owner-cache, explod) pairs from both players, then draw in ascending
+    // sprpriority so higher-priority explods composite over lower ones.
+    let mut items: Vec<(&FighterRender, &fp_engine::Explod)> = Vec::new();
+    for e in m.p1().explods() {
+        items.push((p1_render, e));
+    }
+    for e in m.p2().explods() {
+        items.push((p2_render, e));
+    }
+    items.sort_by_key(|(_, e)| e.sprpriority);
+
+    for (cache, e) in items {
+        let Some(cached) = cache.sprite_cache.get(&e.sprite) else {
+            continue;
+        };
+        let screen_x = world_to_screen_x(e.pos.x - camera_x, win_w);
+        let draw_x = screen_x - cached.axis_x as f32 + e.offset.x as f32;
+        let draw_y = ground_y + e.pos.y - cached.axis_y as f32 + e.offset.y as f32;
+        let params = SpriteDrawParams {
+            x: draw_x,
+            y: draw_y,
             ..Default::default()
         };
         frame.draw_sprite(&cached.texture, &cached.palette, &params);
@@ -3705,6 +3772,7 @@ fn cache_match_run(run: &mut MatchRun, renderer: &Renderer) {
     cache_player_sprite(&mut run.p1_render, run.m.p1(), renderer);
     cache_player_sprite(&mut run.p2_render, run.m.p2(), renderer);
     cache_effect_sprites(run, renderer);
+    cache_explod_sprites(run, renderer);
     if let Some(stage) = run.stage.as_mut() {
         stage.cache_sprites(renderer);
     }
@@ -3772,6 +3840,18 @@ fn draw_match_run(
             p2_render: &run.p2_render,
             common_render: run.common_fx.as_ref().map(|c| &c.render),
         },
+        &run.m,
+        camera_x,
+        win_wf,
+        win_hf,
+    );
+
+    // Explod display entities (T033), drawn OVER both fighters with the sparks,
+    // under the front BG/HUD; each draws from its owner's sprite cache.
+    draw_explods(
+        frame,
+        &run.p1_render,
+        &run.p2_render,
         &run.m,
         camera_x,
         win_wf,

@@ -56,9 +56,9 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, Facing,
-    HelperPosType, HelperSpawn, LoadedCharacter, MoveType, ProjectileSpawn, RoundView, StageView,
-    StateType, TickReport,
+    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, ExplodOp,
+    ExplodPosType, ExplodSpawn, Facing, HelperPosType, HelperSpawn, LoadedCharacter, MoveType,
+    ProjectileSpawn, RoundView, StageView, StateType, TickReport,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -550,6 +550,132 @@ impl Projectile {
     }
 }
 
+/// A hard cap on the number of live explods a single player may own at once
+/// (T033). MUGEN bounds the global explod count; this keeps the explod slot-map
+/// bounded so a runaway `Explod`-spawning loop (e.g. an `Explod` in a persistent
+/// state) can never grow the simulation without limit.
+const MAX_EXPLODS_PER_PLAYER: usize = 64;
+
+/// Hard cap on the number of frames an explod lives, regardless of its
+/// `removetime` (T033). MUGEN allows an explod to loop forever (`removetime = -2`)
+/// or to be left around indefinitely; this ceiling guarantees even an
+/// unbounded-lifetime explod is eventually reaped so the slot-map cannot leak.
+/// It is generous (5 seconds at 60Hz) so a legitimately long explod still plays
+/// in full.
+const EXPLOD_MAX_LIFETIME: i32 = 300;
+
+/// One live **explod** display entity owned by a [`Player`] (T033).
+///
+/// An `Explod` is a short-lived, non-colliding *display* effect spawned by its
+/// owner's `Explod` controller. Unlike a [`Projectile`] it carries no `HitDef` and
+/// never connects; unlike a [`Helper`] it runs no CNS state machine. It simply
+/// plays one of the **owner's** AIR actions ([`anim`](Self::anim)) at a world
+/// position, advances its animation each tick, holds bound to its spawn anchor for
+/// [`bindtime`](Self::bind_remaining) ticks, and self-removes after
+/// [`removetime`](Self::remaining) ticks (or once its one-shot animation finishes,
+/// for the MUGEN `removetime = -1` "play once" convention).
+///
+/// It mirrors [`Effect`] (the hit-spark entity): the current frame's
+/// [`sprite`](Self::sprite)/[`offset`](Self::offset) are re-resolved from the
+/// owner's AIR each tick, and a renderer draws [`sprite`](Self::sprite) at
+/// [`pos`](Self::pos). [`ModifyExplod`](ExplodOp::Modify) updates its fields in
+/// place and [`RemoveExplod`](ExplodOp::Remove) reaps it by id.
+///
+/// Like [`Projectile`] and [`Helper`] (and unlike the standalone serde-deriving
+/// [`Effect`]), an `Explod` is part of the live entity graph rather than the
+/// replay snapshot, so it does not derive serde.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Explod {
+    /// Which player owns this explod: `1` for P1, `2` for P2. A `RemoveExplod`/
+    /// `ModifyExplod` only ever touches its owner's explods, so the slot-map is
+    /// per-player and this field is informational (it records the spawning side
+    /// for a renderer that resolves the explod's frames against that fighter's SFF).
+    pub owner: i32,
+    /// The explod's addressable id (MUGEN's `id`). `-1` is the "no id" sentinel; a
+    /// `RemoveExplod`/`ModifyExplod` with no id matches every owned explod.
+    pub id: i32,
+    /// The owner AIR action (animation) id the explod plays.
+    pub anim: i32,
+    /// The explod's current world position (the resolved anchor + offset). While
+    /// bound it tracks its anchor each tick; once the bind window elapses it holds
+    /// the last bound position.
+    pub pos: Vec2<f32>,
+    /// The current frame's sprite id, resolved from the owner's AIR action each
+    /// tick. A renderer draws this sprite at [`pos`](Self::pos).
+    pub sprite: SpriteId,
+    /// The current frame's pixel offset (from the AIR frame), applied on top of
+    /// [`pos`](Self::pos) by a renderer.
+    pub offset: Vec2<i16>,
+    /// Draw priority relative to the fighters (MUGEN's `sprpriority`). Higher draws
+    /// in front.
+    pub sprpriority: i32,
+    /// The spawn anchor classification (MUGEN's `postype`), kept so a bound explod
+    /// can re-resolve its anchor each tick.
+    pos_type: ExplodPosType,
+    /// The `(x, y)` offset relative to the anchor, facing-mirrored on X at spawn.
+    anchor_offset: Vec2<f32>,
+    /// Remaining ticks the explod stays bound to its anchor (counts down). `-1`
+    /// means "bound for life".
+    bind_remaining: i32,
+    /// Zero-based index of the current animation frame.
+    elem: usize,
+    /// Ticks the current frame has been displayed.
+    elem_time: i32,
+    /// Whether the explod plays its animation exactly once then removes (the MUGEN
+    /// `removetime = -1` convention). When set, the explod is reaped the tick its
+    /// one-shot animation finishes; when clear, the animation loops for the
+    /// explod's whole lifetime.
+    play_once: bool,
+    /// Remaining lifetime in ticks. Always a bounded, non-negative countdown: it is
+    /// seeded from `removetime` (a fixed lifetime, or — for the MUGEN play-once
+    /// `-1` / loop `-2` conventions — [`EXPLOD_MAX_LIFETIME`]) and counts down to
+    /// `0`, at which point the explod is reaped. This guarantees **every** explod
+    /// is eventually reaped (a stuck/looping animation cannot leak the slot-map).
+    remaining: i32,
+}
+
+impl Explod {
+    /// The explod's addressable id (MUGEN's `id`).
+    #[must_use]
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    /// The explod's current animation (action) id.
+    #[must_use]
+    pub fn anim(&self) -> i32 {
+        self.anim
+    }
+
+    /// Which player owns this explod (`1` = P1, `2` = P2).
+    #[must_use]
+    pub fn owner(&self) -> i32 {
+        self.owner
+    }
+
+    /// Remaining lifetime in ticks: a bounded, non-negative countdown (seeded from
+    /// `removetime`, or [`EXPLOD_MAX_LIFETIME`] for the MUGEN play-once / loop
+    /// conventions).
+    #[must_use]
+    pub fn remaining(&self) -> i32 {
+        self.remaining
+    }
+
+    /// Whether this explod plays its animation once then removes (the MUGEN
+    /// `removetime = -1` convention).
+    #[must_use]
+    pub fn play_once(&self) -> bool {
+        self.play_once
+    }
+
+    /// Remaining ticks the explod stays bound to its spawn anchor (or `-1` for
+    /// "bound for life").
+    #[must_use]
+    pub fn bind_remaining(&self) -> i32 {
+        self.bind_remaining
+    }
+}
+
 /// The cross-player redirect relations the match coordinator hands a [`Player`]
 /// for one root tick (T014): the entity it most recently hit (`target`), its
 /// teammate (`partner`), and the `playerid(n)` lookup table.
@@ -594,6 +720,13 @@ pub struct Player {
     /// every frame, and reaped on connect / lifetime / out-of-bounds. Bounded by
     /// [`MAX_PROJECTILES_PER_PLAYER`].
     projectiles: Vec<Projectile>,
+    /// The slot-map of live explod display entities this player owns (T033).
+    /// Populated from each tick's [`fp_character::TickReport::explod_spawns`],
+    /// updated by its [`fp_character::TickReport::explod_ops`] (`ModifyExplod`/
+    /// `RemoveExplod`), advanced every frame, and reaped on `removetime` / when its
+    /// one-shot animation finishes / [`EXPLOD_MAX_LIFETIME`]. Bounded by
+    /// [`MAX_EXPLODS_PER_PLAYER`].
+    explods: Vec<Explod>,
     /// Rolling raw-input history (absolute directions + buttons) this player's
     /// command recognizer scans each tick.
     input_buffer: InputBuffer,
@@ -633,6 +766,7 @@ impl Player {
             loaded,
             helpers: Vec::new(),
             projectiles: Vec::new(),
+            explods: Vec::new(),
             input_buffer: InputBuffer::new(),
             matcher,
             command_defs,
@@ -652,6 +786,16 @@ impl Player {
     #[must_use]
     pub fn projectiles(&self) -> &[Projectile] {
         &self.projectiles
+    }
+
+    /// The live explod display entities this player currently owns (T033), in
+    /// spawn order. Empty until an `Explod` controller fires and the spawn is
+    /// applied (and after each one is reaped on `removetime` / animation end /
+    /// `RemoveExplod`). A renderer draws each [`Explod::sprite`] at
+    /// [`Explod::pos`], resolving the sprite against this player's SFF.
+    #[must_use]
+    pub fn explods(&self) -> &[Explod] {
+        &self.explods
     }
 
     /// Spawns the helpers requested by this tick's
@@ -799,6 +943,218 @@ impl Player {
             advance_projectile_frame(&mut proj.character, air);
             // Reap once it has flown off the stage (either horizontal edge).
             proj.character.pos.x >= left_bound && proj.character.pos.x <= right_bound
+        });
+    }
+
+    /// Resolves an [`ExplodSpawn`]'s `postype` + offset into an absolute world
+    /// position against this player (`p1`), the opponent X (`p2`), and the stage
+    /// edges (T033). The X offset is facing-mirrored by the owner exactly as
+    /// `Helper`/`Projectile` spawns and `Target*` ops mirror their X.
+    fn explod_anchor(&self, spawn: &ExplodSpawn, opponent_x: f32, stage: StageView) -> Vec2<f32> {
+        let owner = &self.character;
+        let (anchor_x, anchor_y) = match spawn.pos_type {
+            ExplodPosType::P1 => (owner.pos.x, owner.pos.y),
+            ExplodPosType::P2 => (opponent_x, owner.pos.y),
+            ExplodPosType::Front => (front_edge_x(owner.facing, stage), owner.pos.y),
+            ExplodPosType::Back => (back_edge_x(owner.facing, stage), owner.pos.y),
+            ExplodPosType::Left => (stage.left, owner.pos.y),
+            ExplodPosType::Right => (stage.right, owner.pos.y),
+        };
+        let (off_x, off_y) = spawn.pos;
+        Vec2::new(
+            anchor_x + off_x * owner.facing.sign() as f32,
+            anchor_y + off_y,
+        )
+    }
+
+    /// Spawns the explods requested by this tick's
+    /// [`fp_character::TickReport::explod_spawns`] into the explod slot-map (T033),
+    /// resolving each [`ExplodSpawn`]'s `postype` + offset into a world position and
+    /// seeding the explod on its `anim`'s first frame so it is visible the frame it
+    /// spawns.
+    ///
+    /// `owner_id` is the spawning player's MUGEN id (`1`/`2`), recorded on the
+    /// explod so a renderer can resolve its frames against the right fighter's SFF.
+    /// Bounded by [`MAX_EXPLODS_PER_PLAYER`]: once the slot-map is full, further
+    /// spawns this tick are dropped (debug-logged, NOT warn — an `Explod` in a
+    /// persistent state would otherwise flood the log) rather than growing without
+    /// limit. An explod whose `anim` action is missing/empty spawns nothing (a
+    /// best-effort skip, never a panic).
+    fn spawn_explods(
+        &mut self,
+        spawns: &[ExplodSpawn],
+        owner_id: i32,
+        opponent_x: f32,
+        stage: StageView,
+    ) {
+        for spawn in spawns {
+            if self.explods.len() >= MAX_EXPLODS_PER_PLAYER {
+                tracing::debug!(
+                    "explod slot-map full ({MAX_EXPLODS_PER_PLAYER}); dropping spawn id={}",
+                    spawn.id
+                );
+                break;
+            }
+            // Resolve the chosen AIR action; an absent/empty action means there is
+            // nothing to draw, so spawn no explod (best-effort, never a panic).
+            let Some(action) = self.loaded.air.action(spawn.anim) else {
+                tracing::debug!(
+                    anim = spawn.anim,
+                    "explod anim not found in AIR; skipping spawn"
+                );
+                continue;
+            };
+            let Some(first) = action.frames.first() else {
+                tracing::debug!(
+                    anim = spawn.anim,
+                    "explod anim has no frames; skipping spawn"
+                );
+                continue;
+            };
+
+            let pos = self.explod_anchor(spawn, opponent_x, stage);
+            let (remaining, play_once) = explod_lifetime(spawn.removetime);
+            let explod = Explod {
+                owner: owner_id,
+                id: spawn.id,
+                anim: spawn.anim,
+                pos,
+                sprite: first.sprite,
+                offset: first.offset,
+                sprpriority: spawn.sprpriority,
+                pos_type: spawn.pos_type,
+                anchor_offset: Vec2::new(spawn.pos.0, spawn.pos.1),
+                bind_remaining: spawn.bindtime,
+                elem: 0,
+                elem_time: 0,
+                play_once,
+                remaining,
+            };
+            tracing::debug!(
+                owner = owner_id,
+                id = spawn.id,
+                anim = spawn.anim,
+                x = pos.x,
+                y = pos.y,
+                remaining,
+                play_once,
+                "spawned explod"
+            );
+            self.explods.push(explod);
+        }
+    }
+
+    /// Applies this tick's [`fp_character::TickReport::explod_ops`]
+    /// (`ModifyExplod`/`RemoveExplod`) to the explod slot-map (T033).
+    ///
+    /// [`ExplodOp::Remove`] removes the matching explods (by id, or all when the
+    /// controller carried no id). [`ExplodOp::Modify`] updates each matching
+    /// explod's fields in place; only the fields the controller carried are
+    /// changed (an absent field leaves the value untouched), and a `removetime`
+    /// change re-clamps the explod's remaining lifetime. Matching is by id:
+    /// `Some(id)` matches that id, `None` matches every owned explod. Never panics.
+    fn apply_explod_ops(&mut self, ops: &[ExplodOp]) {
+        for op in ops {
+            match *op {
+                ExplodOp::Remove(id) => {
+                    self.explods.retain(|e| !explod_id_matches(e.id, id));
+                }
+                ExplodOp::Modify {
+                    id,
+                    anim,
+                    pos,
+                    sprpriority,
+                    bindtime,
+                    removetime,
+                } => {
+                    for e in self
+                        .explods
+                        .iter_mut()
+                        .filter(|e| explod_id_matches(e.id, id))
+                    {
+                        if let Some(a) = anim {
+                            // Re-seeding the cursor on an anim change keeps the
+                            // displayed frame valid for the new action.
+                            if a != e.anim {
+                                e.anim = a;
+                                e.elem = 0;
+                                e.elem_time = 0;
+                            }
+                        }
+                        if let Some((x, y)) = pos {
+                            e.anchor_offset = Vec2::new(x, y);
+                        }
+                        if let Some(p) = sprpriority {
+                            e.sprpriority = p;
+                        }
+                        if let Some(b) = bindtime {
+                            e.bind_remaining = b;
+                        }
+                        if let Some(r) = removetime {
+                            // Re-resolve the lifetime + play-once from the new
+                            // removetime, exactly as a fresh spawn would.
+                            let (rem, once) = explod_lifetime(r);
+                            e.remaining = rem;
+                            e.play_once = once;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advances every live explod this player owns by one tick (T033): decrement
+    /// its bind/lifetime counters, re-resolve its bound anchor (while still bound),
+    /// step its animation cursor against the owner's AIR, and reap it once its
+    /// lifetime elapses or its one-shot animation finishes (the MUGEN
+    /// `removetime = -1` "play once" convention).
+    ///
+    /// `owner_pos`/`owner_facing` are the spawning player's CURRENT position and
+    /// facing (for a bound `postype = p1` explod), `opponent_x` the opponent's X
+    /// (for `postype = p2`), and `stage` the edges (for the edge postypes). Pure
+    /// field writes over a bounded list; never panics.
+    fn tick_explods(
+        &mut self,
+        owner_pos: Vec2<f32>,
+        owner_facing: Facing,
+        opponent_x: f32,
+        stage: StageView,
+    ) {
+        let air = &self.loaded.air;
+        self.explods.retain_mut(|e| {
+            // While bound, re-resolve the anchor each tick so the explod tracks its
+            // postype anchor (a `p1` explod follows the moving owner). Once the bind
+            // window elapses it holds its last bound world position.
+            let still_bound = e.bind_remaining != 0;
+            if still_bound {
+                let (anchor_x, anchor_y) = match e.pos_type {
+                    ExplodPosType::P1 => (owner_pos.x, owner_pos.y),
+                    ExplodPosType::P2 => (opponent_x, owner_pos.y),
+                    ExplodPosType::Front => (front_edge_x(owner_facing, stage), owner_pos.y),
+                    ExplodPosType::Back => (back_edge_x(owner_facing, stage), owner_pos.y),
+                    ExplodPosType::Left => (stage.left, owner_pos.y),
+                    ExplodPosType::Right => (stage.right, owner_pos.y),
+                };
+                e.pos = Vec2::new(
+                    anchor_x + e.anchor_offset.x * owner_facing.sign() as f32,
+                    anchor_y + e.anchor_offset.y,
+                );
+            }
+            if e.bind_remaining > 0 {
+                e.bind_remaining -= 1;
+            }
+
+            // Lifetime: `remaining` is always a bounded, non-negative countdown.
+            // Reaching 0 reaps the explod (this guarantees every explod is
+            // eventually reclaimed, even a looping or stuck animation).
+            e.remaining -= 1;
+            if e.remaining < 0 {
+                return false;
+            }
+
+            // Step the animation cursor against the owner's AIR. A `play_once`
+            // explod is reaped here the tick its one-shot animation finishes.
+            advance_explod_frame(e, air, e.play_once)
         });
     }
 
@@ -1715,6 +2071,9 @@ impl Match {
         let p1_helper_spawns = std::mem::take(&mut p1_report.helper_spawns);
         // Projectile spawns P1 requested this tick (T013).
         let p1_projectile_spawns = std::mem::take(&mut p1_report.projectile_spawns);
+        // Explod spawns + modify/remove ops P1 requested this tick (T033).
+        let p1_explod_spawns = std::mem::take(&mut p1_report.explod_spawns);
+        let p1_explod_ops = std::mem::take(&mut p1_report.explod_ops);
         self.p1_sound_requests = p1_report.sound_requests;
         // (2a) Apply P1's deferred `Target*` ops to P1's target, the OPPONENT (P2).
         //      `self.p1`/`self.p2` are distinct fields, so the split borrow of the
@@ -1750,6 +2109,8 @@ impl Match {
         let p2_freeze = p2_report.freeze_request;
         let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
         let p2_projectile_spawns = std::mem::take(&mut p2_report.projectile_spawns);
+        let p2_explod_spawns = std::mem::take(&mut p2_report.explod_spawns);
+        let p2_explod_ops = std::mem::take(&mut p2_report.explod_ops);
         self.p2_sound_requests = p2_report.sound_requests;
         // (2b) Apply P2's deferred `Target*` ops to its target, the OPPONENT (P1).
         if fighting {
@@ -1798,6 +2159,30 @@ impl Match {
         self.p2.spawn_projectiles(&p2_projectile_spawns);
         self.p1.tick_projectiles(stage);
         self.p2.tick_projectiles(stage);
+
+        // (2f) Spawn each player's requested explods into its slot-map, apply this
+        //      tick's `ModifyExplod`/`RemoveExplod` ops, then advance every live
+        //      explod (T033). An explod is a pure display entity (no collision), so
+        //      it lives and animates across phases (not gated on `fighting`).
+        //      Order: spawn (so a new explod appears the frame its `Explod` fired),
+        //      then ops (a `RemoveExplod`/`ModifyExplod` in the same tick can touch
+        //      the brand-new explod, matching MUGEN's same-tick controller order),
+        //      then advance (so a fresh explod shows its first frame this frame).
+        //      The `postype = p2` anchor resolves against the pre-tick opponent X
+        //      captured above; the bound-anchor re-resolution uses each player's
+        //      CURRENT (post-tick) position so a bound explod follows the live body.
+        self.p1
+            .spawn_explods(&p1_explod_spawns, MUGEN_PLAYER_ID_P1, p2_x, stage);
+        self.p2
+            .spawn_explods(&p2_explod_spawns, MUGEN_PLAYER_ID_P2, p1_x, stage);
+        self.p1.apply_explod_ops(&p1_explod_ops);
+        self.p2.apply_explod_ops(&p2_explod_ops);
+        let p1_pos = self.p1.character.pos;
+        let p1_facing = self.p1.character.facing;
+        let p2_pos = self.p2.character.pos;
+        let p2_facing = self.p2.character.facing;
+        self.p1.tick_explods(p1_pos, p1_facing, p2_pos.x, stage);
+        self.p2.tick_explods(p2_pos, p2_facing, p1_pos.x, stage);
 
         // (3) Combat both directions: P1 attacks P2, then P2 attacks P1.
         //     Each direction reads the attacker's Clsn1 and the defender's Clsn2
@@ -2326,6 +2711,9 @@ impl Match {
         // Live projectiles likewise do not survive a round boundary (T013).
         self.p1.projectiles.clear();
         self.p2.projectiles.clear();
+        // Live explods do not survive a round boundary either (T033).
+        self.p1.explods.clear();
+        self.p2.explods.clear();
 
         tracing::info!(
             round = self.round_number,
@@ -2519,6 +2907,91 @@ fn effect_lifetime(action: &AnimAction) -> i32 {
         .map(|f| f.ticks.max(0))
         .fold(0i32, |acc, t| acc.saturating_add(t));
     total.clamp(1, EFFECT_MAX_LIFETIME)
+}
+
+/// Resolves an explod's `(remaining_lifetime, play_once)` from its `removetime`
+/// (T033). The lifetime is ALWAYS a bounded, non-negative countdown so every
+/// explod is eventually reaped (no leak), while `play_once` records whether the
+/// animation should stop after one play-through.
+///
+/// - `removetime >= 0`: a fixed lifetime — that exact tick count, clamped to
+///   [`EXPLOD_MAX_LIFETIME`]. The animation loops within the lifetime
+///   (`play_once = false`).
+/// - `removetime == -1` (MUGEN "play the animation once, then remove"): seeded to
+///   the [`EXPLOD_MAX_LIFETIME`] ceiling but `play_once = true`, so the explod is
+///   normally reaped the tick its one-shot animation finishes — the ceiling is a
+///   backstop for an animation that never finishes (an infinite-hold final frame).
+/// - any other negative (`-2` "loop forever", etc.): seeded to the ceiling with
+///   `play_once = false` (a looping animation bounded only by the ceiling).
+fn explod_lifetime(removetime: i32) -> (i32, bool) {
+    match removetime {
+        r if r >= 0 => (r.min(EXPLOD_MAX_LIFETIME), false),
+        -1 => (EXPLOD_MAX_LIFETIME, true),
+        _ => (EXPLOD_MAX_LIFETIME, false),
+    }
+}
+
+/// Whether an explod with id `explod_id` matches a `RemoveExplod`/`ModifyExplod`
+/// selector `selector` (T033): `Some(id)` matches only that id; `None` (the
+/// controller fired with no `id`) matches every owned explod.
+fn explod_id_matches(explod_id: i32, selector: Option<i32>) -> bool {
+    match selector {
+        Some(id) => explod_id == id,
+        None => true,
+    }
+}
+
+/// Advances one explod's animation cursor by a tick against the owner's AIR `air`,
+/// re-resolving its current-frame [`Explod::sprite`]/[`Explod::offset`] (T033).
+///
+/// Returns `true` to keep the explod, `false` to drop it. The cursor advances when
+/// the current frame's `ticks` budget elapses. When `play_once` is set (the MUGEN
+/// `removetime = -1` convention), the explod is **reaped the tick it would advance
+/// past its final frame** — it plays the animation exactly once. Otherwise the
+/// animation **loops** (the MUGEN `removetime = -2` / fixed-time conventions),
+/// wrapping to frame `0` past the end so a fixed-lifetime explod keeps animating.
+/// A frame with `ticks <= 0` (an infinite hold) parks the cursor. A missing/empty
+/// action drops the explod. A loop guard bounds the advance against a run of
+/// zero-duration frames; never panics.
+fn advance_explod_frame(e: &mut Explod, air: &AirFile, play_once: bool) -> bool {
+    let Some(action) = air.action(e.anim) else {
+        return false;
+    };
+    if action.frames.is_empty() {
+        return false;
+    }
+    let last = action.frames.len() - 1;
+    e.elem_time += 1;
+    let mut guard = action.frames.len() + 1;
+    while guard > 0 {
+        guard -= 1;
+        let Some(frame) = action.frames.get(e.elem) else {
+            // Cursor ran past the end (e.g. the action shrank): wrap to the start.
+            e.elem = 0;
+            e.elem_time = 0;
+            break;
+        };
+        if frame.ticks <= 0 || e.elem_time < frame.ticks {
+            break;
+        }
+        e.elem_time = 0;
+        // Step past the elapsed frame. Past the last frame, a play-once explod is
+        // reaped (it has shown every frame); a looping one wraps to the start.
+        if e.elem >= last {
+            if play_once {
+                return false;
+            }
+            e.elem = 0;
+        } else {
+            e.elem += 1;
+        }
+    }
+    // Re-resolve the (possibly advanced) current frame's sprite + offset.
+    if let Some(frame) = action.frames.get(e.elem) {
+        e.sprite = frame.sprite;
+        e.offset = frame.offset;
+    }
+    true
 }
 
 /// Advances a projectile's animation cursor (`anim_elem`/`anim_elem_time`) by one
@@ -9598,6 +10071,410 @@ time = 1
         assert!(
             gap_after < gap_before,
             "the AI-driven P2 must close the gap on P1 ({gap_before} -> {gap_after})"
+        );
+    }
+
+    // ---- Explod subsystem (T033) ------------------------------------------
+
+    /// A two-frame AIR on action `anim`, each frame lasting `ticks` ticks, so an
+    /// explod's animation advance / play-once expiry is observable.
+    fn two_frame_air(anim: i32, ticks: i32) -> AirFile {
+        let mk = |g: u16| AnimFrame {
+            sprite: SpriteId::new(g, 0),
+            offset: Vec2::new(0, 0),
+            ticks,
+            flip_h: false,
+            flip_v: false,
+            blend: BlendMode::Normal,
+            clsn1: Vec::new(),
+            clsn2: Vec::new(),
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        actions.insert(
+            anim,
+            AnimAction {
+                action_number: anim,
+                frames: vec![mk(0), mk(1)],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// A headless [`Player`] at world X `x` whose AIR carries the given two-frame
+    /// action, used to drive the explod slot-map methods directly.
+    fn explod_player(x: f32, anim: i32, ticks: i32) -> Player {
+        let mut c = Character::new();
+        c.pos = Vec2::new(x, 0.0);
+        c.facing = Facing::Right;
+        Player::new(c, loaded_with(two_frame_air(anim, ticks)))
+    }
+
+    fn spawn(id: i32, anim: i32, removetime: i32) -> ExplodSpawn {
+        ExplodSpawn {
+            id,
+            anim,
+            pos_type: ExplodPosType::P1,
+            pos: (0.0, 0.0),
+            sprpriority: 0,
+            bindtime: -1,
+            removetime,
+        }
+    }
+
+    /// AC1: spawning an explod inserts a live, rendered entity carrying the parsed
+    /// anim / id / sprpriority and resolves its first frame's sprite immediately so
+    /// it is drawable the frame it spawns.
+    #[test]
+    fn explod_spawn_inserts_rendered_entity() {
+        let mut p = explod_player(0.0, 5, 4);
+        let s = ExplodSpawn {
+            id: 3,
+            anim: 5,
+            pos_type: ExplodPosType::P1,
+            pos: (10.0, -20.0),
+            sprpriority: 2,
+            bindtime: -1,
+            removetime: 8,
+        };
+        p.spawn_explods(&[s], MUGEN_PLAYER_ID_P1, 100.0, StageView::default());
+        assert_eq!(p.explods().len(), 1, "one explod spawned");
+        let e = p.explods()[0];
+        assert_eq!(e.id(), 3);
+        assert_eq!(e.anim(), 5);
+        assert_eq!(e.owner(), MUGEN_PLAYER_ID_P1);
+        assert_eq!(e.sprpriority, 2);
+        // postype p1 anchored at the owner (x=0, facing right) + offset (10, -20).
+        assert_eq!(e.pos, Vec2::new(10.0, -20.0));
+        // First frame's sprite is resolved so a renderer can draw it immediately.
+        assert_eq!(e.sprite, SpriteId::new(0, 0));
+        assert_eq!(e.remaining(), 8, "removetime carried as the lifetime");
+    }
+
+    /// AC1: a spawn whose `anim` action is missing spawns nothing (best-effort
+    /// skip, never a panic).
+    #[test]
+    fn explod_spawn_missing_anim_is_skipped() {
+        let mut p = explod_player(0.0, 5, 4);
+        // Action 999 does not exist in the AIR.
+        p.spawn_explods(
+            &[spawn(1, 999, 8)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        assert!(
+            p.explods().is_empty(),
+            "no explod for a missing anim action"
+        );
+    }
+
+    /// AC3: an explod with a non-negative `removetime` counts down and is reaped
+    /// when its lifetime elapses. `removetime = N` keeps it alive for `N` ticks,
+    /// then the tick that would take `remaining` below `0` reaps it.
+    #[test]
+    fn explod_expires_on_removetime() {
+        let mut p = explod_player(0.0, 5, 99); // long frame ticks; lifetime drives expiry
+        p.spawn_explods(
+            &[spawn(1, 5, 3)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(p.explods().len(), 1);
+        assert_eq!(p.explods()[0].remaining(), 3);
+        for expected in [2, 1, 0] {
+            p.tick_explods(
+                Vec2::new(0.0, 0.0),
+                Facing::Right,
+                0.0,
+                StageView::default(),
+            );
+            assert_eq!(
+                p.explods()[0].remaining(),
+                expected,
+                "counts down by one per tick"
+            );
+        }
+        // The next tick takes remaining below 0 and reaps the explod.
+        p.tick_explods(
+            Vec2::new(0.0, 0.0),
+            Facing::Right,
+            0.0,
+            StageView::default(),
+        );
+        assert!(p.explods().is_empty(), "explod reaped at removetime expiry");
+    }
+
+    /// AC3: a `removetime = -1` (play-once) explod is reaped the tick its one-shot
+    /// animation finishes (it does not loop forever).
+    #[test]
+    fn explod_play_once_reaped_when_animation_finishes() {
+        // Two frames, 1 tick each → the animation finishes after 2 advancing ticks.
+        let mut p = explod_player(0.0, 5, 1);
+        p.spawn_explods(
+            &[spawn(1, 5, -1)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(p.explods().len(), 1);
+        // Tick 1: cursor steps to the second (final) frame; still alive.
+        p.tick_explods(
+            Vec2::new(0.0, 0.0),
+            Facing::Right,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(p.explods().len(), 1, "still playing the last frame");
+        assert_eq!(
+            p.explods()[0].sprite,
+            SpriteId::new(1, 0),
+            "advanced to frame 2"
+        );
+        // Tick 2: would step past the final frame → play-once reaps it.
+        p.tick_explods(
+            Vec2::new(0.0, 0.0),
+            Facing::Right,
+            0.0,
+            StageView::default(),
+        );
+        assert!(
+            p.explods().is_empty(),
+            "play-once explod reaped at animation end"
+        );
+    }
+
+    /// AC3: a looping (`removetime = -2`) explod is bounded — it cannot live past
+    /// [`EXPLOD_MAX_LIFETIME`] even though its animation loops forever.
+    #[test]
+    fn explod_loop_is_bounded_by_max_lifetime() {
+        let mut p = explod_player(0.0, 5, 1);
+        p.spawn_explods(
+            &[spawn(1, 5, -2)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        // remaining seeded to the ceiling, so it counts down and is eventually
+        // reaped (it is NOT play-once, so its animation loops the whole time).
+        assert_eq!(p.explods()[0].remaining(), EXPLOD_MAX_LIFETIME);
+        assert!(
+            !p.explods()[0].play_once(),
+            "a -2 explod loops, not play-once"
+        );
+        for _ in 0..=EXPLOD_MAX_LIFETIME {
+            p.tick_explods(
+                Vec2::new(0.0, 0.0),
+                Facing::Right,
+                0.0,
+                StageView::default(),
+            );
+        }
+        assert!(
+            p.explods().is_empty(),
+            "a looping explod is reaped by EXPLOD_MAX_LIFETIME"
+        );
+    }
+
+    /// AC2: `ModifyExplod` updates only the matching explod's given fields, leaving
+    /// the others untouched.
+    #[test]
+    fn modify_explod_updates_matching_fields_only() {
+        let mut p = explod_player(0.0, 5, 99);
+        // Two explods: id 1 and id 2, both anim 5.
+        p.spawn_explods(
+            &[spawn(1, 5, 50), spawn(2, 5, 50)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        // Modify only id 1: new sprpriority + removetime; leave anim/pos/bindtime.
+        p.apply_explod_ops(&[ExplodOp::Modify {
+            id: Some(1),
+            anim: None,
+            pos: None,
+            sprpriority: Some(9),
+            bindtime: None,
+            removetime: Some(20),
+        }]);
+        let e1 = p.explods().iter().find(|e| e.id() == 1).unwrap();
+        let e2 = p.explods().iter().find(|e| e.id() == 2).unwrap();
+        assert_eq!(e1.sprpriority, 9, "id 1 sprpriority updated");
+        assert_eq!(e1.remaining(), 20, "id 1 removetime re-clamped");
+        assert_eq!(e1.anim(), 5, "id 1 anim untouched (absent field)");
+        // id 2 is wholly untouched.
+        assert_eq!(e2.sprpriority, 0);
+        assert_eq!(e2.remaining(), 50);
+    }
+
+    /// AC2: a no-id `ModifyExplod` (selector `None`) updates ALL of the owner's
+    /// explods.
+    #[test]
+    fn modify_explod_no_id_matches_all() {
+        let mut p = explod_player(0.0, 5, 99);
+        p.spawn_explods(
+            &[spawn(1, 5, 50), spawn(2, 5, 50)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        p.apply_explod_ops(&[ExplodOp::Modify {
+            id: None,
+            anim: None,
+            pos: None,
+            sprpriority: Some(4),
+            bindtime: None,
+            removetime: None,
+        }]);
+        assert!(
+            p.explods().iter().all(|e| e.sprpriority == 4),
+            "no-id ModifyExplod touched every explod"
+        );
+    }
+
+    /// AC2: `RemoveExplod` by id removes only the matching explods; a no-id
+    /// `RemoveExplod` removes them all.
+    #[test]
+    fn remove_explod_by_id_and_all() {
+        let mut p = explod_player(0.0, 5, 99);
+        p.spawn_explods(
+            &[spawn(1, 5, 50), spawn(2, 5, 50), spawn(1, 5, 50)],
+            MUGEN_PLAYER_ID_P1,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(p.explods().len(), 3);
+        // Remove id 1 → both id-1 explods gone, the id-2 stays.
+        p.apply_explod_ops(&[ExplodOp::Remove(Some(1))]);
+        assert_eq!(p.explods().len(), 1);
+        assert_eq!(p.explods()[0].id(), 2);
+        // Remove all.
+        p.apply_explod_ops(&[ExplodOp::Remove(None)]);
+        assert!(
+            p.explods().is_empty(),
+            "no-id RemoveExplod cleared the slot-map"
+        );
+    }
+
+    /// AC3: the explod slot-map is bounded — a runaway spawn loop cannot grow it
+    /// past [`MAX_EXPLODS_PER_PLAYER`].
+    #[test]
+    fn explod_slot_map_is_bounded() {
+        let mut p = explod_player(0.0, 5, 99);
+        let many: Vec<ExplodSpawn> = (0..MAX_EXPLODS_PER_PLAYER as i32 + 50)
+            .map(|i| spawn(i, 5, 50))
+            .collect();
+        p.spawn_explods(&many, MUGEN_PLAYER_ID_P1, 0.0, StageView::default());
+        assert_eq!(
+            p.explods().len(),
+            MAX_EXPLODS_PER_PLAYER,
+            "explod count capped at MAX_EXPLODS_PER_PLAYER"
+        );
+    }
+
+    /// AC3: a bound explod tracks its anchor each tick (a `postype = p1` explod
+    /// follows the moving owner), then holds its last position once unbound.
+    #[test]
+    fn explod_bound_tracks_anchor_then_holds() {
+        let mut p = explod_player(0.0, 5, 99);
+        let s = ExplodSpawn {
+            id: 1,
+            anim: 5,
+            pos_type: ExplodPosType::P1,
+            pos: (5.0, 0.0),
+            sprpriority: 0,
+            bindtime: 1, // bound for exactly one more tick after spawn
+            removetime: 50,
+        };
+        p.spawn_explods(&[s], MUGEN_PLAYER_ID_P1, 0.0, StageView::default());
+        assert_eq!(p.explods()[0].pos, Vec2::new(5.0, 0.0));
+        // Owner moved to x=30; while bound, the explod re-anchors to follow.
+        p.tick_explods(
+            Vec2::new(30.0, 0.0),
+            Facing::Right,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(
+            p.explods()[0].pos,
+            Vec2::new(35.0, 0.0),
+            "tracked the owner"
+        );
+        // Bind window now elapsed; a further owner move no longer drags the explod.
+        p.tick_explods(
+            Vec2::new(100.0, 0.0),
+            Facing::Right,
+            0.0,
+            StageView::default(),
+        );
+        assert_eq!(
+            p.explods()[0].pos,
+            Vec2::new(35.0, 0.0),
+            "held its last bound position after the bind window elapsed"
+        );
+    }
+
+    /// AC1 + AC3 end-to-end through `Match::tick`: a CNS `Explod` controller in a
+    /// player's state spawns a live explod entity on the match, observable via the
+    /// public `Player::explods()` accessor, and a round reset clears it.
+    #[test]
+    fn explod_spawns_through_match_tick_and_clears_on_round_reset() {
+        use fp_character::{CompiledController, CompiledExpr, CompiledParam, CompiledTriggerGroup};
+
+        // A state 0 whose only controller is `Explod` (anim 5), gated to fire on
+        // the first tick (`Time = 0`).
+        let explod_ctrl = CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("Explod".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile("Time = 0")],
+            }],
+            persistent: Some(CompiledExpr::compile("0")),
+            ignorehitpause: None,
+            params: [
+                ("anim".to_string(), CompiledParam::compile("5")),
+                ("id".to_string(), CompiledParam::compile("42")),
+                ("removetime".to_string(), CompiledParam::compile("100")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut states = HashMap::new();
+        states.insert(0, state0_with(explod_ctrl));
+
+        let mut loaded = loaded_with(two_frame_air(5, 4));
+        loaded.states = states;
+
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        let p1 = Player::new(p1c, loaded);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        p2c.facing = Facing::Left;
+        let p2 = Player::new(p2c, loaded_with(two_frame_air(0, 4)));
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+
+        // Run a few ticks (the intro phase still ticks state machines and spawns
+        // entities — an explod is a display entity, not gated on `fighting`).
+        for _ in 0..3 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        let explods = m.p1().explods();
+        assert_eq!(explods.len(), 1, "the Explod controller spawned one explod");
+        assert_eq!(explods[0].id(), 42);
+        assert_eq!(explods[0].anim(), 5);
+
+        // A round reset clears the explod slot-map.
+        m.reset_for_next_round();
+        assert!(
+            m.p1().explods().is_empty(),
+            "explods do not survive a round boundary"
         );
     }
 }

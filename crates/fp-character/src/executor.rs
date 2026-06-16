@@ -81,15 +81,16 @@
 //! A controller type that is **not** handled is split two ways so no documented
 //! controller silently no-ops without a tracked reason:
 //!
-//! - A **documented MUGEN controller blocked on an unbuilt subsystem** (explod
-//!   entities, the stage/background owner, the full global PalFX modulation, or the
-//!   bind / hit-count entity lifecycle — see [`is_tracked_deferred_controller`] and
+//! - A **documented MUGEN controller blocked on an unbuilt subsystem** (the
+//!   stage/background owner, the full global PalFX modulation, or the bind /
+//!   hit-count entity lifecycle — see [`is_tracked_deferred_controller`] and
 //!   T007-T014) routes to a named, `tracing::warn!`-logged no-op. The `Helper`
-//!   (T012) and `Projectile` (T013) entity-spawn controllers, and the
-//!   `parent`/`root`/`helper`/`target`/`partner`/`playerid` redirects (T012/T014),
-//!   are now handled. The `HitAdd`, `AttackDist`, and `TargetDrop` controllers are
-//!   still tracked here: they need the hit-count / guard-distance / bind-release
-//!   lifecycle the slot-map does not drive yet.
+//!   (T012) and `Projectile` (T013) entity-spawn controllers, the
+//!   `Explod`/`ModifyExplod`/`RemoveExplod` display-entity controllers (T033), and
+//!   the `parent`/`root`/`helper`/`target`/`partner`/`playerid` redirects
+//!   (T012/T014), are now handled. The `HitAdd`, `AttackDist`, and `TargetDrop`
+//!   controllers are still tracked here: they need the hit-count / guard-distance /
+//!   bind-release lifecycle the slot-map does not drive yet.
 //! - A **genuinely unrecognized** token (a typo / non-MUGEN extension) routes to a
 //!   `tracing::debug!`-logged no-op.
 //!
@@ -551,6 +552,144 @@ pub struct ProjectileSpawn {
     pub remove_time: i32,
 }
 
+/// How an [`Explod`](ExplodSpawn)'s spawn position is interpreted, mirroring
+/// MUGEN's `Explod` `postype` parameter (T033).
+///
+/// The `pos = x, y` offset is resolved against one of these anchors by the
+/// downstream spawner (`fp-engine`), which owns both players' world positions and
+/// so is the only place that can turn a `postype` + offset into an absolute world
+/// position. `fp-character` only *classifies* the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplodPosType {
+    /// `postype = p1` (the MUGEN default): the offset is relative to the
+    /// **spawning** player's axis, in that player's facing direction.
+    #[default]
+    P1,
+    /// `postype = p2`: relative to the opponent's axis.
+    P2,
+    /// `postype = front`: relative to the front edge of the screen (the edge the
+    /// spawner faces).
+    Front,
+    /// `postype = back`: relative to the back edge of the screen.
+    Back,
+    /// `postype = left`: relative to the left edge of the screen.
+    Left,
+    /// `postype = right`: relative to the right edge of the screen.
+    Right,
+}
+
+impl ExplodPosType {
+    /// Parses a MUGEN `postype` token (case-insensitive), defaulting to
+    /// [`ExplodPosType::P1`] on an absent / unrecognized token (MUGEN's default).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        let t = raw.trim();
+        if t.eq_ignore_ascii_case("p2") {
+            Self::P2
+        } else if t.eq_ignore_ascii_case("front") {
+            Self::Front
+        } else if t.eq_ignore_ascii_case("back") {
+            Self::Back
+        } else if t.eq_ignore_ascii_case("left") {
+            Self::Left
+        } else if t.eq_ignore_ascii_case("right") {
+            Self::Right
+        } else {
+            // "p1" and anything unrecognized → the MUGEN default.
+            Self::P1
+        }
+    }
+}
+
+/// A deferred request, emitted by an `Explod` controller, to spawn a short-lived
+/// **explod** display entity owned by this character (T033).
+///
+/// `fp-character` ticks one entity at a time and cannot create — or own — another
+/// live entity from inside a single character's tick, so (exactly like `Helper`,
+/// `Projectile`, `PlaySnd`, and the `Target*` controllers) the `Explod` controller
+/// does not spawn inline. Instead it records the request on
+/// [`TickReport::explod_spawns`], and the entity owner (`fp-engine`'s `Player`,
+/// which holds the slot-map of live explods) reads it after the tick and inserts
+/// the new explod into the slot-map. This keeps the executor a single-entity,
+/// deterministic, panic-free simulation.
+///
+/// An explod is a pure **display** effect (no collision / hit): it plays one of
+/// the owner's AIR actions ([`anim`](Self::anim)) at a position resolved from
+/// [`pos_type`](Self::pos_type) + [`pos`](Self::pos), holds for
+/// [`bindtime`](Self::bindtime) bound to its anchor, and self-removes after
+/// [`removetime`](Self::removetime) ticks. The fields are the subset of MUGEN's
+/// `Explod` parameters this engine models; unmodeled parameters (`scale`/`facing`/
+/// `vfacing`/`shadow`/`ontop`/`ownpal`/`random`/`accel`/`vel`/…) take their MUGEN
+/// defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExplodSpawn {
+    /// The explod's id, used to address it from `RemoveExplod`/`ModifyExplod`
+    /// (MUGEN's `id`). Defaults to `-1` when absent — MUGEN's "no id" sentinel,
+    /// which `RemoveExplod`/`ModifyExplod` with no id match against (all of this
+    /// player's explods).
+    pub id: i32,
+    /// The owner's AIR action (animation) id the explod plays (MUGEN's `anim`).
+    /// Defaults to `0` when absent.
+    pub anim: i32,
+    /// How [`pos`](Self::pos) is anchored (MUGEN's `postype`); see
+    /// [`ExplodPosType`].
+    pub pos_type: ExplodPosType,
+    /// The `(x, y)` spawn offset relative to the [`pos_type`](Self::pos_type)
+    /// anchor, in the spawner's facing-relative convention on X (MUGEN's `pos`).
+    /// The spawner (`fp-engine`) applies the facing mirroring.
+    pub pos: (f32, f32),
+    /// Draw priority relative to the fighters (MUGEN's `sprpriority`). Higher draws
+    /// in front; defaults to `0`.
+    pub sprpriority: i32,
+    /// How many ticks the explod stays **bound** to its spawn anchor (MUGEN's
+    /// `bindtime`). `-1` (the MUGEN default) binds for the explod's whole life; a
+    /// non-negative value binds for that many ticks, after which the explod holds
+    /// its last bound world position.
+    pub bindtime: i32,
+    /// How many ticks the explod lives before self-removing (MUGEN's `removetime`).
+    /// `-1` (a common authoring) means "play the animation once, then remove";
+    /// `-2` means "loop forever" (bounded here by [`Explod`](crate)'s lifetime cap);
+    /// a non-negative value caps the lifetime in ticks.
+    pub removetime: i32,
+}
+
+/// A deferred operation on this character's existing explods, emitted by a
+/// `RemoveExplod` or `ModifyExplod` controller (T033).
+///
+/// Like [`ExplodSpawn`], these defer because the explod slot-map is owned by the
+/// entity owner (`fp-engine`'s `Player`), not the ticking character. The owner
+/// reads [`TickReport::explod_ops`] after the tick and applies each op to its
+/// slot-map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExplodOp {
+    /// `RemoveExplod`: remove this player's explods. `Some(id)` removes only the
+    /// explods with that id; `None` (the controller fired with no `id`) removes
+    /// **all** of this player's explods (MUGEN's no-id `RemoveExplod`).
+    Remove(Option<i32>),
+    /// `ModifyExplod`: update the matching explods' parameters in place. `id`
+    /// selects which explods to modify (`Some(id)` = that id, `None` = all of this
+    /// player's explods). The optional fields are the parameters that were present
+    /// on the controller; an absent field (`None`) leaves the explod's value
+    /// untouched, mirroring MUGEN (`ModifyExplod` changes only the params you give
+    /// it).
+    Modify {
+        /// Which explods to modify: `Some(id)` matches that id, `None` matches all
+        /// of this player's explods.
+        id: Option<i32>,
+        /// New animation id, if the controller carried `anim`.
+        anim: Option<i32>,
+        /// New `(x, y)` offset relative to the anchor, if the controller carried
+        /// `pos`.
+        pos: Option<(f32, f32)>,
+        /// New draw priority, if the controller carried `sprpriority`.
+        sprpriority: Option<i32>,
+        /// New bind time, if the controller carried `bindtime`.
+        bindtime: Option<i32>,
+        /// New remove time, if the controller carried `removetime`.
+        removetime: Option<i32>,
+    },
+}
+
 /// A summary of what one [`Character::tick`] did, returned for diagnostics and
 /// tests.
 ///
@@ -609,6 +748,19 @@ pub struct TickReport {
     /// spawn; the entity owner (`fp-engine`'s `Player`, which holds the projectile
     /// slot-map) reads them after the tick and inserts each new projectile.
     pub projectile_spawns: Vec<ProjectileSpawn>,
+    /// Explod-spawn requests emitted by `Explod` controllers this tick, in fire
+    /// order (T033). Empty on a tick with no firing `Explod`, and (like the other
+    /// request fields) never carried across ticks because a fresh [`TickReport`]
+    /// is built per tick. `fp-character` only *describes* each spawn; the entity
+    /// owner (`fp-engine`'s `Player`, which holds the explod slot-map) reads them
+    /// after the tick and inserts each new explod into the slot-map.
+    pub explod_spawns: Vec<ExplodSpawn>,
+    /// Explod modify/remove operations emitted by `ModifyExplod`/`RemoveExplod`
+    /// controllers this tick, in fire order (T033). Empty on a tick with no firing
+    /// `ModifyExplod`/`RemoveExplod`, and never carried across ticks. The entity
+    /// owner (`fp-engine`'s `Player`) reads them after the tick and applies each
+    /// [`ExplodOp`] to its explod slot-map.
+    pub explod_ops: Vec<ExplodOp>,
 }
 
 impl Character {
@@ -1428,20 +1580,26 @@ impl Character {
             self.ctrl_helper(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("Projectile") {
             self.ctrl_projectile(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("Explod") {
+            self.ctrl_explod(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("ModifyExplod") {
+            self.ctrl_modify_explod(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("RemoveExplod") {
+            self.ctrl_remove_explod(ctrl, env, report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
-            // run because it depends on an unbuilt subsystem (helpers, explods,
-            // projectiles, multi-entity redirects, the background/stage owner, or
-            // the full PalFX modulation). Tracked to a named, WARN-logged no-op
-            // (NOT the silent debug fall-through below) so the gap is visible and
+            // run because it depends on an unbuilt subsystem (the bind / hit-count
+            // entity lifecycle, the background/stage owner, or the full global
+            // PalFX modulation). Tracked to a named, WARN-logged no-op (NOT the
+            // silent debug fall-through below) so the gap is visible and
             // attributable to its blocking task. See `is_tracked_deferred_controller`.
             // Log each deferred controller kind ONCE, not every tick. A deferred
             // controller in a persistent state (e.g. state -2, which runs every
-            // frame — evilken's `RemoveExplod` does exactly this) would otherwise
-            // emit thousands of WARN lines per second, flooding the terminal and
-            // stalling the 60Hz loop (the "stuck / blocked by unbuilt systems"
-            // symptom). The gap stays visible (first occurrence warns) and remains
-            // documented in `is_tracked_deferred_controller`, without the spam.
+            // frame) would otherwise emit thousands of WARN lines per second,
+            // flooding the terminal and stalling the 60Hz loop (the "stuck /
+            // blocked by unbuilt systems" symptom). The gap stays visible (first
+            // occurrence warns) and remains documented in
+            // `is_tracked_deferred_controller`, without the spam.
             thread_local! {
                 static WARNED_DEFERRED: std::cell::RefCell<std::collections::HashSet<String>> =
                     std::cell::RefCell::new(std::collections::HashSet::new());
@@ -2141,6 +2299,160 @@ impl Character {
              spawned from state {}",
             hitdef.attr,
             hitdef.damage,
+            ctrl.state_number
+        );
+    }
+
+    /// `Explod`: emit an [`ExplodSpawn`] request to bring a short-lived display
+    /// explod to life, owned by this character (T033).
+    ///
+    /// `fp-character` ticks a single entity and cannot create — or own — another
+    /// live entity inside one tick, so (exactly like `Helper`, `Projectile`,
+    /// `PlaySnd`, and the `Target*` controllers) this defers: it pushes an
+    /// [`ExplodSpawn`] onto [`TickReport::explod_spawns`] and the entity owner
+    /// (`fp-engine`'s `Player`, which holds the slot-map of live explods) inserts,
+    /// advances, and reaps the explod after the tick.
+    ///
+    /// Reads the subset of MUGEN's `Explod` parameters this engine models: `id`
+    /// (the addressable id for `RemoveExplod`/`ModifyExplod`; MUGEN default `-1`),
+    /// `anim` (the owner AIR action to play; default `0`), `pos = x, y` (the spawn
+    /// offset, each axis defaulting to `0`), `postype` (the [`ExplodPosType`]
+    /// anchor; default `p1`), `sprpriority` (draw order; default `0`), `bindtime`
+    /// (ticks bound to the anchor; MUGEN default `-1` = bound for life), and
+    /// `removetime` (the lifetime; default `-1` = play the animation once then
+    /// remove). A missing parameter takes its MUGEN default; nothing here panics.
+    fn ctrl_explod(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        let id = ctrl
+            .params
+            .get("id")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(-1, |v| v.to_int());
+        let anim = ctrl
+            .params
+            .get("anim")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let pos_type = ctrl
+            .params
+            .get("postype")
+            .map_or(ExplodPosType::default(), |p| ExplodPosType::parse(p.raw()));
+        let pos_param = ctrl.params.get("pos");
+        let pos_x = pos_param
+            .and_then(|p| self.eval_param_component(p, 0, env))
+            .map_or(0.0, |v| v.to_float());
+        let pos_y = pos_param
+            .and_then(|p| self.eval_param_component(p, 1, env))
+            .map_or(0.0, |v| v.to_float());
+        let sprpriority = ctrl
+            .params
+            .get("sprpriority")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(0, |v| v.to_int());
+        let bindtime = ctrl
+            .params
+            .get("bindtime")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(-1, |v| v.to_int());
+        let removetime = ctrl
+            .params
+            .get("removetime")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(-1, |v| v.to_int());
+
+        report.explod_spawns.push(ExplodSpawn {
+            id,
+            anim,
+            pos_type,
+            pos: (pos_x, pos_y),
+            sprpriority,
+            bindtime,
+            removetime,
+        });
+        tracing::debug!(
+            "tick: Explod id={id} anim={anim} postype={pos_type:?} pos=({pos_x},{pos_y}) \
+             sprpriority={sprpriority} bindtime={bindtime} removetime={removetime} \
+             spawned from state {}",
+            ctrl.state_number
+        );
+    }
+
+    /// `ModifyExplod`: emit an [`ExplodOp::Modify`] to update this character's
+    /// matching explods in place (T033).
+    ///
+    /// Like [`ctrl_explod`](Self::ctrl_explod) this defers (the explod slot-map is
+    /// owned by `fp-engine`). It reads only the parameters that are present and
+    /// records each as an `Option`; an absent parameter leaves the explod's value
+    /// unchanged, matching MUGEN (`ModifyExplod` changes only the params you give
+    /// it). `id` selects which explods to modify: `Some(id)` matches that id,
+    /// `None` (no `id` parameter) matches all of this player's explods. Never
+    /// panics.
+    fn ctrl_modify_explod(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        let id = ctrl
+            .params
+            .get("id")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+        let anim = ctrl
+            .params
+            .get("anim")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+        let pos = ctrl.params.get("pos").map(|p| {
+            let x = self
+                .eval_param_component(p, 0, env)
+                .map_or(0.0, |v| v.to_float());
+            let y = self
+                .eval_param_component(p, 1, env)
+                .map_or(0.0, |v| v.to_float());
+            (x, y)
+        });
+        let sprpriority = ctrl
+            .params
+            .get("sprpriority")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+        let bindtime = ctrl
+            .params
+            .get("bindtime")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+        let removetime = ctrl
+            .params
+            .get("removetime")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+
+        report.explod_ops.push(ExplodOp::Modify {
+            id,
+            anim,
+            pos,
+            sprpriority,
+            bindtime,
+            removetime,
+        });
+        tracing::debug!(
+            "tick: ModifyExplod id={id:?} anim={anim:?} pos={pos:?} sprpriority={sprpriority:?} \
+             bindtime={bindtime:?} removetime={removetime:?} from state {}",
+            ctrl.state_number
+        );
+    }
+
+    /// `RemoveExplod`: emit an [`ExplodOp::Remove`] to remove this character's
+    /// matching explods (T033).
+    ///
+    /// `id` selects which explods to remove: `Some(id)` removes only the explods
+    /// with that id; `None` (no `id` parameter) removes **all** of this player's
+    /// explods (MUGEN's no-id `RemoveExplod`). Like the other explod controllers it
+    /// defers — the slot-map is owned by `fp-engine`. Never panics.
+    fn ctrl_remove_explod(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
+        let id = ctrl
+            .params
+            .get("id")
+            .and_then(|p| self.eval_param(p, env))
+            .map(|v| v.to_int());
+        report.explod_ops.push(ExplodOp::Remove(id));
+        tracing::debug!(
+            "tick: RemoveExplod id={id:?} from state {}",
             ctrl.state_number
         );
     }
@@ -4229,14 +4541,15 @@ fn strip_quotes(raw: &str) -> &str {
 ///
 /// The blocking subsystems (and their tasks):
 ///
-/// - **Helper lifecycle / explods** (`DestroySelf`, `Explod`, `ModifyExplod`,
-///   `RemoveExplod`, `BindToParent`, `BindToRoot`, `ParentVarSet`/`ParentVarAdd`)
-///   — these need helper *lifecycle* management (self-destruction, binding,
-///   cross-entity var writes) and the explod entity kind, which the slot-map does
-///   not own yet. (`Helper` is handled — it emits a [`HelperSpawn`] request the
-///   entity owner inserts into the slot-map; T012. `Projectile` is now handled
+/// - **Helper lifecycle** (`DestroySelf`, `ExplodBindTime`, `BindToParent`,
+///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — these need helper *lifecycle*
+///   management (self-destruction, binding, cross-entity var writes) the slot-map
+///   does not own yet. (`Helper` is handled — it emits a [`HelperSpawn`] request
+///   the entity owner inserts into the slot-map; T012. `Projectile` is now handled
 ///   too — it emits a [`ProjectileSpawn`] the entity owner advances and resolves
-///   hits for; T013.)
+///   hits for; T013. `Explod`/`ModifyExplod`/`RemoveExplod` are now handled too —
+///   they emit an [`ExplodSpawn`]/[`ExplodOp`] the entity owner spawns into,
+///   modifies, and reaps from its explod slot-map; T033.)
 /// - **Target binding lifecycle** (`BindToTarget`) — the `target`/`partner`/
 ///   `playerid(n)` *redirects* now resolve (T014), but binding a player to its
 ///   target each tick needs the per-tick bind/release lifecycle the slot-map does
@@ -4264,13 +4577,12 @@ fn strip_quotes(raw: &str) -> &str {
 /// `MoveHitReset` (clears the move-connection flags).
 fn is_tracked_deferred_controller(kind: &str) -> bool {
     const DEFERRED: &[&str] = &[
-        // Multi-entity (explods / projectiles) — T013. (`Helper` itself is now
-        // handled: it emits a `HelperSpawn` request on the `TickReport` for the
-        // entity owner to spawn into the slot-map — see `ctrl_helper`, T012.)
+        // Multi-entity helper lifecycle. (`Helper` emits a `HelperSpawn`; T012.
+        // `Projectile` emits a `ProjectileSpawn`; T013. `Explod`/`ModifyExplod`/
+        // `RemoveExplod` emit an `ExplodSpawn`/`ExplodOp`; T033. `ExplodBindTime`
+        // adjusts an existing explod's bind window, which the explod slot-map
+        // exposes but no per-explod-bind redirect drives yet, so it stays deferred.)
         "DestroySelf",
-        "Explod",
-        "ModifyExplod",
-        "RemoveExplod",
         "ExplodBindTime",
         "BindToParent",
         "BindToRoot",
@@ -15624,16 +15936,14 @@ mod tests {
         assert_eq!(lone.vars[1], 0, "no graph: `parent` resolves to None → 0");
     }
 
-    /// A documented-but-deferred controller (e.g. `Explod`, `BGPalFX`)
+    /// A documented-but-deferred controller (e.g. `BGPalFX`, `AllPalFX`)
     /// is recognized by [`is_tracked_deferred_controller`] — it routes to the
     /// tracked WARN no-op, not the silent fall-through — while a genuine
     /// non-controller string is not.
     #[test]
     fn deferred_controllers_are_tracked() {
         for kind in [
-            "Explod",
-            "ModifyExplod",
-            "RemoveExplod",
+            "ExplodBindTime",
             "BGPalFX",
             "AllPalFX",
             "BindToParent",
@@ -15676,6 +15986,10 @@ mod tests {
             "MoveHitReset",
             "Helper",
             "Projectile",
+            // T033: the Explod family now emits deferred spawn / op requests.
+            "Explod",
+            "ModifyExplod",
+            "RemoveExplod",
         ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
@@ -15690,14 +16004,126 @@ mod tests {
     /// neither panics nor mutates state) — exercising the WARN branch end-to-end.
     #[test]
     fn deferred_controller_dispatch_is_safe_noop() {
-        let lc = one_ctrl_synth("Explod", &[("anim", "0"), ("id", "1")]);
+        // `BGPalFX` remains deferred (the stage/background owner is not on a
+        // Character), so it exercises the tracked-no-op branch end-to-end.
+        let lc = one_ctrl_synth("BGPalFX", &[("time", "1")]);
         let mut ch = Character::new();
         let before = ch.life;
         let report = lc.tick(&mut ch);
         // The controller "fired" (gating passed) but had no effect on the entity.
-        assert_eq!(ch.life, before, "deferred Explod did not mutate state");
+        assert_eq!(ch.life, before, "deferred BGPalFX did not mutate state");
         assert!(report.freeze_request.is_none());
         assert!(report.target_ops.is_empty());
+    }
+
+    /// `Explod` emits an [`ExplodSpawn`] onto the report with the parsed
+    /// anim / id / pos / postype / sprpriority / bindtime / removetime (T033, AC1).
+    #[test]
+    fn explod_emits_spawn_request_with_parsed_params() {
+        let lc = one_ctrl_synth(
+            "Explod",
+            &[
+                ("id", "7"),
+                ("anim", "230"),
+                ("pos", "10, -20"),
+                ("postype", "p2"),
+                ("sprpriority", "3"),
+                ("bindtime", "5"),
+                ("removetime", "12"),
+            ],
+        );
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.explod_spawns.len(), 1, "one explod spawn emitted");
+        let s = report.explod_spawns[0];
+        assert_eq!(s.id, 7);
+        assert_eq!(s.anim, 230);
+        assert_eq!(s.pos, (10.0, -20.0));
+        assert_eq!(s.pos_type, ExplodPosType::P2);
+        assert_eq!(s.sprpriority, 3);
+        assert_eq!(s.bindtime, 5);
+        assert_eq!(s.removetime, 12);
+        // A pure display request: no state mutation, no freeze, no target op.
+        assert!(report.freeze_request.is_none());
+        assert!(report.target_ops.is_empty());
+        assert!(report.explod_ops.is_empty());
+    }
+
+    /// `Explod` with no params takes MUGEN defaults: id `-1`, anim `0`, pos
+    /// `(0, 0)`, postype `p1`, sprpriority `0`, bindtime `-1`, removetime `-1`
+    /// (T033).
+    #[test]
+    fn explod_defaults_when_params_absent() {
+        let lc = one_ctrl_synth("Explod", &[]);
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert_eq!(report.explod_spawns.len(), 1);
+        let s = report.explod_spawns[0];
+        assert_eq!(s.id, -1, "default id is the no-id sentinel");
+        assert_eq!(s.anim, 0);
+        assert_eq!(s.pos, (0.0, 0.0));
+        assert_eq!(s.pos_type, ExplodPosType::P1);
+        assert_eq!(s.sprpriority, 0);
+        assert_eq!(s.bindtime, -1, "default bindtime is bound-for-life");
+        assert_eq!(s.removetime, -1, "default removetime is play-once");
+    }
+
+    /// `ModifyExplod` emits an [`ExplodOp::Modify`] carrying ONLY the params that
+    /// were present (absent params stay `None`, leaving the explod untouched) and
+    /// `RemoveExplod` emits an [`ExplodOp::Remove`] with its id selector (T033, AC2).
+    #[test]
+    fn modify_and_remove_explod_emit_ops() {
+        let modify = one_ctrl_synth(
+            "ModifyExplod",
+            &[("id", "4"), ("anim", "99"), ("sprpriority", "-1")],
+        );
+        let mut ch = Character::new();
+        let report = modify.tick(&mut ch);
+        assert_eq!(report.explod_ops.len(), 1);
+        match report.explod_ops[0] {
+            ExplodOp::Modify {
+                id,
+                anim,
+                pos,
+                sprpriority,
+                bindtime,
+                removetime,
+            } => {
+                assert_eq!(id, Some(4));
+                assert_eq!(anim, Some(99));
+                assert_eq!(pos, None, "absent pos stays None");
+                assert_eq!(sprpriority, Some(-1));
+                assert_eq!(bindtime, None);
+                assert_eq!(removetime, None);
+            }
+            other => panic!("expected ExplodOp::Modify, got {other:?}"),
+        }
+
+        // RemoveExplod by id.
+        let remove = one_ctrl_synth("RemoveExplod", &[("id", "4")]);
+        let mut ch2 = Character::new();
+        let report2 = remove.tick(&mut ch2);
+        assert_eq!(report2.explod_ops, vec![ExplodOp::Remove(Some(4))]);
+
+        // RemoveExplod with no id → remove-all selector (None).
+        let remove_all = one_ctrl_synth("RemoveExplod", &[]);
+        let mut ch3 = Character::new();
+        let report3 = remove_all.tick(&mut ch3);
+        assert_eq!(report3.explod_ops, vec![ExplodOp::Remove(None)]);
+    }
+
+    /// `ExplodPosType::parse` maps the MUGEN `postype` tokens (case-insensitive)
+    /// and defaults to `p1` on an unknown / absent token (T033).
+    #[test]
+    fn explod_postype_parse_maps_tokens_and_defaults() {
+        assert_eq!(ExplodPosType::parse("p1"), ExplodPosType::P1);
+        assert_eq!(ExplodPosType::parse("P2"), ExplodPosType::P2);
+        assert_eq!(ExplodPosType::parse("Front"), ExplodPosType::Front);
+        assert_eq!(ExplodPosType::parse("back"), ExplodPosType::Back);
+        assert_eq!(ExplodPosType::parse("LEFT"), ExplodPosType::Left);
+        assert_eq!(ExplodPosType::parse("right"), ExplodPosType::Right);
+        assert_eq!(ExplodPosType::parse("bogus"), ExplodPosType::P1);
+        assert_eq!(ExplodPosType::parse(""), ExplodPosType::P1);
     }
 
     /// Entering a `facep2 = 1` state turns the character to face the opponent.
