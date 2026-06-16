@@ -9,6 +9,19 @@ use nom::number::complete::{le_i16, le_u16, le_u32, le_u8};
 /// Size of a single sprite sub-header in bytes.
 pub const SPRITE_SUBHEADER_SIZE: usize = 28;
 
+/// Bounded slack allowed past what the sub-header block can physically hold.
+///
+/// A well-formed SFF v2 declares `num_sprites` entries and provides exactly that
+/// many sub-headers; a *malformed* file can over-declare (truncated/garbage
+/// table), and we substitute placeholders for the missing tail so positional
+/// `linked_index` references stay aligned. To keep that behaviour while refusing
+/// to honour an unbounded `num_sprites` (e.g. `u32::MAX`, which would otherwise
+/// drive a ~137 GB allocation and a multi-billion-iteration loop), the effective
+/// count is clamped to what the block can hold plus this small slack. The slack
+/// is deliberately generous enough to cover real-world off-by-a-few truncations
+/// yet tiny relative to any allocation that could threaten the process.
+const SPRITE_COUNT_SLACK: usize = 256;
+
 /// Compression format used to encode sprite pixel data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -199,7 +212,27 @@ pub fn parse_sprite(input: &[u8]) -> FpResult<SffSprite> {
 /// positional `linked_index` references stay aligned. The whole parse only errors
 /// out when *nothing* can be read at all.
 pub fn parse_all_sprites(data: &[u8], count: u32) -> FpResult<Vec<SffSprite>> {
-    let count = count as usize;
+    let declared = count as usize;
+
+    // `count` is `num_sprites`, read raw and uncapped from the file header
+    // (offset 40), so a malformed/malicious file can declare e.g. `u32::MAX`.
+    // The sub-header block cannot describe more entries than it physically holds,
+    // so cap the declared count to what the block can hold (`data` is already
+    // clamped to EOF by `from_bytes_v2`) plus a small placeholder slack. This
+    // preserves positional placeholders for genuinely-truncated tables while
+    // refusing to reserve capacity / iterate proportional to an unbounded field
+    // (which would OOM/abort the process — see CLAUDE.md "reject oversized
+    // allocations before allocating").
+    let max_entries = data.len() / SPRITE_SUBHEADER_SIZE;
+    let count = declared.min(max_entries.saturating_add(SPRITE_COUNT_SLACK));
+    if count < declared {
+        tracing::warn!(
+            declared,
+            capped = count,
+            block_len = data.len(),
+            "SFF v2: declared sprite count far exceeds the sub-header block; capping to a sane bound"
+        );
+    }
 
     let mut sprites = Vec::with_capacity(count);
     let mut bad = 0usize;
@@ -207,8 +240,13 @@ pub fn parse_all_sprites(data: &[u8], count: u32) -> FpResult<Vec<SffSprite>> {
         let offset = i * SPRITE_SUBHEADER_SIZE;
         // Bounds-check this entry against the block before slicing. A sub-header
         // whose offset runs past the end of the block (truncated/garbage count)
-        // becomes a placeholder rather than aborting the entire set.
-        let sprite = match data.get(offset..offset + SPRITE_SUBHEADER_SIZE) {
+        // becomes a placeholder rather than aborting the entire set. `checked_add`
+        // keeps the never-panic intent uniform (the count cap above already rules
+        // out overflow on real 64-bit targets, but this stays safe everywhere).
+        let entry = offset
+            .checked_add(SPRITE_SUBHEADER_SIZE)
+            .and_then(|end| data.get(offset..end));
+        let sprite = match entry {
             Some(slice) => match parse_sprite(slice) {
                 Ok(sprite) => sprite,
                 Err(err) => {
@@ -374,6 +412,40 @@ mod tests {
     fn all_subheaders_malformed_is_fatal() {
         // Declares two sprites but provides no sub-header bytes at all.
         let err = parse_all_sprites(&[], 2).unwrap_err();
+        assert!(err.to_string().contains("no valid sprite sub-headers"));
+    }
+
+    /// T037 (regression guard): a garbage `num_sprites` near `u32::MAX` in a tiny
+    /// block must NOT drive a giant `Vec::with_capacity` / multi-billion-iteration
+    /// loop. The declared count is capped to what the block can hold plus a small
+    /// slack, so the call returns quickly without an oversized allocation.
+    #[test]
+    fn enormous_declared_count_is_capped_not_allocated() {
+        // One real sub-header, but the header claims `u32::MAX` sprites.
+        let block = make_sprite_bytes(1, 2, 32, 32, 2, 0);
+        assert_eq!(block.len(), SPRITE_SUBHEADER_SIZE);
+
+        let sprites = parse_all_sprites(&block, u32::MAX)
+            .expect("an over-declared count must not abort or allocate unbounded");
+
+        // The block holds 1 entry; the result is capped to that plus the bounded
+        // placeholder slack, NOT ~4.29 billion entries.
+        assert_eq!(sprites.len(), 1 + SPRITE_COUNT_SLACK);
+        // The single real sprite still parsed correctly at position 0.
+        assert_eq!(sprites[0].group, 1);
+        assert_eq!(sprites[0].image, 2);
+        // Everything past it is a safe self-linked placeholder.
+        assert_eq!(sprites[1].width, 0);
+        assert_eq!(sprites[1].data_length, 0);
+        assert_eq!(sprites[1].linked_index, 1);
+    }
+
+    /// An empty block with a huge declared count caps to the slack bound and then
+    /// errors (nothing valid to render) — it must do so fast, never allocating
+    /// proportional to the declared `u32`.
+    #[test]
+    fn enormous_declared_count_empty_block_is_fatal_fast() {
+        let err = parse_all_sprites(&[], u32::MAX).unwrap_err();
         assert!(err.to_string().contains("no valid sprite sub-headers"));
     }
 }

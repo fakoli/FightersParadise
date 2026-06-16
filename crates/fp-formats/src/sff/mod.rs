@@ -163,24 +163,31 @@ impl SffFile {
         // placeholder for each out-of-range entry rather than aborting the whole
         // file — the valid sprites still load.
         let sprite_start = file_header.sprite_offset as usize;
-        let sprite_end = (sprite_start + file_header.sprite_length as usize).min(data.len());
-        let sprite_block = if sprite_start <= sprite_end {
-            &data[sprite_start..sprite_end]
-        } else {
+        // `saturating_add` keeps the never-panic intent uniform with the rest of
+        // the SFF parsers (e.g. `pcx_end` in v1.rs); computed once and reused.
+        let sprite_declared_end = sprite_start.saturating_add(file_header.sprite_length as usize);
+        let sprite_end = sprite_declared_end.min(data.len());
+        let sprite_block = if sprite_start > sprite_end {
+            // Block starts past EOF: nothing parseable. One diagnostic only.
             tracing::warn!(
                 sprite_start,
                 file_len = data.len(),
                 "SFF v2: sprite sub-header block starts past end of file; treating as empty"
             );
-            &[]
+            &[][..]
+        } else {
+            if sprite_end < sprite_declared_end {
+                // In-range start but the declared table runs past EOF: the tail
+                // sprites become placeholders. Mutually exclusive with the
+                // starts-past-EOF case above, so only one warn fires per file.
+                tracing::warn!(
+                    declared = file_header.num_sprites,
+                    available_bytes = sprite_end - sprite_start,
+                    "SFF v2: sprite sub-header block truncated; out-of-range sprites become placeholders"
+                );
+            }
+            &data[sprite_start..sprite_end]
         };
-        if sprite_end < sprite_start + file_header.sprite_length as usize {
-            tracing::warn!(
-                declared = file_header.num_sprites,
-                available_bytes = sprite_block.len(),
-                "SFF v2: sprite sub-header block truncated; out-of-range sprites become placeholders"
-            );
-        }
         let sprites = sprite::parse_all_sprites(sprite_block, file_header.num_sprites)?;
 
         // Determine number of palettes from the palette block size
