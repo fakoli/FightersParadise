@@ -4788,6 +4788,75 @@ damage = 60, 0
     }
 
     #[test]
+    fn common1_guard_and_round_states() {
+        // T056: the shipped engine-default common1.cns must define the guard
+        // (120/130/131/132/140), guard-hit (150-155), win/lose/draw (170/175),
+        // intro (190/191), and round-init (5900) states, AND the fallback merge
+        // must supply them to a character that authors none (so e.g. evilken
+        // inherits 120/130/5900). Pins the T056 acceptance criteria.
+        let path = shipped_common1();
+        if !path.exists() {
+            eprintln!("skipping: shipped common1.cns absent");
+            return;
+        }
+        let cns = CnsFile::load(&path).expect("shipped common1.cns must parse");
+        let numbers: std::collections::HashSet<i32> =
+            cns.statedefs.iter().map(|d| d.number).collect();
+        for n in [
+            120, 130, 131, 132, 140, // guard stance
+            150, 151, 152, 153, 154, 155, // guard-hit reactions
+            170, 175, // lose / draw
+            190, 191,  // pre-intro / intro
+            5900, // round init
+        ] {
+            assert!(
+                numbers.contains(&n),
+                "shipped common1.cns must define [Statedef {n}]"
+            );
+        }
+
+        // The 5900 round-init state must read full life and converge to stand:
+        // it carries a LifeSet (re-assert life) and a ChangeState (back to 0).
+        let s5900 = cns
+            .statedefs
+            .iter()
+            .find(|d| d.number == 5900)
+            .expect("5900 present");
+        let kinds: Vec<String> = s5900
+            .controllers
+            .iter()
+            .filter_map(|c| c.controller_type.as_ref().map(|t| t.to_ascii_lowercase()))
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "lifeset"),
+            "5900 must re-assert life (LifeSet); got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "changestate"),
+            "5900 must hand back to a movement state (ChangeState); got {kinds:?}"
+        );
+
+        // Fallback merge: a character that authors none of these inherits them
+        // from the engine default (resolving a MISSING `stcommon`, as evilken does).
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        states.insert(0, CompiledState::from_parsed(&Statedef::default()));
+        assert!(
+            !states.contains_key(&120) && !states.contains_key(&5900),
+            "precondition: no guard/round-init states yet"
+        );
+        let missing = Path::new("/nonexistent/dir/common1.cns");
+        merge_default_common_states(&mut states, "common1.cns", missing);
+        for n in [120, 130, 131, 132, 140, 150, 170, 190, 191, 5900] {
+            assert!(
+                states.contains_key(&n),
+                "fallback must supply guard/win/intro/round-init [Statedef {n}]"
+            );
+        }
+        // The character's own state 0 still wins (first-wins merge unchanged).
+        assert!(states.contains_key(&0), "existing state 0 preserved");
+    }
+
+    #[test]
     fn engine_default_common1_path_finds_shipped_asset() {
         // The resolver walks CWD then ancestors; tests run with CWD at the crate
         // dir (`crates/fp-character`), so the workspace `assets/data/common1.cns`

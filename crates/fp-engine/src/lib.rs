@@ -297,6 +297,19 @@ const DEFAULT_ROUND_SECONDS: i32 = 99;
 /// Ticks per second; the engine runs at a fixed 60Hz (see the architecture KB).
 const TICKS_PER_SECOND: i32 = 60;
 
+/// The MUGEN engine-common **round-initialisation** state ([Statedef 5900],
+/// authored in `common1.cns`). MUGEN drives every fighter through 5900 at the
+/// start of each round to re-seed its resources / var defaults, then hand it
+/// back to the neutral stand.
+///
+/// The engine `Match` owns the authoritative round reset
+/// ([`Match::reset_for_next_round`] / the initial seeding), so 5900 is
+/// **advisory** and authored to *converge* with that reset (re-asserting full
+/// life on the same value, then `ChangeState 0`) rather than fight it. When a
+/// character defines 5900 it is entered at round init so that convergence runs;
+/// a character that omits it is unaffected (the engine's field reset stands).
+const ROUND_INIT_STATE: i32 = 5900;
+
 /// The default number of round wins required to win the match. MUGEN's default
 /// `rounds.to.win` is `2` — best of three rounds. Override per-match with
 /// [`Match::with_rounds_to_win`] / [`Match::set_rounds_to_win`].
@@ -1736,7 +1749,7 @@ impl Match {
         let p1_reset = RoundResetState::capture(&p1.character);
         let p2_reset = RoundResetState::capture(&p2.character);
         let round_frames = round_seconds.max(0).saturating_mul(TICKS_PER_SECOND);
-        Self {
+        let mut m = Self {
             p1,
             p2,
             bounds,
@@ -1760,7 +1773,11 @@ impl Match {
             effects: Vec::new(),
             common_fx: None,
             single_round: false,
-        }
+        };
+        // Drive each fighter through its round-init state (5900) for round 1, the
+        // same way [`Match::reset_for_next_round`] does for every later round.
+        m.run_round_init();
+        m
     }
 
     /// Installs the shared common-effects (`fightfx`) animation set used to
@@ -2924,12 +2941,49 @@ impl Match {
         self.p1.explods.clear();
         self.p2.explods.clear();
 
+        // Drive each fighter through its round-init state (5900) so its authored
+        // convergence runs on top of the field reset just applied (see
+        // [`Match::run_round_init`]).
+        self.run_round_init();
+
         tracing::info!(
             round = self.round_number,
             p1_round_wins = self.p1_round_wins,
             p2_round_wins = self.p2_round_wins,
             "round reset: starting next round"
         );
+    }
+
+    /// Drives each fighter into the engine-common round-init state
+    /// ([`ROUND_INIT_STATE`], `common1.cns` [Statedef 5900]) **iff it defines
+    /// one**, so the authored round-init logic runs at the top of every round.
+    ///
+    /// This is how 5900 *integrates with* the engine's authoritative round reset
+    /// without fighting it: the field reset
+    /// ([`reset_fighter_for_round`]) has already restored full life, the start
+    /// position/facing, and the neutral stand; entering 5900 then re-asserts
+    /// those (its `LifeSet value = Const(data.life)` writes the same full-life
+    /// value, and its `ChangeState 0` returns to the same neutral stand the reset
+    /// selected). Because the round opens in [`RoundState::Intro`] — where both
+    /// fighters still tick their state machines (so idle/intro animations play)
+    /// but receive no commands — 5900's controllers run on the intro's first tick
+    /// and converge it back to state `0`. The net effect on a converging 5900 is
+    /// nil; a character can override 5900 (the loader's first-wins merge keeps its
+    /// version) to seed per-round vars, and that runs here instead.
+    ///
+    /// A fighter that does **not** define 5900 is left exactly where the field
+    /// reset put it (state `0`); the lookup is a safe no-op. Never panics.
+    fn run_round_init(&mut self) {
+        if self.p1.loaded.states.contains_key(&ROUND_INIT_STATE) {
+            self.p1
+                .character
+                .change_state(&self.p1.loaded.states, ROUND_INIT_STATE);
+        }
+        if self.p2.loaded.states.contains_key(&ROUND_INIT_STATE) {
+            self.p2
+                .character
+                .change_state(&self.p2.loaded.states, ROUND_INIT_STATE);
+        }
     }
 
     /// Enters [`RoundState::Ko`], freezing the round clock and removing control
@@ -8625,6 +8679,125 @@ time = 1
         // Reset to the next round directly; sparks must be cleared.
         m.reset_for_next_round();
         assert!(m.effects().is_empty(), "round reset clears live sparks");
+    }
+
+    // ---- T056: round-init common state (5900) ------------------------------
+
+    /// A [`CompiledController`] of the given `type`, with `value = <expr>` and a
+    /// `trigger1 = <trigger>` gate. Mirrors the shape an authored `common1.cns`
+    /// 5900 controller compiles to.
+    fn value_controller(ty: &str, value: &str, trigger: &str) -> CompiledController {
+        CompiledController {
+            state_number: ROUND_INIT_STATE,
+            label: String::new(),
+            controller_type: Some(ty.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile(trigger)],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [("value".to_string(), CompiledParam::compile(value))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A [`LoadedCharacter`] whose state graph defines the engine-common round-init
+    /// state ([`ROUND_INIT_STATE`], 5900): on `Time = 0` it re-asserts full life
+    /// (`LifeSet value = Const(data.life)`) and hands back to the neutral stand
+    /// (`ChangeState value = 0`) — the converging shape the authored 5900 has.
+    /// Also defines a (no-op) state 0 so the convergence target exists.
+    fn round_init_loaded() -> LoadedCharacter {
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        let s5900 = CompiledState {
+            number: ROUND_INIT_STATE,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("S".to_string()),
+            controllers: vec![
+                value_controller("LifeSet", "Const(data.life)", "Time = 0"),
+                value_controller("ChangeState", "0", "Time = 0"),
+            ],
+            ..Default::default()
+        };
+        loaded.states.insert(ROUND_INIT_STATE, s5900);
+        // A trivial state 0 so the 5900 ChangeState target is a defined state.
+        loaded.states.insert(
+            0,
+            CompiledState {
+                number: 0,
+                state_type: Some("S".to_string()),
+                movetype: Some("I".to_string()),
+                physics: Some("S".to_string()),
+                ..Default::default()
+            },
+        );
+        loaded
+    }
+
+    /// AC (T056): the engine drives a fighter through its round-init state (5900)
+    /// at the start of each round, and 5900 *converges* with the engine's
+    /// authoritative field reset rather than fighting it.
+    ///
+    /// - At construction (round 1) a character that defines 5900 is entered into
+    ///   it (it is NOT left in state 0).
+    /// - Ticking the intro runs 5900, which re-asserts full life and `ChangeState`s
+    ///   back to the neutral stand (state 0) — so the net effect converges.
+    /// - The same happens on a `reset_for_next_round`.
+    /// - A character that defines NO 5900 is left in state 0 (safe no-op).
+    #[test]
+    fn round_init_uses_5900() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        // P1 defines 5900; P2 does not (the no-op control).
+        let p1 = Player::new(p1c, round_init_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Round 1: the engine drove P1 into its round-init state, and left the
+        // 5900-less P2 in the neutral stand.
+        assert_eq!(
+            m.p1.character.state_no, ROUND_INIT_STATE,
+            "a fighter that defines 5900 is entered into it at round init"
+        );
+        assert_eq!(
+            m.p2.character.state_no, 0,
+            "a fighter with no 5900 is left in the neutral stand (no-op)"
+        );
+
+        // Drive 5900 to convergence: drop P1 below full life first to prove the
+        // LifeSet re-asserts it, then tick once (the intro still ticks the state
+        // machine). 5900 runs on Time = 0 → full life + ChangeState 0.
+        m.p1.character.life = 1;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1.character.life, m.p1.character.life_max,
+            "5900's LifeSet re-asserts full life on round init"
+        );
+        assert_eq!(
+            m.p1.character.state_no, 0,
+            "5900 hands back to the neutral stand — it converges with the reset"
+        );
+
+        // A between-round reset re-runs round init the same way.
+        m.p1.character.state_no = 42; // pretend it ended the round elsewhere
+        m.reset_for_next_round();
+        assert_eq!(
+            m.p1.character.state_no, ROUND_INIT_STATE,
+            "reset_for_next_round re-enters 5900 for the fighter that defines it"
+        );
+        assert_eq!(
+            m.p2.character.state_no, 0,
+            "the 5900-less fighter is reset to the neutral stand, not 5900"
+        );
     }
 
     /// AC (gated, skip-if-missing): drive a REAL KFM punch through the actual
