@@ -12,22 +12,27 @@ and the honest [Known Issues](known-issues.md) list. For format coverage and aut
 
 ## Where we start from
 
-Fighters Paradise is **not** an early stub project. It is already a **playable two-character
-fighter**: `fp-app` renders a two-player `fp_engine::Match` driven by *real* Kung Fu Man data
-(.def/.sff/.air/.cmd/.cns/.snd), with a keyboard P1, a life **and power** HUD, KO/winner readout,
-and best-of-3 rounds. KFM's signature throw, supers (meter), hitpause, i-frames, hit reactions,
-jump+airjump+land, and damage multipliers all work end to end. The workspace is 14 crates / ~59k LOC
-with **~2,000 `#[test]` attributes** (full suite ~2,045 passing including doc-tests);
+Fighters Paradise is **not** an early stub project. It is a **complete, playable fighting game**
+(v1.0, 2026-06-15): `fp-app` renders a two-player `fp_engine::Match` driven by *real* Kung Fu Man
+data (.def/.sff/.air/.cmd/.cns/.snd), with a Title screen → character select → stage select →
+fight flow, a keyboard P1 (remappable), a life **and power** HUD, KO/winner readout, and
+best-of-3 rounds. KFM's signature throw, supers (meter), hitpause, i-frames, hit reactions,
+jump+airjump+land, and damage multipliers all work end to end. Characters walk, run, and jump
+correctly — bare velocity consts resolve (PRs #98/#99). The workspace is 14 crates / ~59k LOC with
+**~2,600 `#[test]` attributes** (full suite ~2,644 passing including doc-tests);
 `cargo clippy --workspace --all-targets -- -D warnings` is clean and CI is green.
 
-**Update (audit-P run):** the 23-PR audit run closed the bulk of the milestone work below.
-`fp-stage` and `fp-ui` have **graduated from stubs** (typed stage `.def` + parallax render; typed
-`fight.def` screenpack + `ScreenpackHud`), `fp-storyboard` is no longer parser-only (it has a
-`StoryboardPlayer` + intro/ending overlay), and the executor dispatch chain now handles **~40
-controllers** (was ~30). An **original clean-room training-dummy** character ships in
-`assets/trainingdummy/`, and CI loads + matches + validates it on every push — the real-content
-safety net is finally real. What remains is M4 (determinism/replay #38, modes #39) and M5 (the
-authoring moat); see those sections below.
+**Update (audit-P run + v1.0 + behavioral-test-harness run):** the 23-PR audit run closed the bulk
+of the milestone work below. `fp-stage` and `fp-ui` have **graduated from stubs** (typed stage
+`.def` + parallax render; typed `fight.def` screenpack + `ScreenpackHud`), `fp-storyboard` is no
+longer parser-only (it has a `StoryboardPlayer` + intro/ending overlay), and the executor dispatch
+chain now handles **~40 controllers** (was ~30). An **original clean-room training-dummy** character
+ships in `assets/trainingdummy/`, and CI loads + matches + validates it on every push — the
+real-content safety net is finally real. Bare velocity consts resolve (PRs #98/#99) so characters
+walk, run, and jump correctly. A **GUI-free behavioral test harness** (motion synthesizer, range-
+of-motion table, evilken move-execution) now asserts in-game behavior headlessly — no window
+needed. What remains is M4 (determinism/replay #38, modes #39) and M5 (the authoring moat); see
+those sections below.
 
 The work items are drawn from the [faithfulness audit](knowledge-base/08-faithfulness-audit.md),
 which ranks 39 MUGEN-fidelity gaps by priority and effort. Each milestone below cites those item IDs

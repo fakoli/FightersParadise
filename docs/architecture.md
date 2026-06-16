@@ -6,13 +6,17 @@ reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen_(game_engine
 `.sff`, `.air`, `.cmd`, `.cns`, `.snd` — and today drives a **playable
 two-character match** off real Kung Fu Man data.
 
-> Status snapshot (2026-06): a playable best-of-3 fight (P1 keyboard, P2 idle
-> dummy), real KFM data end to end, ~2,000 `#[test]` functions across 14 crates
-> (full suite ~2,045 passing including doc/integration tests). **No crate is a
-> true stub anymore** — `fp-stage`, `fp-ui`, and `fp-storyboard` have all
+> Status snapshot (2026-06): a **complete, playable fighting game** (v1.0
+> 2026-06-15) — Title screen → character select → stage select → fight,
+> Setup/Options with live key remapping, directory-discovery of content the MUGEN
+> way, P1 keyboard/gamepad, P2 CPU or human. ~2,600 `#[test]` attributes across
+> 14 crates (full suite ~2,644 passing including doc/integration tests). **No
+> crate is a stub anymore** — `fp-stage`, `fp-ui`, and `fp-storyboard` have all
 > graduated; several presentation features are wired but partial or asset-blocked.
-> See [Known issues](known-issues.md) and the [Roadmap](roadmap.md). For the
-> per-feature MUGEN-fidelity ledger see the
+> A **GUI-free behavioral test harness** (motion synthesizer, range-of-motion
+> table, evilken move-execution) runs fully headless. See [Known
+> issues](known-issues.md) and the [Roadmap](roadmap.md). For the per-feature
+> MUGEN-fidelity ledger see the
 > [faithfulness audit](knowledge-base/08-faithfulness-audit.md).
 
 Related docs: root [README](../README.md) · [MUGEN compatibility](mugen-compatibility.md)
@@ -130,12 +134,6 @@ real frame (variable Δt)
         ▼
  begin_frame → draw fighters → HUD → present     (exactly once per frame)
 ```
-
-> **Known imprecision (audit #27):** the keyboard is sampled *inside* the
-> catch-up loop (`event_pump.keyboard_state()` at
-> `crates/fp-app/src/main.rs:1131`), so a frame that drains multiple ticks
-> re-reads the same live input on each tick instead of snapshotting once per
-> frame. Tracked in [Known issues](known-issues.md).
 
 ### 2.2 Struct-based entities (not ECS) — so the VM has direct field access
 
@@ -512,9 +510,10 @@ Putting it together, here is a single 60 Hz tick of a live fight, from a key
 press to a pixel. Steps map to the `Match::tick` order in §4.
 
 ```
-[fp-app]   while accumulator ≥ TICK_DURATION:                    main.rs:1127
-   │  ── (caveat #27: keyboard sampled here, inside the loop) ──
+[fp-app]   keyboard snapshotted once per frame (before the loop) main.rs:1127
    │  keyboard → MatchInput (absolute directions)                main.rs:1131
+   │
+   │  while accumulator ≥ TICK_DURATION:
    ▼
 [fp-engine] Match::tick(p1_input, p2_input)                      lib.rs:661
    │
@@ -577,11 +576,14 @@ through `TickReport` (§2.6) for the `Match` to apply.
 Fighters Paradise is a clean-room reimplementation: **no Elecbyte/MUGEN engine
 source and no copyrighted assets are shipped or tracked.** Kung Fu Man content
 (CC BY-NC 3.0, Elecbyte) is used **only for local development** through a
-gitignored `test-assets` symlink; zero content files (`.sff/.air/.cmd/.cns/.def/.snd`)
-are git-tracked. The project's own code is MIT-licensed. See the root
-[README](../README.md) and [MUGEN compatibility](mugen-compatibility.md) for the
-full licensing and trademark notes. KFM content must never be redistributed with
-this engine.
+gitignored `test-assets` symlink; zero **third-party** content files are
+git-tracked. The only tracked MUGEN-format originals are the project's own
+clean-room assets: `assets/trainingdummy/` (MIT, the CI conformance fixture),
+`assets/data/` (MIT — `fightfx.sff`, `font.fnt`, `common1.cns`), and the shipped
+default motif (`system.def`/`select.def`). The project's code is MIT-licensed.
+See the root [README](../README.md) and [MUGEN
+compatibility](mugen-compatibility.md) for the full licensing and trademark notes.
+KFM content must never be redistributed with this engine.
 
 ---
 
