@@ -40,6 +40,7 @@ use std::path::{Component, Path};
 use fp_core::{FpError, FpResult};
 use fp_formats::air::{begin_action_number, salvage_frame_columns};
 use fp_formats::cns::{section_header, strip_comment, SectionKind};
+use serde::Serialize;
 
 /// The kind of repair applied to a single CNS/CMD line.
 ///
@@ -560,6 +561,298 @@ pub fn write_air_overlay(overlay: &AirOverlay, dest: &Path) -> FpResult<()> {
     write_overlay_text(&overlay.text, dest)
 }
 
+// ---------------------------------------------------------------------------
+// Import report: tiered human + stable-JSON rendering + severity gate (T085)
+// ---------------------------------------------------------------------------
+
+/// The severity tier a repair / flag falls under in the import report.
+///
+/// The tier drives both the human grouping and the `--strict` gate: a report is
+/// considered to have failed `--strict` iff its [`Tier::Flagged`] list is
+/// non-empty (a flag is something the import could *not* provably auto-repair and
+/// a human should look at). [`Tier::Repaired`] and [`Tier::Advisory`] never affect
+/// the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// The import rewrote the content into a provably-safe shape (e.g. commented
+    /// out a stray line, salvaged a junk AIR column, pruned a dead frame). No
+    /// human action needed; recorded for transparency.
+    Repaired,
+    /// The import detected a problem it did **not** rewrite — a human should look.
+    /// The only thing that trips `--strict`.
+    Flagged,
+    /// An informational note (no problem, no rewrite). Never trips `--strict`.
+    Advisory,
+}
+
+impl Tier {
+    /// The stable, human-facing label for this tier (used as the JSON key and the
+    /// human-report section heading).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Repaired => "repaired",
+            Tier::Flagged => "flagged",
+            Tier::Advisory => "advisory",
+        }
+    }
+}
+
+/// The stable category label for a CNS/CMD [`RepairKind`] (used for per-category
+/// counts and as the JSON `kind`).
+#[must_use]
+fn cns_category(kind: RepairKind) -> &'static str {
+    match kind {
+        RepairKind::StrayLine => "StrayLine",
+        RepairKind::EmptyKey => "EmptyKey",
+        RepairKind::ColonHeader => "ColonHeader",
+        RepairKind::MalformedHeader => "MalformedHeader",
+    }
+}
+
+/// The tier an AIR [`AirRepairKind`] is reported under. A salvaged junk column or
+/// a pruned dead frame is a provably-safe rewrite ([`Tier::Repaired`]); a
+/// missing-sprite reference that was only *flagged* (not pruned) is something a
+/// human should resolve ([`Tier::Flagged`]).
+#[must_use]
+fn air_tier(kind: AirRepairKind) -> Tier {
+    match kind {
+        AirRepairKind::JunkColumn | AirRepairKind::DeadFrame => Tier::Repaired,
+        AirRepairKind::MissingSpriteRef => Tier::Flagged,
+    }
+}
+
+/// The stable category label for an AIR [`AirRepairKind`].
+#[must_use]
+fn air_category(kind: AirRepairKind) -> &'static str {
+    match kind {
+        AirRepairKind::JunkColumn => "JunkColumn",
+        AirRepairKind::DeadFrame => "DeadFrame",
+        AirRepairKind::MissingSpriteRef => "MissingSpriteRef",
+    }
+}
+
+/// A single line in the import report: one repair or flag, attributed to a source
+/// `file:line`, with its tier and stable category.
+///
+/// Field order matters: it is the key the report sorts by (`file`, then `line_no`,
+/// then `category`) so the human and JSON faces are deterministic across runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportEntry {
+    /// The source file the repair was found in (as the user named it on the CLI).
+    pub file: String,
+    /// 1-based source line number (`None` only for whole-file advisories that have
+    /// no single owning line).
+    pub line_no: Option<usize>,
+    /// The severity tier ([`Tier::Repaired`] / [`Tier::Flagged`] / [`Tier::Advisory`]).
+    pub tier: Tier,
+    /// The stable category label (e.g. `"StrayLine"`, `"MissingSpriteRef"`).
+    pub kind: String,
+    /// The original (pre-repair) line text, trimmed of surrounding whitespace.
+    pub original: String,
+}
+
+impl ReportEntry {
+    /// The sort key that makes the report deterministic: `(file, line_no, kind)`.
+    ///
+    /// `line_no: None` sorts before any numbered line (a whole-file advisory leads
+    /// its file's section).
+    fn sort_key(&self) -> (&str, usize, &str) {
+        (
+            self.file.as_str(),
+            self.line_no.unwrap_or(0),
+            self.kind.as_str(),
+        )
+    }
+}
+
+/// A tiered, deterministic report of every repair/flag an import produced over one
+/// or more source files.
+///
+/// Built incrementally with [`ImportReport::add_cns`] / [`ImportReport::add_air`],
+/// then rendered to a human face ([`ImportReport::render`]) or a stable, sorted
+/// JSON document ([`ImportReport::to_json`]). The `--strict` gate keys off
+/// [`ImportReport::has_flags`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ImportReport {
+    /// Every report entry, kept sorted by `(file, line_no, kind)` so both faces are
+    /// byte-stable across runs on identical input.
+    pub entries: Vec<ReportEntry>,
+}
+
+impl ImportReport {
+    /// Creates an empty report.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Re-sorts the entries by `(file, line_no, kind)`. Called after every
+    /// `add_*` so the report is always in canonical order — never relies on
+    /// insertion or `HashMap` order.
+    fn resort(&mut self) {
+        self.entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    }
+
+    /// Folds every repair from a [`CnsOverlay`] into the report, attributing each
+    /// to `file`.
+    pub fn add_cns(&mut self, file: &str, overlay: &CnsOverlay) {
+        for r in &overlay.repairs {
+            self.entries.push(ReportEntry {
+                file: file.to_string(),
+                line_no: Some(r.line_no),
+                // Every CNS text repair is a provably-safe rewrite.
+                tier: Tier::Repaired,
+                kind: cns_category(r.kind).to_string(),
+                original: r.original.trim().to_string(),
+            });
+        }
+        self.resort();
+    }
+
+    /// Folds every repair/flag from an [`AirOverlay`] into the report, attributing
+    /// each to `file`.
+    pub fn add_air(&mut self, file: &str, overlay: &AirOverlay) {
+        for r in &overlay.repairs {
+            self.entries.push(ReportEntry {
+                file: file.to_string(),
+                line_no: Some(r.line_no),
+                tier: air_tier(r.kind),
+                kind: air_category(r.kind).to_string(),
+                original: r.original.trim().to_string(),
+            });
+        }
+        self.resort();
+    }
+
+    /// All entries belonging to `tier`, in canonical sorted order.
+    fn entries_in(&self, tier: Tier) -> impl Iterator<Item = &ReportEntry> {
+        self.entries.iter().filter(move |e| e.tier == tier)
+    }
+
+    /// Returns `true` when the report carries at least one [`Tier::Flagged`] entry
+    /// — the condition `--strict` exits non-zero on.
+    #[must_use]
+    pub fn has_flags(&self) -> bool {
+        self.entries.iter().any(|e| e.tier == Tier::Flagged)
+    }
+
+    /// Returns `true` when the report carries no entries at all (nothing repaired,
+    /// nothing flagged) — the input was clean.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Per-category counts within a tier, in `(category, count)` pairs sorted by
+    /// category, so the human face is deterministic.
+    fn category_counts(&self, tier: Tier) -> Vec<(&'static str, usize)> {
+        // Use a fixed category order rather than a HashMap so output is stable.
+        const CATS: &[&str] = &[
+            "StrayLine",
+            "EmptyKey",
+            "ColonHeader",
+            "MalformedHeader",
+            "JunkColumn",
+            "DeadFrame",
+            "MissingSpriteRef",
+        ];
+        CATS.iter()
+            .filter_map(|cat| {
+                let n = self.entries_in(tier).filter(|e| e.kind == *cat).count();
+                (n > 0).then_some((*cat, n))
+            })
+            .collect()
+    }
+
+    /// Renders the human-readable report: a per-tier section (each with its
+    /// per-category counts and `file:line` lines), the clean-room license reminder
+    /// (printed **every** run), and — for clean input — `PASS — no repairs needed`.
+    ///
+    /// Deterministic for a given report: the entry list is kept sorted, and the
+    /// tiers/categories are emitted in a fixed order.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("Import report\n");
+
+        if self.is_clean() {
+            out.push_str("\nPASS — no repairs needed\n");
+        } else {
+            out.push_str(&format!(
+                "\n{} repair(s)/flag(s) across {} file(s).\n",
+                self.entries.len(),
+                self.distinct_files()
+            ));
+            for tier in [Tier::Repaired, Tier::Flagged, Tier::Advisory] {
+                let counts = self.category_counts(tier);
+                let total: usize = counts.iter().map(|(_, n)| n).sum();
+                if total == 0 {
+                    continue;
+                }
+                let breakdown = counts
+                    .iter()
+                    .map(|(c, n)| format!("{c} x{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "\n{} ({total}): {breakdown}\n",
+                    tier.label().to_uppercase()
+                ));
+                for e in self.entries_in(tier) {
+                    let loc = match e.line_no {
+                        Some(n) => format!("{}:{n}", e.file),
+                        None => e.file.clone(),
+                    };
+                    out.push_str(&format!("  - {loc} {} — {}\n", e.kind, e.original));
+                }
+            }
+        }
+
+        out.push('\n');
+        out.push_str(crate::validate::LICENSE_REMINDER);
+        out.push('\n');
+        out
+    }
+
+    /// The number of distinct source files referenced by the report.
+    fn distinct_files(&self) -> usize {
+        let mut files: Vec<&str> = self.entries.iter().map(|e| e.file.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len()
+    }
+
+    /// Serializes the report to **stable, sorted JSON** (pretty-printed).
+    ///
+    /// The entry list is kept sorted by `(file, line_no, kind)`, and the JSON is
+    /// produced over that ordered vec, so two runs over identical input emit a
+    /// **byte-identical** document. Never relies on `HashMap` iteration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FpError::Other`] if serialization fails (should not happen for
+    /// this all-owned, no-NaN model — surfaced rather than panicking).
+    pub fn to_json(&self) -> FpResult<String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| FpError::Other(format!("import report JSON serialization failed: {e}")))
+    }
+
+    /// Writes the stable JSON to `dest`, refusing any destination inside an
+    /// `assets/` tree (the same clean-room write guard as the overlays).
+    ///
+    /// # Errors
+    ///
+    /// - [`FpError::Other`] if `dest` lies inside an `assets/` directory, or if
+    ///   serialization fails — the file is **not** written.
+    /// - [`FpError::Io`] if the parent cannot be created or the file written.
+    pub fn write_json(&self, dest: &Path) -> FpResult<()> {
+        let json = self.to_json()?;
+        write_overlay_text(&json, dest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,5 +1171,126 @@ type = Null
         let err = write_air_overlay(&overlay, &p).expect_err("must refuse assets/ path");
         assert!(matches!(err, FpError::Other(_)));
         assert!(!p.exists(), "must not create the file when refused");
+    }
+
+    // -------------------------------------------------------------------
+    // Import report: tiers, human face, stable JSON, --strict gate (T085)
+    // -------------------------------------------------------------------
+
+    /// Builds a report over the dirty CNS + a dirty AIR with one flagged
+    /// (un-pruned) missing-sprite reference, so it exercises both Repaired and
+    /// Flagged tiers across two files.
+    fn dirty_report() -> ImportReport {
+        let mut report = ImportReport::new();
+        report.add_cns("kfm.cns", &repair_cns_text(DIRTY_CNS));
+        // (0,2) absent, no --prune -> a flagged MissingSpriteRef + a Repaired
+        // JunkColumn.
+        let air = repair_air_text(DIRTY_AIR, false, |g, i| !(g == 0 && i == 2));
+        report.add_air("kfm.air", &air);
+        report
+    }
+
+    #[test]
+    fn import_report_groups_by_tier_with_counts_and_file_line() {
+        let report = dirty_report();
+        let text = report.render();
+        // Tier headings present, in fixed order, with totals.
+        let repaired_at = text.find("REPAIRED").expect("repaired section");
+        let flagged_at = text.find("FLAGGED").expect("flagged section");
+        assert!(repaired_at < flagged_at, "REPAIRED before FLAGGED:\n{text}");
+        // Per-category counts: 2 stray lines + the rest from DIRTY_CNS, plus the
+        // AIR junk column under Repaired; the missing-sprite under Flagged.
+        assert!(text.contains("StrayLine x2"), "{text}");
+        assert!(text.contains("EmptyKey x1"), "{text}");
+        assert!(text.contains("ColonHeader x1"), "{text}");
+        assert!(text.contains("MalformedHeader x1"), "{text}");
+        assert!(text.contains("JunkColumn x1"), "{text}");
+        assert!(text.contains("MissingSpriteRef x1"), "{text}");
+        // file:line attribution appears.
+        assert!(text.contains("kfm.cns:"), "{text}");
+        assert!(text.contains("kfm.air:"), "{text}");
+        // License reminder prints on a non-clean run too.
+        assert!(text.contains(crate::validate::LICENSE_REMINDER), "{text}");
+    }
+
+    #[test]
+    fn import_report_clean_prints_pass_and_license() {
+        let mut report = ImportReport::new();
+        report.add_cns("clean.cns", &repair_cns_text("[Statedef 0]\ntype = S\n"));
+        assert!(report.is_clean(), "no repairs -> clean");
+        let text = report.render();
+        assert!(
+            text.contains("PASS — no repairs needed"),
+            "clean content must print the PASS line:\n{text}"
+        );
+        assert!(
+            text.contains(crate::validate::LICENSE_REMINDER),
+            "the license reminder prints every run, including clean:\n{text}"
+        );
+    }
+
+    #[test]
+    fn import_report_json_is_stable_across_two_runs() {
+        let report = dirty_report();
+        let a = report.to_json().expect("json a");
+        let b = report.to_json().expect("json b");
+        assert_eq!(a, b, "two encodes of the same report are byte-identical");
+
+        // A freshly rebuilt report from identical input also matches (no
+        // HashMap-order leakage across construction).
+        let c = dirty_report().to_json().expect("json c");
+        assert_eq!(a, c, "rebuilt-from-identical-input JSON is byte-identical");
+
+        // Sanity: the JSON actually carries the data, sorted (kfm.air entries
+        // before kfm.cns because 'a' < 'c').
+        let air_at = c.find("kfm.air").expect("air in json");
+        let cns_at = c.find("kfm.cns").expect("cns in json");
+        assert!(air_at < cns_at, "entries sorted by file:\n{c}");
+        assert!(c.contains("\"flagged\""), "flagged tier serialized:\n{c}");
+    }
+
+    #[test]
+    fn import_report_strict_gate_keys_off_flagged_only() {
+        // A report with only Repaired entries must NOT trip --strict.
+        let mut repaired_only = ImportReport::new();
+        repaired_only.add_cns("a.cns", &repair_cns_text(DIRTY_CNS));
+        assert!(
+            !repaired_only.has_flags(),
+            "all-repaired report has no flags"
+        );
+        assert!(!repaired_only.is_clean(), "but it is not clean either");
+
+        // A report with a flagged missing-sprite trips --strict.
+        let flagged = dirty_report();
+        assert!(flagged.has_flags(), "missing-sprite flag trips --strict");
+
+        // A clean report has neither.
+        let clean = ImportReport::new();
+        assert!(!clean.has_flags());
+        assert!(clean.is_clean());
+    }
+
+    #[test]
+    fn import_report_json_write_guard_refuses_assets_dir() {
+        let report = dirty_report();
+        let dir = std::env::temp_dir().join("fp-import-report-guard");
+        let p = dir.join("assets/report.json");
+        let err = report.write_json(&p).expect_err("must refuse assets/ path");
+        assert!(matches!(err, FpError::Other(_)));
+        assert!(!p.exists(), "must not create the file when refused");
+    }
+
+    #[test]
+    fn import_report_json_write_to_cache_succeeds_and_matches() {
+        let report = dirty_report();
+        let dir = std::env::temp_dir().join("fp-import-report-ok");
+        let dest = dir.join(".fp-cache/report.json");
+        let _ = std::fs::remove_file(&dest);
+        report
+            .write_json(&dest)
+            .expect("cache-dir write must succeed");
+        let written = std::fs::read_to_string(&dest).expect("report file exists");
+        assert_eq!(written, report.to_json().unwrap());
+        let _ = std::fs::remove_file(&dest);
     }
 }

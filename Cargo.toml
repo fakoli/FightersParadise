@@ -63,5 +63,9 @@ pollster = "0.4"
 # serialized — only the per-tick mutable state.
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+# Stable, sorted JSON for the `import --report-json` content-import report (F034
+# T085). Used only by the offline import tool to emit a deterministic,
+# byte-identical-across-runs report; not on any runtime/render path.
+serde_json = "1"
 # Dev-only: property/fuzz testing (fp-vm never-panic contract, audit #37).
 proptest = "1"

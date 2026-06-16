@@ -232,102 +232,204 @@ fn run_validate(args: &[String]) -> i32 {
     }
 }
 
-/// Runs the `import <file.cns|.cmd|.air> <overlay-out> [--prune]` subcommand:
-/// reads a CNS/CMD/AIR file, produces a repaired-text overlay (see [`import`]),
-/// and writes it to the output path — refusing any destination inside an
-/// `assets/` tree.
+/// Parsed flags / positionals for the `import` subcommand.
+struct ImportArgs {
+    /// The source `.cns`/`.cmd`/`.air` file to import.
+    src: String,
+    /// Where to write the repaired overlay, if requested (positional). `None` in
+    /// report-only mode (`--report`/`--report-json` with no overlay-out).
+    overlay_out: Option<String>,
+    /// `--prune`: remove dead AIR frames (vs. only flagging them).
+    prune: bool,
+    /// `--report`: print the tiered human report to stdout.
+    report: bool,
+    /// `--report-json <path>`: write the stable, sorted JSON report.
+    report_json: Option<String>,
+    /// `--strict`: exit non-zero iff the report has Flagged entries.
+    strict: bool,
+}
+
+/// Parses the `import` argv (everything after `fp-app import`) into [`ImportArgs`].
+///
+/// Positionals are `<src>` then an optional `<overlay-out>`; the rest are flags.
+/// Returns `None` on a usage error (no source, or `--report-json` missing its
+/// path) so the caller can print usage and exit `2`.
+fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut prune = false;
+    let mut report = false;
+    let mut strict = false;
+    let mut report_json: Option<String> = None;
+
+    let mut i = 2; // skip "fp-app" and "import"
+    while i < args.len() {
+        let a = &args[i];
+        if a.eq_ignore_ascii_case("--prune") {
+            prune = true;
+        } else if a.eq_ignore_ascii_case("--report") {
+            report = true;
+        } else if a.eq_ignore_ascii_case("--strict") {
+            strict = true;
+        } else if a.eq_ignore_ascii_case("--report-json") {
+            // Path is the next token.
+            i += 1;
+            report_json = Some(args.get(i)?.clone());
+        } else if a.starts_with("--") {
+            // Unknown flag: a usage error.
+            return None;
+        } else {
+            positionals.push(a);
+        }
+        i += 1;
+    }
+
+    let src = (*positionals.first()?).to_string();
+    let overlay_out = positionals.get(1).map(|s| (*s).to_string());
+    Some(ImportArgs {
+        src,
+        overlay_out,
+        prune,
+        report,
+        report_json,
+        strict,
+    })
+}
+
+/// Runs the `import <file.cns|.cmd|.air> [<overlay-out>] [--prune] [--report]
+/// [--report-json <path>] [--strict]` subcommand: reads a CNS/CMD/AIR file,
+/// produces a repaired-text overlay (see [`import`]), optionally writes it,
+/// builds a tiered repair report, and renders it (human + stable JSON).
 ///
 /// `.cns`/`.cmd` files take the CNS line-repair path. `.air` files take the AIR
 /// overlay path: junk frame columns (`2..A` → `2`) are always salvaged, and with
 /// `--prune` dead frames (whose sprite is absent from the sibling `.sff`) are
-/// removed — but never an action's last frame. The sprite-presence oracle is the
-/// `.sff` that sits next to the `.air`; if none is found, pruning is a no-op
-/// (every sprite is assumed present) and salvage still applies.
+/// removed — but never an action's last frame.
 ///
-/// Returns the process exit code: `2` for a usage error, `1` if the source
-/// cannot be read or the overlay cannot be written (e.g. the clean-room write
-/// guard refused an `assets/` destination), `0` on success. The overlay is
-/// engine *output*, never written back over the source asset.
+/// - `--report` prints the human, tier-grouped report to stdout.
+/// - `--report-json <path>` writes the stable, sorted JSON report (refusing an
+///   `assets/` destination).
+/// - `--strict` makes the process exit non-zero iff the report carries any
+///   **Flagged** entry (default exits 0 even with flags); it is for CI/evidence.
+///
+/// Every clean-room write path refuses an `assets/` destination. Returns the
+/// process exit code: `2` for a usage error, `1` on read/write failure, `0` on
+/// success — except under `--strict` with flags, which returns `1`.
 fn run_import(args: &[String]) -> i32 {
-    let (Some(src_arg), Some(out_arg)) = (args.get(2), args.get(3)) else {
-        eprintln!("usage: fp-app import <file.cns|.cmd|.air> <overlay-out> [--prune]");
+    let Some(parsed) = parse_import_args(args) else {
+        eprintln!(
+            "usage: fp-app import <file.cns|.cmd|.air> [<overlay-out>] \
+             [--prune] [--report] [--report-json <path>] [--strict]"
+        );
         return 2;
     };
-    let prune = args.iter().any(|a| a.eq_ignore_ascii_case("--prune"));
-    let src = Path::new(src_arg);
+    let src = Path::new(&parsed.src);
+
+    let text = match fp_formats::text::read_text_file(src) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("import: cannot read {}: {e}", src.display());
+            eprintln!("import: failed to read {}: {e}", src.display());
+            return 1;
+        }
+    };
+
+    let mut report = import::ImportReport::new();
 
     // `.air` files take the AIR overlay path (column salvage + dead-frame prune).
-    if src
+    let write_result = if src
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("air"))
     {
-        return run_import_air(src, out_arg, prune);
+        run_import_air(src, &text, &parsed, &mut report)
+    } else {
+        run_import_cns(src, &text, &parsed, &mut report)
+    };
+    if write_result != 0 {
+        return write_result;
     }
 
-    let text = match fp_formats::text::read_text_file(src) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("import: cannot read {}: {e}", src.display());
-            eprintln!("import: failed to read {}: {e}", src.display());
+    // Emit the report face(s).
+    if parsed.report {
+        print!("{}", report.render());
+    }
+    if let Some(json_path) = &parsed.report_json {
+        if let Err(e) = report.write_json(Path::new(json_path)) {
+            tracing::error!("import: cannot write report JSON {json_path}: {e}");
+            eprintln!("import: failed to write report JSON {json_path}: {e}");
             return 1;
         }
-    };
-    let overlay = import::repair_cns_text(&text);
-    match import::write_overlay(&overlay, Path::new(out_arg)) {
-        Ok(()) => {
-            if overlay.is_clean() {
-                tracing::info!(
-                    "import: {} is clean; overlay is byte-identical",
-                    src.display()
-                );
-            } else {
-                use import::RepairKind::*;
-                tracing::info!(
-                    "import: wrote overlay {} ({} repair(s): {} stray, {} empty-key, {} colon-header, {} malformed-header)",
-                    out_arg,
-                    overlay.repairs.len(),
-                    overlay.count(StrayLine),
-                    overlay.count(EmptyKey),
-                    overlay.count(ColonHeader),
-                    overlay.count(MalformedHeader),
-                );
-            }
-            for repair in &overlay.repairs {
-                tracing::info!(
-                    "import: {}:{} {:?} — {}",
-                    src.display(),
-                    repair.line_no,
-                    repair.kind,
-                    repair.original.trim()
-                );
-            }
-            0
-        }
-        Err(e) => {
+        tracing::info!("import: wrote report JSON {json_path}");
+    }
+
+    // `--strict` is the only flag-tied exit-code behavior.
+    if parsed.strict && report.has_flags() {
+        eprintln!("import: --strict failed — the report contains flagged entries");
+        return 1;
+    }
+    0
+}
+
+/// The CNS/CMD branch of [`run_import`]: repairs the text, optionally writes the
+/// overlay, folds the repairs into `report`. Returns a non-zero exit code only on
+/// a write failure.
+fn run_import_cns(
+    src: &Path,
+    text: &str,
+    parsed: &ImportArgs,
+    report: &mut import::ImportReport,
+) -> i32 {
+    let overlay = import::repair_cns_text(text);
+    if let Some(out_arg) = &parsed.overlay_out {
+        if let Err(e) = import::write_overlay(&overlay, Path::new(out_arg)) {
             tracing::error!("import: cannot write overlay {out_arg}: {e}");
             eprintln!("import: failed to write overlay {out_arg}: {e}");
-            1
+            return 1;
+        }
+        if overlay.is_clean() {
+            tracing::info!(
+                "import: {} is clean; overlay is byte-identical",
+                src.display()
+            );
+        } else {
+            use import::RepairKind::*;
+            tracing::info!(
+                "import: wrote overlay {} ({} repair(s): {} stray, {} empty-key, {} colon-header, {} malformed-header)",
+                out_arg,
+                overlay.repairs.len(),
+                overlay.count(StrayLine),
+                overlay.count(EmptyKey),
+                overlay.count(ColonHeader),
+                overlay.count(MalformedHeader),
+            );
         }
     }
+    for repair in &overlay.repairs {
+        tracing::info!(
+            "import: {}:{} {:?} — {}",
+            src.display(),
+            repair.line_no,
+            repair.kind,
+            repair.original.trim()
+        );
+    }
+    report.add_cns(&parsed.src, &overlay);
+    0
 }
 
 /// The AIR branch of [`run_import`]: produces a repaired AIR overlay (column
-/// salvage + opt-in dead-frame prune) and writes it to `out_arg`.
+/// salvage + opt-in dead-frame prune), optionally writes it, and folds the
+/// repairs into `report`.
 ///
 /// The dead-frame oracle is the `.sff` sitting next to `src` (same stem). When
 /// no sibling `.sff` is found or it fails to load, every sprite is assumed
-/// present: pruning becomes a no-op and only column salvage applies. Returns the
-/// process exit code (`1` on read/write failure, `0` otherwise).
-fn run_import_air(src: &Path, out_arg: &str, prune: bool) -> i32 {
-    let text = match fp_formats::text::read_text_file(src) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("import: cannot read {}: {e}", src.display());
-            eprintln!("import: failed to read {}: {e}", src.display());
-            return 1;
-        }
-    };
-
+/// present: pruning becomes a no-op and only column salvage applies. Returns a
+/// non-zero exit code only on a write failure.
+fn run_import_air(
+    src: &Path,
+    text: &str,
+    parsed: &ImportArgs,
+    report: &mut import::ImportReport,
+) -> i32 {
     // Locate a sibling `.sff` (`foo.air` -> `foo.sff`) as the sprite-presence
     // oracle. If absent/unloadable, fall back to "all present" so salvage still
     // runs and prune is a safe no-op (warn-logged so the user knows).
@@ -340,7 +442,7 @@ fn run_import_air(src: &Path, out_arg: &str, prune: bool) -> i32 {
             }
         }
     });
-    if prune && sff.is_none() {
+    if parsed.prune && sff.is_none() {
         tracing::warn!(
             "import: --prune requested but no loadable sibling .sff for {}; \
              treating every sprite as present (no frame will be pruned)",
@@ -348,45 +450,44 @@ fn run_import_air(src: &Path, out_arg: &str, prune: bool) -> i32 {
         );
     }
 
-    let overlay = import::repair_air_text(&text, prune, |g, i| {
+    let overlay = import::repair_air_text(text, parsed.prune, |g, i| {
         sff.as_ref().is_none_or(|s| s.has_renderable_sprite(g, i))
     });
 
-    match import::write_air_overlay(&overlay, Path::new(out_arg)) {
-        Ok(()) => {
-            use import::AirRepairKind::*;
-            if overlay.is_clean() {
-                tracing::info!(
-                    "import: {} is clean; AIR overlay is byte-identical",
-                    src.display()
-                );
-            } else {
-                tracing::info!(
-                    "import: wrote AIR overlay {} ({} junk-column, {} dead-frame pruned, {} missing-sprite flagged)",
-                    out_arg,
-                    overlay.count(JunkColumn),
-                    overlay.count(DeadFrame),
-                    overlay.count(MissingSpriteRef),
-                );
-            }
-            for repair in &overlay.repairs {
-                tracing::info!(
-                    "import: {}:{} {:?} (action {:?}) — {}",
-                    src.display(),
-                    repair.line_no,
-                    repair.kind,
-                    repair.action,
-                    repair.original.trim()
-                );
-            }
-            0
-        }
-        Err(e) => {
+    if let Some(out_arg) = &parsed.overlay_out {
+        if let Err(e) = import::write_air_overlay(&overlay, Path::new(out_arg)) {
             tracing::error!("import: cannot write AIR overlay {out_arg}: {e}");
             eprintln!("import: failed to write AIR overlay {out_arg}: {e}");
-            1
+            return 1;
+        }
+        use import::AirRepairKind::*;
+        if overlay.is_clean() {
+            tracing::info!(
+                "import: {} is clean; AIR overlay is byte-identical",
+                src.display()
+            );
+        } else {
+            tracing::info!(
+                "import: wrote AIR overlay {} ({} junk-column, {} dead-frame pruned, {} missing-sprite flagged)",
+                out_arg,
+                overlay.count(JunkColumn),
+                overlay.count(DeadFrame),
+                overlay.count(MissingSpriteRef),
+            );
         }
     }
+    for repair in &overlay.repairs {
+        tracing::info!(
+            "import: {}:{} {:?} (action {:?}) — {}",
+            src.display(),
+            repair.line_no,
+            repair.kind,
+            repair.action,
+            repair.original.trim()
+        );
+    }
+    report.add_air(&parsed.src, &overlay);
+    0
 }
 
 /// Cached GPU textures for a single sprite.
