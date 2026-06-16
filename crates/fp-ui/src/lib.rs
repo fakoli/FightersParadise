@@ -20,14 +20,19 @@
 //!   the versus-screen placements). Parser + model only; no render integration.
 //! - [`select_def`] — a pure parser turning a motif `select.def` into a typed
 //!   [`SelectDef`] roster (character slots, extra stages, options).
+//! - [`discovery`] — pure directory scanners: a `chars/` directory into a
+//!   character roster ([`discover_chars`]) and a `data/` directory into a list of
+//!   motif/screenpack sets ([`discover_motifs`]). Filesystem-only, never panics.
 
 #![warn(missing_docs)]
 
+pub mod discovery;
 pub mod renderer;
 pub mod screenpack;
 pub mod select_def;
 pub mod system_def;
 
+pub use discovery::{discover_chars, discover_motifs, CharEntry, MotifEntry};
 pub use renderer::{
     bar_fill_uv, clamp_fraction, combo_text, face_draw_pos, MatchHudState, ScreenpackHud,
 };
