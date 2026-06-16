@@ -2598,8 +2598,7 @@ struct MatchOverlays {
 /// any special command name the instant its motion completes.
 ///
 /// Toggled with F3 (`Off → P1 → P2 → Both → Off`, reusing [`OverlayScope`]) and
-/// **off by default outside Training** — the run loop enables it automatically
-/// only when the match is a Training session. The strip reads each player's
+/// **off by default**. The strip reads each player's
 /// rolling [`fp_input::InputBuffer`] (via `Player::input_buffer`) and folds the
 /// absolute directions to facing-relative numpad notation; the command flash
 /// reads `Player::just_matched_commands`. Pure draw — no game state mutated.
@@ -5269,7 +5268,7 @@ fn draw_match_run(
         .draw(frame, run.m(), hud.font(), camera_x, win_wf, win_hf);
 
     // Player-facing input display (T064): per-side input-history strip + command
-    // flash. Off by default; the run loop only enables it in Training. Drawn under
+    // flash. Off by default; toggled with F3. Drawn under
     // the HUD so the strip text reads over the stage but below lifebars.
     overlays
         .input_display
