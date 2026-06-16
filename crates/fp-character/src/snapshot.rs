@@ -139,6 +139,10 @@ pub struct CharacterSnapshot {
     pub move_connect: MoveConnect,
     /// Whether the character has a hit-established target.
     pub has_target: bool,
+    /// Per-projectile-id contact/hit/guard timing (the `Proj*<id>` triggers),
+    /// captured as a key-sorted `Vec` so the snapshot bytes stay deterministic
+    /// (the live field is a `HashMap`).
+    pub proj_events: Vec<(i32, crate::ProjContactTracker)>,
     /// Runtime attack multiplier.
     pub attack_mul: f32,
     /// Runtime defence multiplier.
@@ -190,6 +194,12 @@ impl CharacterSnapshot {
             ch.fire_counts.iter().map(|(&k, &v)| (k, v)).collect();
         fire_counts.sort_unstable_by_key(|&(k, _)| k);
 
+        // Likewise `proj_events` (the `Proj*<id>` trigger tracker) is a HashMap —
+        // sort by projid for deterministic snapshot bytes.
+        let mut proj_events: Vec<(i32, crate::ProjContactTracker)> =
+            ch.proj_events.iter().map(|(&k, &v)| (k, v)).collect();
+        proj_events.sort_unstable_by_key(|&(k, _)| k);
+
         Self {
             pos: ch.pos,
             vel: ch.vel,
@@ -225,6 +235,7 @@ impl CharacterSnapshot {
             shaketime: ch.shaketime,
             move_connect: ch.move_connect,
             has_target: ch.has_target,
+            proj_events,
             attack_mul: ch.attack_mul,
             defence_mul: ch.defence_mul,
             cur_sprpriority: ch.cur_sprpriority,
@@ -286,6 +297,7 @@ impl CharacterSnapshot {
         ch.shaketime = self.shaketime;
         ch.move_connect = self.move_connect;
         ch.has_target = self.has_target;
+        ch.proj_events = self.proj_events.iter().copied().collect();
         ch.attack_mul = self.attack_mul;
         ch.defence_mul = self.defence_mul;
         ch.cur_sprpriority = self.cur_sprpriority;
@@ -354,6 +366,9 @@ mod tests {
         // Advance the RNG so the stored seed is non-default.
         let _ = fp_vm::EvalContext::random(&ch);
         ch.fire_counts.insert((200, 2), 1);
+        // A couple of projectile-contact trackers in the runtime map.
+        ch.record_proj_event(2000, false);
+        ch.record_proj_event(2001, true);
 
         let snap = CharacterSnapshot::capture(&ch);
 

@@ -399,10 +399,15 @@ fn eval_inner(expr: &Expr, ctx: &dyn EvalContext) -> Eval {
             standtype,
             attr_codes,
         } => eval_hitdefattr_tail(standtype, attr_codes, ctx),
-        // Projectiles are unimplemented; the parsed two-argument projectile-info
-        // form (Task A) exists only so the surrounding boolean survives. It always
-        // reports "no projectiles" → `0`, so it never fires a trigger.
-        Expr::ProjTail { .. } => Eval::Int(0),
+        // The two-argument projectile-info form `ProjContact<id> = v, op t`
+        // (T026): true iff a projectile of that id fired the named event matching
+        // `v` *and* the time since it satisfies `op t`.
+        Expr::ProjTail {
+            name,
+            value,
+            op,
+            time,
+        } => eval_proj_tail(name, value, *op, time, ctx),
         Expr::Assign { bank, index, value } => eval_assign(*bank, index, value, ctx),
     }
 }
@@ -473,6 +478,105 @@ fn eval_timemod_tail(divisor: &Expr, remainder: &Expr, ctx: &dyn EvalContext) ->
 /// evaluates to `0` and the surrounding `&& movecontact` simply does not fire.
 fn eval_hitdefattr_tail(standtype: &str, attr_codes: &[String], ctx: &dyn EvalContext) -> Eval {
     Eval::Int(i32::from(ctx.hitdef_attr_matches(standtype, attr_codes)))
+}
+
+/// Evaluates the two-argument projectile-info form
+/// `ProjContact<id> / ProjHit<id> / ProjGuarded<id> = value, op time` (T026).
+///
+/// MUGEN semantics: true iff a projectile of the trigger's id fired the named
+/// event (contact / hit / guard) **and** the time elapsed since it satisfies the
+/// secondary `op time` comparison. The evaluator reads the "ticks since the
+/// event" once through the corresponding `*Time` trigger (`ProjContactTime<id>`,
+/// `ProjHitTime<id>`, `ProjGuardedTime<id>`) — the owning entity resolves it from
+/// its per-id projectile tracker (`-1` if the event never happened) — and
+/// computes:
+///
+/// - **fired**: the leading `value` matches whether the event has occurred. The
+///   event has occurred iff its time is `>= 0`; `value` is the author's boolean
+///   expectation (`= 1` in practice — "did it contact"), so this checks
+///   `(time >= 0) == (value != 0)`; and
+/// - **secondary**: `time op time_operand`.
+///
+/// Both must hold. When the event never happened the time reads `-1`, so a
+/// `= 1, op t` form is false (`fired` fails) — exactly MUGEN's "no projectile
+/// connected, the trigger does not fire". A bottom `value` or `time` operand
+/// propagates (the conjunction is then bottom → never fires); never panics.
+///
+/// The `*Time` trigger name is derived from the written name by inserting `Time`
+/// after the base (`ProjContact2000` → `ProjContactTime2000`); a name that does
+/// not parse as a projectile-info trigger yields `0` (never fires).
+fn eval_proj_tail(
+    name: &str,
+    value: &Expr,
+    op: BinaryOp,
+    time: &Expr,
+    ctx: &dyn EvalContext,
+) -> Eval {
+    let Some(time_name) = proj_time_trigger_name(name) else {
+        // Not a recognized projectile-info trigger → never fires (safe default).
+        return Eval::Int(0);
+    };
+    // Read the "ticks since the event" once (the owner resolves `-1` for never).
+    let elapsed = Eval::from_value(ctx.trigger(&time_name, &[]));
+    let v = eval_inner(value, ctx);
+    let t = eval_inner(time, ctx);
+    if Eval::either_bottom(v, t) {
+        return Eval::Bottom;
+    }
+    // `fired`: the event has happened (time >= 0) matches the author's boolean
+    // expectation `value`.
+    let occurred = elapsed.to_int() >= 0;
+    let fired = occurred == (v.to_int() != 0);
+    if !fired {
+        return Eval::Int(0);
+    }
+    // Secondary comparison: time-since-event `op` operand.
+    let secondary = eval_binary_values(op, elapsed, t);
+    Eval::Int(i32::from(secondary.as_bool()))
+}
+
+/// Maps a written projectile-info trigger name to the corresponding `*Time`
+/// trigger name the evaluator reads for the time-since-event value (T026), e.g.
+/// `ProjContact2000` → `ProjContactTime2000`, `ProjHit5` → `ProjHitTime5`. Returns
+/// `None` if `name` is not a `ProjContact` / `ProjHit` / `ProjGuarded` trigger
+/// (with or without the `Time` infix already present) followed by an id suffix.
+///
+/// Case-insensitive on the base; the original id suffix (and its case) is kept.
+/// A name that already carries the `Time` infix (the bare `ProjContactTime<id>`
+/// form should never reach the tail path, but be defensive) is returned as-is.
+fn proj_time_trigger_name(name: &str) -> Option<String> {
+    // Allocation-free guard: reject anything not beginning with a case-insensitive
+    // `proj` before touching the prefix tables, and match each base against the
+    // name slice with `eq_ignore_ascii_case` rather than lowercasing the whole
+    // string (the old `to_ascii_lowercase()` allocated on every call). This runs
+    // only for the rare folded `ProjTail` node, but keeping it allocation-light on
+    // the no-match path costs nothing.
+    if name.len() < 4 || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
+        return None;
+    }
+    let starts_with_ci = |base: &str| {
+        name.get(..base.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
+    };
+    // Already a `*Time` form → use verbatim.
+    const TIME_BASES: [&str; 3] = ["projcontacttime", "projguardedtime", "projhittime"];
+    if TIME_BASES.iter().any(|b| starts_with_ci(b)) {
+        return Some(name.to_string());
+    }
+    // (base, time-infixed base) — insert `Time` after the family base, keeping
+    // the trailing id suffix from the original (case-preserved) name.
+    const BASES: [(&str, &str); 3] = [
+        ("projcontact", "ProjContactTime"),
+        ("projguarded", "ProjGuardedTime"),
+        ("projhit", "ProjHitTime"),
+    ];
+    for (base, time_base) in BASES {
+        if starts_with_ci(base) {
+            let suffix = &name[base.len()..];
+            return Some(format!("{time_base}{suffix}"));
+        }
+    }
+    None
 }
 
 /// Evaluates the two-parameter `AnimElem = N, op M` comparison form (task 4.10,
@@ -4033,18 +4137,60 @@ mod tests {
     }
 
     #[test]
-    fn proj_tail_always_zero_projectiles_unimplemented() {
-        // The projectile-info tail parses but always evaluates to 0 (projectiles
-        // are unimplemented), so it never fires and never panics.
-        let ctx = MockContext::new();
+    fn proj_tail_no_event_does_not_fire() {
+        // T026: with no projectile-contact tracked, the `*Time` trigger reads the
+        // never sentinel (-1, the EvalContext default of 0 still reads as "no
+        // contact" here since the mock returns DEFAULT=0 ... so seed -1 explicitly
+        // to model "never"). A `= 1, op t` form requires the event to have
+        // occurred, so an unseeded context never fires — and never panics.
+        let ctx = MockContext::new().with_trigger("ProjContactTime2000", &[], Value::Int(-1));
         assert_eq!(ev("projcontact2000 = 1, < 20", &ctx), Value::Int(0));
-        assert_eq!(ev("ProjHit1000 = 1, > 5", &ctx), Value::Int(0));
-        // It still composes in a boolean without collapsing the whole expression.
-        let ctx = MockContext::new().with_trigger("Time", &[], Value::Int(5));
+        // Still composes in a boolean without collapsing the whole expression.
+        let ctx = ctx.with_trigger("Time", &[], Value::Int(5));
         assert_eq!(
             ev("projcontact2000 = 1, < 20 || time > 2", &ctx),
             Value::Int(1)
         );
+    }
+
+    #[test]
+    fn proj_tail_fires_within_time_window() {
+        // T026: a projectile id 2000 contacted 3 ticks ago. The `*Time` seam
+        // returns 3; `ProjContact2000 = 1, < 20` is true (the event happened AND
+        // 3 < 20), and the boolean form composes.
+        let ctx = MockContext::new().with_trigger("ProjContactTime2000", &[], Value::Int(3));
+        assert_eq!(ev("ProjContact2000 = 1, < 20", &ctx), Value::Int(1));
+        assert_eq!(ev("ProjContact2000 = 1, <= 3", &ctx), Value::Int(1));
+        // Outside the window → does not fire.
+        assert_eq!(ev("ProjContact2000 = 1, < 3", &ctx), Value::Int(0));
+        assert_eq!(ev("ProjContact2000 = 1, = 0", &ctx), Value::Int(0));
+        // `= 1, = 3` matches the exact elapsed time.
+        assert_eq!(ev("ProjContact2000 = 1, = 3", &ctx), Value::Int(1));
+    }
+
+    #[test]
+    fn proj_tail_hit_and_guard_read_their_own_time_triggers() {
+        // T026: `ProjHit<id>` reads `ProjHitTime<id>`, `ProjGuarded<id>` reads
+        // `ProjGuardedTime<id>` — each family resolves through its own `*Time`
+        // trigger, independent of the others.
+        let ctx = MockContext::new()
+            .with_trigger("ProjHitTime500", &[], Value::Int(2))
+            .with_trigger("ProjGuardedTime500", &[], Value::Int(-1));
+        // The id 500 landed a clean hit 2 ticks ago, was never guarded.
+        assert_eq!(ev("ProjHit500 = 1, <= 4", &ctx), Value::Int(1));
+        assert_eq!(ev("ProjGuarded500 = 1, <= 4", &ctx), Value::Int(0));
+    }
+
+    #[test]
+    fn proj_tail_value_zero_form_is_no_contact() {
+        // T026: the `value` operand is the author's boolean expectation. `= 0`
+        // asks "did NOT contact" — true only when the event has not happened.
+        let never = MockContext::new().with_trigger("ProjContactTime9", &[], Value::Int(-1));
+        // Never contacted AND elapsed (-1) < 5 → the "= 0" expectation holds.
+        assert_eq!(ev("ProjContact9 = 0, < 5", &never), Value::Int(1));
+        let contacted = MockContext::new().with_trigger("ProjContactTime9", &[], Value::Int(1));
+        // It DID contact, so `= 0` (expecting "no contact") fails.
+        assert_eq!(ev("ProjContact9 = 0, < 5", &contacted), Value::Int(0));
     }
 
     // =====================================================================
