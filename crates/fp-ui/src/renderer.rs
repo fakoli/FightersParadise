@@ -19,10 +19,11 @@ use std::collections::HashMap;
 use fp_formats::fnt::FntFont;
 use fp_formats::sff::SffFile;
 use fp_render::{
-    GlyphFont, PaletteTexture, RenderFrame, Renderer, SpriteDrawParams, SpriteTexture,
+    GlyphFont, PalFx, PaletteTexture, RenderFrame, Renderer, SpriteDrawParams, SpriteTexture,
     TextDrawParams,
 };
 
+use crate::hud_config::{BarColor, HudConfig, HudElement};
 use crate::screenpack::{FaceSide, LifebarSide, PowerbarSide, ScreenpackLayout, SpriteRef};
 
 /// Live, per-frame HUD inputs the screenpack renderer needs, decoupled from any
@@ -71,6 +72,10 @@ pub struct ScreenpackHud {
     /// Fonts in `font0..` slot order; `fonts[i]` is the GPU upload of layout font
     /// slot `i`. A font that failed to load is `None` (its text is skipped).
     fonts: Vec<Option<GlyphFont>>,
+    /// Player-facing customization overrides (bar colors, offset/scale, per-element
+    /// visibility) layered over [`layout`](Self::layout) at draw time. Defaults to
+    /// the no-op [`HudConfig::default`], so an unconfigured HUD draws unchanged.
+    hud_config: HudConfig,
 }
 
 /// One uploaded `fight.sff` sprite: its index texture, palette, and pixel size.
@@ -116,12 +121,34 @@ impl ScreenpackHud {
             layout,
             sprites,
             fonts,
+            hud_config: HudConfig::default(),
         }
     }
 
     /// The parsed layout backing this HUD (e.g. for power-level sound routing).
     pub fn layout(&self) -> &ScreenpackLayout {
         &self.layout
+    }
+
+    /// The player-facing HUD customization overrides this HUD draws with (T046).
+    pub fn hud_config(&self) -> &HudConfig {
+        &self.hud_config
+    }
+
+    /// Replaces the HUD customization overrides (T046).
+    ///
+    /// The app calls this when the player changes a value on the in-game
+    /// HUD-customization screen (or loads one from a config file); the next
+    /// [`draw`](Self::draw) honors the new overrides. Passing
+    /// [`HudConfig::default`] restores the unchanged HUD.
+    pub fn set_hud_config(&mut self, config: HudConfig) {
+        self.hud_config = config;
+    }
+
+    /// Mutable access to the HUD customization overrides, for an in-place edit
+    /// (e.g. the customization screen toggling one element).
+    pub fn hud_config_mut(&mut self) -> &mut HudConfig {
+        &mut self.hud_config
     }
 
     /// Draws the whole screenpack HUD for the current frame.
@@ -133,103 +160,166 @@ impl ScreenpackHud {
     /// (logged once at build), so a partial screenpack still renders whatever it
     /// does define.
     pub fn draw(&self, frame: &mut RenderFrame<'_>, state: &MatchHudState) {
-        // Life bars.
-        self.draw_lifebar(frame, &self.layout.p1_lifebar, state.p1_life);
-        self.draw_lifebar(frame, &self.layout.p2_lifebar, state.p2_life);
-        // Power bars.
-        self.draw_powerbar(frame, &self.layout.p1_powerbar, state.p1_power);
-        self.draw_powerbar(frame, &self.layout.p2_powerbar, state.p2_power);
-        // Fighter portraits ([Face]).
-        self.draw_face(frame, &self.layout.p1_face);
-        self.draw_face(frame, &self.layout.p2_face);
-        // Names.
-        self.draw_text_slot(
-            frame,
-            self.layout.p1_name.font,
-            self.layout.p1_name.pos.x as f32,
-            self.layout.p1_name.pos.y as f32,
-            &state.p1_name,
-        );
-        self.draw_text_slot(
-            frame,
-            self.layout.p2_name.font,
-            self.layout.p2_name.pos.x as f32,
-            self.layout.p2_name.pos.y as f32,
-            &state.p2_name,
-        );
-        // Timer.
-        if let Some(secs) = state.timer_seconds {
-            self.draw_text_slot(
+        let cfg = &self.hud_config;
+        let (dx, dy) = cfg.offset();
+        // A global pixel offset added to every element's anchor; `(0, 0)` (the
+        // default) leaves the position byte-identical.
+        let (ox, oy) = (dx as f32, dy as f32);
+
+        // Life bars — gated on the Life element's visibility, tinted by the
+        // configured life color and globally scaled.
+        if cfg.is_visible(HudElement::Life) {
+            let tint = cfg.life_color();
+            self.draw_lifebar(frame, &self.layout.p1_lifebar, state.p1_life, ox, oy, tint);
+            self.draw_lifebar(frame, &self.layout.p2_lifebar, state.p2_life, ox, oy, tint);
+        }
+        // Power bars — gated on the Power element's visibility.
+        if cfg.is_visible(HudElement::Power) {
+            let tint = cfg.power_color();
+            self.draw_powerbar(
                 frame,
-                self.layout.time.font,
-                self.layout.time.pos.x as f32,
-                self.layout.time.pos.y as f32,
-                &secs.to_string(),
+                &self.layout.p1_powerbar,
+                state.p1_power,
+                ox,
+                oy,
+                tint,
+            );
+            self.draw_powerbar(
+                frame,
+                &self.layout.p2_powerbar,
+                state.p2_power,
+                ox,
+                oy,
+                tint,
             );
         }
-        // Round announcer.
+        // Fighter portraits ([Face]) — drawn with the bars (no separate toggle).
+        self.draw_face(frame, &self.layout.p1_face, ox, oy);
+        self.draw_face(frame, &self.layout.p2_face, ox, oy);
+        // Names — gated on the Name element's visibility.
+        if cfg.is_visible(HudElement::Name) {
+            self.draw_text_slot(
+                frame,
+                self.layout.p1_name.font,
+                self.layout.p1_name.pos.x as f32 + ox,
+                self.layout.p1_name.pos.y as f32 + oy,
+                &state.p1_name,
+            );
+            self.draw_text_slot(
+                frame,
+                self.layout.p2_name.font,
+                self.layout.p2_name.pos.x as f32 + ox,
+                self.layout.p2_name.pos.y as f32 + oy,
+                &state.p2_name,
+            );
+        }
+        // Timer — gated on the Timer element's visibility.
+        if cfg.is_visible(HudElement::Timer) {
+            if let Some(secs) = state.timer_seconds {
+                self.draw_text_slot(
+                    frame,
+                    self.layout.time.font,
+                    self.layout.time.pos.x as f32 + ox,
+                    self.layout.time.pos.y as f32 + oy,
+                    &secs.to_string(),
+                );
+            }
+        }
+        // Round announcer (always drawn — not a player-toggleable element).
         if !state.round_text.is_empty() {
             self.draw_text_slot(
                 frame,
                 self.layout.round.font,
-                self.layout.round.pos.x as f32,
-                self.layout.round.pos.y as f32,
+                self.layout.round.pos.x as f32 + ox,
+                self.layout.round.pos.y as f32 + oy,
                 &state.round_text,
             );
         }
-        // Combo counter — only while a combo is active (>= 2 hits).
-        if let Some(text) = combo_text(state.combo_count) {
-            self.draw_text_slot(
-                frame,
-                self.layout.combo.font,
-                self.layout.combo.pos.x as f32,
-                self.layout.combo.pos.y as f32,
-                &text,
-            );
+        // Combo counter — only while a combo is active (>= 2 hits) AND the Combo
+        // element is visible.
+        if cfg.is_visible(HudElement::Combo) {
+            if let Some(text) = combo_text(state.combo_count) {
+                self.draw_text_slot(
+                    frame,
+                    self.layout.combo.font,
+                    self.layout.combo.pos.x as f32 + ox,
+                    self.layout.combo.pos.y as f32 + oy,
+                    &text,
+                );
+            }
         }
     }
 
     /// Draws one life bar: every `bg0..bgN` background layer in z-order at full
     /// size, then the mid layer, then the front layer clipped horizontally to
     /// `frac` of the bar's `range` span.
-    fn draw_lifebar(&self, frame: &mut RenderFrame<'_>, bar: &LifebarSide, frac: f32) {
-        let base_x = bar.pos.x as f32;
-        let base_y = bar.pos.y as f32;
+    ///
+    /// `(ox, oy)` is the global HUD pixel offset (see [`HudConfig::offset`]) added
+    /// to the bar's anchor; `tint` retints the front fill (a neutral
+    /// [`BarColor::WHITE`] is a no-op). The global [scale](HudConfig::scale) is
+    /// read from the config.
+    fn draw_lifebar(
+        &self,
+        frame: &mut RenderFrame<'_>,
+        bar: &LifebarSide,
+        frac: f32,
+        ox: f32,
+        oy: f32,
+        tint: BarColor,
+    ) {
+        let base_x = bar.pos.x as f32 + ox;
+        let base_y = bar.pos.y as f32 + oy;
+        let scale = self.hud_config.scale();
         // Every background layer, then mid, all drawn whole.
         for &bg in &bar.bg_layers {
-            self.draw_sprite_ref(frame, Some(bg), base_x, base_y);
+            self.draw_sprite_ref(frame, Some(bg), base_x, base_y, scale);
         }
-        self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
+        self.draw_sprite_ref(frame, bar.mid, base_x, base_y, scale);
         // Front fill clips to the life fraction over the bar's range.
-        self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
+        self.draw_bar_fill(
+            frame, bar.front, base_x, base_y, bar.range, frac, scale, tint,
+        );
     }
 
     /// Draws one power bar (same layering as a life bar, clipped to `frac`).
-    fn draw_powerbar(&self, frame: &mut RenderFrame<'_>, bar: &PowerbarSide, frac: f32) {
-        let base_x = bar.pos.x as f32;
-        let base_y = bar.pos.y as f32;
+    ///
+    /// See [`draw_lifebar`](Self::draw_lifebar) for the `(ox, oy)`/`tint` meaning.
+    fn draw_powerbar(
+        &self,
+        frame: &mut RenderFrame<'_>,
+        bar: &PowerbarSide,
+        frac: f32,
+        ox: f32,
+        oy: f32,
+        tint: BarColor,
+    ) {
+        let base_x = bar.pos.x as f32 + ox;
+        let base_y = bar.pos.y as f32 + oy;
+        let scale = self.hud_config.scale();
         for &bg in &bar.bg_layers {
-            self.draw_sprite_ref(frame, Some(bg), base_x, base_y);
+            self.draw_sprite_ref(frame, Some(bg), base_x, base_y, scale);
         }
-        self.draw_sprite_ref(frame, bar.mid, base_x, base_y);
-        self.draw_bar_fill(frame, bar.front, base_x, base_y, bar.range, frac);
+        self.draw_sprite_ref(frame, bar.mid, base_x, base_y, scale);
+        self.draw_bar_fill(
+            frame, bar.front, base_x, base_y, bar.range, frac, scale, tint,
+        );
     }
 
     /// Draws one player's portrait ([`FaceSide`]) at its parsed position.
     ///
     /// The draw position is the face's `pos` plus the sprite's `offset` (computed
-    /// purely by [`face_draw_pos`]); the portrait is drawn at full size (scale
-    /// `1.0`). A face with no sprite reference, or whose sprite failed to upload,
-    /// draws nothing.
-    fn draw_face(&self, frame: &mut RenderFrame<'_>, face: &FaceSide) {
+    /// purely by [`face_draw_pos`]) plus the global HUD `(ox, oy)` offset; the
+    /// portrait is drawn at full size (scale `1.0`). A face with no sprite
+    /// reference, or whose sprite failed to upload, draws nothing.
+    fn draw_face(&self, frame: &mut RenderFrame<'_>, face: &FaceSide, ox: f32, oy: f32) {
         let Some(r) = face.spr else { return };
         let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
             return;
         };
         let (x, y) = face_draw_pos(face);
         let params = SpriteDrawParams {
-            x,
-            y,
+            x: x + ox,
+            y: y + oy,
             ..Default::default()
         };
         frame.draw_sprite(&gpu.texture, &gpu.palette, &params);
@@ -240,6 +330,10 @@ impl ScreenpackHud {
     /// Uses [`bar_fill_uv`] to compute the visible UV sub-rectangle and the
     /// destination width, so a `frac` of `0` draws nothing and `1` draws the full
     /// sprite. A negative `range` span (P2's mirrored bar) clips from the right.
+    /// `scale` multiplies the drawn size (`1.0` = unchanged) and `tint` retints
+    /// the fill (a neutral [`BarColor::WHITE`] yields the identity tint, i.e. no
+    /// change).
+    #[allow(clippy::too_many_arguments)]
     fn draw_bar_fill(
         &self,
         frame: &mut RenderFrame<'_>,
@@ -248,6 +342,8 @@ impl ScreenpackHud {
         base_y: f32,
         range: (i32, i32),
         frac: f32,
+        scale: f32,
+        tint: BarColor,
     ) {
         let Some(r) = front else { return };
         let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
@@ -261,18 +357,24 @@ impl ScreenpackHud {
         let params = SpriteDrawParams {
             x: base_x + r.offset.x as f32 + dst_x_off,
             y: base_y + r.offset.y as f32,
+            scale_x: scale,
+            scale_y: scale,
+            palfx: bar_tint_palfx(tint),
             ..Default::default()
         };
         frame.draw_sprite_region(&gpu.texture, &gpu.palette, &params, uv, dst_w, gpu.height);
     }
 
-    /// Draws a sprite reference at its full size (background/mid layers, faces).
+    /// Draws a sprite reference at full size scaled by `scale` (background/mid
+    /// layers). `scale` of `1.0` (the default config) is byte-identical to the
+    /// pre-T046 draw.
     fn draw_sprite_ref(
         &self,
         frame: &mut RenderFrame<'_>,
         spr: Option<SpriteRef>,
         base_x: f32,
         base_y: f32,
+        scale: f32,
     ) {
         let Some(r) = spr else { return };
         let Some(gpu) = self.sprites.get(&(r.group, r.image)) else {
@@ -281,6 +383,8 @@ impl ScreenpackHud {
         let params = SpriteDrawParams {
             x: base_x + r.offset.x as f32,
             y: base_y + r.offset.y as f32,
+            scale_x: scale,
+            scale_y: scale,
             ..Default::default()
         };
         frame.draw_sprite(&gpu.texture, &gpu.palette, &params);
@@ -453,6 +557,19 @@ pub fn face_draw_pos(face: &FaceSide) -> (f32, f32) {
     ((face.pos.x + ox) as f32, (face.pos.y + oy) as f32)
 }
 
+/// The [`PalFx`] tint used to draw a bar's front fill for a configured
+/// [`BarColor`] (T046).
+///
+/// A neutral [`BarColor::WHITE`] returns [`PalFx::IDENTITY`] exactly — the no-op
+/// tint — so the default HUD config produces byte-for-byte identical bar fills;
+/// any other color tints the fill via a per-channel multiply.
+///
+/// Pure and unit-tested — no GPU.
+#[must_use]
+pub fn bar_tint_palfx(color: BarColor) -> PalFx {
+    color.to_palfx()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +706,85 @@ mod tests {
             (5, 1),
             "bg1 second (drawn on top)"
         );
+    }
+
+    // ---- T046 HUD customization: no-override regression guard ------------
+
+    #[test]
+    fn default_bar_tint_is_identity_palfx() {
+        // Acceptance #1 keystone: with no override, the life/power bar tint is the
+        // identity PalFx, so a default-config bar fill draws byte-for-byte as it
+        // did before T046 (an identity PalFx is the SpriteDrawParams default).
+        use crate::hud_config::HudConfig;
+        let cfg = HudConfig::default();
+        assert_eq!(bar_tint_palfx(cfg.life_color()), PalFx::IDENTITY);
+        assert_eq!(bar_tint_palfx(cfg.power_color()), PalFx::IDENTITY);
+    }
+
+    #[test]
+    fn default_config_bar_fill_params_match_pre_t046_draw() {
+        // Acceptance #1: reproduce the exact SpriteDrawParams the renderer's
+        // `draw_bar_fill` builds for the DEFAULT config (offset (0,0), scale 1.0,
+        // white tint) and assert it equals the pre-T046 construction
+        // (`x, y, ..Default::default()`). This is the regression guard that a
+        // no-override HUD is unchanged.
+        use crate::hud_config::HudConfig;
+        let cfg = HudConfig::default();
+        let (ox, oy) = cfg.offset();
+        let scale = cfg.scale();
+        let tint = cfg.life_color();
+        // Stand-in for a parsed front-fill sprite offset + a bar anchor.
+        let (base_x, base_y) = (80.0 + ox as f32, 33.0 + oy as f32);
+        let (off_x, off_y, dst_x_off) = (4.0, 4.0, 0.0);
+
+        // The T046 path (config-driven).
+        let t046 = SpriteDrawParams {
+            x: base_x + off_x + dst_x_off,
+            y: base_y + off_y,
+            scale_x: scale,
+            scale_y: scale,
+            palfx: bar_tint_palfx(tint),
+            ..Default::default()
+        };
+        // The original pre-T046 path.
+        let original = SpriteDrawParams {
+            x: 80.0 + off_x + dst_x_off,
+            y: 33.0 + off_y,
+            ..Default::default()
+        };
+        assert_eq!(t046.x, original.x);
+        assert_eq!(t046.y, original.y);
+        assert_eq!(t046.scale_x, original.scale_x);
+        assert_eq!(t046.scale_y, original.scale_y);
+        assert!(t046.palfx.is_identity());
+        assert_eq!(t046.palfx, original.palfx);
+        assert_eq!(t046.alpha, original.alpha);
+        assert_eq!(t046.blend, original.blend);
+    }
+
+    #[test]
+    fn default_config_is_all_visible_no_shift() {
+        // Every element visible, no anchor shift: the draw() visibility gates and
+        // offset add are all no-ops under the default config.
+        use crate::hud_config::{HudConfig, HudElement};
+        let cfg = HudConfig::default();
+        assert_eq!(cfg.offset(), (0, 0));
+        assert_eq!(cfg.scale(), 1.0);
+        for e in HudElement::ALL {
+            assert!(cfg.is_visible(e), "{e:?} visible under default config");
+        }
+    }
+
+    #[test]
+    fn a_set_override_changes_the_tint_the_renderer_reads() {
+        // A configured non-white life color is a real tint the renderer applies
+        // (so the change is visible), while a neutral color stays the no-op.
+        use crate::hud_config::{BarColor, HudConfig};
+        let mut cfg = HudConfig::default();
+        cfg.set_life_color(BarColor::RED);
+        let fx = bar_tint_palfx(cfg.life_color());
+        assert!(!fx.is_identity(), "a real override is not the no-op tint");
+        assert_eq!(fx.mul, [1.0, 0.0, 0.0]);
     }
 
     #[test]
