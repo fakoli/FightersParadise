@@ -383,7 +383,12 @@ fn finish_statedef(current: &mut Option<Statedef>, statedefs: &mut Vec<Statedef>
 }
 
 /// The kind of section header encountered.
-enum SectionKind {
+///
+/// Exposed (with [`SectionKind::parse`]) so the content-import overlay can reuse
+/// the parser's own header classifier as the oracle for "is this header
+/// recoverable" rather than re-implementing the CNS header grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionKind {
     /// `[Statedef N]`.
     Statedef(i32),
     /// `[State N, label]`.
@@ -401,7 +406,7 @@ impl SectionKind {
     /// Classifies a section header's inner text (without the brackets).
     /// Returns `None` only when a `Statedef`/`State` header is malformed beyond
     /// recovery (e.g. a non-numeric state number).
-    fn parse(inner: &str) -> Option<Self> {
+    pub fn parse(inner: &str) -> Option<Self> {
         let lower = inner.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("statedef") {
             // Require a separating space so we don't match "statedeffoo".
@@ -481,7 +486,10 @@ fn split_header_number(s: &str) -> &str {
 
 /// Returns the inner text of a `[...]` section header, or `None` if the line is
 /// not a section header.
-fn section_header(line: &str) -> Option<&str> {
+///
+/// Exposed so the content-import overlay can recognise a well-formed header line
+/// using exactly the parser's own rule.
+pub fn section_header(line: &str) -> Option<&str> {
     if line.starts_with('[') && line.ends_with(']') && line.len() >= 2 {
         Some(line[1..line.len() - 1].trim())
     } else {
@@ -490,7 +498,10 @@ fn section_header(line: &str) -> Option<&str> {
 }
 
 /// Strips a `;` comment from a line, returning the part before it.
-fn strip_comment(line: &str) -> &str {
+///
+/// Exposed so the content-import overlay strips comments using exactly the same
+/// rule as the parser when classifying a line for repair.
+pub fn strip_comment(line: &str) -> &str {
     match line.find(';') {
         Some(pos) => &line[..pos],
         None => line,

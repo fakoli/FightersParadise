@@ -60,6 +60,7 @@
 //! pattern. Missing or unloadable assets degrade gracefully to the test pattern
 //! with a clear log message; the app never panics.
 
+mod import;
 mod screens;
 mod validate;
 
@@ -179,6 +180,15 @@ fn main() {
         std::process::exit(run_validate(&args));
     }
 
+    // The `import` subcommand writes a repaired CNS/CMD overlay; it is also a
+    // headless CLI path and must not open a window.
+    if args
+        .get(1)
+        .is_some_and(|a| a.eq_ignore_ascii_case("import"))
+    {
+        std::process::exit(run_import(&args));
+    }
+
     if let Err(e) = run() {
         tracing::error!("Fatal error: {e}");
         std::process::exit(1);
@@ -217,6 +227,67 @@ fn run_validate(args: &[String]) -> i32 {
         Err(e) => {
             tracing::error!("validate: cannot load {}: {e}", def_path.display());
             eprintln!("validate: failed to load {}: {e}", def_path.display());
+            1
+        }
+    }
+}
+
+/// Runs the `import <file.cns|.cmd> <overlay-out>` subcommand: reads a CNS/CMD
+/// file, produces a repaired-text overlay (see [`import`]), and writes it to the
+/// output path — refusing any destination inside an `assets/` tree.
+///
+/// Returns the process exit code: `2` for a usage error, `1` if the source
+/// cannot be read or the overlay cannot be written (e.g. the clean-room write
+/// guard refused an `assets/` destination), `0` on success. The overlay is
+/// engine *output*, never written back over the source asset.
+fn run_import(args: &[String]) -> i32 {
+    let (Some(src_arg), Some(out_arg)) = (args.get(2), args.get(3)) else {
+        eprintln!("usage: fp-app import <file.cns|.cmd> <overlay-out>");
+        return 2;
+    };
+    let src = Path::new(src_arg);
+    let text = match fp_formats::text::read_text_file(src) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("import: cannot read {}: {e}", src.display());
+            eprintln!("import: failed to read {}: {e}", src.display());
+            return 1;
+        }
+    };
+    let overlay = import::repair_cns_text(&text);
+    match import::write_overlay(&overlay, Path::new(out_arg)) {
+        Ok(()) => {
+            if overlay.is_clean() {
+                tracing::info!(
+                    "import: {} is clean; overlay is byte-identical",
+                    src.display()
+                );
+            } else {
+                use import::RepairKind::*;
+                tracing::info!(
+                    "import: wrote overlay {} ({} repair(s): {} stray, {} empty-key, {} colon-header, {} malformed-header)",
+                    out_arg,
+                    overlay.repairs.len(),
+                    overlay.count(StrayLine),
+                    overlay.count(EmptyKey),
+                    overlay.count(ColonHeader),
+                    overlay.count(MalformedHeader),
+                );
+            }
+            for repair in &overlay.repairs {
+                tracing::info!(
+                    "import: {}:{} {:?} — {}",
+                    src.display(),
+                    repair.line_no,
+                    repair.kind,
+                    repair.original.trim()
+                );
+            }
+            0
+        }
+        Err(e) => {
+            tracing::error!("import: cannot write overlay {out_arg}: {e}");
+            eprintln!("import: failed to write overlay {out_arg}: {e}");
             1
         }
     }
