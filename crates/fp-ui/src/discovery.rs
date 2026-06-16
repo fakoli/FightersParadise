@@ -6,7 +6,8 @@
 //! - **Characters** live one-per-folder under a `chars/` directory, each folder
 //!   holding a same-named `.def` (`chars/kfm/kfm.def`). A flat directory of bare
 //!   `*.def` files is also accepted (so a quick scratch folder of characters
-//!   works without the nested layout).
+//!   works without the nested layout). The scanner accepts either a game *root*
+//!   that holds a `chars/` subdirectory **or** the `chars/` directory itself.
 //! - **Motif sets** (screenpacks) live one-per-folder under a `data/` directory,
 //!   each folder holding a `system.def` (`data/default/system.def`).
 //!
@@ -68,10 +69,11 @@ pub struct MotifEntry {
 /// duplicate `(name, def_path)` is collapsed.
 #[must_use]
 pub fn discover_chars(dir: &Path) -> Vec<CharEntry> {
-    let read = match std::fs::read_dir(dir) {
+    let scan = resolve_container(dir, "chars");
+    let read = match std::fs::read_dir(&scan) {
         Ok(rd) => rd,
         Err(e) => {
-            tracing::warn!("char discovery: cannot read {}: {e}", dir.display());
+            tracing::warn!("char discovery: cannot read {}: {e}", scan.display());
             return Vec::new();
         }
     };
@@ -84,7 +86,7 @@ pub fn discover_chars(dir: &Path) -> Vec<CharEntry> {
             Err(e) => {
                 tracing::debug!(
                     "char discovery: skipping unreadable entry in {}: {e}",
-                    dir.display()
+                    scan.display()
                 );
                 continue;
             }
@@ -135,7 +137,7 @@ pub fn discover_chars(dir: &Path) -> Vec<CharEntry> {
     tracing::info!(
         "char discovery: {} character(s) under {}",
         entries.len(),
-        dir.display()
+        scan.display()
     );
     entries
 }
@@ -152,10 +154,11 @@ pub fn discover_chars(dir: &Path) -> Vec<CharEntry> {
 /// is stable, and duplicate entries are collapsed.
 #[must_use]
 pub fn discover_motifs(dir: &Path) -> Vec<MotifEntry> {
-    let read = match std::fs::read_dir(dir) {
+    let scan = resolve_container(dir, "data");
+    let read = match std::fs::read_dir(&scan) {
         Ok(rd) => rd,
         Err(e) => {
-            tracing::warn!("motif discovery: cannot read {}: {e}", dir.display());
+            tracing::warn!("motif discovery: cannot read {}: {e}", scan.display());
             return Vec::new();
         }
     };
@@ -168,7 +171,7 @@ pub fn discover_motifs(dir: &Path) -> Vec<MotifEntry> {
             Err(e) => {
                 tracing::debug!(
                     "motif discovery: skipping unreadable entry in {}: {e}",
-                    dir.display()
+                    scan.display()
                 );
                 continue;
             }
@@ -205,7 +208,7 @@ pub fn discover_motifs(dir: &Path) -> Vec<MotifEntry> {
     tracing::info!(
         "motif discovery: {} motif(s) under {}",
         entries.len(),
-        dir.display()
+        scan.display()
     );
     entries
 }
@@ -225,6 +228,22 @@ fn file_name_str(path: &Path) -> Option<&str> {
 /// The file stem (name without extension) as a `&str`, if valid UTF-8.
 fn file_stem_str(path: &Path) -> Option<&str> {
     path.file_stem().and_then(|n| n.to_str())
+}
+
+/// Resolve which directory to actually scan for content of a given kind.
+///
+/// Accepts either the content container passed directly, or a MUGEN-style game
+/// *root* that holds the conventionally-named subdirectory (`chars/`, `data/`):
+/// when `dir/<sub>/` exists as a directory, that subdirectory is scanned;
+/// otherwise `dir` itself is. This lets a caller point at a game root (which
+/// holds `chars/`) **or** at the container directly, and both work.
+fn resolve_container(dir: &Path, sub: &str) -> PathBuf {
+    let nested = dir.join(sub);
+    if nested.is_dir() {
+        nested
+    } else {
+        dir.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +284,57 @@ mod tests {
         assert_eq!(roster[1].def_path, dir.join("foo").join("foo.def"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn game_root_with_chars_subdir_is_discovered() {
+        // Point at a game ROOT that holds a `chars/` subdir (the natural
+        // "point at a directory that has a chars folder" usage): discovery
+        // descends into `chars/` automatically.
+        let root = scratch("gameroot-chars");
+        let chars = root.join("chars");
+        std::fs::create_dir_all(&chars).unwrap();
+        make_char_folder(&chars, "foo");
+        make_char_folder(&chars, "bar");
+
+        let roster = discover_chars(&root);
+        assert_eq!(
+            roster.len(),
+            2,
+            "characters under <root>/chars/ are discovered when pointing at the root"
+        );
+        assert_eq!(roster[0].name, "bar");
+        assert_eq!(roster[0].def_path, chars.join("bar").join("bar.def"));
+        assert_eq!(roster[1].name, "foo");
+
+        // Pointing directly at the chars/ container still works (unchanged).
+        assert_eq!(discover_chars(&chars).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn game_root_with_data_subdir_discovers_motifs() {
+        // Point at a game ROOT that holds a `data/` subdir: motif discovery
+        // descends into `data/` automatically.
+        let root = scratch("gameroot-data");
+        let motif = root.join("data").join("default");
+        std::fs::create_dir_all(&motif).unwrap();
+        std::fs::write(motif.join("system.def"), "[Info]\nname = test\n").unwrap();
+
+        let motifs = discover_motifs(&root);
+        assert_eq!(
+            motifs.len(),
+            1,
+            "a motif under <root>/data/ is discovered when pointing at the root"
+        );
+        assert_eq!(motifs[0].name, "default");
+        assert_eq!(motifs[0].system_def_path, motif.join("system.def"));
+
+        // Pointing directly at the data/ container still works.
+        assert_eq!(discover_motifs(&root.join("data")).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
