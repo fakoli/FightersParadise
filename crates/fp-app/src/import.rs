@@ -572,7 +572,7 @@ pub fn write_air_overlay(overlay: &AirOverlay, dest: &Path) -> FpResult<()> {
 /// non-empty (a flag is something the import could *not* provably auto-repair and
 /// a human should look at). [`Tier::Repaired`] and [`Tier::Advisory`] never affect
 /// the exit code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// The import rewrote the content into a provably-safe shape (e.g. commented
@@ -597,13 +597,6 @@ impl Tier {
             Tier::Advisory => "advisory",
         }
     }
-}
-
-/// The tier a CNS/CMD [`RepairKind`] is reported under. Every CNS text repair is
-/// a provably-safe rewrite, so they are all [`Tier::Repaired`].
-#[must_use]
-fn cns_tier(_kind: RepairKind) -> Tier {
-    Tier::Repaired
 }
 
 /// The stable category label for a CNS/CMD [`RepairKind`] (used for per-category
@@ -709,7 +702,8 @@ impl ImportReport {
             self.entries.push(ReportEntry {
                 file: file.to_string(),
                 line_no: Some(r.line_no),
-                tier: cns_tier(r.kind),
+                // Every CNS text repair is a provably-safe rewrite.
+                tier: Tier::Repaired,
                 kind: cns_category(r.kind).to_string(),
                 original: r.original.trim().to_string(),
             });
