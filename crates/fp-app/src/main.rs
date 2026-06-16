@@ -611,6 +611,18 @@ impl FighterAudio {
         };
         match Sound::decode(bytes) {
             Ok(sound) => Some(sound),
+            // A recognised-but-unsupported codec (e.g. CRI ADX) is worth a single
+            // warn so the missing audio is explainable; the result is cached as
+            // `None`, so this fires at most once per (group, sample) and can never
+            // flood the per-tick loop.
+            Err(e @ fp_core::FpError::Unsupported(_)) => {
+                tracing::warn!(
+                    "unsupported sound codec for (group {}, sample {}): {e}; skipping",
+                    key.group,
+                    key.sample,
+                );
+                None
+            }
             Err(e) => {
                 tracing::debug!(
                     "failed to decode sound (group {}, sample {}): {e}; skipping",

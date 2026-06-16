@@ -76,12 +76,38 @@ const SUBHEADER_SIZE: usize = 16;
 pub enum SoundFormat {
     /// RIFF/WAVE (`"RIFF" ...`) — the supported, decodable case.
     Wav,
-    /// CRI ADX (sync byte `0x80`) — recognised but **not** supported; a consumer
-    /// should warn and skip rather than attempt to decode it.
+    /// CRI ADX (sync byte `0x80`, optionally confirmed by the `(c)CRI`
+    /// copyright marker) — recognised but **not** supported; a consumer should
+    /// warn and skip rather than attempt to decode it.
     Adx,
     /// Anything else (or a payload too short to sniff) — format unknown.
     Unknown,
 }
+
+impl SoundFormat {
+    /// Returns `true` if this codec can be decoded to PCM by `fp-audio`.
+    ///
+    /// Only [`SoundFormat::Wav`] is decodable today; [`SoundFormat::Adx`] is
+    /// recognised but unsupported, and [`SoundFormat::Unknown`] cannot be
+    /// trusted. A consumer should warn-and-skip any non-decodable entry rather
+    /// than hand its bytes to the WAV decoder.
+    pub fn is_decodable(self) -> bool {
+        matches!(self, SoundFormat::Wav)
+    }
+}
+
+/// The ASCII copyright marker every CRI ADX stream carries in its header.
+///
+/// It follows the leading `0x80` sync byte at the offset declared by the
+/// copyright-offset field, so a payload containing it (within a short prefix)
+/// is ADX even if a consumer cannot trust the sync byte alone.
+const ADX_COPYRIGHT_MARKER: &[u8] = b"(c)CRI";
+
+/// How far into a payload [`sniff_sound_format`] scans for [`ADX_COPYRIGHT_MARKER`].
+///
+/// ADX places the marker a few bytes past a tiny fixed header; a small bounded
+/// window keeps the sniff allocation-free and cheap while covering real files.
+const ADX_MARKER_SCAN_LEN: usize = 32;
 
 /// A single sound entry parsed from an SND container.
 ///
@@ -100,8 +126,8 @@ pub struct SndEntry {
 impl SndEntry {
     /// Sniffs the payload's codec from its leading magic bytes.
     ///
-    /// This is a pure, allocation-free header check — it reads at most the first
-    /// four bytes and never decodes the audio. Use it to skip an undecodable
+    /// This is a pure, allocation-free header check — it inspects only a short
+    /// bounded prefix and never decodes the audio. Use it to skip an undecodable
     /// payload (e.g. [`SoundFormat::Adx`]) before handing the blob to the WAV
     /// decoder. A too-short or unrecognised payload returns
     /// [`SoundFormat::Unknown`].
@@ -114,9 +140,22 @@ impl SndEntry {
 ///
 /// - **WAV**: starts with the `"RIFF"` chunk magic (the supported case).
 /// - **ADX (CRI)**: starts with the `0x80` sync byte (the high bit of the
-///   copyright-offset field). This codec is not decodable today.
+///   copyright-offset field), **or** carries the `(c)CRI` copyright marker
+///   within the first [`ADX_MARKER_SCAN_LEN`] bytes. The marker is the
+///   stronger signal; either match flags ADX. This codec is not decodable
+///   today, so a consumer should warn-and-skip it (see [`SoundFormat::Adx`]).
 /// - Everything else (including an empty/short payload): [`SoundFormat::Unknown`].
+///
+/// This is a pure, bounded, allocation-free header check and never decodes audio.
 pub fn sniff_sound_format(data: &[u8]) -> SoundFormat {
+    // The `(c)CRI` marker is unambiguous; check it first within a short window.
+    let scan = &data[..data.len().min(ADX_MARKER_SCAN_LEN)];
+    if scan
+        .windows(ADX_COPYRIGHT_MARKER.len())
+        .any(|w| w == ADX_COPYRIGHT_MARKER)
+    {
+        return SoundFormat::Adx;
+    }
     if data.first() == Some(&0x80) {
         return SoundFormat::Adx;
     }
@@ -727,5 +766,87 @@ mod tests {
         let bad = snd.sounds.iter().find(|s| s.sample == 1).unwrap();
         assert_eq!(wav.format(), SoundFormat::Wav);
         assert_eq!(bad.format(), SoundFormat::Adx);
+    }
+
+    /// Builds a synthetic CRI-ADX header: the `0x80` sync byte, a big-endian
+    /// copyright-offset field, the `(c)CRI` copyright marker at the offset that
+    /// field points at, then a little trailing body. This mirrors the shape of a
+    /// real ADX stream (clean-room: authored from the public format description,
+    /// not copied from any tool/asset) so the sniffer's marker path is exercised.
+    fn make_adx_header() -> Vec<u8> {
+        // copyright_offset counts bytes from offset 2 to the marker; we place the
+        // marker at byte 4, so the field value is 4 - 2 = 2.
+        let mut v = vec![0x80, 0x00, 0x00, 0x02];
+        v.extend_from_slice(ADX_COPYRIGHT_MARKER); // marker at offset 4
+        v.extend_from_slice(&[0x00, 0x03, 0x12, 0x04]); // arbitrary trailing header bytes
+        v
+    }
+
+    #[test]
+    fn sniffs_adx_via_copyright_marker_even_without_sync_byte() {
+        // The `(c)CRI` marker is the unambiguous ADX signal: a payload carrying it
+        // is ADX even if its first byte is not the 0x80 sync byte (e.g. a wrapper).
+        let mut data = make_adx_header();
+        data[0] = 0x00; // clobber the sync byte; the marker must still flag ADX
+        assert_eq!(sniff_sound_format(&data), SoundFormat::Adx);
+    }
+
+    #[test]
+    fn adx_marker_beyond_scan_window_is_not_misclassified() {
+        // A `(c)CRI` marker buried far past the bounded scan window must not flag
+        // ADX off the marker alone — the sniff stays cheap and bounded.
+        let mut data = vec![b'O', b'g', b'g', b'S']; // not RIFF, not 0x80
+        data.extend(std::iter::repeat_n(0u8, ADX_MARKER_SCAN_LEN));
+        data.extend_from_slice(ADX_COPYRIGHT_MARKER);
+        assert_eq!(sniff_sound_format(&data), SoundFormat::Unknown);
+    }
+
+    #[test]
+    fn sound_format_decodable_predicate() {
+        // Only WAV is decodable today; ADX and Unknown are warn-and-skip.
+        assert!(SoundFormat::Wav.is_decodable());
+        assert!(!SoundFormat::Adx.is_decodable());
+        assert!(!SoundFormat::Unknown.is_decodable());
+    }
+
+    #[test]
+    fn adx_entry_round_trips_in_container_for_warn_skip() {
+        // AC#1/#3: a realistic ADX-encoded entry living inside a full SND container
+        // is recovered intact (never panics) and flagged ADX, so a consumer can
+        // warn-and-skip it. The container itself parses fine alongside a WAV entry.
+        let adx = make_adx_header();
+        let data = make_test_snd(
+            4,
+            &[
+                (0, 0, b"RIFF....WAVE-pcm"),
+                (1, 0, adx.as_slice()),
+                (2, 0, b"RIFF....WAVE-tail"),
+            ],
+        );
+        let snd = SndFile::from_bytes(&data).expect("mixed-codec container must parse");
+
+        assert_eq!(snd.len(), 3);
+
+        // The ADX payload is recovered byte-for-byte (the container is codec-blind).
+        let recovered = snd.sound(1, 0).expect("adx entry present");
+        assert_eq!(recovered, adx.as_slice());
+
+        // Codec classification lets a consumer route each entry correctly.
+        let by_key = |g, s| {
+            snd.sounds
+                .iter()
+                .find(|e| e.group == g && e.sample == s)
+                .unwrap()
+        };
+        assert!(by_key(0, 0).format().is_decodable(), "WAV decodes");
+        assert_eq!(by_key(1, 0).format(), SoundFormat::Adx);
+        assert!(
+            !by_key(1, 0).format().is_decodable(),
+            "ADX is recognised-but-unsupported, so a consumer skips it"
+        );
+        assert!(
+            by_key(2, 0).format().is_decodable(),
+            "trailing WAV still decodes"
+        );
     }
 }
