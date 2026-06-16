@@ -4,7 +4,7 @@ A clean-room reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen
 fighting engine in Rust, aiming for a **completely customizable fighting-game engine**: bring your own
 characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 
-> **Current state (2026-06-16):** a **complete, playable fighting game**, not just an engine. From the
+> **Current state (2026-06-16 — v1.0+):** a **complete, playable fighting game**, not just an engine. From the
 > **Title screen** you flow through **character select → stage select → fight**, plus a **Setup/Options
 > screen with live key remapping** and **HUD / life-power-bar customization** — all navigable by keyboard
 > or game controller. Bring-your-own content is **discovered from directories the MUGEN way**: point
@@ -226,8 +226,8 @@ MUGEN community content is messy. Parsers and the evaluator must:
 ### Testing
 - Unit tests per module via `#[cfg(test)] mod tests`; binary parsers tested with synthetic byte arrays.
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` must both pass clean.
-- **GUI-free behavioral tests** (PRs #100/#102/#103): `fp_input::synth` provides a `CommandMotionSynth`
-  that generates frame-by-frame input sequences for QCF/DP/charge/etc. motions without a window. Built on
+- **GUI-free behavioral tests** (PRs #100/#102/#103): `fp_input::synth::synth_command` generates
+  frame-by-frame input sequences for QCF/DP/charge/etc. motions without a window (self-validated by replaying through the real `CommandMatcher`). Built on
   top of this: a **range-of-motion table** (`fp-app` tests) asserts that `trainingdummy` transitions into
   walk/run/jump states given synthesized inputs, and an **asset-gated move-execution test** (evilken,
   skips when `test-assets/` absent) proves specials + supers fire on real content with a negative control.
@@ -299,6 +299,24 @@ MUGEN community content is messy. Parsers and the evaluator must:
   across sessions.
 - Live GUI validation that drives the operator's real screen (e.g. `fp-app`) and operator interaction
   stay in the main session — those genuinely need this context.
+
+## Ledger task-authoring standard
+
+Every task added to the fakoli-state ledger (now and going forward) must be **comprehensive and
+guide-rich** — enough for a future agent with full context to execute it well, without prescribing the
+implementation. Each task carries:
+
+- **Priority**, **dependencies**, and **likely files**.
+- **Acceptance criteria** — concrete, testable bullets that define done.
+- **Implementation guides** (not finished code): the recommended approach, a **sample algorithm /
+  pseudocode** for the non-obvious parts, key data structures, and known gotchas. Leave the actual
+  implementation to the executing agent — guides, not solutions.
+- **Verification** — concrete commands/tests that exercise the *specific* mechanic or player-expectation
+  the task targets (so when verification fires, it proves that behavior, not just that the build is green).
+- A pointer to the **reference** it closes (the relevant `docs/knowledge-base/` doc or roadmap track).
+
+This is the standard for the roadmap-driven backlog (MUGEN-mechanics fidelity + masher→master player
+experience); apply it to every task, every time.
 
 ## Documentation
 
