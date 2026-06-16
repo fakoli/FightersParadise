@@ -2630,7 +2630,50 @@ impl TrainingOverlay {
         }
         if let Some(font) = font {
             self.draw_legend(frame, font);
+            // T065: per-side frame-data readout under the legend.
+            if self.scope.shows_p1() {
+                self.draw_frame_data(frame, font, m.p1(), Self::FRAME_DATA_P1_X);
+            }
+            if self.scope.shows_p2() {
+                self.draw_frame_data(frame, font, m.p2(), win_w - Self::FRAME_DATA_P2_INSET);
+            }
         }
+    }
+
+    /// X anchor of P1's frame-data readout.
+    const FRAME_DATA_P1_X: f32 = 8.0;
+    /// Right-edge inset of P2's frame-data readout.
+    const FRAME_DATA_P2_INSET: f32 = 120.0;
+    /// Vertical anchor of the (single-line) frame-data readout.
+    const FRAME_DATA_TOP: f32 = 124.0;
+
+    /// Draws one player's frame-data readout (T065): the startup / active /
+    /// recovery of the action it is currently executing.
+    ///
+    /// The readout is **self-gating** via [`format_frame_data`]: it shows real
+    /// numbers only for an action [`fp_character::MoveFrameData::compute`] can
+    /// count (one with a real attack window), and `S/A/R —` otherwise — never a
+    /// wrong number. A `None` font would have short-circuited the caller, so a
+    /// font is always in hand here.
+    fn draw_frame_data(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        font: &GlyphFont,
+        player: &fp_engine::Player,
+        x: f32,
+    ) {
+        let text = format_frame_data(player);
+        frame.draw_text(
+            font,
+            &text,
+            &TextDrawParams {
+                x,
+                y: Self::FRAME_DATA_TOP,
+                scale: 1.0,
+                alpha: 1.0,
+                blend: BlendMode::Normal,
+            },
+        );
     }
 
     /// Draws the color legend: a labeled line per box kind plus the current scope.
@@ -2673,6 +2716,27 @@ impl TrainingOverlay {
                 },
             );
         }
+    }
+}
+
+/// Formats a player's frame-data readout line (T065): `S<start> A<active>
+/// R<recovery>` for the action it is currently executing, or `S/A/R —` when that
+/// action is not a countable attack (idle / movement / looping / `time = -1`).
+///
+/// Looks up the current action ([`Player::anim`]) in the player's loaded `.air`
+/// table and runs [`fp_character::MoveFrameData::compute`]; a missing action or
+/// an uncountable one both fall to the `—` form (never a wrong number, never a
+/// panic) per the project's error philosophy.
+fn format_frame_data(player: &fp_engine::Player) -> String {
+    let fd = player
+        .loaded
+        .air
+        .actions
+        .get(&player.anim())
+        .and_then(fp_character::MoveFrameData::compute);
+    match fd {
+        Some(fd) => format!("S{} A{} R{}", fd.startup, fd.active, fd.recovery),
+        None => "S/A/R —".to_string(),
     }
 }
 
@@ -8756,6 +8820,78 @@ mod tests {
         assert_eq!(boxes[0].0.color, CLSN2_COLOR);
         assert_eq!(boxes[1].0.color, CLSN1_COLOR);
         assert_eq!(boxes[2].0.color, PUSH_COLOR);
+    }
+
+    /// Builds a headless [`Player`] whose `.air` holds two actions: action 200 is
+    /// a deterministic attack (3 startup / 4 active / 5 recovery, mirroring the
+    /// shipped trainingdummy basic attack), action 0 is a plain idle (no Clsn1).
+    /// The character is parked on `anim` so `format_frame_data` reads it. Asset-free.
+    fn synth_frame_data_player(anim: i32) -> Player {
+        use fp_formats::air::AnimFrame;
+        let attack = AnimAction {
+            action_number: 200,
+            loopstart: 0,
+            frames: vec![
+                AnimFrame {
+                    ticks: 3,
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 4,
+                    clsn1: vec![fp_core::Rect::new(20.0, -50.0, 30.0, 10.0)],
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 5,
+                    ..Default::default()
+                },
+            ],
+        };
+        let idle = AnimAction {
+            action_number: 0,
+            loopstart: 0,
+            frames: vec![AnimFrame {
+                ticks: 10,
+                ..Default::default()
+            }],
+        };
+        let mut actions = HashMap::new();
+        actions.insert(0, idle);
+        actions.insert(200, attack);
+        let loaded = LoadedCharacter {
+            name: "synth".to_string(),
+            localcoord: (320, 240),
+            constants: fp_character::CharacterConstants::default(),
+            states: HashMap::new(),
+            sff: synth_sff(),
+            air: AirFile { actions },
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        };
+        let mut c = Character::new();
+        c.anim = anim;
+        Player::new(c, loaded)
+    }
+
+    #[test]
+    fn format_frame_data_shows_startup_active_recovery_for_attack() {
+        let player = synth_frame_data_player(200);
+        assert_eq!(format_frame_data(&player), "S3 A4 R5");
+    }
+
+    #[test]
+    fn format_frame_data_shows_dash_for_non_attack_action() {
+        // Idle action (no Clsn1) is not countable -> the "—" form, never numbers.
+        let player = synth_frame_data_player(0);
+        assert_eq!(format_frame_data(&player), "S/A/R —");
+    }
+
+    #[test]
+    fn format_frame_data_shows_dash_for_missing_action() {
+        // An action absent from the .air table also degrades to "—", never panics.
+        let player = synth_frame_data_player(999);
+        assert_eq!(format_frame_data(&player), "S/A/R —");
     }
 
     #[test]

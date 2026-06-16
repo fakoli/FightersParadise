@@ -12128,4 +12128,56 @@ time = 1
         restored.restore_from_snapshot(&decoded);
         assert_eq!(restored.ai_level(), 7);
     }
+
+    // ====================================================================
+    // T065: frame-data readout — static startup/active/recovery from an AIR
+    // action, plus on-block / on-hit frame advantage derived from the
+    // defender's induced stun and the attacker's remaining recovery.
+    // ====================================================================
+
+    /// A deterministic attack action's static frame data must decompose to the
+    /// hand-counted startup / active / recovery, and the on-block / on-hit frame
+    /// advantage must equal `defender_stun − attacker_recovery`.
+    ///
+    /// This ties the engine's combat numbers to the player-facing readout: the
+    /// attacker's frames-until-actionable at contact is its move recovery (the
+    /// static tail computed from the AIR), and the defender's stun is the
+    /// block-/hit-stun the engine induces.
+    #[test]
+    fn frame_advantage_on_block_equals_blockstun_minus_recovery() {
+        use fp_character::{frame_advantage, MoveFrameData};
+
+        // A simple attack: 4-tick startup, 3-tick active (Clsn1), 8-tick recovery.
+        let action = AnimAction {
+            action_number: 200,
+            loopstart: 0,
+            frames: vec![
+                AnimFrame {
+                    ticks: 4,
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 3,
+                    clsn1: vec![Rect::new(0.0, -40.0, 30.0, -10.0)],
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 8,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let fd = MoveFrameData::compute(&action).expect("countable attack");
+        assert_eq!((fd.startup, fd.active, fd.recovery), (4, 3, 8));
+
+        // On block: the defender is held in 5 frames of blockstun while the
+        // attacker still owes its 8-frame recovery → 5 − 8 = −3 (disadvantage).
+        let on_block = frame_advantage(5, fd.recovery);
+        assert_eq!(on_block, -3, "on-block advantage = blockstun − recovery");
+
+        // On hit: 12 frames of hitstun vs the same 8 recovery → +4 (advantage).
+        let on_hit = frame_advantage(12, fd.recovery);
+        assert_eq!(on_hit, 4, "on-hit advantage = hitstun − recovery");
+    }
 }
