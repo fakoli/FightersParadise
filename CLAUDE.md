@@ -4,8 +4,8 @@ A clean-room reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen
 fighting engine in Rust, aiming for a **completely customizable fighting-game engine**: bring your own
 characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 
-> **Current state (2026-06-15 — v1.0):** a **complete, playable fighting game**, not just an engine. From
-> the **Title screen** you flow through **character select → stage select → fight**, plus a **Setup/Options
+> **Current state (2026-06-16):** a **complete, playable fighting game**, not just an engine. From the
+> **Title screen** you flow through **character select → stage select → fight**, plus a **Setup/Options
 > screen with live key remapping** and **HUD / life-power-bar customization** — all navigable by keyboard
 > or game controller. Bring-your-own content is **discovered from directories the MUGEN way**: point
 > `fp-app` at a game root (or a `chars/` folder directly) and the roster auto-populates from
@@ -20,13 +20,15 @@ characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 > `partner`/`playerid` redirects, full PalFX + true AfterImage, per-frame AIR scale/angle/Interpolate, the
 > `:=` assignment operator, deterministic serialization + record/replay, and broad **community-content
 > robustness** (Shift-JIS CNS/CMD + `.def`, SFF v2 sub-header resilience, FNT v2 detect, `FU`/`BU` command
-> tokens, helper lifecycle/`DestroySelf`) — is implemented and unit-tested (**~2621 tests**; clippy
+> tokens, helper lifecycle/`DestroySelf`) — is implemented and unit-tested (**~2644 tests**; clippy
 > `-D warnings` + `cargo fmt --check` are CI gates). **No crate is a stub.** SFF v1 (evilken) and SFF v2
-> (KFM) both render in full color.
+> (KFM) both render in full color. Bare-form MUGEN velocity consts (`const(velocity.walk.fwd)` /
+> `.run` / `.jump` / `.y`) now resolve correctly — characters **walk and jump** (PRs #98/#99).
 >
-> The 1.0 build landed across **47 fakoli-state tasks** (PRs #44–#94) on 2026-06-15; the newest
-> `docs/handoffs/` file is the per-run summary and the remaining non-blocking follow-ups (e.g. `stages/`
-> auto-discovery under a game-root arg, bare no-id `Proj*` triggers, `.snd` ADX decode). See
+> The 1.0 build landed across **47 fakoli-state tasks** (PRs #44–#94) on 2026-06-15, followed by the
+> movement fix (#98/#99), QCF/DP specials for trainingdummy (#97), and a GUI-free behavioral test harness
+> (motion synthesizer + range-of-motion + move-execution tests, #100/#102/#103). The newest
+> `docs/handoffs/` file is the per-run summary. See
 > [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md).
 
 ## Build & Run
@@ -39,7 +41,7 @@ cargo run -p fp-app -- <dir>                          # Discover a roster from a
 cargo run -p fp-app -- --motif <name|path> [args]    # Pick a discovered/explicit motif (T045; falls back to default)
 cargo run -p fp-app -- --simul p1.def [p2.def]       # Team Simul (or --turns) direct match (T027/T028)
 cargo run -p fp-app -- file.sff [file.air]           # Legacy sprite/animation viewer
-cargo test --workspace                               # Run all tests (~2621 pass)
+cargo test --workspace                               # Run all tests (~2644 pass)
 cargo run -p fp-app -- validate char.def             # Character validator (lints a .def's assets/states)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
 ```
@@ -94,20 +96,20 @@ presentation features are partial/asset-blocked — see "Architecture Notes" and
 
 | Crate | Tests | Status | Purpose |
 |-------|------:|--------|---------|
-| `fp-character` | 692 | Implemented | Loader (`.def`→`LoadedCharacter`) + live `Character` entity + per-tick MUGEN-order executor (~40 state controllers) + cross-entity `EvalContext`. **Largest crate.** |
-| `fp-vm` | 491 | Implemented | CNS expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). Triggers, redirects, `Value` model, proptest fuzz, arith NaN→Bottom. |
-| `fp-formats` | 182 | Implemented | Parsers: SFF v1 (PCX **+ trailing-palette extraction**) + SFF v2 (RLE8/RLE5/LZ5/raw **+ PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, SND, **FNT v1, ACT palette**. |
-| `fp-input` | 103 | Implemented | 60-frame ring buffer + command recognition (incl. `~` `/` `$` `>` `+` symbols). |
-| `fp-engine` | 121 | Implemented | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op application, clash/trade resolution, Pause/SuperPause freeze, hit-spark effect entities. |
+| `fp-character` | 794 | Implemented | Loader (`.def`→`LoadedCharacter`) + live `Character` entity + per-tick MUGEN-order executor (~40 state controllers) + cross-entity `EvalContext`. Bare-form velocity consts resolve correctly (walk/run/jump). **Largest crate.** |
+| `fp-vm` | 548 | Implemented | CNS expression engine: lexer → Pratt parser → **tree-walk evaluator** (NOT a bytecode/stack VM despite the name). Triggers, redirects, `Value` model, proptest fuzz, arith NaN→Bottom. |
+| `fp-formats` | 249 | Implemented | Parsers: SFF v1 (PCX **+ trailing-palette extraction**) + SFF v2 (RLE8/RLE5/LZ5/raw **+ PNG8/24/32 decode**), AIR (incl. scale/angle/Interpolate), CMD, DEF, CNS, SND, **FNT v1, ACT palette**. |
+| `fp-input` | 147 | Implemented | 60-frame ring buffer + command recognition (incl. `~` `/` `$` `>` `+` symbols) + **motion synthesizer** (`synth.rs`) for GUI-free behavioral tests. |
+| `fp-engine` | 202 | Implemented | Two-player `Match` coordinator: 6-step tick, round/best-of-N flow, push/bounds, deferred-op application, clash/trade resolution, Pause/SuperPause freeze, hit-spark effect entities. |
 | `fp-physics` | 90 | Implemented | Euler integration, gravity (0.44), Y=0 ground plane, AABB `Clsn` overlap, player push/bounds. No friction (that's `fp-character`). |
 | `fp-combat` | 84 | Implemented | `HitDef` data model, `Clsn1`×`Clsn2` hit primitive, pure `resolve_hit` → `HitOutcome`, `resolve_clash`, `GetHitVars`. Pure data/geometry/decision leaf. |
-| `fp-app` | 89 | Implemented | SDL2 window, 60Hz accumulator loop, CLI args (incl. `validate`), hand-rolled HUD, two-player match wiring, audio routing, Clsn debug overlay (F1). |
-| `fp-storyboard` | 65 | Implemented | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. Per-scene `clearcolor` + `fadein`/`fadeout` (alpha ramp) are computed by the player and applied by `fp-app`; per-scene `bgm` transitions are computed/logged (no music-streaming backend yet). |
-| `fp-audio` | 34 | Implemented | rodio WAV decode + channel-managed playback (`PlaySnd` + HitDef impact sounds); `NullBackend` headless fallback. |
-| `fp-render` | 46 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent), PalFX color-tint uniform, debug-box + `draw_text`/glyph primitives. |
+| `fp-app` | 215 | Implemented | SDL2 window, 60Hz accumulator loop, CLI args (incl. `validate`), hand-rolled HUD + screenpack HUD, two-player match wiring, audio routing, Clsn debug overlay (F1). Range-of-motion + move-execution behavioral tests. |
+| `fp-storyboard` | 73 | Implemented | Storyboard `.def` parser + typed scene model + `StoryboardPlayer`; driven as an intro/ending overlay by `fp-app`. Per-scene `clearcolor` + `fadein`/`fadeout` (alpha ramp) are computed by the player and applied by `fp-app`; per-scene `bgm` transitions are computed/logged (no music-streaming backend yet). |
+| `fp-audio` | 37 | Implemented | rodio WAV decode + channel-managed playback (`PlaySnd` + HitDef impact sounds); `NullBackend` headless fallback. |
+| `fp-render` | 67 | Implemented | wgpu sprite renderer, WGSL palette-lookup shader, 256-color indexed (palette idx 0 = transparent), PalFX color-tint uniform, debug-box + `draw_text`/glyph primitives. |
 | `fp-core` | 20 | Implemented | Shared types: `Vec2`, `Rect`, `SpriteId`, `FpError`/`FpResult`. |
-| `fp-stage` | 13 | Implemented | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax camera render in `fp-app`. (Tile/velocity/mask/`type=anim` and vertical-follow parsed-not-rendered; no real stage fixture.) |
-| `fp-ui` | 17 | Implemented | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it (falls back to the quad HUD when absent). ([Combo] parsed-not-drawn; single bg layer; no real fixture.) |
+| `fp-stage` | 43 | Implemented | Typed `[BGDef]`/`[BG]`/`[Camera]`/`[StageInfo]` parser + parallax camera render in `fp-app`. (Tile/velocity/mask/`type=anim` and vertical-follow parsed-not-rendered.) |
+| `fp-ui` | 75 | Implemented | Typed `fight.def` model + parser + `ScreenpackHud` renderer; `fp-app` loads it (falls back to the quad HUD when absent). ([Combo] parsed-not-drawn; single bg layer.) |
 
 ~59,000 LOC across 14 crates. Dependency graph: `fp-app` → `fp-engine` → `fp-character` → `fp-vm` /
 `fp-combat` / `fp-physics` / `fp-input`; `fp-combat` depends only on `fp-core` + `fp-physics`; everything
@@ -171,6 +173,8 @@ These are the keystones a new session (or maintainer) must understand first.
 | AIR / CMD / DEF / SND parsers | `crates/fp-formats/src/{air,cmd,def,snd}.rs` |
 | FNT v1 bitmap-font parser + ACT palette parser | `crates/fp-formats/src/{fnt,act}.rs` |
 | Command compile + backward-scan matcher | `crates/fp-input/src/command.rs` |
+| Motion synthesizer (GUI-free behavioral tests) | `crates/fp-input/src/synth.rs` |
+| Behavioral test harness design | `docs/knowledge-base/2026-06-16-behavioral-test-harness.md` |
 | Input ring buffer | `crates/fp-input/src/buffer.rs` |
 | Physics integration + ground plane | `crates/fp-physics/src/lib.rs` |
 | AABB collision + `place_clsn` facing mirror | `crates/fp-physics/src/collision.rs` |
@@ -222,6 +226,12 @@ MUGEN community content is messy. Parsers and the evaluator must:
 ### Testing
 - Unit tests per module via `#[cfg(test)] mod tests`; binary parsers tested with synthetic byte arrays.
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` must both pass clean.
+- **GUI-free behavioral tests** (PRs #100/#102/#103): `fp_input::synth` provides a `CommandMotionSynth`
+  that generates frame-by-frame input sequences for QCF/DP/charge/etc. motions without a window. Built on
+  top of this: a **range-of-motion table** (`fp-app` tests) asserts that `trainingdummy` transitions into
+  walk/run/jump states given synthesized inputs, and an **asset-gated move-execution test** (evilken,
+  skips when `test-assets/` absent) proves specials + supers fire on real content with a negative control.
+  Design: `docs/knowledge-base/2026-06-16-behavioral-test-harness.md`.
 - **CI note:** the real-*KFM* regression tests are still asset-gated (`test-assets/` is gitignored with no
   CI fetch step), so they run as **green no-ops on CI** — run the suite locally with KFM linked to exercise
   real KFM. But CI is no longer blind to real content (audit #36, done): it loads, matches, and runs the
@@ -304,7 +314,8 @@ Authoritative project docs live in `docs/`; research/planning docs in `docs/know
   point** (see "Session handoffs" below).
 - [docs/format-specs/sff-v2.md](docs/format-specs/sff-v2.md) — SFF v2 binary layout.
 - [docs/knowledge-base/](docs/knowledge-base/) — MUGEN research (01-03), roadmap (05), execution plan
-  (06, live ledger), evaluator semantics (07), faithfulness audit (08). Note: doc 04 (codebase review)
+  (06, live ledger), evaluator semantics (07), faithfulness audit (08), behavioral test harness design
+  (`2026-06-16-behavioral-test-harness.md`). Note: doc 04 (codebase review)
   and the top-level CHANGELOG are stale; trust the source over them.
 - Root [README.md](README.md) for the public-facing overview.
 
