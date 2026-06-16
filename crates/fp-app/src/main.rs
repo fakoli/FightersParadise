@@ -2391,8 +2391,6 @@ impl OverlayScope {
 struct TrainingOverlay {
     /// Which side(s) to draw; `Off` disables the overlay entirely.
     scope: OverlayScope,
-    /// Whether to draw the color legend when the overlay is active.
-    show_legend: bool,
 }
 
 impl TrainingOverlay {
@@ -2408,9 +2406,9 @@ impl TrainingOverlay {
     }
 
     /// Draws the in-scope fighters' Clsn boxes (reusing [`collect_clsn_boxes`])
-    /// plus, when [`show_legend`](Self::show_legend) is set and a HUD font is
-    /// available, a small top-left legend. A `None` font simply omits the text
-    /// (no regression, no panic). Nothing is drawn when the scope is `Off`.
+    /// plus, when a HUD font is available, a small top-left legend. A `None` font
+    /// simply omits the text (no regression, no panic). Nothing is drawn when the
+    /// scope is `Off`.
     fn draw(
         &self,
         frame: &mut fp_render::RenderFrame<'_>,
@@ -2433,10 +2431,8 @@ impl TrainingOverlay {
                 frame.draw_debug_box(&b);
             }
         }
-        if self.show_legend {
-            if let Some(font) = font {
-                self.draw_legend(frame, font);
-            }
+        if let Some(font) = font {
+            self.draw_legend(frame, font);
         }
     }
 
@@ -5194,10 +5190,7 @@ fn run() -> fp_core::FpResult<()> {
     // Player-facing training overlay (T063), toggled with F2: a styled, per-side
     // (Off → P1 → P2 → Both) view of the Clsn/push boxes with a legend. Distinct
     // from the F1 dev toggle above; persists for the session.
-    let mut training_overlay = TrainingOverlay {
-        scope: OverlayScope::Off,
-        show_legend: true,
-    };
+    let mut training_overlay = TrainingOverlay::default();
 
     while running {
         // Per-frame edge flags driven from discrete key events (below).
