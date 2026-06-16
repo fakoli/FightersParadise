@@ -545,10 +545,22 @@ fn eval_proj_tail(
 /// A name that already carries the `Time` infix (the bare `ProjContactTime<id>`
 /// form should never reach the tail path, but be defensive) is returned as-is.
 fn proj_time_trigger_name(name: &str) -> Option<String> {
-    let lower = name.to_ascii_lowercase();
+    // Allocation-free guard: reject anything not beginning with a case-insensitive
+    // `proj` before touching the prefix tables, and match each base against the
+    // name slice with `eq_ignore_ascii_case` rather than lowercasing the whole
+    // string (the old `to_ascii_lowercase()` allocated on every call). This runs
+    // only for the rare folded `ProjTail` node, but keeping it allocation-light on
+    // the no-match path costs nothing.
+    if name.len() < 4 || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
+        return None;
+    }
+    let starts_with_ci = |base: &str| {
+        name.get(..base.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
+    };
     // Already a `*Time` form → use verbatim.
     const TIME_BASES: [&str; 3] = ["projcontacttime", "projguardedtime", "projhittime"];
-    if TIME_BASES.iter().any(|b| lower.starts_with(b)) {
+    if TIME_BASES.iter().any(|b| starts_with_ci(b)) {
         return Some(name.to_string());
     }
     // (base, time-infixed base) — insert `Time` after the family base, keeping
@@ -559,7 +571,7 @@ fn proj_time_trigger_name(name: &str) -> Option<String> {
         ("projhit", "ProjHitTime"),
     ];
     for (base, time_base) in BASES {
-        if lower.starts_with(base) {
+        if starts_with_ci(base) {
             let suffix = &name[base.len()..];
             return Some(format!("{time_base}{suffix}"));
         }

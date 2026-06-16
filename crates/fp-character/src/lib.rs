@@ -3112,9 +3112,18 @@ enum ProjTriggerKind {
 /// path and the engine-wide "unknown trigger → 0" default. Longest bases are
 /// tested first so `projcontacttime` is preferred over `projcontact`.
 fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
-    let lower = name.to_ascii_lowercase();
-    // (base, kind, is_time) — `*time` variants listed first so they win the
-    // prefix test over their non-time counterparts.
+    // Cheap allocation-free guard: this runs as the FIRST check for every
+    // bare-ident trigger the executor evaluates each tick (`Time`, `StateNo`,
+    // `Anim`, …), so it must NOT heap-allocate on the common non-proj path. Every
+    // projectile-info trigger begins with a case-insensitive `proj`; anything that
+    // does not is rejected before any prefix matching (and well before the old
+    // `to_ascii_lowercase()` String allocation that lived here).
+    if name.len() < "projhit0".len() || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
+        return None;
+    }
+    // (base, kind, is_time) — `*time` variants listed first so they win the prefix
+    // test over their non-time counterparts. Matched case-insensitively against the
+    // name slice without lowercasing the whole string.
     const BASES: [(&str, ProjTriggerKind, bool); 6] = [
         ("projcontacttime", ProjTriggerKind::Contact, true),
         ("projguardedtime", ProjTriggerKind::Guarded, true),
@@ -3124,10 +3133,13 @@ fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
         ("projhit", ProjTriggerKind::Hit, false),
     ];
     for (base, kind, is_time) in BASES {
-        if let Some(suffix) = lower.strip_prefix(base) {
-            // The id suffix must be a non-negative integer; anything else (empty,
-            // signed, non-numeric) is not a projectile-info trigger.
-            return suffix.parse::<i32>().ok().map(|id| (kind, is_time, id));
+        if let Some(prefix) = name.get(..base.len()) {
+            if prefix.eq_ignore_ascii_case(base) {
+                // The id suffix must be a non-negative integer; anything else
+                // (empty, signed, non-numeric) is not a projectile-info trigger.
+                let suffix = &name[base.len()..];
+                return suffix.parse::<i32>().ok().map(|id| (kind, is_time, id));
+            }
         }
     }
     None
@@ -3896,8 +3908,9 @@ impl<'a> EntityGraph<'a> {
     /// (T026): the total number alive. Returns `0` when the owner has none (or
     /// wired no list — e.g. a bare/test context); never panics.
     ///
-    /// Counts the flat [`own_proj_ids`](Self::own_proj_ids) slice the owner
-    /// installs, so the answer is the owning player's live-projectile count.
+    /// Counts the flat `own_proj_ids` slice the owner installs (via
+    /// [`with_own_proj_ids`](Self::with_own_proj_ids)), so the answer is the owning
+    /// player's live-projectile count.
     #[must_use]
     pub fn num_proj(&self) -> i32 {
         // The slot-map is bounded (`MAX_PROJECTILES_PER_PLAYER`), so this never
