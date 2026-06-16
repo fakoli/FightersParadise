@@ -109,16 +109,28 @@ impl BarColor {
 
     /// A short uppercase label (matching the HUD font's glyph set) for the
     /// customization screen, or `None` for a non-preset color.
+    ///
+    /// Uses `==` comparisons against the preset constants rather than matching
+    /// them as patterns: [`BarColor`] holds `f32` fields, so it cannot derive
+    /// `Eq`, and a float-bearing const is not a structural-match pattern (it
+    /// would trip the `illegal_floating_point_literal_pattern` lint / a hard
+    /// "must derive Eq" error). The derived [`PartialEq`] always compiles.
     #[must_use]
     pub fn label(&self) -> Option<&'static str> {
-        match *self {
-            BarColor::WHITE => Some("WHITE"),
-            BarColor::RED => Some("RED"),
-            BarColor::GREEN => Some("GREEN"),
-            BarColor::BLUE => Some("BLUE"),
-            BarColor::YELLOW => Some("YELLOW"),
-            BarColor::CYAN => Some("CYAN"),
-            _ => None,
+        if *self == BarColor::WHITE {
+            Some("WHITE")
+        } else if *self == BarColor::RED {
+            Some("RED")
+        } else if *self == BarColor::GREEN {
+            Some("GREEN")
+        } else if *self == BarColor::BLUE {
+            Some("BLUE")
+        } else if *self == BarColor::YELLOW {
+            Some("YELLOW")
+        } else if *self == BarColor::CYAN {
+            Some("CYAN")
+        } else {
+            None
         }
     }
 
@@ -278,6 +290,11 @@ impl HudConfig {
     }
 
     /// Sets the global `(dx, dy)` HUD-anchor pixel offset.
+    ///
+    /// Model-only knob: the renderer honors it, but the in-game customization
+    /// screen does not yet expose it (it wires only bar color + element
+    /// visibility). It is intended for a future config loader; until one ships
+    /// the only callers are tests. Setting it is well-defined and safe.
     pub fn set_offset(&mut self, dx: i32, dy: i32) {
         self.offset = (dx, dy);
     }
@@ -290,6 +307,11 @@ impl HudConfig {
 
     /// Sets the global HUD-bar size multiplier, clamped to a sane positive range
     /// (`0.1..=4.0`) so a bad value can never collapse or explode the HUD.
+    ///
+    /// Model-only knob: the renderer honors it (it bakes the multiplier into the
+    /// bar layers' destination size, including the colored front fill), but the
+    /// in-game customization screen does not yet expose it — it is intended for a
+    /// future config loader, so until one ships the only callers are tests.
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = if scale.is_finite() {
             scale.clamp(0.1, 4.0)

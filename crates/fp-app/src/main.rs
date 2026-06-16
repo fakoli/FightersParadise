@@ -3877,7 +3877,11 @@ enum RunScreen {
     /// from the title menu; back returns to Title.
     Setup(screens::SetupScreen),
     /// The HUD-customization screen (T046): bar colors + per-element visibility.
-    /// Reached from the setup screen; back returns to Setup.
+    /// Reached from the setup screen; back returns to Setup. Edits mutate the
+    /// app's [`MenuApp::hud_config`], which is snapshotted onto the screenpack HUD
+    /// at the **next** match start (`enter_fight` -> `set_hud_config`); they do
+    /// not retro-apply to an already-running match (this screen is only reachable
+    /// out of a fight, so that never arises).
     HudCustomize(screens::HudCustomizeScreen),
     /// A running two-player match. On match-over the flow returns to Title.
     Fight(Box<MatchRun>),

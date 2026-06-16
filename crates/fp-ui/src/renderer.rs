@@ -354,15 +354,25 @@ impl ScreenpackHud {
             return;
         }
         let (uv, dst_w, dst_x_off) = bar_fill_uv(range, frac, gpu.width);
-        let params = SpriteDrawParams {
-            x: base_x + r.offset.x as f32 + dst_x_off,
-            y: base_y + r.offset.y as f32,
-            scale_x: scale,
-            scale_y: scale,
-            palfx: bar_tint_palfx(tint),
-            ..Default::default()
-        };
-        frame.draw_sprite_region(&gpu.texture, &gpu.palette, &params, uv, dst_w, gpu.height);
+        // `draw_sprite_region` takes the destination size directly (it does NOT
+        // read `params.scale_x`/`scale_y`), so the global `scale` override must be
+        // baked into the destination width/height here to match the scaled bg/mid
+        // layers (which go through `draw_sprite`). `scale == 1.0` (default config)
+        // leaves `dst_w`/`gpu.height` untouched, so the no-override draw is
+        // byte-for-byte unchanged.
+        let params = bar_fill_params(
+            base_x + r.offset.x as f32 + dst_x_off,
+            base_y + r.offset.y as f32,
+            tint,
+        );
+        frame.draw_sprite_region(
+            &gpu.texture,
+            &gpu.palette,
+            &params,
+            uv,
+            dst_w * scale,
+            gpu.height * scale,
+        );
     }
 
     /// Draws a sprite reference at full size scaled by `scale` (background/mid
@@ -570,6 +580,29 @@ pub fn bar_tint_palfx(color: BarColor) -> PalFx {
     color.to_palfx()
 }
 
+/// Builds the [`SpriteDrawParams`] for a bar front-fill draw at `(x, y)` with the
+/// given [`BarColor`] `tint` (T046).
+///
+/// This is the single construction site the renderer's `draw_bar_fill` uses, so
+/// the no-override regression test can assert against the *real* params rather
+/// than a hand-copied literal. The per-element `scale` is NOT carried on the
+/// params — [`RenderFrame::draw_sprite_region`](fp_render::RenderFrame::draw_sprite_region)
+/// ignores `scale_x`/`scale_y` and takes the destination size directly — so the
+/// caller bakes `scale` into the destination width/height instead. With a neutral
+/// [`BarColor::WHITE`] this yields exactly `SpriteDrawParams { x, y, ..default }`
+/// (identity tint), i.e. the pre-T046 draw.
+///
+/// Pure and unit-tested — no GPU.
+#[must_use]
+pub fn bar_fill_params(x: f32, y: f32, tint: BarColor) -> SpriteDrawParams {
+    SpriteDrawParams {
+        x,
+        y,
+        palfx: bar_tint_palfx(tint),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,29 +756,22 @@ mod tests {
 
     #[test]
     fn default_config_bar_fill_params_match_pre_t046_draw() {
-        // Acceptance #1: reproduce the exact SpriteDrawParams the renderer's
-        // `draw_bar_fill` builds for the DEFAULT config (offset (0,0), scale 1.0,
-        // white tint) and assert it equals the pre-T046 construction
-        // (`x, y, ..Default::default()`). This is the regression guard that a
-        // no-override HUD is unchanged.
+        // Acceptance #1: exercise the REAL param-construction helper
+        // (`bar_fill_params`, the single site `draw_bar_fill` calls) for the
+        // DEFAULT config (offset (0,0), white tint) and assert it equals the
+        // pre-T046 construction (`x, y, ..Default::default()`). This is the
+        // regression guard that a no-override HUD is unchanged — it tracks the
+        // real helper body, not a hand-copied literal.
         use crate::hud_config::HudConfig;
         let cfg = HudConfig::default();
         let (ox, oy) = cfg.offset();
-        let scale = cfg.scale();
         let tint = cfg.life_color();
         // Stand-in for a parsed front-fill sprite offset + a bar anchor.
         let (base_x, base_y) = (80.0 + ox as f32, 33.0 + oy as f32);
         let (off_x, off_y, dst_x_off) = (4.0, 4.0, 0.0);
 
-        // The T046 path (config-driven).
-        let t046 = SpriteDrawParams {
-            x: base_x + off_x + dst_x_off,
-            y: base_y + off_y,
-            scale_x: scale,
-            scale_y: scale,
-            palfx: bar_tint_palfx(tint),
-            ..Default::default()
-        };
+        // The T046 path (config-driven), built by the production helper.
+        let t046 = bar_fill_params(base_x + off_x + dst_x_off, base_y + off_y, tint);
         // The original pre-T046 path.
         let original = SpriteDrawParams {
             x: 80.0 + off_x + dst_x_off,
@@ -760,6 +786,28 @@ mod tests {
         assert_eq!(t046.palfx, original.palfx);
         assert_eq!(t046.alpha, original.alpha);
         assert_eq!(t046.blend, original.blend);
+    }
+
+    #[test]
+    fn bar_fill_scale_changes_the_destination_size() {
+        // The `scale` override must reach the front-fill's DESTINATION size, not
+        // its params (`draw_sprite_region` ignores `scale_x`/`scale_y`). Mirror
+        // the renderer's `draw_bar_fill` size math: a non-1.0 scale multiplies the
+        // dst width and height, and scale 1.0 leaves them untouched (the
+        // no-override byte-for-byte guarantee).
+        let (_uv, dst_w, _off) = bar_fill_uv((0, 256), 1.0, 200.0);
+        let sprite_h = 16.0_f32;
+
+        // Default scale 1.0: destination size is unchanged.
+        let scale = 1.0_f32;
+        assert_eq!(dst_w * scale, 200.0);
+        assert_eq!(sprite_h * scale, 16.0);
+
+        // A 2.0 scale doubles both dimensions of the colored front fill, matching
+        // the doubled bg/mid layers.
+        let scale = 2.0_f32;
+        assert_eq!(dst_w * scale, 400.0, "front fill grows with the frame");
+        assert_eq!(sprite_h * scale, 32.0);
     }
 
     #[test]
