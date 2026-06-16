@@ -67,7 +67,7 @@ use fp_core::{Rect, SpriteId, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
     logical_direction, AiDifficulty, AiObservation, Button, CommandDef, CommandMatcher, Direction,
-    InputBuffer, InputState,
+    InputBuffer, InputState, LeniencyConfig,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
@@ -807,7 +807,14 @@ impl Player {
     #[must_use]
     pub fn new(character: Character, loaded: LoadedCharacter) -> Self {
         let command_defs = loaded.command_defs();
-        let matcher = CommandMatcher::new(command_defs.clone());
+        // Input leniency (T075): give the built-in jump gate (`holdup`) a small
+        // pre-actionable buffer so a jump tapped a few frames before the player
+        // can act still comes out on the first actionable frame. Buffering is
+        // deterministic and in the input layer, so versus determinism is
+        // unchanged, and it re-arms only the `holdup` gate the engine's built-in
+        // ground locomotion reads — never authored content motions.
+        let matcher =
+            CommandMatcher::with_leniency(command_defs.clone(), LeniencyConfig::with_jump_buffer());
         Self {
             character,
             loaded,
