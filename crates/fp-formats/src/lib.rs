@@ -13,7 +13,8 @@
 //! - [`cns`] — CNS state files — statedefs and state controllers with raw triggers
 //! - [`def`] — DEF configuration files — simple INI-like key/value config
 //! - [`snd`] — Sound container format — WAV/PCM blobs addressed by (group, sample)
-//! - [`fnt`] — FNT bitmap font format (v1) — embedded PCX glyph strip + glyph map
+//! - [`fnt`] — FNT font format — v1 bitmap (embedded PCX glyph strip + glyph map)
+//!   decoded fully; v2 (MUGEN 1.0+ SFF sprite-font) detected + glyph-table parsed
 //! - [`text`] — legacy-encoding-tolerant text decoding (Shift-JIS, ...) shared by
 //!   the text parsers above so non-UTF-8 community files parse instead of being
 //!   skipped

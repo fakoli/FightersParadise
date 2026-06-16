@@ -46,8 +46,44 @@
 //! glyph's `x` start column and `width` within the PCX strip. The glyph's height
 //! is the full PCX image height.
 //!
-//! FNT **v2** (MUGEN 1.0, a TTF/SFF-backed sprite-font) is detected by its
-//! version byte and **skipped with a warning** — it is not implemented here.
+//! # FNT v2 (MUGEN 1.0+ font)
+//!
+//! FNT **v2** (MUGEN 1.0+) is **not** a binary file at all: unlike v1 it has
+//! **no** `ElecbyteFnt\0` magic. It is a **text `.def`-style** file
+//! ([Elecbyte 1.1 fonts docs](https://www.elecbyte.com/mugendocs-11b1/fonts.html);
+//! see `docs/knowledge-base/03-engine-architecture.md`). A `[Def]` section
+//! declares:
+//!
+//! ```text
+//! [Def]
+//! type    = bitmap        ; "bitmap" (SFF-backed) or "truetype"
+//! file    = font.sff      ; the SFF sprite-font (bitmap) or .ttf (truetype)
+//! size    = 0,0           ; advertised glyph cell size
+//! spacing = 1,0           ; (x,y) extra spacing between glyphs / lines
+//! offset  = 0,0           ; draw offset
+//! ;blend  = ...           ; (truetype) alpha blend
+//!
+//! [Map]
+//! ; the bitmap [Map] maps printable ASCII (32-126) to SFF sprite indices,
+//! ; conventionally as `0,<ASCII>` (group 0, index = the character's code).
+//! ```
+//!
+//! A **bitmap** v2 font references an accompanying **SFF** (one glyph per
+//! character); a **truetype** v2 font references a `.ttf`. Either way the glyph
+//! art lives outside the `.fnt`, so there is no embedded bitmap strip for this
+//! engine's `draw_text` path to consume.
+//!
+//! This module **detects** a v2 font ([`detect_fnt_version`]) — distinguishing
+//! it from the v1 binary `ElecbyteFnt\0` header by recognising the leading
+//! `.def`-style text body — and **parses its `[Def]`/`[Map]` table** into
+//! [`FntV2Info`] ([`FntFont::inspect_v2`]) without panicking, so a caller can
+//! report the declared font type, the SFF/TTF file it references, and how many
+//! glyphs it maps. Because `fp-render`'s text path consumes a decoded *bitmap*
+//! strip (not an SFF/TTF font), [`FntFont::from_bytes`] does **not** synthesize
+//! an `FntFont` for v2: it warns and returns [`FpError::Unsupported`] (a safe
+//! fallback — the caller falls back to the bitmap HUD font), never a crash. The
+//! `[Def]`/`[Map]` table is still parsed first so the error message carries the
+//! declared glyph count.
 //!
 //! # Never crash on bad content
 //!
@@ -84,15 +120,72 @@ const PCX_PALETTE_BLOCK_SIZE: usize = 1 + 768;
 /// Number of RGBA bytes in a fully expanded 256-colour palette (256 × 4).
 const PALETTE_RGBA_SIZE: usize = 256 * 4;
 
-/// Which FNT container version a file declares.
+/// Which FNT format a file uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FntVersion {
-    /// FNT v1 — embedded 8-bit PCX glyph strip + `[Def]`/`[Map]` text section
-    /// (WinMUGEN era). The only version this module decodes.
+    /// FNT v1 — a **binary** file: the `ElecbyteFnt\0` magic, an embedded 8-bit
+    /// PCX glyph strip, and a `[Def]`/`[Map]` text section (WinMUGEN era). The
+    /// only format this module decodes.
     V1,
-    /// FNT v2 — MUGEN 1.0 sprite/TTF font. Detected but **not** implemented;
-    /// [`FntFont::from_bytes`] warns and returns an error for it.
+    /// FNT v2 — a MUGEN 1.0+ **text `.def`-style** font (no binary magic) that
+    /// references an external SFF sprite-font (`type = bitmap`) or `.ttf`
+    /// (`type = truetype`). Detected and its `[Def]`/`[Map]` table is parsed
+    /// ([`FntFont::inspect_v2`]), but no bitmap [`FntFont`] is synthesised:
+    /// [`FntFont::from_bytes`] warns and returns [`FpError::Unsupported`] for it
+    /// (a safe fallback, never a crash).
     V2,
+}
+
+/// A parsed FNT **v2** `[Def]`/`[Map]` table and metrics.
+///
+/// FNT v2 fonts are text `.def`-style files that reference an external **SFF**
+/// sprite-font (`type = bitmap`) or a `.ttf` (`type = truetype`) instead of an
+/// inline PCX strip, so this engine cannot yet render them through the bitmap
+/// `draw_text` path. [`FntFont::inspect_v2`] still parses the v2 text body into
+/// this struct — without panicking — so callers can detect a v2 font and report
+/// what it references and how many glyphs it maps before falling back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FntV2Info {
+    /// `[Def] type` (`"bitmap"` / `"truetype"`), lowercased. Empty if absent.
+    pub font_type: String,
+    /// `[Def] file` — the referenced SFF sprite-font (`type = bitmap`) or `.ttf`
+    /// (`type = truetype`). Empty if absent. The glyph art lives in this file,
+    /// not in the `.fnt` itself.
+    pub file: String,
+    /// Per-character SFF sprite **index**, keyed by `char`, parsed from the
+    /// `[Map]`. A bitmap v2 `[Map]` maps printable ASCII (32-126) to SFF sprite
+    /// indices, conventionally written `0,<ASCII>` (group 0, index = ASCII code)
+    /// — this records the index. Empty for a `truetype` font (no `[Map]`).
+    pub glyphs: HashMap<char, u16>,
+    /// Extra horizontal spacing (pixels) after each glyph, from `[Def] spacing`.
+    pub spacing_x: i32,
+    /// Extra vertical spacing (pixels) between lines, from `[Def] spacing`.
+    pub spacing_y: i32,
+}
+
+impl FntV2Info {
+    /// Number of distinct mapped glyphs in the v2 glyph table.
+    pub fn glyph_count(&self) -> usize {
+        self.glyphs.len()
+    }
+}
+
+/// Detects the [`FntVersion`] of `data` **without** attempting to fully decode
+/// the font body.
+///
+/// The two FNT formats are structurally different files, not two layouts behind
+/// a shared header:
+///
+/// * **v1** is binary — it begins with the 12-byte `ElecbyteFnt\0` magic.
+/// * **v2** (MUGEN 1.0+) is a text `.def`-style file with **no** binary magic
+///   (a leading `[Def]`/`type=` body).
+///
+/// So detection keys on the magic: a buffer that starts with `ElecbyteFnt\0` is
+/// v1; a buffer that instead looks like a `.def`-style text font (UTF-8 text
+/// with a `[Def]` section or a `type =` key) is v2. Returns a parse error for a
+/// too-short buffer or for a binary blob that is neither — never panics.
+pub fn detect_fnt_version(data: &[u8]) -> FpResult<FntVersion> {
+    detect_version(data)
 }
 
 /// A single glyph's column within the font's glyph strip.
@@ -155,12 +248,51 @@ impl FntFont {
         match detect_version(data)? {
             FntVersion::V1 => Self::from_bytes_v1(data),
             FntVersion::V2 => {
-                tracing::warn!("FNT v2 fonts are not yet supported; skipping");
-                Err(FpError::Unsupported(
-                    "FNT v2 (MUGEN 1.0 sprite/TTF font) is not implemented".into(),
-                ))
+                // Parse the v2 `[Def]`/`[Map]` table (best-effort, never panics)
+                // so the diagnostic reports what the font references and how many
+                // glyphs it declares, then fall back: this engine renders bitmap
+                // strips, not SFF/TTF fonts, so no `FntFont` is synthesised.
+                let info = Self::inspect_v2(data).unwrap_or_else(|_| FntV2Info {
+                    font_type: String::new(),
+                    file: String::new(),
+                    glyphs: HashMap::new(),
+                    spacing_x: 0,
+                    spacing_y: 0,
+                });
+                tracing::warn!(
+                    glyphs = info.glyph_count(),
+                    font_type = %info.font_type,
+                    file = %info.file,
+                    "FNT v2 (MUGEN 1.0+ text .def font) is not yet renderable; skipping"
+                );
+                Err(FpError::Unsupported(format!(
+                    "FNT v2 (MUGEN 1.0+ text .def font, type='{}', {} glyphs) is not implemented",
+                    info.font_type,
+                    info.glyph_count()
+                )))
             }
         }
+    }
+
+    /// Parses an FNT **v2** font's `[Def]`/`[Map]` table into [`FntV2Info`]
+    /// without decoding (or requiring) its referenced SFF/TTF.
+    ///
+    /// This is the inspection entry point for v2 fonts. A v2 `.fnt` is a text
+    /// `.def`-style file (no binary header), so the **whole buffer** is parsed
+    /// as text: the `[Def]` metrics (`type`, `file`, `spacing`) plus the bitmap
+    /// `[Map]` (`char -> SFF sprite index`). Returns a parse error if the file
+    /// is not detected as v2; a malformed `[Map]` line is skipped with a warning
+    /// rather than failing. Never panics.
+    pub fn inspect_v2(data: &[u8]) -> FpResult<FntV2Info> {
+        match detect_version(data)? {
+            FntVersion::V2 => {}
+            FntVersion::V1 => {
+                return Err(FpError::parse("FNT", "not an FNT v2 font (got v1)"));
+            }
+        }
+        // v2 is a text `.def` file with no binary header: parse the entire body.
+        let text_str = decode_text(data);
+        Ok(parse_v2_text_section(&text_str))
     }
 
     /// Parses an FNT **v1** font from raw bytes.
@@ -256,34 +388,75 @@ fn parse_v1_header(data: &[u8]) -> FpResult<FntV1Header> {
     })
 }
 
-/// Detects whether `data` is an FNT v1 or v2 file.
+/// Detects whether `data` is an FNT v1 (binary) or v2 (text `.def`) file.
 ///
-/// Both begin with the same 12-byte `ElecbyteFnt\0` signature followed by four
-/// version bytes; the high-order byte (offset 15) is `1` for v1 and `2` for v2.
+/// v1 is identified by its 12-byte `ElecbyteFnt\0` magic; v2 has no magic and is
+/// recognised as a `.def`-style text body (a `[Def]` section header or a
+/// `type =` key). Returns a parse error for a too-short buffer or a binary blob
+/// that is neither.
 fn detect_version(data: &[u8]) -> FpResult<FntVersion> {
-    if data.len() < 16 {
-        return Err(FpError::parse(
-            "FNT",
-            format!(
-                "file too small for FNT header: {} bytes (need 16)",
-                data.len()
-            ),
-        ));
+    // v1: binary, leads with the ElecbyteFnt\0 magic.
+    if data.len() >= FNT_SIGNATURE.len()
+        && &data[0..FNT_SIGNATURE.len()] == FNT_SIGNATURE.as_slice()
+    {
+        if data.len() < 16 {
+            return Err(FpError::parse(
+                "FNT",
+                format!(
+                    "file too small for FNT v1 header: {} bytes (need 16)",
+                    data.len()
+                ),
+            ));
+        }
+        return match data[15] {
+            // The version-high byte is 1 for the v1 binary font. Real v2 fonts
+            // are text (handled below) and never reach this branch; an unknown
+            // byte is rejected rather than guessed.
+            1 => Ok(FntVersion::V1),
+            other => Err(FpError::parse(
+                "FNT",
+                format!("unsupported binary FNT version {other} (expected 1)"),
+            )),
+        };
     }
-    if &data[0..12] != FNT_SIGNATURE.as_slice() {
-        return Err(FpError::parse(
-            "FNT",
-            "invalid file signature (expected 'ElecbyteFnt\\0')",
-        ));
+
+    // v2: a text `.def`-style font (no binary magic). MUGEN 1.0+ emits these as
+    // UTF-8 text; recognise a leading `[Def]` section or a `type =` key.
+    if looks_like_v2_text(data) {
+        return Ok(FntVersion::V2);
     }
-    match data[15] {
-        1 => Ok(FntVersion::V1),
-        2 => Ok(FntVersion::V2),
-        other => Err(FpError::parse(
-            "FNT",
-            format!("unsupported FNT version {other} (expected 1 or 2)"),
-        )),
+
+    Err(FpError::parse(
+        "FNT",
+        "unrecognised FNT: not a v1 binary ('ElecbyteFnt\\0') nor a v2 text '.def' font",
+    ))
+}
+
+/// Heuristic: does `data` look like a MUGEN 1.0+ FNT v2 text font?
+///
+/// A v2 `.fnt` is a `.def`-style text file (no binary magic). We accept it as
+/// v2 when it decodes as (mostly) text and contains a `[Def]` section header or
+/// a `type =` key — the markers every v2 font carries — while explicitly
+/// rejecting any buffer bearing a binary `Elecbyte*` magic.
+fn looks_like_v2_text(data: &[u8]) -> bool {
+    // Reject any binary Elecbyte container (FNT v1, SFF, SND, ...): those are not
+    // text v2 fonts even though a stray `[Def]` substring could appear in them.
+    if data.starts_with(b"Elecbyte") {
+        return false;
     }
+    let text = decode_text(data);
+    let lower = text.to_ascii_lowercase();
+    // Scan declaration lines: a `[def]` section header or a `type=` key.
+    lower.lines().any(|raw| {
+        let line = strip_comment(raw).trim();
+        if let Some(name) = section_name(line) {
+            return name.eq_ignore_ascii_case("def");
+        }
+        if let Some((key, _)) = split_kv(line) {
+            return key.trim().eq_ignore_ascii_case("type");
+        }
+        false
+    })
 }
 
 /// Reads a little-endian `u32` at `pos`, returning `0` if out of range.
@@ -520,6 +693,134 @@ fn parse_map_line(line: &str) -> Option<(char, Glyph)> {
     ))
 }
 
+/// Parses an FNT **v2** text body (`[Def]` metrics + bitmap `[Map]`) into
+/// [`FntV2Info`].
+///
+/// Case-insensitive sections/keys; `;`/`//`/`#` comments; CRLF-tolerant. The
+/// `[Def]` carries `type` (`bitmap`/`truetype`), `file` (the SFF/TTF the glyphs
+/// live in), and `spacing`. The `[Map]` is the documented MUGEN 1.0 bitmap form
+/// `0,<ASCII>` — group, then the character's ASCII code — recorded here as
+/// `char -> SFF sprite index`. Malformed lines are skipped with a warning. Pure
+/// and unit-testable.
+fn parse_v2_text_section(text: &str) -> FntV2Info {
+    let mut info = FntV2Info {
+        font_type: String::new(),
+        file: String::new(),
+        glyphs: HashMap::new(),
+        spacing_x: 0,
+        spacing_y: 0,
+    };
+    let mut in_map = false;
+
+    for raw in text.lines() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(name) = section_name(line) {
+            in_map = name.eq_ignore_ascii_case("map");
+            continue;
+        }
+
+        if in_map {
+            if let Some((ch, index)) = parse_v2_map_line(line) {
+                info.glyphs.insert(ch, index);
+            }
+            continue;
+        }
+
+        if let Some((key, value)) = split_kv(line) {
+            match key.to_ascii_lowercase().as_str() {
+                "type" => info.font_type = value.trim().to_ascii_lowercase(),
+                "file" => info.file = unquote(value.trim()).to_string(),
+                "spacing" => {
+                    if let Some((x, y)) = parse_pair(value) {
+                        info.spacing_x = x;
+                        info.spacing_y = y;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    info
+}
+
+/// Parses one FNT v2 bitmap `[Map]` line into `(char, sff_index)`.
+///
+/// MUGEN 1.0 bitmap fonts list one glyph per line as `<group>,<ASCII>` — the
+/// SFF group/sprite index (conventionally `0`) followed by the character's
+/// ASCII code. We record `char -> sprite index` from that pair. A quoted/bare
+/// character literal followed by an index (`"X" 3`, `A 3`) is also accepted.
+/// Returns `None` (with a warning) for an unparseable line.
+fn parse_v2_map_line(line: &str) -> Option<(char, u16)> {
+    let bytes = line.as_bytes();
+
+    // A quoted leading token names the character literal directly: "X", ...
+    if bytes.first() == Some(&b'"') {
+        let close = line[1..].find('"').map(|i| i + 1)?;
+        let ch = line[1..close].chars().next()?;
+        let rest = &line[close + 1..];
+        let idx = first_int(rest).unwrap_or(0);
+        return Some((ch, clamp_u16(idx)));
+    }
+
+    // Otherwise tokenise on commas/whitespace. The documented bitmap form is
+    // `<group>,<ascii>`: two integers where the second is the character's ASCII
+    // code and we record the (group/sprite) index from the first. A single
+    // bare character followed by an index is also accepted.
+    let toks: Vec<&str> = line
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    match toks.as_slice() {
+        // `<index>,<ascii>` — both numeric: ASCII code names the char.
+        [a, b, ..] if a.parse::<i32>().is_ok() && b.parse::<u32>().is_ok() => {
+            let index = a.parse::<i32>().ok()?;
+            let code = b.parse::<u32>().ok()?;
+            let ch = char::from_u32(code)?;
+            Some((ch, clamp_u16(index)))
+        }
+        // `<char> <index>` — a literal/numeric char then a sprite index.
+        [first, idx, ..] => {
+            let ch = char_token(first)?;
+            let index = idx.parse::<i32>().ok().unwrap_or(0);
+            Some((ch, clamp_u16(index)))
+        }
+        _ => {
+            tracing::warn!(line, "FNT v2: unparseable [Map] line; skipped");
+            None
+        }
+    }
+}
+
+/// Interprets a `[Map]` character token: a purely numeric token is an ASCII
+/// code, otherwise it is a single literal character.
+fn char_token(tok: &str) -> Option<char> {
+    if let Ok(code) = tok.parse::<u32>() {
+        char::from_u32(code)
+    } else {
+        tok.chars().next()
+    }
+}
+
+/// Returns the first integer found in `s` (comma/whitespace separated), if any.
+fn first_int(s: &str) -> Option<i32> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .find_map(|t| t.parse::<i32>().ok())
+}
+
+/// Strips a surrounding pair of double quotes from `s`, if present.
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
 /// Clamps a (possibly negative) integer into `u16` range.
 fn clamp_u16(v: i32) -> u16 {
     v.clamp(0, u16::MAX as i32) as u16
@@ -608,28 +909,168 @@ B 8 6
 32 14 5
 ";
 
+    /// A synthetic but **format-faithful** MUGEN 1.0+ FNT v2 file: a UTF-8 text
+    /// `.def`-style font (NO binary `ElecbyteFnt\0` magic) with a `[Def]`
+    /// (`type = bitmap`, a referenced `file`, `spacing`) and a bitmap `[Map]`
+    /// listing `<group>,<ASCII>` lines (the documented MUGEN 1.0 bitmap mapping).
+    /// `0,65` is `A`→sprite 0, `1,66` is `B`→sprite 1, `7,32` is space→sprite 7.
+    const SAMPLE_V2_TEXT: &str = "\
+; MUGEN 1.0 sprite font
+[Def]
+type    = bitmap
+file    = myfont.sff
+size    = 12,12
+spacing = 2,3
+offset  = 0,0
+
+[Map]
+0,65
+1,66
+7,32
+";
+
     #[test]
-    fn detects_v1_and_v2() {
+    fn detects_v1_binary_and_v2_text() {
+        // v1 is the binary ElecbyteFnt\0 file; detection keys on the magic.
         let pcx = make_pcx(16, 10, 1, 200);
-        let mut data = make_fnt(&pcx, SAMPLE_TEXT);
-        assert_eq!(detect_version(&data).unwrap(), FntVersion::V1);
-        data[15] = 2;
-        assert_eq!(detect_version(&data).unwrap(), FntVersion::V2);
+        let v1 = make_fnt(&pcx, SAMPLE_TEXT);
+        assert_eq!(detect_version(&v1).unwrap(), FntVersion::V1);
+        assert_eq!(detect_fnt_version(&v1).unwrap(), FntVersion::V1);
+
+        // v2 is a real text `.def` font (no binary magic at all).
+        let v2 = SAMPLE_V2_TEXT.as_bytes();
+        assert_eq!(detect_version(v2).unwrap(), FntVersion::V2);
+        assert_eq!(detect_fnt_version(v2).unwrap(), FntVersion::V2);
+    }
+
+    #[test]
+    fn detect_fnt_version_on_real_v2_text_file() {
+        // A genuine text-shaped v2 font (UTF-8 `[Def]`/`[Map]`, no magic) is
+        // detected as v2 without panicking.
+        let data = SAMPLE_V2_TEXT.as_bytes();
+        assert!(!data.starts_with(b"Elecbyte"), "v2 has no binary magic");
+        assert_eq!(detect_fnt_version(data).unwrap(), FntVersion::V2);
+    }
+
+    #[test]
+    fn v2_detected_from_type_key_without_def_section() {
+        // Even without an explicit [Def] header, a leading `type =` key marks a
+        // v2 text font.
+        let data = b"type = truetype\nfile = arial.ttf\n";
+        assert_eq!(detect_fnt_version(data).unwrap(), FntVersion::V2);
+    }
+
+    #[test]
+    fn detect_fnt_version_rejects_short_and_bad_sig() {
+        // Empty / tiny binary buffers and a non-text, non-magic blob are neither.
+        assert!(detect_fnt_version(&[0u8; 8]).is_err());
+        assert!(detect_fnt_version(&[0u8; FNT_HEADER_SIZE]).is_err());
+        assert!(detect_fnt_version(&[0xFFu8; 64]).is_err());
+    }
+
+    #[test]
+    fn non_magic_text_not_misclassified_as_v1() {
+        // A text file that is NOT a font (no [Def]/type=) is rejected, not
+        // accepted as v1 (which requires the binary magic) nor as v2.
+        let data = b"hello world\nthis is not a font\n";
+        assert!(detect_fnt_version(data).is_err());
+    }
+
+    #[test]
+    fn v2_inspect_parses_def_and_map() {
+        let data = SAMPLE_V2_TEXT.as_bytes();
+        let info = FntFont::inspect_v2(data).unwrap();
+        assert_eq!(info.font_type, "bitmap");
+        assert_eq!(info.file, "myfont.sff");
+        assert_eq!(info.glyph_count(), 3);
+        // `0,65` -> 'A' at sprite index 0; `1,66` -> 'B' at index 1.
+        assert_eq!(info.glyphs.get(&'A'), Some(&0));
+        assert_eq!(info.glyphs.get(&'B'), Some(&1));
+        // `7,32` -> space (ASCII 32) at sprite index 7.
+        assert_eq!(info.glyphs.get(&' '), Some(&7));
+        assert_eq!(info.spacing_x, 2);
+        assert_eq!(info.spacing_y, 3);
+    }
+
+    #[test]
+    fn v2_inspect_truetype_has_file_no_glyphs() {
+        let data = b"[Def]\ntype = truetype\nfile = arial.ttf\nsize = 18\n";
+        let info = FntFont::inspect_v2(data).unwrap();
+        assert_eq!(info.font_type, "truetype");
+        assert_eq!(info.file, "arial.ttf");
+        assert_eq!(info.glyph_count(), 0);
+    }
+
+    #[test]
+    fn v2_inspect_quoted_file_is_unquoted() {
+        let data = b"[Def]\ntype = bitmap\nfile = \"my font.sff\"\n";
+        let info = FntFont::inspect_v2(data).unwrap();
+        assert_eq!(info.file, "my font.sff");
+    }
+
+    #[test]
+    fn v2_inspect_rejects_v1() {
+        let pcx = make_pcx(16, 10, 1, 200);
+        let v1 = make_fnt(&pcx, SAMPLE_TEXT);
+        // inspect_v2 on a v1 binary file is a (recoverable) error, not a panic.
+        assert!(FntFont::inspect_v2(&v1).is_err());
+    }
+
+    #[test]
+    fn v2_inspect_skips_malformed_map_lines() {
+        // Bare/quoted-literal forms plus a junk line: the junk is dropped, the
+        // rest survive — no panic.
+        let text = "[Def]\ntype = bitmap\n[Map]\nA 0\n!!!nonsense\nC 2\n\"D\" 3\n1,66\n";
+        let info = FntFont::inspect_v2(text.as_bytes()).unwrap();
+        assert_eq!(info.glyphs.get(&'A'), Some(&0));
+        assert_eq!(info.glyphs.get(&'C'), Some(&2));
+        assert_eq!(info.glyphs.get(&'D'), Some(&3));
+        // `1,66` -> 'B' at index 1.
+        assert_eq!(info.glyphs.get(&'B'), Some(&1));
+        assert!(!info.glyphs.contains_key(&'!'));
+    }
+
+    #[test]
+    fn from_bytes_on_real_v2_text_file_is_unsupported_not_panic() {
+        // A genuine text v2 font with a populated glyph table: from_bytes must
+        // report Unsupported (safe fallback for the bitmap render path), never
+        // panic, and the message should carry the parsed glyph count.
+        let data = SAMPLE_V2_TEXT.as_bytes();
+        match FntFont::from_bytes(data).unwrap_err() {
+            FpError::Unsupported(msg) => {
+                assert!(msg.contains("FNT v2"), "msg: {msg}");
+                assert!(
+                    msg.contains("3 glyphs"),
+                    "msg should carry glyph count: {msg}"
+                );
+                assert!(msg.contains("bitmap"), "msg should carry font type: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]
     fn rejects_bad_signature() {
+        // An all-zero 64-byte binary blob: no magic, not text -> rejected.
         let data = vec![0u8; FNT_HEADER_SIZE];
         assert!(detect_version(&data).is_err());
     }
 
     #[test]
-    fn v2_is_unsupported_not_panic() {
+    fn v2_text_is_unsupported_not_panic() {
+        let err = FntFont::from_bytes(SAMPLE_V2_TEXT.as_bytes()).unwrap_err();
+        assert!(matches!(err, FpError::Unsupported(_)));
+    }
+
+    #[test]
+    fn unknown_binary_version_byte_is_error_not_v1() {
+        // A binary ElecbyteFnt\0 file with an unexpected version-high byte is a
+        // recoverable error (never silently treated as v1 or v2), no panic.
         let pcx = make_pcx(16, 10, 1, 200);
         let mut data = make_fnt(&pcx, SAMPLE_TEXT);
-        data[15] = 2;
-        let err = FntFont::from_bytes(&data).unwrap_err();
-        assert!(matches!(err, FpError::Unsupported(_)));
+        data[15] = 9;
+        assert!(detect_version(&data).is_err());
+        assert!(FntFont::from_bytes(&data).is_err());
     }
 
     #[test]
