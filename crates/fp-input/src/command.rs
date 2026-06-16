@@ -401,7 +401,10 @@ impl CommandMatcher {
 /// Parses a MUGEN command string into a vector of command elements.
 ///
 /// Supports the following syntax:
-/// - Direction tokens: `U`, `D`, `F`, `B`, `UF`, `UB`, `DF`, `DB`
+/// - Direction tokens: `U`, `D`, `F`, `B`, `UF`, `UB`, `DF`, `DB`. Diagonals
+///   also accept the reversed (horizontal-then-vertical) token order authored
+///   by some community characters: `FU`/`BU`/`FD`/`BD` are aliases for
+///   `UF`/`UB`/`DF`/`DB` respectively.
 /// - Button tokens: `a`, `b`, `c`, `x`, `y`, `z`, `s` (case-insensitive)
 /// - `~` prefix: release modifier
 /// - `/` prefix: hold modifier
@@ -537,12 +540,19 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
     }
 
     // Then try direction tokens (case-insensitive, check two-char before single).
+    //
+    // Diagonals are accepted in either token order: the canonical
+    // vertical-then-horizontal form (`UF`/`UB`/`DF`/`DB`) and the reversed
+    // horizontal-then-vertical aliases (`FU`/`BU`/`FD`/`BD`) authored by many
+    // community characters (e.g. CVTW2Ryu). Both orderings map to the same
+    // `DirToken`, so a char that writes diagonals in reversed order still
+    // compiles every command instead of failing with "unknown command token".
     let upper = remaining.to_uppercase();
     let dir_token = match upper.as_str() {
-        "UF" => Some(DirToken::UF),
-        "UB" => Some(DirToken::UB),
-        "DF" => Some(DirToken::DF),
-        "DB" => Some(DirToken::DB),
+        "UF" | "FU" => Some(DirToken::UF),
+        "UB" | "BU" => Some(DirToken::UB),
+        "DF" | "FD" => Some(DirToken::DF),
+        "DB" | "BD" => Some(DirToken::DB),
         "U" => Some(DirToken::U),
         "D" => Some(DirToken::D),
         "F" => Some(DirToken::F),
@@ -1309,6 +1319,97 @@ mod tests {
                 detect: true,
                 strict: false,
             }
+        );
+    }
+
+    #[test]
+    fn compile_reversed_diagonal_aliases() {
+        // Many community chars (e.g. CVTW2Ryu) author diagonals in reversed
+        // (horizontal-then-vertical) order: FU/BU/FD/BD. These must compile to
+        // the same DirToken as the canonical UF/UB/DF/DB so the character's
+        // commands work instead of failing with "unknown command token".
+        let cases = [
+            ("FU", DirToken::UF),
+            ("BU", DirToken::UB),
+            ("FD", DirToken::DF),
+            ("BD", DirToken::DB),
+        ];
+        for (src, want) in cases {
+            assert_eq!(
+                compile_command(src).unwrap()[0],
+                CommandElement::Dir {
+                    token: want,
+                    modifier: InputModifier::Press,
+                    detect: false,
+                    strict: false,
+                },
+                "reversed-diagonal `{src}` should alias to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_reversed_diagonal_aliases_case_insensitive() {
+        // Reversed diagonals are case-insensitive just like the canonical ones
+        // (`fu` == `FU`).
+        for src in ["fu", "Fu", "fU", "FU"] {
+            assert_eq!(
+                compile_command(src).unwrap()[0],
+                CommandElement::Dir {
+                    token: DirToken::UF,
+                    modifier: InputModifier::Press,
+                    detect: false,
+                    strict: false,
+                },
+                "`{src}` should alias to UF regardless of case"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_reversed_diagonal_aliases_with_prefixes() {
+        // The aliases play nicely with the modifier/detect/strict prefixes the
+        // same way the canonical tokens do (e.g. `/$FU` == hold + detect + UF).
+        assert_eq!(
+            compile_command("/$FU").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::UF,
+                modifier: InputModifier::Hold,
+                detect: true,
+                strict: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compile_cvtw2ryu_style_reversed_diagonal_commands() {
+        // Acceptance criterion: `~DF, F, FU, x` and `~DB, B, BU, a` (the
+        // reversed-diagonal command shapes authored by characters like
+        // CVTW2Ryu) compile successfully, FU->UF and BU->UB.
+        let qcf_up = compile_command("~DF, F, FU, x").unwrap();
+        assert_eq!(qcf_up.len(), 4);
+        assert_eq!(
+            qcf_up[2],
+            CommandElement::Dir {
+                token: DirToken::UF,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "the third element `FU` must alias to UF"
+        );
+
+        let qcb_up = compile_command("~DB, B, BU, a").unwrap();
+        assert_eq!(qcb_up.len(), 4);
+        assert_eq!(
+            qcb_up[2],
+            CommandElement::Dir {
+                token: DirToken::UB,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+            },
+            "the third element `BU` must alias to UB"
         );
     }
 
