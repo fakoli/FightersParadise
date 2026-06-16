@@ -2826,6 +2826,29 @@ fn is_def_path(p: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("def"))
 }
 
+/// Resolves `path` to an absolute path so paths discovered under a **relative**
+/// directory argument do not get re-rooted when later joined against another
+/// base (e.g. `SelectScreen::build_pick`'s `base_dir.join(def_path)`).
+///
+/// Prefers [`std::fs::canonicalize`] (which also resolves `..`/symlinks and
+/// confirms the file exists); when that fails (the file is gone, or the platform
+/// rejects it) it falls back to joining the current working directory, and as a
+/// last resort returns the input unchanged. Never panics — a `current_dir`
+/// failure simply degrades to the relative path. An already-absolute path
+/// canonicalizes (or cwd-joins) to itself.
+fn absolutize(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// The top-level launch route chosen from the (palette-flag-stripped) positional
 /// CLI args. See [`cli_route`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2855,7 +2878,13 @@ fn cli_route(args: &[String]) -> CliRoute {
     match args.get(1) {
         None => CliRoute::Menu,
         Some(a) if a.eq_ignore_ascii_case("menu") => CliRoute::Menu,
-        Some(a) if Path::new(a).is_dir() => CliRoute::Directory(PathBuf::from(a)),
+        // Absolutize the directory up-front so the discovered character `.def`s
+        // are absolute paths. `SelectScreen::build_pick` later resolves a roster
+        // entry via `base_dir.join(def_path)` (base = the motif's `select.def`
+        // dir); a RELATIVE dir arg (e.g. `fp-app chars/`) would otherwise yield
+        // relative discovered paths that get re-rooted under the motif dir and
+        // fail to load. `absolutize` also defends `augment_roster`'s dedup.
+        Some(a) if Path::new(a).is_dir() => CliRoute::Directory(absolutize(Path::new(a))),
         Some(_) => CliRoute::Direct,
     }
 }
@@ -3606,36 +3635,46 @@ impl Motif {
         if discovered.is_empty() {
             return;
         }
-        // Existing resolved def paths (relative to the select.def dir) so we don't
-        // duplicate a character the motif already lists.
+        // The motif's own roster `.def`s resolve relative to the `select.def`
+        // directory (matching `SelectScreen::build_pick`), so compute that base to
+        // dedup the motif's existing characters against the discovered ones.
         let base_dir = self
             .select_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        // Existing resolved def paths, ABSOLUTIZED so the dedup compares in the
+        // same path space as the (also-absolutized) discovered paths below — a
+        // relative CLI dir arg would otherwise never compare equal to a motif's
+        // resolved path and the dedup would silently miss.
         let mut have: Vec<PathBuf> = self
             .select
             .slots
             .iter()
             .filter_map(|s| match s {
-                fp_ui::SelectSlot::Character(e) => Some(base_dir.join(&e.def_path)),
+                fp_ui::SelectSlot::Character(e) => Some(absolutize(&base_dir.join(&e.def_path))),
                 _ => None,
             })
             .collect();
 
         let mut added = 0;
         for c in discovered {
-            if have.iter().any(|p| p == &c.def_path) {
+            // Absolutize the discovered path BEFORE storing it: `SelectScreen`
+            // resolves a roster entry via `base_dir.join(def_path)`, where
+            // `base_dir` is the motif's `select.def` directory. A relative
+            // discovered path (from a relative CLI dir arg, e.g. `fp-app chars/`)
+            // would be re-rooted under that dir and fail to load; an absolute path
+            // joins to itself, so the character loads from where it was found.
+            let resolved = absolutize(&c.def_path);
+            if have.iter().any(|p| p == &resolved) {
                 continue;
             }
-            have.push(c.def_path.clone());
+            have.push(resolved.clone());
             self.select
                 .slots
                 .push(fp_ui::SelectSlot::Character(fp_ui::RosterEntry {
                     name: c.name.clone(),
-                    // Store the discovered def path verbatim; SelectScreen resolves
-                    // it against base_dir, and an absolute path resolves to itself.
-                    def_path: c.def_path.to_string_lossy().into_owned(),
+                    def_path: resolved.to_string_lossy().into_owned(),
                     include_stage: true,
                     ..Default::default()
                 }));
@@ -3757,6 +3796,14 @@ fn discover_stages(select: &SelectDef, select_path: &Path) -> Vec<screens::Stage
 /// 3. a discovered motif **name** matched (case-insensitively) against the
 ///    motifs found under [`DEFAULT_MOTIF_DIR`].
 fn resolve_motif_system_def(selector: &str) -> Option<PathBuf> {
+    resolve_motif_system_def_in(selector, Path::new(DEFAULT_MOTIF_DIR))
+}
+
+/// Resolves a `--motif` selector against a specific motif directory (the form-3
+/// search root). Split from [`resolve_motif_system_def`] so the discovered-name
+/// path can be unit-tested against a synthetic motif dir without touching the
+/// shipped [`DEFAULT_MOTIF_DIR`]. Pure given the filesystem.
+fn resolve_motif_system_def_in(selector: &str, motif_dir: &Path) -> Option<PathBuf> {
     let sel = selector.trim();
     if sel.is_empty() {
         return None;
@@ -3779,8 +3826,8 @@ fn resolve_motif_system_def(selector: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    // (3) A discovered motif name under the default motif dir.
-    fp_ui::discover_motifs(Path::new(DEFAULT_MOTIF_DIR))
+    // (3) A discovered motif name under the motif dir.
+    fp_ui::discover_motifs(motif_dir)
         .into_iter()
         .find(|m| m.name.eq_ignore_ascii_case(sel))
         .map(|m| m.system_def_path)
@@ -8206,8 +8253,10 @@ mod tests {
         let dir = discovery_scratch("route_dir");
         assert_eq!(
             cli_route(&["fp-app".to_string(), dir.to_string_lossy().into_owned()]),
-            CliRoute::Directory(dir.clone()),
-            "an existing directory routes to Directory"
+            // `cli_route` absolutizes (canonicalizes) the dir, which on macOS
+            // resolves `/var` -> `/private/var`, so compare against the same.
+            CliRoute::Directory(absolutize(&dir)),
+            "an existing directory routes to Directory (absolutized)"
         );
         // A single .def still routes to Direct unchanged.
         assert_eq!(
@@ -8271,6 +8320,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// T045 (review fix): form (3) — a discovered motif NAME resolves against the
+    /// motif dir (case-insensitively), locking acceptance criterion 3's
+    /// name-selection path against a synthetic motif tree (no shipped asset).
+    #[test]
+    fn resolve_motif_system_def_matches_discovered_name() {
+        // A motif dir holding `<dir>/dark/system.def`, the stand-in for
+        // DEFAULT_MOTIF_DIR's discovered-motif layout.
+        let dir = discovery_scratch("motif_name");
+        let motif_dir = dir.join("dark");
+        std::fs::create_dir_all(&motif_dir).unwrap();
+        let sysdef = motif_dir.join("system.def");
+        std::fs::write(&sysdef, "[Info]\nname = Dark\n").unwrap();
+
+        // The bare name resolves to the discovered motif's system.def.
+        assert_eq!(
+            resolve_motif_system_def_in("dark", &dir),
+            Some(sysdef.clone()),
+            "a discovered motif name resolves to its system.def"
+        );
+        // Matching is case-insensitive.
+        assert_eq!(
+            resolve_motif_system_def_in("DARK", &dir),
+            Some(sysdef),
+            "name matching is case-insensitive"
+        );
+        // An unknown name still yields None (default-motif fallback, no panic).
+        assert_eq!(resolve_motif_system_def_in("missing", &dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// T043: `Motif::augment_roster` appends discovered characters as new roster
     /// slots without dropping the motif's existing roster, and de-duplicates a
     /// character already listed.
@@ -8328,6 +8408,83 @@ mod tests {
         assert!(names.iter().any(|n| n == "Newbie"), "discovered appended");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T043 (review fix): the realistic invocation — a **relative** characters
+    /// directory whose `select.def` motif lives elsewhere. `discover_chars` over a
+    /// relative dir yields relative `def_path`s; `augment_roster` must absolutize
+    /// them so `SelectScreen::build_pick` (`base_dir.join(def_path)`, base = the
+    /// motif's `select.def` dir) resolves to the REAL on-disk file rather than
+    /// re-rooting `chars/foo/foo.def` under the motif dir.
+    #[test]
+    fn relative_dir_discovered_pick_resolves_to_real_file() {
+        // A unique RELATIVE characters tree under cwd (the crate root in tests),
+        // plus a SEPARATE motif select.def dir — so a re-rooting bug would point
+        // the pick at <motif_dir>/<relative path>, a non-existent location.
+        let rel_root = PathBuf::from(format!("fp_app_reldir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rel_root);
+        let chars_dir = rel_root.join("chars");
+        let foo = chars_dir.join("foo");
+        std::fs::create_dir_all(&foo).unwrap();
+        let foo_def = foo.join("foo.def");
+        std::fs::write(&foo_def, "[Info]\nname = Foo\n").unwrap();
+
+        // The motif's select.def lives in a different subdir (stand-in for
+        // assets/data) with no roster of its own.
+        let motif_dir = rel_root.join("motif");
+        std::fs::create_dir_all(&motif_dir).unwrap();
+        let select_path = motif_dir.join("select.def");
+        std::fs::write(&select_path, "[Characters]\n").unwrap();
+
+        // Discover over the RELATIVE chars dir -> relative def_paths.
+        let discovered = fp_ui::discover_chars(&chars_dir);
+        assert_eq!(discovered.len(), 1, "the one character is discovered");
+        // (Sanity: discovery produced a relative path, exercising the bug case.)
+        assert!(
+            discovered[0].def_path.is_relative(),
+            "discovered path is relative (the failing case)"
+        );
+
+        let mut motif = Motif::load_from(&select_path, &select_path);
+        motif.augment_roster(&discovered);
+
+        // Drive a Training select: P1 picks cell 0, P2 mirrors -> a MatchPick.
+        let mut screen = screens::SelectScreen::new(
+            screens::SelectMode::Training,
+            &motif.select,
+            &motif.system.select_info,
+            &motif.select_path,
+        );
+        let confirm = screens::MenuInput {
+            confirm: true,
+            ..Default::default()
+        };
+        let outcome = screen.update(confirm, 0);
+        let pick = match outcome {
+            screens::SelectOutcome::Done(p) => p,
+            other => panic!("expected a completed pick, got {other:?}"),
+        };
+
+        // The resolved pick MUST point at the real on-disk file, NOT the
+        // motif-dir-rebased wrong location.
+        let wrong = motif_dir.join("chars").join("foo").join("foo.def");
+        assert_ne!(
+            pick.p1_def, wrong,
+            "pick must not be re-rooted under the motif dir"
+        );
+        assert!(
+            pick.p1_def.is_file(),
+            "resolved pick {} must exist on disk",
+            pick.p1_def.display()
+        );
+        // Same canonical file as the discovered .def.
+        assert_eq!(
+            std::fs::canonicalize(&pick.p1_def).unwrap(),
+            std::fs::canonicalize(&foo_def).unwrap(),
+            "pick resolves to the discovered character file"
+        );
+
+        let _ = std::fs::remove_dir_all(&rel_root);
     }
 
     /// T044: `discover_stages` merges stages found by scanning a sibling `stages/`
