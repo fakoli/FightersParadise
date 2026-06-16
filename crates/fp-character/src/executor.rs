@@ -4346,6 +4346,18 @@ impl Character {
         // Advance through as many elements as this tick's elapsed time allows.
         // A hold-forever frame (ticks <= 0) never advances; a frame whose time
         // is not yet up stops the loop.
+        //
+        // `wrapped` records whether the cursor crossed the end of the action this
+        // tick (a finite action looping back to its `loopstart`). MUGEN reports
+        // `AnimTime = 0` on the last tick of the animation; for a *finite looping*
+        // action (no hold-forever final frame) the cursor lands on the loopstart
+        // element on the very tick it completes, so without this flag `AnimTime`
+        // would jump straight from a negative value to the full negative span of
+        // the next cycle and `0` would never be observable — which silently breaks
+        // every state that exits on `trigger = AnimTime = 0` (e.g. attack states
+        // that loop their animation). On the wrap tick we therefore force
+        // `AnimTime = 0`, then let the next tick compute the new cycle normally.
+        let mut wrapped = false;
         while let Some(frame) = action.frames.get(elem) {
             let dur = frame.ticks;
             // Hold-forever element, or this element's time not yet up: stop.
@@ -4357,11 +4369,16 @@ impl Character {
             elem += 1;
             if elem >= action.frames.len() {
                 elem = clamp_index_usize(action.loopstart, action.frames.len());
+                wrapped = true;
             }
         }
 
         self.anim_elem = i32::try_from(elem).unwrap_or(0);
-        self.anim_time = remaining_anim_time(action, elem, self.anim_elem_time);
+        self.anim_time = if wrapped {
+            0
+        } else {
+            remaining_anim_time(action, elem, self.anim_elem_time)
+        };
     }
 
     /// Builds the per-element cumulative start-offset table on the character from
@@ -8849,6 +8866,61 @@ mod tests {
             ch.anim_time, -4,
             "AnimTime counts down negatively; got {}",
             ch.anim_time
+        );
+    }
+
+    /// T056 regression: a *finite looping* animation (no hold-forever final frame)
+    /// must report `AnimTime = 0` for exactly one tick when it completes a cycle.
+    ///
+    /// MUGEN reports `AnimTime = 0` on the last tick of an animation; countless
+    /// states exit on `trigger = AnimTime = 0`. Before the fix, the per-tick
+    /// advance consumed the final element's last tick in the same call that looped
+    /// back to `loopstart`, so `AnimTime` jumped straight from a negative value
+    /// into the next cycle's negative span and `0` was never observable — silently
+    /// breaking every state that exits on `AnimTime = 0` for a looping animation
+    /// (this is exactly how evilken's punch, state 206 / anim 206, got stuck). The
+    /// wrap-tick now forces `AnimTime = 0`, then the next tick computes normally.
+    #[test]
+    fn finite_looping_anim_reports_animtime_zero_on_wrap_tick() {
+        // Action 0: two frames (durations 2 and 3 → total 5), loops at 0.
+        let st = state(
+            0,
+            Entry {
+                st: Some("S"),
+                ph: Some("N"),
+                anim: Some("0"),
+                ..Entry::default()
+            },
+            vec![],
+        );
+        let lc = loaded(vec![st], tiny_air(0, &[2, 3]));
+        let mut ch = Character::new();
+        ch.state_no = 0;
+        ch.anim = 0;
+        ch.anim_elem = 0;
+        ch.anim_elem_time = 0;
+
+        // Tick through one full 5-tick cycle and record AnimTime each tick. The
+        // cycle should produce AnimTime = 0 exactly once (the wrap tick).
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            lc.tick(&mut ch);
+            times.push(ch.anim_time);
+        }
+        assert!(
+            times.contains(&0),
+            "a finite looping animation never reported AnimTime = 0 over a full \
+             cycle (saw {times:?}); states that exit on `AnimTime = 0` would hang"
+        );
+        assert_eq!(
+            times.iter().filter(|&&t| t == 0).count(),
+            1,
+            "AnimTime = 0 should occur exactly once per loop cycle (saw {times:?})"
+        );
+        // All other ticks of the cycle are strictly negative (ticks-until-end).
+        assert!(
+            times.iter().all(|&t| t <= 0),
+            "AnimTime should never be positive (saw {times:?})"
         );
     }
 

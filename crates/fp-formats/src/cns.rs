@@ -415,8 +415,10 @@ impl SectionKind {
             // *controller* header, where the post-comma text is the controller's
             // label, a Statedef's label carries no parser-relevant meaning.)
             let after = rest.trim();
-            let num = match after.split_once(',') {
-                Some((n, _label)) => n.trim(),
+            // Some community content separates the (ignored) Statedef label with a
+            // colon instead of a comma (`[Statedef 9999: Label]`); accept either.
+            let num = match split_number_label(after) {
+                Some((n, _label)) => n,
                 None => after,
             };
             return match num.parse::<i32>() {
@@ -429,10 +431,13 @@ impl SectionKind {
                 return Some(SectionKind::Other);
             }
             // Split on the original-case `inner` to keep the label's casing.
-            // The header layout is `State <number>, <label>`.
+            // The header layout is `State <number>, <label>`. Some community
+            // content separates the label with a colon (`[State 9999: ParentVarSet]`)
+            // — a real controller header whose controllers must NOT be dropped, so
+            // accept `:` as an alternate separator to `,` (`split_number_label`).
             let after = inner[inner.len() - rest.len()..].trim_start();
-            let (num_str, label) = match after.split_once(',') {
-                Some((n, l)) => (n.trim(), l.trim().to_string()),
+            let (num_str, label) = match split_number_label(after) {
+                Some((n, l)) => (n, l.trim().to_string()),
                 None => (after.trim(), String::new()),
             };
             return match num_str.parse::<i32>() {
@@ -442,6 +447,23 @@ impl SectionKind {
         }
         Some(SectionKind::Other)
     }
+}
+
+/// Splits a section header's post-keyword text into its leading state-number
+/// token and trailing label, on the first `,` *or* `:` separator.
+///
+/// The canonical MUGEN separator is a comma (`[State 200, 1]`), but some
+/// community content uses a colon (`[State 9999: ParentVarSet]`). Both name a
+/// real state/controller whose body must be parsed, so we treat `:` as an
+/// alternate separator rather than letting the header fail to classify (which
+/// silently drops the controller). Returns `None` when neither separator is
+/// present, so the caller falls back to treating the whole text as the number.
+fn split_number_label(after: &str) -> Option<(&str, &str)> {
+    let sep = after
+        .char_indices()
+        .find(|&(_, c)| c == ',' || c == ':')
+        .map(|(i, _)| i)?;
+    Some((after[..sep].trim(), &after[sep + 1..]))
 }
 
 /// Returns the inner text of a `[...]` section header, or `None` if the line is
@@ -521,6 +543,71 @@ type = S
         let cns = CnsFile::from_str(text).unwrap();
         let nums: Vec<i32> = cns.statedefs.iter().map(|s| s.number).collect();
         assert_eq!(nums, vec![-1, -2, -3]);
+    }
+
+    /// T056 regression: a `[State N: Label]` controller header (colon instead of
+    /// the canonical comma) is real community-content seen in the wild (e.g.
+    /// evilken's AI helper: `[State 9999: ParentVarSet]`). The controller it names
+    /// must be parsed and attached to its Statedef, NOT dropped — dropping it
+    /// silently deletes a real engine controller (here, a `ParentVarSet` and a
+    /// `DestroySelf`), which is exactly the kind of "malformed section header
+    /// skipped" loss that broke evilken's AI/helper states.
+    #[test]
+    fn state_controller_header_with_colon_separator_is_not_dropped() {
+        let text = "\
+[Statedef 9998]
+ctrl = 0
+anim = 9999
+
+[State 9999: ParentVarSet]
+type = ParentVarSet
+trigger1 = 1
+var(30) = 59
+
+[State 9999: DestroySelf]
+type = DestroySelf
+trigger1 = parent, var(30) = -1
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        assert_eq!(cns.statedefs.len(), 1);
+        let def = &cns.statedefs[0];
+        assert_eq!(def.number, 9998);
+        assert_eq!(
+            def.controllers.len(),
+            2,
+            "both colon-separated controllers must be parsed, not dropped"
+        );
+        assert_eq!(
+            def.controllers[0].controller_type.as_deref(),
+            Some("ParentVarSet")
+        );
+        assert_eq!(def.controllers[0].state_number, 9999);
+        assert_eq!(
+            def.controllers[1].controller_type.as_deref(),
+            Some("DestroySelf")
+        );
+        // The label after the colon is captured (trimmed), like a comma label.
+        assert_eq!(def.controllers[0].label, "ParentVarSet");
+    }
+
+    /// T056 regression: a `[Statedef N: Label]` header (colon-separated label)
+    /// must classify as the Statedef with that number — the same tolerance the
+    /// comma form already had — rather than failing to parse and dropping the
+    /// whole state.
+    #[test]
+    fn statedef_header_with_colon_label_classifies() {
+        let text = "\
+[Statedef 1300: Special Intro]
+type = S
+
+[State 1300, 1]
+type = Null
+trigger1 = 1
+";
+        let cns = CnsFile::from_str(text).unwrap();
+        assert_eq!(cns.statedefs.len(), 1);
+        assert_eq!(cns.statedefs[0].number, 1300);
+        assert_eq!(cns.statedefs[0].controllers.len(), 1);
     }
 
     #[test]
