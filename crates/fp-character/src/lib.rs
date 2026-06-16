@@ -92,12 +92,12 @@ pub use loader::{
     LoadedCharacter, LoadedPalette,
 };
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use fp_core::Vec2;
 use fp_formats::air::AnimAction;
-use fp_vm::{EvalContext, Redirect, Rng, Value};
+use fp_vm::{AssignBank, EvalContext, Redirect, Rng, Value};
 use serde::{Deserialize, Serialize};
 
 /// The fixed default seed for a fresh character's `random` RNG stream.
@@ -1667,6 +1667,26 @@ pub struct Character {
     /// System float variable bank, `sysfvar(0)`..=`sysfvar(4)`.
     pub sysfvars: [f32; NUM_SYSFVARS],
 
+    /// Pending in-expression assignments (`var(n) := e`, T036) buffered during a
+    /// single expression evaluation, before they are flushed into the real banks.
+    ///
+    /// MUGEN's `:=` writes a variable in the *middle* of evaluating a trigger or
+    /// controller-parameter expression. The VM evaluates against a shared `&self`
+    /// (the [`EvalContext`] interface is read-only by design), so the write cannot
+    /// land directly on the bank arrays during eval; instead the
+    /// [`assign`](EvalContext::assign) hook records it here through interior
+    /// mutability. The executor calls [`flush_var_assignments`](Character::flush_var_assignments)
+    /// at the top of each tick to drain this log into the real banks. Reads
+    /// ([`read_var`](Character::read_var) etc.) consult this overlay *first* so a
+    /// later read in the **same** expression already sees an assignment from
+    /// earlier in that expression (matching MUGEN's left-to-right evaluation).
+    ///
+    /// It is **not** serialized: it is always drained to empty between ticks, so a
+    /// snapshot taken at a tick boundary captures the flushed bank arrays and
+    /// nothing is lost. Each entry is `(bank, index, value)`; last write to a slot
+    /// wins (the log is scanned in reverse on read and applied in order on flush).
+    var_assignments: RefCell<Vec<(AssignBank, i32, Value)>>,
+
     // ---- Static data -------------------------------------------------------
     /// Authored per-character constants loaded from the `.cns`.
     pub constants: CharacterConstants,
@@ -2184,6 +2204,7 @@ impl Default for Character {
             fvars: [0.0; NUM_FVARS],
             sysvars: [0; NUM_SYSVARS],
             sysfvars: [0.0; NUM_SYSFVARS],
+            var_assignments: RefCell::new(Vec::new()),
             constants,
             commands: Box::new(NoCommands),
             fire_counts: std::collections::HashMap::new(),
@@ -2487,9 +2508,31 @@ impl Character {
         elapsed.saturating_sub(offsets[idx])
     }
 
+    /// Returns the most recent pending in-expression assignment (`:=`) to slot
+    /// `index` of `bank`, if any, so a read sees a same-expression write before it
+    /// is flushed to the real banks (T036). The overlay log is scanned in reverse
+    /// (last write wins); when empty (the common case) this is a cheap early-out.
+    fn pending_assignment(&self, bank: AssignBank, index: i32) -> Option<Value> {
+        let log = self.var_assignments.borrow();
+        if log.is_empty() {
+            return None;
+        }
+        log.iter()
+            .rev()
+            .find(|(b, i, _)| *b == bank && *i == index)
+            .map(|(_, _, v)| *v)
+    }
+
     /// Reads integer variable `index`, or `0` if the index is out of range.
+    ///
+    /// A pending `:=` assignment to this slot (T036) takes precedence over the
+    /// stored bank value, so an in-expression write is visible to a later read in
+    /// the same expression.
     #[must_use]
     fn read_var(&self, index: i32) -> i32 {
+        if let Some(v) = self.pending_assignment(AssignBank::Var, index) {
+            return v.to_int();
+        }
         usize::try_from(index)
             .ok()
             .and_then(|i| self.vars.get(i))
@@ -2498,8 +2541,13 @@ impl Character {
     }
 
     /// Reads float variable `index`, or `0.0` if the index is out of range.
+    ///
+    /// A pending `:=` assignment to this slot (T036) takes precedence.
     #[must_use]
     fn read_fvar(&self, index: i32) -> f32 {
+        if let Some(v) = self.pending_assignment(AssignBank::FVar, index) {
+            return v.to_float();
+        }
         usize::try_from(index)
             .ok()
             .and_then(|i| self.fvars.get(i))
@@ -2508,8 +2556,13 @@ impl Character {
     }
 
     /// Reads system integer variable `index`, or `0` if out of range.
+    ///
+    /// A pending `:=` assignment to this slot (T036) takes precedence.
     #[must_use]
     fn read_sysvar(&self, index: i32) -> i32 {
+        if let Some(v) = self.pending_assignment(AssignBank::SysVar, index) {
+            return v.to_int();
+        }
         usize::try_from(index)
             .ok()
             .and_then(|i| self.sysvars.get(i))
@@ -2518,13 +2571,62 @@ impl Character {
     }
 
     /// Reads system float variable `index`, or `0.0` if out of range.
+    ///
+    /// A pending `:=` assignment to this slot (T036) takes precedence.
     #[must_use]
     fn read_sysfvar(&self, index: i32) -> f32 {
+        if let Some(v) = self.pending_assignment(AssignBank::SysFVar, index) {
+            return v.to_float();
+        }
         usize::try_from(index)
             .ok()
             .and_then(|i| self.sysfvars.get(i))
             .copied()
             .unwrap_or(0.0)
+    }
+
+    /// Drains the pending in-expression assignment (`:=`) overlay (T036) into the
+    /// real variable banks, applying each buffered write in order (so the last
+    /// write to a slot wins) and clearing the log.
+    ///
+    /// The executor calls this at the top of every tick — once the previous tick's
+    /// `&mut self` boundary is reached — so the banks always reflect every `:=`
+    /// that fired, and a snapshot taken at a tick boundary sees the flushed values
+    /// (the overlay is empty then). An out-of-range index is silently skipped,
+    /// matching the engine-wide "bad input → safe no-op" rule. Returns the number
+    /// of assignments applied (`0` is the common, fast case).
+    pub fn flush_var_assignments(&mut self) -> usize {
+        // Take ownership of the buffered writes, leaving the overlay empty.
+        let pending = std::mem::take(self.var_assignments.get_mut());
+        let applied = pending.len();
+        for (bank, index, value) in pending {
+            let Ok(i) = usize::try_from(index) else {
+                continue;
+            };
+            match bank {
+                AssignBank::Var => {
+                    if let Some(slot) = self.vars.get_mut(i) {
+                        *slot = value.to_int();
+                    }
+                }
+                AssignBank::FVar => {
+                    if let Some(slot) = self.fvars.get_mut(i) {
+                        *slot = value.to_float();
+                    }
+                }
+                AssignBank::SysVar => {
+                    if let Some(slot) = self.sysvars.get_mut(i) {
+                        *slot = value.to_int();
+                    }
+                }
+                AssignBank::SysFVar => {
+                    if let Some(slot) = self.sysfvars.get_mut(i) {
+                        *slot = value.to_float();
+                    }
+                }
+            }
+        }
+        applied
     }
 
     /// Maps a bare letter token (`S`, `A`, …) to its stable category code, or
@@ -3064,6 +3166,24 @@ impl EvalContext for Character {
 
     fn sysvar(&self, index: i32) -> Value {
         Value::Int(self.read_sysvar(index))
+    }
+
+    fn assign(&self, bank: AssignBank, index: i32, value: Value) -> Value {
+        // In-expression assignment (`var(n) := e`, T036). The VM evaluates against
+        // a shared `&self`, so the write is buffered into the interior-mutable
+        // overlay here and flushed into the real bank by the executor at the next
+        // tick boundary (see [`Character::flush_var_assignments`]). The overlay is
+        // read-back first by `read_var`/etc., so a later read in the SAME
+        // expression already sees this write. The returned value is coerced to the
+        // bank's element type so it matches a subsequent read.
+        let stored = match bank {
+            AssignBank::Var | AssignBank::SysVar => Value::Int(value.to_int()),
+            AssignBank::FVar | AssignBank::SysFVar => Value::Float(value.to_float()),
+        };
+        self.var_assignments
+            .borrow_mut()
+            .push((bank, index, stored));
+        stored
     }
 
     fn trigger_str(&self, name: &str, key: &str) -> Value {
@@ -3820,6 +3940,15 @@ impl EvalContext for EvalCtx<'_> {
 
     fn sysvar(&self, index: i32) -> Value {
         self.me.sysvar(index)
+    }
+
+    fn assign(&self, bank: AssignBank, index: i32, value: Value) -> Value {
+        // `:=` writes the *self* character's variable bank (T036): delegate to the
+        // wrapped character's interior-mutable overlay. A redirected assignment
+        // (`root, var(0) := 1`) is evaluated against the redirect target's own
+        // context, so the write still lands on whichever entity the redirect
+        // resolved to — never on the wrong character.
+        self.me.assign(bank, index, value)
     }
 
     fn command_active(&self, name: &str) -> bool {

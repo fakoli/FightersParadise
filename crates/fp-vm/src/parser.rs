@@ -369,6 +369,36 @@ pub enum Expr {
         /// The secondary operand (`time`) the projectile time is compared against.
         time: Box<Expr>,
     },
+    /// MUGEN's in-expression assignment `var(n) := e` (and the `fvar` / `sysvar`
+    /// / `sysfvar` bank variants), e.g. `var(5) := 8000` or
+    /// `-1 + 0 * (var(31) := 2)` (T036).
+    ///
+    /// Modern characters use this to set a state variable *inline*, in the middle
+    /// of an expression: the assignment writes `value` into slot `index` of `bank`
+    /// **and** evaluates to the assigned value, so it can appear as a sub-term of a
+    /// larger arithmetic / boolean expression. The evaluator performs the write
+    /// through the [`EvalContext::assign`](crate::eval::EvalContext::assign) hook
+    /// and yields the assigned value; see [the evaluator](crate::evaluator) for the
+    /// precise lowering.
+    ///
+    /// The left-hand side must be one of the four indexed variable banks
+    /// (`var` / `fvar` / `sysvar` / `sysfvar`); the parser rejects any other LHS
+    /// (a literal, a bare trigger, an arbitrary call) as a recoverable
+    /// [`ParseError`], so the whole expression maps to the const-`0` fallback
+    /// rather than a panic. The `index` is an arbitrary expression (MUGEN allows
+    /// `var(var(0)) := 1`), evaluated at run time.
+    ///
+    /// `:=` binds **looser than every other operator** (assignment is the
+    /// lowest-precedence form), so `var(0) := a && b` assigns the whole `a && b`.
+    Assign {
+        /// Which variable bank the assignment writes to.
+        bank: crate::eval::AssignBank,
+        /// The slot-index expression (`n` in `var(n)`), evaluated at run time.
+        index: Box<Expr>,
+        /// The value expression assigned to the slot (everything to the right of
+        /// `:=`).
+        value: Box<Expr>,
+    },
 }
 
 /// A recoverable parse failure.
@@ -430,6 +460,20 @@ pub enum ParseError {
         /// What was wrong with the redirection.
         reason: String,
         /// 0-based character column of the offending redirection keyword.
+        column: usize,
+    },
+
+    /// An in-expression assignment (`:=`) had a left-hand side that is not an
+    /// assignable variable target. MUGEN's `:=` writes one of the four indexed
+    /// banks (`var(n)` / `fvar(n)` / `sysvar(n)` / `sysfvar(n)`); a literal, a
+    /// bare trigger, or any other call to the left of `:=` is rejected here.
+    /// Mapped, like every other variant, to the bad-expression → `0` contract
+    /// rather than a panic.
+    #[error("`:=` left-hand side is not an assignable variable at column {column}: {reason}")]
+    InvalidAssignTarget {
+        /// What was wrong with the assignment target.
+        reason: String,
+        /// 0-based character column of the `:=` operator.
         column: usize,
     },
 
@@ -675,6 +719,36 @@ fn standtype_from_expr(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Classifies the left-hand side of an in-expression assignment (`:=`, T036) into
+/// its target [`AssignBank`](crate::eval::AssignBank) and slot-index expression,
+/// or [`None`] if `lhs` is not an assignable variable-bank call.
+///
+/// MUGEN's `:=` writes one of the four indexed variable banks, written as a
+/// single-argument call: `var(n)`, `fvar(n)`, `sysvar(n)`, or `sysfvar(n)`
+/// (case-insensitive). The argument expression `n` is returned (cloned) as the
+/// slot index — it is an arbitrary expression (e.g. `var(var(0)) := 1`), evaluated
+/// at run time. Any other shape (a literal, a bare trigger, a zero-/multi-argument
+/// call, or a non-bank function) yields [`None`] so the parser reports a
+/// recoverable [`ParseError::InvalidAssignTarget`].
+fn assign_target(lhs: &Expr) -> Option<(crate::eval::AssignBank, Expr)> {
+    use crate::eval::AssignBank;
+    let Expr::Call { name, args } = lhs else {
+        return None;
+    };
+    // The bank call takes exactly one argument: the slot index.
+    let [index] = args.as_slice() else {
+        return None;
+    };
+    let bank = match name.to_ascii_lowercase().as_str() {
+        "var" => AssignBank::Var,
+        "fvar" => AssignBank::FVar,
+        "sysvar" => AssignBank::SysVar,
+        "sysfvar" => AssignBank::SysFVar,
+        _ => return None,
+    };
+    Some((bank, index.clone()))
+}
+
 // Note on the two highest precedence levels: unary prefixes conceptually sit at
 // level 7 and the exponent `**` at level 8 (above every infix operator listed in
 // `binary_binding_power`). Both are handled structurally — unary in
@@ -856,11 +930,64 @@ impl<'a> Parser<'a> {
         // operator to its right, so this only continues an *outer* fold (e.g.
         // closing a parenthesized group), never re-binds inside the body.
         if let Some(redirected) = self.try_parse_redirect()? {
-            return self.fold_binary_ops(redirected, min_bp);
+            let folded = self.fold_binary_ops(redirected, min_bp)?;
+            return self.maybe_fold_assign(folded, min_bp);
         }
 
         let lhs = self.parse_prefix()?;
-        self.fold_binary_ops(lhs, min_bp)
+        let folded = self.fold_binary_ops(lhs, min_bp)?;
+        self.maybe_fold_assign(folded, min_bp)
+    }
+
+    /// If the next token is `:=` and we are at the loosest binding level
+    /// (`min_bp == 0`, i.e. assignment is permitted here), folds the just-parsed
+    /// `lhs` into an [`Expr::Assign`] over the rest of the expression (T036).
+    ///
+    /// MUGEN's `:=` binds **looser than every operator**, so assignment is only
+    /// recognized at `min_bp == 0` — the top level and every fresh full-expression
+    /// context (call argument, range bound, redirect body, parenthesized group).
+    /// At a higher `min_bp` (the RHS of an operator) a stray `:=` is left in place
+    /// and surfaces as a recoverable trailing-token error upstream, never a panic.
+    ///
+    /// The right-hand side is parsed with `parse_expr(0)` so a chained
+    /// `var(0) := var(1) := 5` (right-associative) and a loose `var(0) := a && b`
+    /// both assign the whole trailing expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::InvalidAssignTarget`] when the `lhs` is not an
+    /// assignable variable bank call (`var(n)` / `fvar(n)` / `sysvar(n)` /
+    /// `sysfvar(n)`), or [`ParseError::UnexpectedEof`] when nothing follows `:=`.
+    fn maybe_fold_assign(&mut self, lhs: Expr, min_bp: u8) -> Result<Expr, ParseError> {
+        if min_bp != 0 {
+            return Ok(lhs);
+        }
+        let Some(tok) = self.peek() else {
+            return Ok(lhs);
+        };
+        if tok.kind != TokenKind::Assign {
+            return Ok(lhs);
+        }
+        let column = tok.column;
+        // Commit to the assignment: the LHS must be an assignable variable call.
+        let (bank, index) = assign_target(&lhs).ok_or_else(|| ParseError::InvalidAssignTarget {
+            reason: "expected one of var(n) / fvar(n) / sysvar(n) / sysfvar(n)".to_string(),
+            column,
+        })?;
+        self.advance(); // consume `:=`
+        if self.is_at_end() {
+            return Err(ParseError::UnexpectedEof {
+                expected: "an expression after `:=`".to_string(),
+            });
+        }
+        // The value is the whole trailing expression (loosest binding), so a
+        // right-associative chain and a trailing boolean both bind correctly.
+        let value = self.parse_expr(0)?;
+        Ok(Expr::Assign {
+            bank,
+            index: Box::new(index),
+            value: Box::new(value),
+        })
     }
 
     /// Left-folds binary operators with binding power `>= min_bp` onto an
@@ -2833,12 +2960,18 @@ mod tests {
     }
 
     #[test]
-    fn assign_operator_is_not_an_expression_operator() {
-        // `:=` is the redirection/assignment op; it is NOT a binary expression
-        // operator here. `var(0) := 5` parses the call, then `:=` is a leftover
-        // token the top-level reports as unexpected. It must not panic.
-        let err = parse_str("var(0) := 5").unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedToken { .. }), "{err:?}");
+    fn assign_operator_parses_as_an_assignment() {
+        // T036: `:=` is the in-expression assignment operator. `var(0) := 5`
+        // parses to an `Expr::Assign` over var(0) (it used to be rejected as a
+        // leftover token; it is now supported). It must not panic.
+        assert_eq!(
+            parse_str("var(0) := 5").unwrap(),
+            Expr::Assign {
+                bank: AssignBank::Var,
+                index: Box::new(int(0)),
+                value: Box::new(int(5)),
+            }
+        );
     }
 
     #[test]
@@ -4349,5 +4482,163 @@ mod tests {
             );
             // And tokenizing/parsing never panics (implicitly: we reached here).
         }
+    }
+
+    // =====================================================================
+    // T036 — in-expression assignment (`:=`).
+    // =====================================================================
+
+    use crate::eval::AssignBank;
+
+    /// Shorthand for an [`Expr::Assign`] expected tree.
+    fn assign(bank: AssignBank, index: Expr, value: Expr) -> Expr {
+        Expr::Assign {
+            bank,
+            index: Box::new(index),
+            value: Box::new(value),
+        }
+    }
+
+    #[test]
+    fn assign_basic_var_parses() {
+        // AC1: `var(5) := 8000` parses to an assignment over var(5).
+        assert_eq!(
+            parse_str("var(5) := 8000").unwrap(),
+            assign(AssignBank::Var, int(5), int(8000))
+        );
+    }
+
+    #[test]
+    fn assign_all_banks_parse() {
+        // AC3: var / fvar / sysvar (and sysfvar) all parse to their bank.
+        assert_eq!(
+            parse_str("var(0) := 1").unwrap(),
+            assign(AssignBank::Var, int(0), int(1))
+        );
+        assert_eq!(
+            parse_str("fvar(1) := 2.5").unwrap(),
+            assign(AssignBank::FVar, int(1), Expr::Float(2.5))
+        );
+        assert_eq!(
+            parse_str("sysvar(2) := 3").unwrap(),
+            assign(AssignBank::SysVar, int(2), int(3))
+        );
+        assert_eq!(
+            parse_str("sysfvar(3) := 4.0").unwrap(),
+            assign(AssignBank::SysFVar, int(3), Expr::Float(4.0))
+        );
+    }
+
+    #[test]
+    fn assign_is_case_insensitive_on_bank_name() {
+        assert_eq!(
+            parse_str("VAR(0) := 1").unwrap(),
+            assign(AssignBank::Var, int(0), int(1))
+        );
+        assert_eq!(
+            parse_str("SysVar(0) := 1").unwrap(),
+            assign(AssignBank::SysVar, int(0), int(1))
+        );
+    }
+
+    #[test]
+    fn assign_embedded_in_arithmetic_parses() {
+        // AC2: `-1 + 0 * (var(31) := 2)` must parse (no fallback-to-0). The
+        // parenthesized assignment is a sub-term of the surrounding arithmetic.
+        let ast = parse_str("-1 + 0 * (var(31) := 2)").unwrap();
+        // -1 + (0 * (var(31) := 2))  — `*` binds tighter than `+`.
+        let expected = bin(
+            BinaryOp::Add,
+            un(UnaryOp::Neg, int(1)),
+            bin(
+                BinaryOp::Mul,
+                int(0),
+                assign(AssignBank::Var, int(31), int(2)),
+            ),
+        );
+        assert_eq!(ast, expected);
+    }
+
+    #[test]
+    fn assign_rhs_takes_whole_trailing_expression() {
+        // `:=` binds looser than every operator: the RHS is the whole `a && b`.
+        assert_eq!(
+            parse_str("var(0) := 1 && 2").unwrap(),
+            assign(AssignBank::Var, int(0), bin(BinaryOp::And, int(1), int(2)))
+        );
+    }
+
+    #[test]
+    fn assign_index_can_be_an_expression() {
+        // MUGEN allows a computed index, e.g. `var(var(0)) := 1`.
+        assert_eq!(
+            parse_str("var(var(0)) := 1").unwrap(),
+            assign(AssignBank::Var, call("var", vec![int(0)]), int(1))
+        );
+    }
+
+    #[test]
+    fn assign_is_right_associative() {
+        // `var(0) := var(1) := 5` assigns 5 to var(1), then that to var(0).
+        assert_eq!(
+            parse_str("var(0) := var(1) := 5").unwrap(),
+            assign(
+                AssignBank::Var,
+                int(0),
+                assign(AssignBank::Var, int(1), int(5)),
+            )
+        );
+    }
+
+    #[test]
+    fn assign_invalid_target_is_recoverable_error() {
+        // A non-bank LHS is a recoverable error (maps to const-0), never a panic.
+        for src in [
+            "5 := 1",        // literal LHS
+            "life := 1",     // bare trigger LHS
+            "abs(1) := 1",   // non-bank call LHS
+            "var() := 1",    // zero-arg var (not a slot)
+            "var(0,1) := 1", // multi-arg var
+        ] {
+            assert!(
+                matches!(parse_str(src), Err(ParseError::InvalidAssignTarget { .. })),
+                "{src:?} should be an InvalidAssignTarget error"
+            );
+        }
+    }
+
+    #[test]
+    fn assign_missing_rhs_is_recoverable_error() {
+        assert!(matches!(
+            parse_str("var(0) :="),
+            Err(ParseError::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn assign_inside_call_argument_parses() {
+        // A `:=` is permitted inside a call argument (a fresh full-expression
+        // context): `cond(var(0) := 1, 2, 3)` parses without mistaking the arg
+        // comma for an assignment boundary.
+        assert_eq!(
+            parse_str("cond(var(0) := 1, 2, 3)").unwrap(),
+            call(
+                "cond",
+                vec![assign(AssignBank::Var, int(0), int(1)), int(2), int(3)],
+            )
+        );
+    }
+
+    #[test]
+    fn assign_rhs_can_be_a_call() {
+        // The RHS is a full expression, so a function call works.
+        assert_eq!(
+            parse_str("var(0) := cond(1, 2, 3)").unwrap(),
+            assign(
+                AssignBank::Var,
+                int(0),
+                call("cond", vec![int(1), int(2), int(3)]),
+            )
+        );
     }
 }

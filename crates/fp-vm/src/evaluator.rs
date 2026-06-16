@@ -105,10 +105,13 @@
 //!   pre-4.10 behavior: the `Str` operand is bottom, so the comparison is `0`
 //!   (never fires) — documented and never a panic.
 //!
-//! ## Not yet in scope
+//! ## In-expression assignment (`:=`, T036)
 //!
-//! The `:=` assignment operator is **not** represented in the current [`Expr`]
-//! AST (deferred to task 4.9).
+//! MUGEN's assignment-in-expression operator — `var(n) := e` and the `fvar` /
+//! `sysvar` / `sysfvar` bank variants — is represented by [`Expr::Assign`]. The
+//! evaluator writes the value through the [`EvalContext::assign`] hook and yields
+//! the assigned value, so an assignment can appear as a sub-term of a larger
+//! expression (`-1 + 0 * (var(31) := 2)`). See [`eval_assign`].
 //!
 //! [kb]: ../../../docs/knowledge-base/07-evaluator-semantics.md
 
@@ -400,7 +403,34 @@ fn eval_inner(expr: &Expr, ctx: &dyn EvalContext) -> Eval {
         // form (Task A) exists only so the surrounding boolean survives. It always
         // reports "no projectiles" → `0`, so it never fires a trigger.
         Expr::ProjTail { .. } => Eval::Int(0),
+        Expr::Assign { bank, index, value } => eval_assign(*bank, index, value, ctx),
     }
+}
+
+/// Evaluates MUGEN's in-expression assignment `var(n) := e` (and the `fvar` /
+/// `sysvar` / `sysfvar` bank variants), the [`Expr::Assign`] node (T036).
+///
+/// The index and value sub-expressions are evaluated, then the write is performed
+/// through the [`EvalContext::assign`] hook, and the **assigned value** (as the
+/// hook reports it back, narrowed/widened to the bank's element type) becomes the
+/// value of the whole assignment expression — so `var(5) := 8000` evaluates to
+/// `8000` and `-1 + 0 * (var(31) := 2)` both sets `var(31)` and yields `-1`.
+///
+/// A bottom index or value propagates: the assignment is skipped and the result is
+/// bottom (→ `0` at the public boundary), so an erroring assignment never fires a
+/// surrounding trigger and never writes a garbage slot.
+fn eval_assign(
+    bank: crate::eval::AssignBank,
+    index: &Expr,
+    value: &Expr,
+    ctx: &dyn EvalContext,
+) -> Eval {
+    let idx = eval_inner(index, ctx);
+    let val = eval_inner(value, ctx);
+    if Eval::either_bottom(idx, val) {
+        return Eval::Bottom;
+    }
+    Eval::from_value(ctx.assign(bank, idx.to_int(), val.into_value()))
 }
 
 /// Evaluates the two-argument `TimeMod = d, c` form (Task A).
@@ -1059,9 +1089,9 @@ fn float_fn(v: Eval, f: fn(f32) -> f32) -> Eval {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{EvalContext, Redirect, Value};
+    use crate::eval::{AssignBank, EvalContext, Redirect, Value};
     use crate::parser::{parse_str, ParseError};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
     /// Renders `(name, args)` into a stable, case-insensitive lookup key, mirroring
@@ -1091,9 +1121,12 @@ mod tests {
     struct MockContext {
         triggers: HashMap<String, Value>,
         member_triggers: HashMap<String, Value>,
-        vars: HashMap<i32, i32>,
-        fvars: HashMap<i32, f32>,
-        sysvars: HashMap<i32, i32>,
+        // Interior-mutable so the assignment hook (`var(i) := e`, T036) can persist
+        // a write through the shared `&self` and a later read sees it.
+        vars: RefCell<HashMap<i32, i32>>,
+        fvars: RefCell<HashMap<i32, f32>>,
+        sysvars: RefCell<HashMap<i32, i32>>,
+        sysfvars: RefCell<HashMap<i32, f32>>,
         rng: Cell<Option<Rng>>,
         redirects: HashMap<Redirect, Box<MockContext>>,
     }
@@ -1110,16 +1143,16 @@ mod tests {
             self.member_triggers.insert(member_key(name, member), value);
             self
         }
-        fn with_var(mut self, index: i32, value: i32) -> Self {
-            self.vars.insert(index, value);
+        fn with_var(self, index: i32, value: i32) -> Self {
+            self.vars.borrow_mut().insert(index, value);
             self
         }
-        fn with_fvar(mut self, index: i32, value: f32) -> Self {
-            self.fvars.insert(index, value);
+        fn with_fvar(self, index: i32, value: f32) -> Self {
+            self.fvars.borrow_mut().insert(index, value);
             self
         }
-        fn with_sysvar(mut self, index: i32, value: i32) -> Self {
-            self.sysvars.insert(index, value);
+        fn with_sysvar(self, index: i32, value: i32) -> Self {
+            self.sysvars.borrow_mut().insert(index, value);
             self
         }
         fn with_seed(self, seed: i32) -> Self {
@@ -1147,21 +1180,49 @@ mod tests {
         }
         fn var(&self, index: i32) -> Value {
             self.vars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Int)
         }
         fn fvar(&self, index: i32) -> Value {
             self.fvars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Float)
         }
         fn sysvar(&self, index: i32) -> Value {
             self.sysvars
+                .borrow()
                 .get(&index)
                 .copied()
                 .map_or(Value::DEFAULT, Value::Int)
+        }
+        fn assign(&self, bank: AssignBank, index: i32, value: Value) -> Value {
+            // Persist the write (interior mutability) and return the read-back value.
+            match bank {
+                AssignBank::Var => {
+                    let v = value.to_int();
+                    self.vars.borrow_mut().insert(index, v);
+                    Value::Int(v)
+                }
+                AssignBank::FVar => {
+                    let v = value.to_float();
+                    self.fvars.borrow_mut().insert(index, v);
+                    Value::Float(v)
+                }
+                AssignBank::SysVar => {
+                    let v = value.to_int();
+                    self.sysvars.borrow_mut().insert(index, v);
+                    Value::Int(v)
+                }
+                AssignBank::SysFVar => {
+                    let v = value.to_float();
+                    self.sysfvars.borrow_mut().insert(index, v);
+                    Value::Float(v)
+                }
+            }
         }
         fn redirect(&self, target: Redirect) -> Option<&dyn EvalContext> {
             self.redirects
@@ -3984,5 +4045,96 @@ mod tests {
             ev("projcontact2000 = 1, < 20 || time > 2", &ctx),
             Value::Int(1)
         );
+    }
+
+    // =====================================================================
+    // T036 — in-expression assignment (`:=`).
+    // =====================================================================
+
+    #[test]
+    fn assign_sets_var_and_evaluates_to_assigned_value() {
+        // AC1: `var(5) := 8000` sets var 5 to 8000 and evaluates to 8000.
+        let ctx = MockContext::new();
+        assert_eq!(ev("var(5) := 8000", &ctx), Value::Int(8000));
+        // AC3: a later read of the assigned var returns the assigned value.
+        assert_eq!(ctx.var(5), Value::Int(8000));
+    }
+
+    #[test]
+    fn assign_embedded_in_arithmetic_evaluates_and_sets() {
+        // AC2: `-1 + 0 * (var(31) := 2)` evaluates (no fallback-to-0) and sets
+        // var 31. The arithmetic value is -1 (the `0 *` zeroes the assignment's
+        // contribution), but the side effect still happens.
+        let ctx = MockContext::new();
+        assert_eq!(ev("-1 + 0 * (var(31) := 2)", &ctx), Value::Int(-1));
+        assert_eq!(ctx.var(31), Value::Int(2));
+    }
+
+    #[test]
+    fn assign_covers_var_fvar_sysvar_banks() {
+        // AC3: assignment + read-back across int / float / system banks.
+        let ctx = MockContext::new();
+
+        assert_eq!(ev("var(0) := 42", &ctx), Value::Int(42));
+        assert_eq!(ctx.var(0), Value::Int(42));
+
+        assert_eq!(ev("fvar(1) := 3.5", &ctx), Value::Float(3.5));
+        assert_eq!(ctx.fvar(1), Value::Float(3.5));
+
+        assert_eq!(ev("sysvar(2) := 7", &ctx), Value::Int(7));
+        assert_eq!(ctx.sysvar(2), Value::Int(7));
+    }
+
+    #[test]
+    fn assign_coerces_value_to_bank_element_type() {
+        // An int assigned to a float bank widens; a float assigned to an int bank
+        // narrows (truncating toward zero) — matching a later read of the slot.
+        let ctx = MockContext::new();
+        assert_eq!(ev("fvar(0) := 5", &ctx), Value::Float(5.0));
+        assert_eq!(ctx.fvar(0), Value::Float(5.0));
+        assert_eq!(ev("var(0) := 3.9", &ctx), Value::Int(3));
+        assert_eq!(ctx.var(0), Value::Int(3));
+    }
+
+    #[test]
+    fn assign_value_is_visible_to_later_reads_in_same_expression() {
+        // Once written, a subsequent read in the SAME expression sees the new
+        // value (the write persists through interior mutability before the read).
+        let ctx = MockContext::new();
+        assert_eq!(ev("(var(0) := 9) + var(0)", &ctx), Value::Int(18));
+        assert_eq!(ctx.var(0), Value::Int(9));
+    }
+
+    #[test]
+    fn assign_with_computed_index() {
+        // `var(var(0)) := 5` assigns to the slot named by var(0). var(0) is 0
+        // initially, so this assigns 5 to var(0) — then `var(0)` reads 5.
+        let ctx = MockContext::new();
+        assert_eq!(ev("var(var(0)) := 5", &ctx), Value::Int(5));
+        assert_eq!(ctx.var(0), Value::Int(5));
+    }
+
+    #[test]
+    fn assign_chained_right_associative() {
+        // `var(0) := var(1) := 5` writes 5 to var(1) and to var(0).
+        let ctx = MockContext::new();
+        assert_eq!(ev("var(0) := var(1) := 5", &ctx), Value::Int(5));
+        assert_eq!(ctx.var(0), Value::Int(5));
+        assert_eq!(ctx.var(1), Value::Int(5));
+    }
+
+    #[test]
+    fn assign_default_context_does_not_panic_and_returns_value() {
+        // A context that does not override `assign` (the default no-op write) still
+        // evaluates a `:=` expression to the assigned value without panicking.
+        struct ReadOnly;
+        impl EvalContext for ReadOnly {
+            fn trigger(&self, _name: &str, _args: &[Value]) -> Value {
+                Value::DEFAULT
+            }
+        }
+        assert_eq!(ev("var(5) := 8000", &ReadOnly), Value::Int(8000));
+        // The read is not persisted by the default hook, so a later read is 0.
+        assert_eq!(ev("var(5)", &ReadOnly), Value::Int(0));
     }
 }

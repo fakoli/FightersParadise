@@ -404,6 +404,10 @@ fn render(expr: &Expr) -> String {
         } => {
             format!("{name} = {}, {op} {}", render(value), render(time))
         }
+        Expr::Assign { bank, index, value } => {
+            // Fully parenthesized so it round-trips: `(bank(index) := value)`.
+            format!("({bank}({}) := {})", render(index), render(value))
+        }
     }
 }
 

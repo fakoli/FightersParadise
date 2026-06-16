@@ -35,7 +35,7 @@ pub mod lexer;
 pub mod parser;
 pub mod triggers;
 
-pub use eval::{EvalContext, Redirect, Value};
+pub use eval::{AssignBank, EvalContext, Redirect, Value};
 pub use evaluator::{eval, Rng};
 pub use lexer::{tokenize, Token, TokenKind};
 pub use parser::{parse, parse_str, BinaryOp, Bound, Expr, ParseError, UnaryOp};
