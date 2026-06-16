@@ -1430,7 +1430,12 @@ impl Player {
     /// `ground.back` constants. KFM asserts `Width 16, x` on crouch/attack and its
     /// throw-bind state (810) to change how it pushes; with no override the
     /// behaviour is unchanged.
-    fn push_widths(&self) -> (f32, f32) {
+    ///
+    /// Exposed publicly so the app's training/Clsn overlay (T063) can draw the
+    /// player-push box alongside the Clsn1/Clsn2 hit/hurt boxes; the engine's own
+    /// push/bounds logic calls it internally too.
+    #[must_use]
+    pub fn push_widths(&self) -> (f32, f32) {
         let w = self.character.cur_width;
         if w.active {
             (w.front, w.back)
