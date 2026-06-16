@@ -276,6 +276,12 @@ fn path_touches_assets(path: &Path) -> bool {
 /// - [`FpError::Io`] if the parent directory cannot be created or the file
 ///   cannot be written.
 pub fn write_overlay(overlay: &CnsOverlay, dest: &Path) -> FpResult<()> {
+    write_overlay_text(&overlay.text, dest)
+}
+
+/// Shared overlay-write core: enforces the clean-room `assets/` write guard,
+/// creates the parent directory, and writes `text` to `dest`.
+fn write_overlay_text(text: &str, dest: &Path) -> FpResult<()> {
     if path_touches_assets(dest) {
         return Err(FpError::Other(format!(
             "refusing to write import overlay inside an assets/ tree: {} \
@@ -288,7 +294,7 @@ pub fn write_overlay(overlay: &CnsOverlay, dest: &Path) -> FpResult<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(dest, overlay.text.as_bytes())?;
+    std::fs::write(dest, text.as_bytes())?;
     Ok(())
 }
 
@@ -551,20 +557,7 @@ pub fn repair_air_text(
 /// - [`FpError::Io`] if the parent cannot be created or the file cannot be
 ///   written.
 pub fn write_air_overlay(overlay: &AirOverlay, dest: &Path) -> FpResult<()> {
-    if path_touches_assets(dest) {
-        return Err(FpError::Other(format!(
-            "refusing to write import overlay inside an assets/ tree: {} \
-             (overlays are engine output, not clean-room source content)",
-            dest.display()
-        )));
-    }
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(dest, overlay.text.as_bytes())?;
-    Ok(())
+    write_overlay_text(&overlay.text, dest)
 }
 
 #[cfg(test)]
