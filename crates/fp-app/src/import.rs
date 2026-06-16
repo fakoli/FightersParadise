@@ -38,6 +38,7 @@
 use std::path::{Component, Path};
 
 use fp_core::{FpError, FpResult};
+use fp_formats::air::{begin_action_number, salvage_frame_columns};
 use fp_formats::cns::{section_header, strip_comment, SectionKind};
 
 /// The kind of repair applied to a single CNS/CMD line.
@@ -275,6 +276,12 @@ fn path_touches_assets(path: &Path) -> bool {
 /// - [`FpError::Io`] if the parent directory cannot be created or the file
 ///   cannot be written.
 pub fn write_overlay(overlay: &CnsOverlay, dest: &Path) -> FpResult<()> {
+    write_overlay_text(&overlay.text, dest)
+}
+
+/// Shared overlay-write core: enforces the clean-room `assets/` write guard,
+/// creates the parent directory, and writes `text` to `dest`.
+fn write_overlay_text(text: &str, dest: &Path) -> FpResult<()> {
     if path_touches_assets(dest) {
         return Err(FpError::Other(format!(
             "refusing to write import overlay inside an assets/ tree: {} \
@@ -287,8 +294,270 @@ pub fn write_overlay(overlay: &CnsOverlay, dest: &Path) -> FpResult<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(dest, overlay.text.as_bytes())?;
+    std::fs::write(dest, text.as_bytes())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AIR overlay: column salvage + opt-in dead-frame pruning (T084)
+// ---------------------------------------------------------------------------
+
+/// The kind of repair the AIR overlay applied to a single `.air` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AirRepairKind {
+    /// A frame line carried a column with trailing junk (e.g. the `2..A` ticks
+    /// column seen in real content); the column was salvaged to its leading
+    /// integer (`2`). The frame is **kept** — this is a fidelity repair, applied
+    /// regardless of `--prune`.
+    JunkColumn,
+    /// A frame references a sprite that is **absent** from the `.sff` (or a
+    /// degenerate non-linked `0×0` sprite). Without `--prune` the frame is left
+    /// in place and only flagged (a diagnostic, **not** a rewrite). The overlay
+    /// `text` is unchanged for this line.
+    MissingSpriteRef,
+    /// A dead frame (see [`AirRepairKind::MissingSpriteRef`]) that `--prune`
+    /// actually **removed**: the frame line is dropped from the overlay `text`.
+    /// Pruning never removes an action's last surviving frame — that frame is
+    /// downgraded to a [`AirRepairKind::MissingSpriteRef`] flag instead, so every
+    /// action keeps at least one frame (AIR hard-errors on zero actions).
+    DeadFrame,
+}
+
+/// A single AIR repair, recording the source line (1-based), the action it
+/// belongs to (if any), and the original line text for the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirRepair {
+    /// The repair category.
+    pub kind: AirRepairKind,
+    /// 1-based line number in the source file.
+    pub line_no: usize,
+    /// The `[Begin Action N]` this frame belongs to, or `None` if it precedes
+    /// the first action header.
+    pub action: Option<i32>,
+    /// The original (pre-repair) line text, with line endings stripped.
+    pub original: String,
+}
+
+/// The result of repairing an AIR text into an overlay: the rewritten text plus
+/// the list of repairs applied (and flags raised).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AirOverlay {
+    /// The repaired AIR text, ready to be written and re-parsed.
+    pub text: String,
+    /// Every repair applied / flag raised, in source order.
+    pub repairs: Vec<AirRepair>,
+}
+
+impl AirOverlay {
+    /// Returns the number of repairs of a given [`AirRepairKind`].
+    #[must_use]
+    pub fn count(&self, kind: AirRepairKind) -> usize {
+        self.repairs.iter().filter(|r| r.kind == kind).count()
+    }
+
+    /// Returns `true` when no repair was applied and no flag was raised.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.repairs.is_empty()
+    }
+}
+
+/// One classified source line, retained through the two-pass overlay build.
+struct AirLine<'a> {
+    /// Content without its line terminator.
+    content: &'a str,
+    /// Original line terminator (`"\r\n"`, `"\n"`, or `""`).
+    term: &'a str,
+    /// 1-based source line number.
+    line_no: usize,
+    /// The action this line belongs to (set on `[Begin Action]`, carried down).
+    action: Option<i32>,
+    /// What to do with this line, decided in pass 1 and finalized in pass 2.
+    role: AirLineRole,
+}
+
+/// The classified role of a source line.
+enum AirLineRole {
+    /// Not a frame line — emit verbatim.
+    Passthrough,
+    /// A frame line. `salvaged` is the column-salvaged text (== content when no
+    /// junk), `had_junk` records whether a `JunkColumn` repair applies, and
+    /// `dead` records whether the referenced sprite is absent/degenerate.
+    Frame {
+        salvaged: String,
+        had_junk: bool,
+        dead: bool,
+    },
+}
+
+/// Repairs an AIR text into an overlay, salvaging junk frame columns and,
+/// when `prune` is set, removing dead frames whose `(group, image)` does not
+/// resolve to a renderable sprite according to `sprite_present`.
+///
+/// `sprite_present(group, image)` is the dead-frame oracle — pass
+/// [`fp_formats::sff::SffFile::has_renderable_sprite`]. A frame is *dead* when
+/// `sprite_present` returns `false` (the sprite is absent or a non-linked `0×0`
+/// entry); linked / by-design-`0×0` sprites resolve to real pixels and are
+/// reported present, so they are never pruned.
+///
+/// Behavior:
+/// - **Junk columns** (`2..A` → `2`) are always salvaged and reported
+///   [`AirRepairKind::JunkColumn`] — independent of `prune`.
+/// - **Dead frames** with `prune == false` are only flagged
+///   ([`AirRepairKind::MissingSpriteRef`]); the overlay text keeps the (salvaged)
+///   line.
+/// - **Dead frames** with `prune == true` are removed from the overlay text and
+///   reported [`AirRepairKind::DeadFrame`] — **except** the last surviving frame
+///   of an action, which is downgraded to a flag so the action never empties.
+///
+/// A clean input with `prune == false` yields a byte-identical overlay.
+pub fn repair_air_text(
+    text: &str,
+    prune: bool,
+    sprite_present: impl Fn(u16, u16) -> bool,
+) -> AirOverlay {
+    let raw_lines = split_keep_terminators(text);
+
+    // Pass 1: classify every line, salvage columns, detect dead frames.
+    let mut current_action: Option<i32> = None;
+    let mut lines: Vec<AirLine> = Vec::with_capacity(raw_lines.len());
+    for (idx, (content, term)) in raw_lines.iter().enumerate() {
+        // A BOM only ever lands on line 1; the AIR parser strips it before its
+        // own header check, so do the same when classifying.
+        let body = content.strip_prefix('\u{feff}').unwrap_or(content);
+
+        if let Some(num) = begin_action_number(body) {
+            current_action = Some(num);
+            lines.push(AirLine {
+                content,
+                term,
+                line_no: idx + 1,
+                action: current_action,
+                role: AirLineRole::Passthrough,
+            });
+            continue;
+        }
+
+        let role = match salvage_frame_columns(body) {
+            Some(fr) => AirLineRole::Frame {
+                dead: !sprite_present(fr.group, fr.image),
+                salvaged: fr.salvaged,
+                had_junk: fr.had_junk,
+            },
+            None => AirLineRole::Passthrough,
+        };
+        lines.push(AirLine {
+            content,
+            term,
+            line_no: idx + 1,
+            action: current_action,
+            role,
+        });
+    }
+
+    // Count live (non-dead) frames per action so pruning never empties one.
+    // `None` (frames before the first header) groups under a single bucket.
+    let mut live_frames: std::collections::HashMap<Option<i32>, usize> =
+        std::collections::HashMap::new();
+    for line in &lines {
+        if let AirLineRole::Frame { dead: false, .. } = line.role {
+            *live_frames.entry(line.action).or_insert(0) += 1;
+        }
+    }
+    // Track how many frames of each action still remain as we walk (so the
+    // *last* remaining frame of an action is never pruned away).
+    let mut remaining: std::collections::HashMap<Option<i32>, usize> =
+        std::collections::HashMap::new();
+    for line in &lines {
+        if let AirLineRole::Frame { .. } = line.role {
+            *remaining.entry(line.action).or_insert(0) += 1;
+        }
+    }
+
+    // Pass 2: assemble the overlay text and the repair list.
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut repairs = Vec::new();
+    for line in &lines {
+        match &line.role {
+            AirLineRole::Passthrough => {
+                out.push_str(line.content);
+                out.push_str(line.term);
+            }
+            AirLineRole::Frame {
+                salvaged,
+                had_junk,
+                dead,
+            } => {
+                let bom = if line.content.starts_with('\u{feff}') {
+                    "\u{feff}"
+                } else {
+                    ""
+                };
+                // The salvaged text never carries the BOM (it was stripped before
+                // classification); re-prepend it so line 1 keeps its BOM.
+                let salvaged_line = format!("{bom}{salvaged}");
+
+                if *had_junk {
+                    repairs.push(AirRepair {
+                        kind: AirRepairKind::JunkColumn,
+                        line_no: line.line_no,
+                        action: line.action,
+                        original: (*line.content).to_string(),
+                    });
+                }
+
+                let live_in_action = live_frames.get(&line.action).copied().unwrap_or(0);
+                let entry = remaining.entry(line.action).or_insert(0);
+                let frames_left = *entry;
+                *entry = frames_left.saturating_sub(1);
+
+                if *dead {
+                    // Would pruning empty the action? It does when this action has
+                    // no live frames AND this is the last frame line still standing.
+                    let would_empty = live_in_action == 0 && frames_left <= 1;
+                    if prune && !would_empty {
+                        // Remove the frame line entirely (do not emit it). The
+                        // surrounding lines (and this line's terminator) vanish
+                        // with it — a pure line-level deletion.
+                        repairs.push(AirRepair {
+                            kind: AirRepairKind::DeadFrame,
+                            line_no: line.line_no,
+                            action: line.action,
+                            original: (*line.content).to_string(),
+                        });
+                        continue;
+                    }
+                    // Not pruned (either `--prune` off, or pruning would empty the
+                    // action): keep the (salvaged) line and only flag it.
+                    repairs.push(AirRepair {
+                        kind: AirRepairKind::MissingSpriteRef,
+                        line_no: line.line_no,
+                        action: line.action,
+                        original: (*line.content).to_string(),
+                    });
+                }
+
+                out.push_str(&salvaged_line);
+                out.push_str(line.term);
+            }
+        }
+    }
+
+    AirOverlay { text: out, repairs }
+}
+
+/// Writes an AIR overlay's repaired text to `dest`, refusing any destination
+/// inside an `assets/` tree (the same clean-room write guard as
+/// [`write_overlay`]).
+///
+/// # Errors
+///
+/// - [`FpError::Other`] if `dest` lies inside an `assets/` directory — the file
+///   is **not** written.
+/// - [`FpError::Io`] if the parent cannot be created or the file cannot be
+///   written.
+pub fn write_air_overlay(overlay: &AirOverlay, dest: &Path) -> FpResult<()> {
+    write_overlay_text(&overlay.text, dest)
 }
 
 #[cfg(test)]
@@ -469,5 +738,145 @@ type = Null
         let written = std::fs::read_to_string(&dest).expect("overlay file exists");
         assert_eq!(written, overlay.text);
         let _ = std::fs::remove_file(&dest);
+    }
+
+    // -------------------------------------------------------------------
+    // AIR overlay (T084)
+    // -------------------------------------------------------------------
+
+    /// A synthetic AIR whose action 0 references sprites (0,0), (0,1), (0,2) and
+    /// carries a `2..A` junk column on its second frame. The caller's
+    /// `sprite_present` predicate decides which `(group, image)` are renderable.
+    const DIRTY_AIR: &str = "\
+; idle
+[Begin Action 0]
+0, 0, 0,0, 7
+0, 1, 0,0, 2..A
+0, 2, 0,0, 7
+";
+
+    #[test]
+    fn overlay_air_salvages_junk_column() {
+        // Everything present -> no dead frames; the `2..A` column is salvaged.
+        let overlay = repair_air_text(DIRTY_AIR, false, |_g, _i| true);
+        assert_eq!(
+            overlay.count(AirRepairKind::JunkColumn),
+            1,
+            "the `2..A` column is the one junk repair"
+        );
+        assert_eq!(overlay.count(AirRepairKind::DeadFrame), 0);
+        assert_eq!(overlay.count(AirRepairKind::MissingSpriteRef), 0);
+        // The salvaged line is in the overlay text; the junk is gone.
+        assert!(overlay.text.contains("0, 1, 0,0, 2\n"));
+        assert!(!overlay.text.contains("2..A"));
+        // The clean frames are byte-preserved.
+        assert!(overlay.text.contains("0, 0, 0,0, 7\n"));
+    }
+
+    #[test]
+    fn overlay_air_clean_file_roundtrips_byte_identical() {
+        let clean = "[Begin Action 0]\r\n0, 0, 0,0, 7\r\n0, 1, 0,0, 7\r\n";
+        let overlay = repair_air_text(clean, true, |_g, _i| true);
+        assert!(overlay.is_clean(), "a clean AIR raises no repairs");
+        assert_eq!(
+            overlay.text, clean,
+            "a clean AIR round-trips byte-identical (incl. CRLF)"
+        );
+    }
+
+    #[test]
+    fn overlay_air_flags_missing_without_prune() {
+        // (0,2) is absent; without --prune it is only flagged, line kept.
+        let overlay = repair_air_text(DIRTY_AIR, false, |g, i| !(g == 0 && i == 2));
+        assert_eq!(
+            overlay.count(AirRepairKind::MissingSpriteRef),
+            1,
+            "the absent (0,2) frame is flagged"
+        );
+        assert_eq!(
+            overlay.count(AirRepairKind::DeadFrame),
+            0,
+            "without --prune nothing is removed"
+        );
+        // The dead frame's (salvaged) line is still present in the text.
+        assert!(overlay.text.contains("0, 2, 0,0, 7\n"));
+    }
+
+    #[test]
+    fn overlay_air_prunes_dead_frame() {
+        // (0,2) is absent; with --prune the frame is removed and reported.
+        let overlay = repair_air_text(DIRTY_AIR, true, |g, i| !(g == 0 && i == 2));
+        assert_eq!(
+            overlay.count(AirRepairKind::DeadFrame),
+            1,
+            "the absent (0,2) frame is pruned"
+        );
+        assert_eq!(
+            overlay.count(AirRepairKind::MissingSpriteRef),
+            0,
+            "a pruned frame is reported as DeadFrame, not just flagged"
+        );
+        // The dead frame line is gone; the surviving frames + junk salvage remain.
+        assert!(!overlay.text.contains("0, 2, 0,0, 7"));
+        assert!(overlay.text.contains("0, 0, 0,0, 7\n"));
+        assert!(overlay.text.contains("0, 1, 0,0, 2\n"));
+        // And the still-present overlay must still parse as a valid AIR.
+        let reparsed = fp_formats::air::AirFile::from_str(&overlay.text)
+            .expect("pruned overlay must re-parse");
+        let action = reparsed.action(0).expect("action 0 survives");
+        assert_eq!(action.frames.len(), 2, "two frames survive the prune");
+    }
+
+    #[test]
+    fn overlay_air_linked_zero_dim_sprite_survives_prune() {
+        // A 0x0-by-design sprite resolves to real pixels via its link, so the
+        // presence oracle reports it present and --prune leaves it alone.
+        // Model that here: (0,1) is "linked" so present == true even though we
+        // pretend it is a 0x0 entry.
+        let air = "[Begin Action 0]\n0, 0, 0,0, 7\n0, 1, 0,0, 7\n";
+        let present = |g: u16, i: u16| {
+            // (0,0) real, (0,1) linked-0x0 -> both renderable.
+            matches!((g, i), (0, 0) | (0, 1))
+        };
+        let overlay = repair_air_text(air, true, present);
+        assert!(
+            overlay.is_clean(),
+            "a linked/by-design 0x0 sprite is not dead and is not pruned"
+        );
+        assert_eq!(overlay.text, air, "nothing pruned -> byte-identical");
+    }
+
+    #[test]
+    fn overlay_air_prune_never_empties_last_frame_of_action() {
+        // Every frame of action 5 references an absent sprite. With --prune we
+        // must keep the LAST one so the action never empties (AIR errors on zero
+        // actions / an action with no frames is meaningless).
+        let air = "[Begin Action 5]\n0, 0, 0,0, 7\n0, 1, 0,0, 7\n";
+        let overlay = repair_air_text(air, true, |_g, _i| false);
+        // First frame pruned, last frame downgraded to a flag.
+        assert_eq!(
+            overlay.count(AirRepairKind::DeadFrame),
+            1,
+            "all-but-last pruned"
+        );
+        assert_eq!(
+            overlay.count(AirRepairKind::MissingSpriteRef),
+            1,
+            "the last surviving frame is flagged, not pruned"
+        );
+        // The overlay still parses and action 5 keeps exactly one frame.
+        let reparsed = fp_formats::air::AirFile::from_str(&overlay.text).expect("must re-parse");
+        let action = reparsed.action(5).expect("action 5 survives");
+        assert_eq!(action.frames.len(), 1, "the action retains its last frame");
+    }
+
+    #[test]
+    fn overlay_air_write_guard_refuses_assets_dir() {
+        let overlay = repair_air_text(DIRTY_AIR, false, |_g, _i| true);
+        let dir = std::env::temp_dir().join("fp-import-air-guard");
+        let p = dir.join("assets/kfm/kfm.air");
+        let err = write_air_overlay(&overlay, &p).expect_err("must refuse assets/ path");
+        assert!(matches!(err, FpError::Other(_)));
+        assert!(!p.exists(), "must not create the file when refused");
     }
 }

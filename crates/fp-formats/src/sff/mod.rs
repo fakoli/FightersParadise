@@ -260,6 +260,36 @@ impl SffFile {
             .find(|s| s.group == group && s.image == image)
     }
 
+    /// Returns `true` if a sprite with the given `(group, image)` pair is present
+    /// and resolves to **real, renderable pixels**.
+    ///
+    /// This is the dead-frame oracle used by the AIR import overlay (`--prune`):
+    /// an AIR frame whose `(group, image)` is *not* renderable references a sprite
+    /// that does not exist in this `.sff` at all, or a degenerate `0×0` sprite
+    /// that owns its own (empty) data. Such a frame draws nothing and is a
+    /// candidate for pruning.
+    ///
+    /// A sprite is considered renderable when it exists and either:
+    /// - has non-zero dimensions (`width > 0 && height > 0`), **or**
+    /// - is *linked* to another sprite (`linked_index != own index`) — a linked
+    ///   sprite carries no data of its own but resolves to the linked sprite's
+    ///   pixels, so a `0×0`-by-design link is *not* dead.
+    ///
+    /// A `0×0` sprite that links to *itself* (the
+    /// [`SffSprite::placeholder`](crate::sff::SffSprite::placeholder) shape, or a
+    /// genuinely empty entry) owns no pixels and is therefore *not* renderable.
+    #[must_use]
+    pub fn has_renderable_sprite(&self, group: u16, image: u16) -> bool {
+        self.sprites
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.group == group && s.image == image)
+            .any(|(index, s)| {
+                let linked = s.linked_index as usize != index;
+                linked || (s.width > 0 && s.height > 0)
+            })
+    }
+
     /// Decompresses the pixel data for the sprite at the given index.
     ///
     /// If the sprite is linked to another sprite, follows the link to obtain
@@ -728,6 +758,74 @@ mod tests {
         assert_eq!(sprite.height, 2);
 
         assert!(sff.sprite(99, 99).is_none());
+    }
+
+    /// A zeroed [`SffHeader`] for in-memory test fixtures (the
+    /// presence-predicate test below builds an `SffFile` directly).
+    fn blank_header() -> SffHeader {
+        SffHeader {
+            version_major: 2,
+            version_minor1: 0,
+            version_minor2: 0,
+            version_minor3: 0,
+            num_groups: 0,
+            num_sprites: 0,
+            sprite_offset: 0,
+            sprite_length: 0,
+            palette_offset: 0,
+            palette_length: 0,
+            ldata_offset: 0,
+            ldata_length: 0,
+            tdata_offset: 0,
+            tdata_length: 0,
+        }
+    }
+
+    #[test]
+    fn has_renderable_sprite_distinguishes_dead_linked_and_real() {
+        // Build an SffFile by hand with four distinct sprite shapes:
+        //  index 0 (0,0): real 8x8, self-linked  -> renderable
+        //  index 1 (0,1): 0x0 but LINKED to index 0 -> renderable (shares pixels)
+        //  index 2 (0,2): 0x0 self-linked (placeholder) -> NOT renderable (dead)
+        let mut real = SffSprite::placeholder(0);
+        real.group = 0;
+        real.image = 0;
+        real.width = 8;
+        real.height = 8;
+
+        let mut linked = SffSprite::placeholder(1);
+        linked.group = 0;
+        linked.image = 1;
+        linked.width = 0;
+        linked.height = 0;
+        linked.linked_index = 0; // links to the real sprite -> not dead
+
+        let mut dead = SffSprite::placeholder(2);
+        dead.group = 0;
+        dead.image = 2; // self-linked 0x0 -> dead
+
+        let sff = SffFile {
+            version: SffVersion::V2,
+            header: blank_header(),
+            sprites: vec![real, linked, dead],
+            palettes: Vec::new(),
+            ldata: Vec::new(),
+            tdata: Vec::new(),
+        };
+
+        assert!(sff.has_renderable_sprite(0, 0), "real 8x8 sprite renders");
+        assert!(
+            sff.has_renderable_sprite(0, 1),
+            "a 0x0 sprite linked to real pixels is NOT dead"
+        );
+        assert!(
+            !sff.has_renderable_sprite(0, 2),
+            "a 0x0 self-linked placeholder IS dead"
+        );
+        assert!(
+            !sff.has_renderable_sprite(7, 7),
+            "an absent (group,image) is not renderable"
+        );
     }
 
     #[test]

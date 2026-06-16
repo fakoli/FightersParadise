@@ -232,9 +232,17 @@ fn run_validate(args: &[String]) -> i32 {
     }
 }
 
-/// Runs the `import <file.cns|.cmd> <overlay-out>` subcommand: reads a CNS/CMD
-/// file, produces a repaired-text overlay (see [`import`]), and writes it to the
-/// output path — refusing any destination inside an `assets/` tree.
+/// Runs the `import <file.cns|.cmd|.air> <overlay-out> [--prune]` subcommand:
+/// reads a CNS/CMD/AIR file, produces a repaired-text overlay (see [`import`]),
+/// and writes it to the output path — refusing any destination inside an
+/// `assets/` tree.
+///
+/// `.cns`/`.cmd` files take the CNS line-repair path. `.air` files take the AIR
+/// overlay path: junk frame columns (`2..A` → `2`) are always salvaged, and with
+/// `--prune` dead frames (whose sprite is absent from the sibling `.sff`) are
+/// removed — but never an action's last frame. The sprite-presence oracle is the
+/// `.sff` that sits next to the `.air`; if none is found, pruning is a no-op
+/// (every sprite is assumed present) and salvage still applies.
 ///
 /// Returns the process exit code: `2` for a usage error, `1` if the source
 /// cannot be read or the overlay cannot be written (e.g. the clean-room write
@@ -242,10 +250,20 @@ fn run_validate(args: &[String]) -> i32 {
 /// engine *output*, never written back over the source asset.
 fn run_import(args: &[String]) -> i32 {
     let (Some(src_arg), Some(out_arg)) = (args.get(2), args.get(3)) else {
-        eprintln!("usage: fp-app import <file.cns|.cmd> <overlay-out>");
+        eprintln!("usage: fp-app import <file.cns|.cmd|.air> <overlay-out> [--prune]");
         return 2;
     };
+    let prune = args.iter().any(|a| a.eq_ignore_ascii_case("--prune"));
     let src = Path::new(src_arg);
+
+    // `.air` files take the AIR overlay path (column salvage + dead-frame prune).
+    if src
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("air"))
+    {
+        return run_import_air(src, out_arg, prune);
+    }
+
     let text = match fp_formats::text::read_text_file(src) {
         Ok(t) => t,
         Err(e) => {
@@ -288,6 +306,84 @@ fn run_import(args: &[String]) -> i32 {
         Err(e) => {
             tracing::error!("import: cannot write overlay {out_arg}: {e}");
             eprintln!("import: failed to write overlay {out_arg}: {e}");
+            1
+        }
+    }
+}
+
+/// The AIR branch of [`run_import`]: produces a repaired AIR overlay (column
+/// salvage + opt-in dead-frame prune) and writes it to `out_arg`.
+///
+/// The dead-frame oracle is the `.sff` sitting next to `src` (same stem). When
+/// no sibling `.sff` is found or it fails to load, every sprite is assumed
+/// present: pruning becomes a no-op and only column salvage applies. Returns the
+/// process exit code (`1` on read/write failure, `0` otherwise).
+fn run_import_air(src: &Path, out_arg: &str, prune: bool) -> i32 {
+    let text = match fp_formats::text::read_text_file(src) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("import: cannot read {}: {e}", src.display());
+            eprintln!("import: failed to read {}: {e}", src.display());
+            return 1;
+        }
+    };
+
+    // Locate a sibling `.sff` (`foo.air` -> `foo.sff`) as the sprite-presence
+    // oracle. If absent/unloadable, fall back to "all present" so salvage still
+    // runs and prune is a safe no-op (warn-logged so the user knows).
+    let sff = src.with_extension("sff").canonicalize().ok().and_then(|p| {
+        match fp_formats::sff::SffFile::load(&p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("import: could not load sibling SFF {}: {e}", p.display());
+                None
+            }
+        }
+    });
+    if prune && sff.is_none() {
+        tracing::warn!(
+            "import: --prune requested but no loadable sibling .sff for {}; \
+             treating every sprite as present (no frame will be pruned)",
+            src.display()
+        );
+    }
+
+    let overlay = import::repair_air_text(&text, prune, |g, i| {
+        sff.as_ref().is_none_or(|s| s.has_renderable_sprite(g, i))
+    });
+
+    match import::write_air_overlay(&overlay, Path::new(out_arg)) {
+        Ok(()) => {
+            use import::AirRepairKind::*;
+            if overlay.is_clean() {
+                tracing::info!(
+                    "import: {} is clean; AIR overlay is byte-identical",
+                    src.display()
+                );
+            } else {
+                tracing::info!(
+                    "import: wrote AIR overlay {} ({} junk-column, {} dead-frame pruned, {} missing-sprite flagged)",
+                    out_arg,
+                    overlay.count(JunkColumn),
+                    overlay.count(DeadFrame),
+                    overlay.count(MissingSpriteRef),
+                );
+            }
+            for repair in &overlay.repairs {
+                tracing::info!(
+                    "import: {}:{} {:?} (action {:?}) — {}",
+                    src.display(),
+                    repair.line_no,
+                    repair.kind,
+                    repair.action,
+                    repair.original.trim()
+                );
+            }
+            0
+        }
+        Err(e) => {
+            tracing::error!("import: cannot write AIR overlay {out_arg}: {e}");
+            eprintln!("import: failed to write AIR overlay {out_arg}: {e}");
             1
         }
     }
