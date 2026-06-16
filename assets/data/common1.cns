@@ -597,3 +597,383 @@ type = ChangeState
 trigger1 = AnimTime = 0
 value = 0
 ctrl = 1
+
+;==========================================================================
+; GUARD (120-155)
+;--------------------------------------------------------------------------
+; The proactive guard stance (120-140) and the guard-hit reactions (150-155).
+;
+; ENGINE INTEGRATION NOTE (Fighters Paradise specifics):
+;   A *connecting* attack that the defender successfully blocks is consumed by
+;   the engine's existing guard path (`fp_character::combat::resolve_attack`):
+;   the defender is sent into the stance-based common get-hit state (5000/5010/
+;   5020) with `GetHitVar(guarded) = 1`, the `guard` damage component is applied,
+;   and the `guard_velocity` pushback is set. That path is faithful and stays
+;   authoritative for the moment a block lands. The guard states authored here
+;   are the *stance* states a character holds while blocking (entered from the
+;   character's own `.cmd`/`.cns` when it holds back), plus the dedicated guard-
+;   hit reactions (150-155) MUGEN routes a blocked hit through once a HitDef
+;   carries a distinct `guard.*` state. They are defined so a character (or the
+;   engine, as the guard model grows) can `ChangeState` into them; each is a
+;   `ChangeAnim` + `VelSet`/guard-pushback + recovery `ChangeState`, exactly
+;   MUGEN's structure, and reads the guard pushback through `GetHitVar(xvel)`
+;   so it converges with the existing guard-velocity behavior.
+;--------------------------------------------------------------------------
+
+;--------------------------------------------------------------------------
+; 120 - Guard start (the instant the character begins to block). Branches to
+; the stance-appropriate guard hold (130 stand / 131 crouch / 132 air).
+[Statedef 120]
+type    = S
+movetype= I
+physics = S
+anim    = 120
+velset  = 0,0
+
+[State 120, to crouch guard]
+type = ChangeState
+trigger1 = command = "holddown"
+value = 131
+
+[State 120, to air guard]
+type = ChangeState
+trigger1 = StateType = A
+value = 132
+
+[State 120, to stand guard]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 130
+
+;--------------------------------------------------------------------------
+; 130 - Stand guard (holding block, on the ground, standing). Held while the
+; back direction stays down; releasing it returns to neutral via 140.
+[Statedef 130]
+type    = S
+movetype= I
+physics = S
+anim    = 130
+velset  = 0,0
+
+[State 130, stop]
+type = VelSet
+trigger1 = 1
+x = 0
+
+[State 130, release]
+type = ChangeState
+trigger1 = command != "holdback"
+value = 140
+
+;--------------------------------------------------------------------------
+; 131 - Crouch guard (holding block while crouching).
+[Statedef 131]
+type    = C
+movetype= I
+physics = C
+anim    = 131
+velset  = 0,0
+
+[State 131, stop]
+type = VelSet
+trigger1 = 1
+x = 0
+
+[State 131, release]
+type = ChangeState
+trigger1 = command != "holdback"
+value = 140
+
+;--------------------------------------------------------------------------
+; 132 - Air guard (holding block while airborne).
+[Statedef 132]
+type    = A
+movetype= I
+physics = N
+anim    = 132
+
+[State 132, release]
+type = ChangeState
+trigger1 = command != "holdback"
+value = 140
+
+[State 132, to neutral on land]
+type = ChangeState
+trigger1 = Pos Y >= 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 140 - Guard end (the recovery as the block is dropped). Returns control.
+[Statedef 140]
+type    = S
+movetype= I
+physics = S
+anim    = 140
+velset  = 0,0
+
+[State 140, to stand]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 150 - Stand guard, hit (block-stun shake). Holds for the guard hit-time, then
+; the knock-back slide (151).
+[Statedef 150]
+type    = S
+movetype= H
+physics = S
+anim    = 150
+velset  = 0,0
+
+[State 150, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(150)
+value = 150
+
+[State 150, to knockback]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 151
+
+;--------------------------------------------------------------------------
+; 151 - Stand guard, hit (block-stun knock-back slide, then recover).
+[Statedef 151]
+type    = S
+movetype= H
+physics = S
+anim    = 151
+
+[State 151, guard pushback]
+type = VelSet
+trigger1 = Time = 0
+x = GetHitVar(xvel)
+
+[State 151, to stand]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 0
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 152 - Crouch guard, hit (block-stun shake), then 153.
+[Statedef 152]
+type    = C
+movetype= H
+physics = C
+anim    = 152
+velset  = 0,0
+
+[State 152, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(152)
+value = 152
+
+[State 152, to knockback]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 153
+
+;--------------------------------------------------------------------------
+; 153 - Crouch guard, hit (block-stun knock-back slide, then recover).
+[Statedef 153]
+type    = C
+movetype= H
+physics = C
+anim    = 153
+
+[State 153, guard pushback]
+type = VelSet
+trigger1 = Time = 0
+x = GetHitVar(xvel)
+
+[State 153, to crouch]
+type = ChangeState
+trigger1 = Time >= GetHitVar(hittime)
+trigger1 = AnimTime = 0
+value = 11
+ctrl = 1
+
+;--------------------------------------------------------------------------
+; 154 - Air guard, hit (block-stun shake), then 155.
+[Statedef 154]
+type    = A
+movetype= H
+physics = N
+anim    = 154
+velset  = 0,0
+
+[State 154, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(154)
+value = 154
+
+[State 154, to knockback]
+type = ChangeState
+trigger1 = HitShakeOver
+value = 155
+
+;--------------------------------------------------------------------------
+; 155 - Air guard, hit (block-stun knock-back, then recover on landing).
+[Statedef 155]
+type    = A
+movetype= H
+physics = N
+anim    = 155
+
+[State 155, guard pushback]
+type = VelSet
+trigger1 = Time = 0
+x = GetHitVar(xvel)
+
+[State 155, to neutral on land]
+type = ChangeState
+trigger1 = Pos Y >= 0
+value = 0
+ctrl = 1
+
+;==========================================================================
+; WIN / LOSE / DRAW (170/175)
+;--------------------------------------------------------------------------
+; The loser's down/defeated pose (170) and the draw pose (175). The winner's
+; victory pose is the character's own win state (entered by the engine win
+; flow); these two cover the non-winning outcomes so a defeated/drawn fighter
+; settles into a defined, no-recovery hold instead of stalling on its last
+; reaction. Both are `L`-type (lying) holds with no `ctrl`.
+;--------------------------------------------------------------------------
+
+;--------------------------------------------------------------------------
+; 170 - Lose (defeated). A held pose with no recovery for the round loser.
+[Statedef 170]
+type    = L
+movetype= I
+physics = N
+velset  = 0,0
+
+[State 170, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(170)
+value = 170
+
+[State 170, hold]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+;--------------------------------------------------------------------------
+; 175 - Draw (time-over draw / double KO). A standing held pose, no recovery.
+[Statedef 175]
+type    = S
+movetype= I
+physics = S
+velset  = 0,0
+
+[State 175, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(175)
+value = 175
+
+[State 175, hold]
+type = ChangeAnim
+trigger1 = Time > 0
+value = anim
+
+;==========================================================================
+; INTRO (190/191)
+;--------------------------------------------------------------------------
+; The pre-intro placeholder (190) and the intro animation (191). The engine's
+; `RoundState::Intro` holds control off both fighters for the intro window; a
+; character that authors an intro animation plays it here, then drops to the
+; neutral stand (0) when the intro finishes.
+;--------------------------------------------------------------------------
+
+;--------------------------------------------------------------------------
+; 190 - Pre-intro (the frame(s) before the intro animation begins). Branches
+; straight into the intro (191) if one exists, else falls through to stand.
+[Statedef 190]
+type    = S
+movetype= I
+physics = S
+velset  = 0,0
+ctrl    = 0
+
+[State 190, to intro]
+type = ChangeState
+trigger1 = SelfAnimExist(191)
+value = 191
+
+[State 190, no intro -> stand]
+type = ChangeState
+trigger1 = !SelfAnimExist(191)
+value = 0
+
+;--------------------------------------------------------------------------
+; 191 - Intro animation. Plays the intro action, then returns to the neutral
+; stand (0) once the animation completes (or immediately if it is missing).
+[Statedef 191]
+type    = S
+movetype= I
+physics = S
+velset  = 0,0
+ctrl    = 0
+
+[State 191, anim]
+type = ChangeAnim
+trigger1 = Time = 0
+trigger1 = SelfAnimExist(191)
+value = 191
+
+[State 191, to stand]
+type = ChangeState
+trigger1 = AnimTime = 0
+value = 0
+
+;==========================================================================
+; ROUND INIT (5900)
+;--------------------------------------------------------------------------
+; The engine-common round-initialisation state. MUGEN drives every fighter
+; through 5900 at the start of each round to re-seed its resources and var
+; defaults, then hand it back to the neutral stand. In Fighters Paradise the
+; engine `Match` owns the authoritative round reset (it restores full life,
+; the start position/facing, and a fresh state machine in
+; `reset_fighter_for_round`), so 5900 is ADVISORY and authored to *converge*
+; with that reset rather than fight it:
+;   * `LifeSet value = Const(data.life)` re-asserts full life - a harmless
+;     no-op on the same value the engine already set.
+;   * `PowerSet` is intentionally omitted: power CARRIES across the rounds of a
+;     match in this engine (see `Match::reset_for_next_round`), so 5900 must NOT
+;     zero it. (A character that wants a per-round power reset can author its own
+;     5900 - the loader's first-wins merge keeps the character's version.)
+;   * `CtrlSet value = 0` removes control for the intro (the engine grants it
+;     back when `RoundState::Intro` elapses).
+;   * `ChangeState value = 0` returns to the neutral stand, the same state the
+;     engine reset already selected - so the two converge.
+;--------------------------------------------------------------------------
+[Statedef 5900]
+type    = S
+movetype= I
+physics = S
+velset  = 0,0
+
+[State 5900, life]
+type = LifeSet
+trigger1 = Time = 0
+value = Const(data.life)
+
+[State 5900, no control during intro]
+type = CtrlSet
+trigger1 = Time = 0
+value = 0
+
+[State 5900, to stand]
+type = ChangeState
+trigger1 = Time = 0
+value = 0
