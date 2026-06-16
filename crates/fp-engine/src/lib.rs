@@ -454,10 +454,11 @@ const MAX_HELPERS_PER_PLAYER: usize = 56;
 /// `root` redirects resolve back up the spawning chain (the owning player), which
 /// the slot-map wires into a [`EntityGraph`] each tick.
 ///
-/// This minimal model carries what T012 needs — the live entity, its id, and the
-/// facing it was spawned with. Helper *lifecycle* (`DestroySelf`, expiry,
-/// binding) and helper-specific constants (`size.*`, own palette) are out of
-/// scope here (T013).
+/// This model carries the live entity, its id, the facing it was spawned with,
+/// and its remaining lifespan. Helper *lifecycle* — `DestroySelf` (the helper
+/// removes itself) and `removetime` expiry (a finite lifespan auto-reaps it) — is
+/// implemented in T032; helper binding and helper-specific constants (`size.*`,
+/// own palette) remain out of scope.
 pub struct Helper {
     /// The live child entity, advanced each frame via
     /// [`Character::tick_as_helper`].
@@ -465,6 +466,13 @@ pub struct Helper {
     /// The id this helper is addressable by (`helper(id)`), from the spawning
     /// `Helper` controller's `id` parameter.
     pub helper_id: i32,
+    /// Remaining lifetime in ticks before the owner auto-expires this helper
+    /// (T032), or `-1` for "no time limit" (it then lives until it runs
+    /// `DestroySelf` or the slot-map cap is hit). A non-negative value counts down
+    /// once per tick and the helper is reaped when it would go negative, exactly
+    /// like a [`Projectile`]'s [`remaining`](Projectile::remaining). Seeded from
+    /// the spawning [`fp_character::HelperSpawn::remove_time`].
+    pub remaining: i32,
 }
 
 impl Helper {
@@ -484,6 +492,13 @@ impl Helper {
     #[must_use]
     pub fn helper_id(&self) -> i32 {
         self.helper_id
+    }
+
+    /// Remaining lifetime in ticks before the owner auto-expires this helper
+    /// (T032), or `-1` for "no time limit".
+    #[must_use]
+    pub fn remaining(&self) -> i32 {
+        self.remaining
     }
 }
 
@@ -802,19 +817,22 @@ impl Player {
     /// [`fp_character::TickReport::helper_spawns`] into the slot-map (T012),
     /// resolving each [`HelperSpawn`]'s `postype` + offset into a world position
     /// against this player (`p1`) and the supplied opponent position (`p2`) / stage
-    /// edges. The new helper shares the owner's loaded assets and begins in the
-    /// requested `stateno`.
+    /// edges. The new helper shares the owner's loaded assets, begins in the
+    /// requested `stateno`, and is seeded with the spawn's
+    /// [`remove_time`](fp_character::HelperSpawn::remove_time) lifespan (T032) so a
+    /// finite-lifespan helper auto-expires in [`tick_helpers`](Self::tick_helpers).
     ///
     /// Bounded by [`MAX_HELPERS_PER_PLAYER`]: once the slot-map is full, further
-    /// spawns this tick are dropped (warn-logged) rather than growing without
+    /// spawns this tick are dropped (debug-logged) rather than growing without
     /// limit. Never panics.
     fn spawn_helpers(&mut self, spawns: &[HelperSpawn], opponent_x: f32, stage: StageView) {
         for spawn in spawns {
             if self.helpers.len() >= MAX_HELPERS_PER_PLAYER {
                 // debug, not warn: a character that spawns helpers faster than they
-                // are destroyed (e.g. evilken — `DestroySelf` is still a deferred
-                // no-op, so its helpers never self-retire) saturates the bounded
-                // slot-map and would emit this every tick, flooding the log.
+                // are destroyed saturates the bounded slot-map and would emit this
+                // every tick, flooding the log. With `DestroySelf` (T032) honored,
+                // a well-behaved character's helpers now self-retire so this cap is
+                // a safety net, not the normal path.
                 tracing::debug!(
                     "helper slot-map full ({MAX_HELPERS_PER_PLAYER}); dropping spawn id={}",
                     spawn.helper_id
@@ -855,6 +873,7 @@ impl Player {
             self.helpers.push(Helper {
                 character: child,
                 helper_id: spawn.helper_id,
+                remaining: spawn.remove_time,
             });
         }
     }
@@ -1201,12 +1220,26 @@ impl Player {
 
     /// Ticks every live helper this player owns (T012), each with the spawning
     /// chain installed so its `parent`/`root` redirects resolve to the owning
-    /// root character. Helpers run against the owner's loaded state graph.
+    /// root character, then reaps any helper that retired this tick (T032).
     ///
     /// Each helper sees `opponent` as its `p2` (the same opponent the root
     /// faces). Sibling-helper addressing (`helper(id)` *from* a helper) is out of
     /// scope for T012 — a helper's own helper lookup is empty — so this avoids
     /// aliasing a single helper element against the rest of the slot-map.
+    ///
+    /// Helper lifecycle (T032): a helper is removed from the slot-map this tick
+    /// when **either**
+    /// - it ran a `DestroySelf` controller (its [`TickReport::destroy_self`] is
+    ///   set), or
+    /// - its finite [`remaining`](Helper::remaining) lifespan
+    ///   (seeded from `removetime`) counts down past `0`.
+    ///
+    /// A helper with `remaining == -1` (no time limit) lives until it self-destructs
+    /// (or the slot-map cap is hit). The countdown happens **before** the helper's
+    /// tick so a `removetime = 0` helper is reaped the same frame it would first
+    /// run (matching the projectile lifetime convention). This is what lets a
+    /// character that spawns and destroys helpers each tick stay bounded instead of
+    /// saturating [`MAX_HELPERS_PER_PLAYER`].
     fn tick_helpers(&mut self, opponent: Option<&Character>, stage: StageView) {
         let root = &self.character;
         let loaded = &self.loaded;
@@ -1216,15 +1249,27 @@ impl Player {
         // graph so a helper that reads `NumHelper` / `NumHelper(id)` sees the
         // owning player's count (not its own empty sibling lookup).
         let own_helper_ids: Vec<i32> = self.helpers.iter().map(|h| h.helper_id).collect();
-        for helper in &mut self.helpers {
+        self.helpers.retain_mut(|helper| {
+            // Lifetime: a non-negative `remaining` counts down; reaching below 0
+            // reaps the helper (mirrors `tick_projectiles`). `-1` (no time limit)
+            // is left untouched and never auto-expires.
+            if helper.remaining >= 0 {
+                helper.remaining -= 1;
+                if helper.remaining < 0 {
+                    return false;
+                }
+            }
             // parent and root both resolve to the owning root character (a single
             // spawn level; nested helper chains are T013). No sibling lookup.
             let graph =
                 EntityGraph::new(Some(root), Some(root), &[]).with_own_helper_ids(&own_helper_ids);
-            let _ = helper
+            let report = helper
                 .character
                 .tick_as_helper(loaded, opponent, stage, graph);
-        }
+            // `DestroySelf` (T032): the helper asked to remove itself this tick, so
+            // reap it from the slot-map now.
+            !report.destroy_self
+        });
     }
 
     /// Advances this player's character one frame **standalone**: no opponent, no
@@ -9442,6 +9487,268 @@ time = 1
         }
         assert!(m.p1().helpers().is_empty(), "no P1 helpers");
         assert!(m.p2().helpers().is_empty(), "no P2 helpers");
+    }
+
+    // =====================================================================
+    // T032 — Helper lifecycle: DestroySelf + removetime expiry. A helper that
+    // runs `DestroySelf` is reaped from the slot-map that tick; a helper with a
+    // finite `removetime` auto-expires; and a character that spawns + destroys a
+    // helper every tick stays bounded instead of saturating MAX_HELPERS_PER_PLAYER.
+    // =====================================================================
+
+    /// A loaded character whose state 0 spawns ONE helper (gated to `Time = 0`)
+    /// into state 1000, where the helper runs `DestroySelf` once it has lived at
+    /// least one tick (gated `Time >= 1`). So the helper exists for one frame, then
+    /// removes itself. `helper_removetime` seeds the spawn's `removetime` (`-1` for
+    /// the DestroySelf-only path, a finite value to also exercise auto-expiry).
+    fn destroyself_helper_loaded(helper_removetime: i32) -> LoadedCharacter {
+        let rt = helper_removetime.to_string();
+        let spawn = ctrl_gated(
+            0,
+            "Helper",
+            "Time = 0",
+            &[
+                ("id", "77"),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "30, 0"),
+                ("facing", "1"),
+                ("removetime", rt.as_str()),
+            ],
+        );
+        let st0 = stand_state(0, vec![spawn]);
+        // The helper destroys itself once it has run for at least one tick.
+        let destroy = ctrl_gated(1000, "DestroySelf", "Time >= 1", &[]);
+        let st1000 = stand_state(1000, vec![destroy]);
+
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(0, st0);
+        loaded.states.insert(1000, st1000);
+        loaded
+    }
+
+    /// AC1: a helper that runs `DestroySelf` is removed from the slot-map that
+    /// tick. The helper spawns on tick 1 (its `Time` is 0, so its `DestroySelf` is
+    /// gated off and it survives), then on tick 2 (its `Time` is now >= 1) it runs
+    /// `DestroySelf` and is reaped.
+    #[test]
+    fn helper_destroyself_removes_from_slot_map() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        // removetime = -1: no auto-expiry, so the ONLY way this helper retires is
+        // its own DestroySelf — isolating the DestroySelf path.
+        let p1 = Player::new(p1c, destroyself_helper_loaded(-1));
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Tick 1: spawn + first helper tick (helper Time == 0, DestroySelf gated
+        // off) → the helper is alive.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().helpers().len(),
+            1,
+            "helper spawned and survived its first tick (DestroySelf gated to Time >= 1)"
+        );
+
+        // Tick 2: the helper's Time is now >= 1, so its DestroySelf fires and it is
+        // reaped the same tick. (State 0's Helper is gated to Time == 0, so no new
+        // helper spawns.)
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p1().helpers().is_empty(),
+            "helper removed from the slot-map the tick it ran DestroySelf (AC1)"
+        );
+    }
+
+    /// A loaded character whose state 0 spawns ONE helper (gated `Time = 0`) into
+    /// an inert state 1000 (no `DestroySelf`), with the spawn carrying a finite
+    /// `removetime`. The helper has no way to retire EXCEPT the `removetime`
+    /// expiry, so it isolates the auto-expiry path.
+    fn removetime_helper_loaded(helper_removetime: i32) -> LoadedCharacter {
+        let rt = helper_removetime.to_string();
+        let spawn = ctrl_gated(
+            0,
+            "Helper",
+            "Time = 0",
+            &[
+                ("id", "88"),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "30, 0"),
+                ("facing", "1"),
+                ("removetime", rt.as_str()),
+            ],
+        );
+        let st0 = stand_state(0, vec![spawn]);
+        // Inert helper start state: never self-destructs, so only `removetime`
+        // expiry can reap it.
+        let st1000 = stand_state(1000, Vec::new());
+
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(0, st0);
+        loaded.states.insert(1000, st1000);
+        loaded
+    }
+
+    /// AC2: a helper with a finite `removetime` auto-expires after that many ticks
+    /// even though it never runs `DestroySelf` (its start state is inert). The
+    /// countdown runs before the helper ticks, mirroring the projectile lifetime
+    /// convention, so a `removetime = N` helper lives for `N` post-spawn ticks.
+    #[test]
+    fn helper_removetime_auto_expires() {
+        const REMOVE_TIME: i32 = 3;
+
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, removetime_helper_loaded(REMOVE_TIME));
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Tick 1: spawn (remaining seeded to REMOVE_TIME) + first helper tick
+        // (remaining counts down to REMOVE_TIME - 1).
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(m.p1().helpers().len(), 1, "helper alive after spawn");
+        assert_eq!(
+            m.p1().helpers()[0].remaining(),
+            REMOVE_TIME - 1,
+            "lifetime counts down each tick"
+        );
+
+        // Tick the lifetime down to its last live frame. After REMOVE_TIME total
+        // post-spawn ticks the countdown reaches 0 (still alive); the next tick
+        // takes it below 0 and reaps it.
+        for _ in 0..(REMOVE_TIME - 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.p1().helpers().len(),
+            1,
+            "helper still alive on its last live frame (remaining == 0)"
+        );
+        assert_eq!(m.p1().helpers()[0].remaining(), 0, "on the last live frame");
+
+        // One more tick: remaining goes below 0 → reaped (AC2).
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p1().helpers().is_empty(),
+            "helper auto-expired when its removetime lifespan elapsed (AC2)"
+        );
+    }
+
+    /// A loaded character whose `[State -2]` (the always-run special state) spawns
+    /// a helper of id 5 into state 1000 EVERY tick (no spawn-once guard), and whose
+    /// state 1000 destroys the helper immediately (`DestroySelf` always fires). So
+    /// every tick: one helper spawns, ticks, self-destructs, and is reaped — the
+    /// worst-case churn that used to saturate the slot-map.
+    fn spawn_and_destroy_each_tick_loaded() -> LoadedCharacter {
+        // No `Time`/`NumHelper` gate: spawn a helper every single tick.
+        let spawn = ctrl_of(
+            -2,
+            "Helper",
+            &[
+                ("id", "5"),
+                ("stateno", "1000"),
+                ("postype", "p1"),
+                ("pos", "30, 0"),
+                ("facing", "1"),
+            ],
+        );
+        let st_neg2 = stand_state(-2, vec![spawn]);
+        // The helper destroys itself the moment it runs — so spawn + destroy both
+        // happen the same frame, and the slot-map can never grow.
+        let destroy = ctrl_of(1000, "DestroySelf", &[]);
+        let st1000 = stand_state(1000, vec![destroy]);
+
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(-2, st_neg2);
+        loaded.states.insert(1000, st1000);
+        loaded
+    }
+
+    /// AC3: a character that spawns AND destroys a helper every tick no longer
+    /// saturates [`MAX_HELPERS_PER_PLAYER`]. Before T032 (`DestroySelf` was a
+    /// deferred no-op), the helper never retired, so the slot-map filled to the
+    /// cap within `MAX_HELPERS_PER_PLAYER` frames; with `DestroySelf` honored the
+    /// helper is reaped the same frame it spawns, so the count never climbs above 1.
+    #[test]
+    fn spawn_and_destroy_each_tick_stays_bounded() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, spawn_and_destroy_each_tick_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Tick far past the slot-map cap. A broken DestroySelf would saturate at
+        // MAX_HELPERS_PER_PLAYER within this many frames.
+        for _ in 0..(MAX_HELPERS_PER_PLAYER * 4) {
+            m.tick(MatchInput::none(), MatchInput::none());
+            assert!(
+                m.p1().helpers().len() <= 1,
+                "spawn+destroy each tick keeps the helper count at most 1, never \
+                 saturating MAX_HELPERS_PER_PLAYER = {MAX_HELPERS_PER_PLAYER} (AC3); \
+                 got {}",
+                m.p1().helpers().len()
+            );
+        }
+    }
+
+    /// A self-destructing ROOT player is a documented no-op: the root is not a
+    /// slot-map entity, so its `DestroySelf` cannot remove it mid-match (the
+    /// coordinator only honors `destroy_self` for helper entities). The match keeps
+    /// ticking with both players alive and never panics.
+    #[test]
+    fn root_destroyself_does_not_remove_player() {
+        let destroy = ctrl_of(0, "DestroySelf", &[]);
+        let st0 = stand_state(0, vec![destroy]);
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        loaded.states.insert(0, st0);
+
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, loaded);
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        for _ in 0..10 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        // The root remains a live player (the match still has its P1 entity).
+        assert_eq!(m.p1().life(), m.p1().life_max(), "root still alive");
+        assert!(
+            m.p1().helpers().is_empty(),
+            "the self-destructing root spawned no helpers and is not a helper itself"
+        );
     }
 
     // =====================================================================

@@ -476,10 +476,11 @@ impl HelperPosType {
 /// The fields are the subset of MUGEN's `Helper` parameters needed to bring a
 /// helper to life and address it: the [`helper_id`](Self::helper_id) it is
 /// addressable by (`helper(id)`), the [`state_no`](Self::state_no) it starts in,
-/// and the [`pos_type`](Self::pos_type) + [`pos`](Self::pos) offset the spawner
-/// resolves into a world position. The remaining MUGEN parameters
-/// (`name`/`keyctrl`/`ownpal`/`size.*`/`super.movetime`/…) are not modeled here
-/// yet; a missing parameter takes its MUGEN default.
+/// the [`pos_type`](Self::pos_type) + [`pos`](Self::pos) offset the spawner
+/// resolves into a world position, and the [`remove_time`](Self::remove_time)
+/// lifespan after which the owner auto-expires it (T032). The remaining MUGEN
+/// parameters (`name`/`keyctrl`/`ownpal`/`size.*`/`super.movetime`/…) are not
+/// modeled here yet; a missing parameter takes its MUGEN default.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HelperSpawn {
     /// The helper's id, used to address it via the `helper(id)` redirect. From
@@ -500,6 +501,16 @@ pub struct HelperSpawn {
     /// the **same** way as the spawner, `-1` the **opposite** way. Any other
     /// value is clamped to `1` (MUGEN's default).
     pub facing: i32,
+    /// The helper's lifespan in ticks before the owner auto-expires it (T032). A
+    /// non-negative value is a fixed countdown — the owner reaps the helper after
+    /// that many ticks even if it never runs `DestroySelf`. `-1` (the default when
+    /// the controller carries no `removetime`) means "no time limit": the helper
+    /// lives until it runs `DestroySelf` (or the owner's hard slot-map cap is hit).
+    /// MUGEN's `Helper` controller has no `removetime` of its own; this honors the
+    /// engines that accept it and gives the entity owner an explicit lifespan to
+    /// auto-expire, mirroring how [`ProjectileSpawn::remove_time`] bounds a
+    /// projectile.
+    pub remove_time: i32,
 }
 
 /// A deferred request, emitted by a `Projectile` controller, to spawn a
@@ -761,6 +772,16 @@ pub struct TickReport {
     /// owner (`fp-engine`'s `Player`) reads them after the tick and applies each
     /// [`ExplodOp`] to its explod slot-map.
     pub explod_ops: Vec<ExplodOp>,
+    /// `true` if a `DestroySelf` controller fired this tick (T032). A helper is a
+    /// single live entity that cannot remove itself from the slot-map it lives in —
+    /// only the entity owner (`fp-engine`'s `Player`) can — so (exactly like the
+    /// spawn / op request fields) the controller only *records* the request here
+    /// and the owner reaps the helper after the tick. It defaults to `false` and,
+    /// like every other request field, never carries across ticks (a fresh
+    /// [`TickReport`] is built per tick). A root player that runs `DestroySelf` is a
+    /// documented no-op (the root cannot remove itself mid-match); the coordinator
+    /// only honors it for helper entities.
+    pub destroy_self: bool,
 }
 
 impl Character {
@@ -1601,6 +1622,8 @@ impl Character {
             self.ctrl_modify_explod(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("RemoveExplod") {
             self.ctrl_remove_explod(ctrl, env, report);
+        } else if kind.eq_ignore_ascii_case("DestroySelf") {
+            self.ctrl_destroy_self(ctrl, report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
             // run because it depends on an unbuilt subsystem (the bind / hit-count
@@ -2186,9 +2209,11 @@ impl Character {
     /// the child: `id` (the [`helper_id`](HelperSpawn::helper_id) for the
     /// `helper(id)` redirect; MUGEN default `0`), `stateno` (the starting state;
     /// default `0`), `pos = x, y` (the spawn offset, each axis defaulting to `0`),
-    /// `postype` (the [`HelperPosType`] anchor; default `p1`), and `facing` (`1` =
-    /// same as the spawner, `-1` = opposite; any other value clamps to `1`). A
-    /// missing parameter takes its MUGEN default; nothing here panics.
+    /// `postype` (the [`HelperPosType`] anchor; default `p1`), `facing` (`1` =
+    /// same as the spawner, `-1` = opposite; any other value clamps to `1`), and
+    /// `removetime` (the helper's lifespan in ticks before the owner auto-expires
+    /// it; default `-1` = no time limit, T032). A missing parameter takes its MUGEN
+    /// default; nothing here panics.
     fn ctrl_helper(&self, ctrl: &CompiledController, env: EvalEnv, report: &mut TickReport) {
         let helper_id = ctrl
             .params
@@ -2222,16 +2247,26 @@ impl Character {
             -1 => -1,
             _ => 1,
         };
+        // `removetime` — the helper's lifespan in ticks before the owner
+        // auto-expires it (T032); MUGEN default -1 = no time limit (the helper
+        // lives until it runs `DestroySelf` or the slot-map cap is hit).
+        let remove_time = ctrl
+            .params
+            .get("removetime")
+            .and_then(|p| self.eval_param(p, env))
+            .map_or(-1, |v| v.to_int());
         report.helper_spawns.push(HelperSpawn {
             helper_id,
             state_no,
             pos_type,
             pos: (pos_x, pos_y),
             facing,
+            remove_time,
         });
         tracing::debug!(
             "tick: Helper id={helper_id} stateno={state_no} postype={pos_type:?} \
-             pos=({pos_x},{pos_y}) facing={facing} spawned from state {}",
+             pos=({pos_x},{pos_y}) facing={facing} removetime={remove_time} \
+             spawned from state {}",
             ctrl.state_number
         );
     }
@@ -2470,6 +2505,25 @@ impl Character {
             "tick: RemoveExplod id={id:?} from state {}",
             ctrl.state_number
         );
+    }
+
+    /// `DestroySelf`: record that this entity asked to remove itself this tick
+    /// (T032).
+    ///
+    /// A character ticks a single entity and cannot remove itself from the slot-map
+    /// it lives in (only the entity owner, `fp-engine`'s `Player`, owns that), so —
+    /// exactly like `Helper`/`Explod`/`PlaySnd` defer — this only *records* the
+    /// request by setting [`TickReport::destroy_self`]. The owner reaps the helper
+    /// after the tick. A root player that runs `DestroySelf` simply has the flag
+    /// ignored by the coordinator (a root cannot remove itself mid-match).
+    ///
+    /// MUGEN's `DestroySelf` takes an optional `recursive` parameter (also destroy
+    /// this helper's own descendant helpers); the engine's helper graph is a single
+    /// spawn level today, so there are no descendants to recurse into and the
+    /// parameter is a documented no-op. Never panics.
+    fn ctrl_destroy_self(&self, ctrl: &CompiledController, report: &mut TickReport) {
+        report.destroy_self = true;
+        tracing::debug!("tick: DestroySelf from state {}", ctrl.state_number);
     }
 
     // ---- Target controllers (deferred ops) --------------------------------
@@ -4556,15 +4610,17 @@ fn strip_quotes(raw: &str) -> &str {
 ///
 /// The blocking subsystems (and their tasks):
 ///
-/// - **Helper lifecycle** (`DestroySelf`, `ExplodBindTime`, `BindToParent`,
-///   `BindToRoot`, `ParentVarSet`/`ParentVarAdd`) — these need helper *lifecycle*
-///   management (self-destruction, binding, cross-entity var writes) the slot-map
-///   does not own yet. (`Helper` is handled — it emits a [`HelperSpawn`] request
-///   the entity owner inserts into the slot-map; T012. `Projectile` is now handled
-///   too — it emits a [`ProjectileSpawn`] the entity owner advances and resolves
-///   hits for; T013. `Explod`/`ModifyExplod`/`RemoveExplod` are now handled too —
-///   they emit an [`ExplodSpawn`]/[`ExplodOp`] the entity owner spawns into,
-///   modifies, and reaps from its explod slot-map; T033.)
+/// - **Helper lifecycle** (`ExplodBindTime`, `BindToParent`, `BindToRoot`,
+///   `ParentVarSet`/`ParentVarAdd`) — these need helper *lifecycle* management
+///   (binding, cross-entity var writes) the slot-map does not own yet. (`Helper`
+///   is handled — it emits a [`HelperSpawn`] request the entity owner inserts into
+///   the slot-map; T012. `Projectile` is now handled too — it emits a
+///   [`ProjectileSpawn`] the entity owner advances and resolves hits for; T013.
+///   `Explod`/`ModifyExplod`/`RemoveExplod` are now handled too — they emit an
+///   [`ExplodSpawn`]/[`ExplodOp`] the entity owner spawns into, modifies, and reaps
+///   from its explod slot-map; T033. `DestroySelf` is now handled too — it sets
+///   [`TickReport::destroy_self`] and the entity owner reaps the helper after the
+///   tick; T032.)
 /// - **Target binding lifecycle** (`BindToTarget`) — the `target`/`partner`/
 ///   `playerid(n)` *redirects* now resolve (T014), but binding a player to its
 ///   target each tick needs the per-tick bind/release lifecycle the slot-map does
@@ -4594,10 +4650,11 @@ fn is_tracked_deferred_controller(kind: &str) -> bool {
     const DEFERRED: &[&str] = &[
         // Multi-entity helper lifecycle. (`Helper` emits a `HelperSpawn`; T012.
         // `Projectile` emits a `ProjectileSpawn`; T013. `Explod`/`ModifyExplod`/
-        // `RemoveExplod` emit an `ExplodSpawn`/`ExplodOp`; T033. `ExplodBindTime`
-        // adjusts an existing explod's bind window, which the explod slot-map
-        // exposes but no per-explod-bind redirect drives yet, so it stays deferred.)
-        "DestroySelf",
+        // `RemoveExplod` emit an `ExplodSpawn`/`ExplodOp`; T033. `DestroySelf` sets
+        // `TickReport::destroy_self` and the owner reaps the helper; T032.
+        // `ExplodBindTime` adjusts an existing explod's bind window, which the
+        // explod slot-map exposes but no per-explod-bind redirect drives yet, so it
+        // stays deferred.)
         "ExplodBindTime",
         "BindToParent",
         "BindToRoot",
@@ -15895,7 +15952,7 @@ mod tests {
 
     /// `Helper` is handled (not deferred): it pushes a [`HelperSpawn`] onto
     /// [`TickReport::helper_spawns`] carrying its id / stateno / postype / pos /
-    /// facing. Mirrors how `PlaySnd` and `Target*` defer their effects.
+    /// facing / removetime. Mirrors how `PlaySnd` and `Target*` defer their effects.
     #[test]
     fn helper_controller_emits_spawn_request() {
         let lc = one_ctrl_synth(
@@ -15906,6 +15963,7 @@ mod tests {
                 ("postype", "p1"),
                 ("pos", "20, -5"),
                 ("facing", "1"),
+                ("removetime", "90"),
             ],
         );
         let mut ch = Character::new();
@@ -15917,11 +15975,12 @@ mod tests {
         assert_eq!(spawn.pos_type, HelperPosType::P1);
         assert_eq!(spawn.pos, (20.0, -5.0));
         assert_eq!(spawn.facing, 1);
+        assert_eq!(spawn.remove_time, 90, "removetime carried through (T032)");
     }
 
     /// A bare `Helper` with no parameters spawns with every MUGEN default
-    /// (`id=0`, `stateno=0`, `postype=p1`, `pos=(0,0)`, `facing=1`) and never
-    /// panics.
+    /// (`id=0`, `stateno=0`, `postype=p1`, `pos=(0,0)`, `facing=1`,
+    /// `removetime=-1`) and never panics.
     #[test]
     fn helper_controller_defaults_are_mugen_defaults() {
         let lc = one_ctrl_synth("Helper", &[]);
@@ -15934,6 +15993,10 @@ mod tests {
         assert_eq!(spawn.pos_type, HelperPosType::P1);
         assert_eq!(spawn.pos, (0.0, 0.0));
         assert_eq!(spawn.facing, 1, "default facing is 1 (same as spawner)");
+        assert_eq!(
+            spawn.remove_time, -1,
+            "default removetime is -1 (no time limit, T032)"
+        );
     }
 
     /// `postype` parses every documented anchor (case-insensitive), and `facing`
@@ -15973,6 +16036,42 @@ mod tests {
         let lc = one_ctrl_synth("Null", &[]);
         let mut ch = Character::new();
         assert!(lc.tick(&mut ch).helper_spawns.is_empty());
+    }
+
+    // ---- T032: DestroySelf records a removal request -----------------------
+
+    /// `DestroySelf` is handled (not deferred): it sets
+    /// [`TickReport::destroy_self`] so the entity owner can reap the helper after
+    /// the tick. The controller itself never mutates the entity (life/state are
+    /// untouched) and never panics.
+    #[test]
+    fn destroy_self_sets_report_flag() {
+        let lc = one_ctrl_synth("DestroySelf", &[]);
+        let mut ch = Character::new();
+        let life_before = ch.life;
+        let state_before = ch.state_no;
+        let report = lc.tick(&mut ch);
+        assert!(
+            report.destroy_self,
+            "DestroySelf set the report's destroy_self flag (T032)"
+        );
+        assert_eq!(ch.life, life_before, "DestroySelf does not mutate life");
+        assert_eq!(
+            ch.state_no, state_before,
+            "DestroySelf does not change state"
+        );
+    }
+
+    /// A tick with no `DestroySelf` leaves [`TickReport::destroy_self`] `false`
+    /// (the field is rebuilt fresh per tick and never carries across ticks).
+    #[test]
+    fn no_destroy_self_leaves_flag_clear() {
+        let lc = one_ctrl_synth("Null", &[]);
+        let mut ch = Character::new();
+        assert!(
+            !lc.tick(&mut ch).destroy_self,
+            "destroy_self defaults to false with no DestroySelf controller"
+        );
     }
 
     /// `tick_with_graph` installs the spawning-chain graph so a helper's
@@ -16051,7 +16150,6 @@ mod tests {
             "BindToParent",
             "BindToRoot",
             "BindToTarget",
-            "DestroySelf",
             "MakeDust",
             "ForceFeedback",
             // T015 follow-up review: documented controllers that depend on an
@@ -16092,6 +16190,8 @@ mod tests {
             "Explod",
             "ModifyExplod",
             "RemoveExplod",
+            // T032: `DestroySelf` now sets `TickReport::destroy_self`.
+            "DestroySelf",
         ] {
             assert!(
                 !is_tracked_deferred_controller(handled),
