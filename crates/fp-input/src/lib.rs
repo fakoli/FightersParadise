@@ -11,6 +11,7 @@ pub mod buffer;
 pub mod command;
 pub mod controller;
 pub mod state;
+pub mod synth;
 
 pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
@@ -23,6 +24,7 @@ pub use state::{
     dir_matches, dir_matches_detect, logical_direction, Button, DirToken, Direction, InputState,
     LogicalDirection, BUTTON_COUNT,
 };
+pub use synth::synth_command;
 
 #[cfg(test)]
 mod playability_tests {
