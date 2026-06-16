@@ -5,6 +5,29 @@ gaps mean for you in practice, and where to look in the code if you want to fix
 them. This is the companion to the [Roadmap](roadmap.md): the roadmap is the
 plan, this is the current honest state.
 
+## v1.0 follow-ups (non-blocking)
+
+The v1.0 build (full front-end + directory discovery + HUD customization) is
+feature-complete and green (~2621 tests). These rough edges were surfaced by the
+final-review pass and live validation; none crash the engine:
+
+- **`stages/` under a game-root directory argument is not yet auto-discovered.**
+  Pointing `fp-app` at a game root resolves `chars/` and `data/` (motifs), but
+  stage discovery still keys off the loaded motif's `select.def` directory — a
+  `<root>/stages/` folder is not yet merged into stage-select on the directory
+  route. (`crates/fp-app/src/main.rs` `discover_stages`.)
+- **Bare no-id `Proj*` triggers** (`ProjHit` with no id, meaning "any of my
+  projectiles") evaluate to 0; only `ProjHit<id>`/`ProjContact<id>` etc. are
+  wired. Documented parity gap. (`crates/fp-character/src/lib.rs`
+  `parse_proj_trigger`.)
+- **Mid-match save-state restore drops cosmetic explods/projectiles.** These
+  display-only entities are excluded from `MatchSnapshot` by design; record/replay
+  reproduces a match from its start under a fixed seed, so determinism is
+  unaffected — only an exposed mid-match save-state would notice.
+- **`.snd` ADX entries are recognised-and-skipped, not decoded** (WAV/PCM only).
+- No regression test yet covers cross-entity redirected assignment
+  (`enemy, var(n) := v`) write timing.
+
 Fighters Paradise is a **playable two-character fighter** today — real Kung Fu
 Man data drives a keyboard-controlled P1 vs. a dummy P2 with life bars, KO/round
 flow, throws, supers, hitpause, and i-frames. A large batch of audit fixes has

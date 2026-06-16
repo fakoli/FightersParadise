@@ -4,34 +4,42 @@ A clean-room reimplementation of the [MUGEN](https://en.wikipedia.org/wiki/Mugen
 fighting engine in Rust, aiming for a **completely customizable fighting-game engine**: bring your own
 characters in MUGEN format (`.sff`, `.air`, `.cns`, `.cmd`, `.def`, `.snd`).
 
-> **Current state (2026-06-15 — MUGEN-parity wave complete):** a **playable two-character fighter that
-> renders on screen in full color**, with a broad MUGEN feature set. `fp-app` draws a two-character
-> `fp_engine::Match` (P1 = keyboard, P2 = baseline CPU AI or keyboard) **over a full-color stage
-> background**, with a life/power HUD, combo counter + portraits, KO/winner readout, and best-of-3 rounds.
-> The engine logic — throws, supers (meter), hitpause, i-frames, hit reactions, jump/airjump/land, damage
-> multipliers, plus **helpers + projectiles, `target`/`parent`/`root`/`helper`/`partner`/`playerid`
-> redirects, full PalFX modulation, true AfterImage frame-history, per-frame AIR scale/angle/Interpolate,
-> team Simul/Turns, and deterministic state serialization + record/replay** — is implemented and
-> unit-tested (**~2439 tests**; `cargo fmt --check` is now a CI gate).
+> **Current state (2026-06-15 — v1.0):** a **complete, playable fighting game**, not just an engine. From
+> the **Title screen** you flow through **character select → stage select → fight**, plus a **Setup/Options
+> screen with live key remapping** and **HUD / life-power-bar customization** — all navigable by keyboard
+> or game controller. Bring-your-own content is **discovered from directories the MUGEN way**: point
+> `fp-app` at a game root (or a `chars/` folder directly) and the roster auto-populates from
+> `chars/<name>/<name>.def`; stages come from `stages/`, and selectable motif/screenpack sets from
+> `data/<motif>/` (the `--motif` flag). `fp-app` renders a two-character `fp_engine::Match`
+> (P1 = keyboard/gamepad, P2 = baseline CPU AI or human) over a full-color stage, with a life/power HUD,
+> combo counter + portraits, KO/winner readout, and best-of-3 rounds; team **Simul/Turns** are reachable
+> via `--simul`/`--turns`.
 >
-> ✅ **SFF v2 palette fixed (PR #44 / T001):** v2 palettes are RGBA quadruplets (not RGB triplets), so
-> KFM now decodes to full color (regression-tested) — this closes the old "KFM renders as black
-> silhouettes" bug (former task #32). SFF v1 (evilken) also renders in full color (#40/#41). **No crate is
-> a true stub.** A full parity wave (25 tasks, PRs #44–#67) landed on 2026-06-15 — see the **newest
-> `docs/handoffs/` file** for the run summary and remaining follow-ups (Proj* triggers, partner-in-1v1,
-> fp-app TeamMode wiring, `.snd` ADX). See [docs/known-issues.md](docs/known-issues.md) and
-> [docs/roadmap.md](docs/roadmap.md).
+> The engine — throws, supers (meter), hitpause, i-frames, hit reactions, jump/airjump/land, damage
+> multipliers, helpers + projectiles + the **Explod** subsystem, `target`/`parent`/`root`/`helper`/
+> `partner`/`playerid` redirects, full PalFX + true AfterImage, per-frame AIR scale/angle/Interpolate, the
+> `:=` assignment operator, deterministic serialization + record/replay, and broad **community-content
+> robustness** (Shift-JIS CNS/CMD + `.def`, SFF v2 sub-header resilience, FNT v2 detect, `FU`/`BU` command
+> tokens, helper lifecycle/`DestroySelf`) — is implemented and unit-tested (**~2621 tests**; clippy
+> `-D warnings` + `cargo fmt --check` are CI gates). **No crate is a stub.** SFF v1 (evilken) and SFF v2
+> (KFM) both render in full color.
+>
+> The 1.0 build landed across **47 fakoli-state tasks** (PRs #44–#94) on 2026-06-15; the newest
+> `docs/handoffs/` file is the per-run summary and the remaining non-blocking follow-ups (e.g. `stages/`
+> auto-discovery under a game-root arg, bare no-id `Proj*` triggers, `.snd` ADX decode). See
+> [docs/known-issues.md](docs/known-issues.md) and [docs/roadmap.md](docs/roadmap.md).
 
 ## Build & Run
 
 ```bash
 cargo build --workspace                              # Build everything
-cargo run -p fp-app                                  # Default: two-KFM match (test-assets/kfm/kfm.def)
-cargo run -p fp-app -- p1.def [p2.def]               # Two-character match (one .def = same char both sides)
-cargo run -p fp-app -- chars/                         # Discover a roster from a directory (T043) -> Title menu
+cargo run -p fp-app                                  # No args: boots the Title menu over the shipped clean-room motif
+cargo run -p fp-app -- p1.def [p2.def]               # Direct match (one .def = same char both sides)
+cargo run -p fp-app -- <dir>                          # Discover a roster from a game root or chars/ dir (F020) -> menu
 cargo run -p fp-app -- --motif <name|path> [args]    # Pick a discovered/explicit motif (T045; falls back to default)
+cargo run -p fp-app -- --simul p1.def [p2.def]       # Team Simul (or --turns) direct match (T027/T028)
 cargo run -p fp-app -- file.sff [file.air]           # Legacy sprite/animation viewer
-cargo test --workspace                               # Run all tests (~2045 pass incl. doc tests)
+cargo test --workspace                               # Run all tests (~2621 pass)
 cargo run -p fp-app -- validate char.def             # Character validator (lints a .def's assets/states)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint — must be clean
 ```
