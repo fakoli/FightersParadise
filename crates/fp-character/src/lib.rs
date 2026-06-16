@@ -1808,6 +1808,22 @@ pub struct Character {
     /// there is no per-target tracking here, only this single boolean.
     pub has_target: bool,
 
+    /// Per-projectile-id contact / hit / guard timing, the persistent state
+    /// behind the `ProjContact<id>` / `ProjHit<id>` / `ProjGuarded<id>` /
+    /// `ProjContactTime<id>` / `ProjHitTime<id>` / `ProjGuardedTime<id>` trigger
+    /// family (T026).
+    ///
+    /// Keyed by `projid`; an absent key reports "never" (`-1` time / `0`
+    /// boolean). Advanced each tick by [`tick_proj_events`](Self::tick_proj_events)
+    /// (so every active counter ages one frame) and updated when one of this
+    /// owner's projectiles connects via
+    /// [`record_proj_event`](Self::record_proj_event) — the round coordinator
+    /// (`fp-engine`) is the writer, since the live projectile slot-map lives with
+    /// the [`Player`](../fp_engine/struct.Player.html), not on the self-only
+    /// `Character`. The trigger reads (the `EvalContext::trigger` impl) consult
+    /// it. Cleared on a round reset alongside the other combat bookkeeping.
+    pub proj_events: std::collections::HashMap<i32, ProjContactTracker>,
+
     /// Runtime attack multiplier (MUGEN `AttackMulSet`). Damage this character
     /// *deals* is scaled by this; default `1.0`. Persists until changed or the
     /// round resets.
@@ -2175,6 +2191,106 @@ impl MoveConnect {
     }
 }
 
+/// The "ticks since the last contact / hit / guard" counters for a single
+/// projectile id, the persistent state behind the `ProjContact<id>` /
+/// `ProjHit<id>` / `ProjGuarded<id>` / `ProjContactTime<id>` / `ProjHitTime<id>` /
+/// `ProjGuardedTime<id>` trigger family (T026).
+///
+/// MUGEN tracks, per projectile id (`projid`), how many ticks have elapsed since
+/// a projectile of that id last made contact (touched the opponent at all),
+/// landed a clean hit, or was guarded. The `*Time` triggers read these directly;
+/// the boolean `ProjContact<id>` / `ProjHit<id>` / `ProjGuarded<id>` triggers are
+/// "did it happen this tick" (time `== 0`) and the comma-tail form
+/// `ProjContact<id> = 1, op t` compares the stored time against `t`.
+///
+/// Each counter holds [`NEVER`](Self::NEVER) (`-1`) until the corresponding event
+/// first occurs, then counts **up** from `0` (the tick of the event) each frame.
+/// The owning [`Character`] advances the counters every tick via
+/// [`Character::tick_proj_events`]; the round coordinator (`fp-engine`) records a
+/// fresh event via [`Character::record_proj_event`] when one of this owner's
+/// projectiles connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjContactTracker {
+    /// Ticks since this id last made contact (hit **or** guarded), or
+    /// [`NEVER`](Self::NEVER) if it never has.
+    contact_time: i32,
+    /// Ticks since this id last landed a clean (unblocked) hit, or
+    /// [`NEVER`](Self::NEVER).
+    hit_time: i32,
+    /// Ticks since this id was last guarded/blocked, or [`NEVER`](Self::NEVER).
+    guarded_time: i32,
+}
+
+impl Default for ProjContactTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProjContactTracker {
+    /// The "no such event yet" sentinel returned by the `Proj*Time<id>` triggers
+    /// and stored in each counter before its event first occurs (`-1`, matching
+    /// MUGEN's never-contacted time).
+    pub const NEVER: i32 = -1;
+
+    /// A fresh tracker for an id that has never contacted, hit, or been guarded:
+    /// every counter is [`NEVER`](Self::NEVER).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            contact_time: Self::NEVER,
+            hit_time: Self::NEVER,
+            guarded_time: Self::NEVER,
+        }
+    }
+
+    /// Ticks since this id last made contact (hit or guarded), `-1` if never
+    /// (`ProjContactTime<id>`).
+    #[must_use]
+    pub const fn contact_time(self) -> i32 {
+        self.contact_time
+    }
+
+    /// Ticks since this id last landed a clean hit, `-1` if never
+    /// (`ProjHitTime<id>`).
+    #[must_use]
+    pub const fn hit_time(self) -> i32 {
+        self.hit_time
+    }
+
+    /// Ticks since this id was last guarded, `-1` if never (`ProjGuardedTime<id>`).
+    #[must_use]
+    pub const fn guarded_time(self) -> i32 {
+        self.guarded_time
+    }
+
+    /// Advances each *active* counter by one tick (a counter still at
+    /// [`NEVER`](Self::NEVER) stays there). Saturating so a long-lived id can
+    /// never overflow `i32`.
+    fn tick(&mut self) {
+        for t in [
+            &mut self.contact_time,
+            &mut self.hit_time,
+            &mut self.guarded_time,
+        ] {
+            if *t >= 0 {
+                *t = t.saturating_add(1);
+            }
+        }
+    }
+
+    /// Records a connection this tick: contact is always reset to `0`, and the
+    /// clean-hit or guard counter is reset to `0` depending on `guarded`.
+    fn record(&mut self, guarded: bool) {
+        self.contact_time = 0;
+        if guarded {
+            self.guarded_time = 0;
+        } else {
+            self.hit_time = 0;
+        }
+    }
+}
+
 impl Default for Character {
     fn default() -> Self {
         let constants = CharacterConstants::default();
@@ -2216,6 +2332,7 @@ impl Default for Character {
             shaketime: 0,
             move_connect: MoveConnect::default(),
             has_target: false,
+            proj_events: std::collections::HashMap::new(),
             invuln: InvulnMask::default(),
             asserted: AssertedFlags::default(),
             cur_width: WidthOverride::default(),
@@ -2385,6 +2502,59 @@ impl Character {
     /// safe defaults). See [`RoundView`].
     pub fn set_round_view(&mut self, view: RoundView) {
         self.round_view = view;
+    }
+
+    /// Advances every tracked projectile-id contact/hit/guard counter by one tick
+    /// (T026), aging the values the `ProjContact<id>` / `ProjHit<id>` /
+    /// `ProjGuarded<id>` / `Proj*Time<id>` triggers report.
+    ///
+    /// The round coordinator (`fp-engine`'s `Match`) calls this once per frame for
+    /// each player after recording any new connections this tick (see
+    /// [`record_proj_event`](Self::record_proj_event)), so a counter reads `0` on
+    /// the tick its projectile connected and counts up from there. A counter still
+    /// at [`ProjContactTracker::NEVER`] (its event has not happened) stays there.
+    /// Never panics.
+    pub fn tick_proj_events(&mut self) {
+        for tracker in self.proj_events.values_mut() {
+            tracker.tick();
+        }
+    }
+
+    /// Records that one of this owner's projectiles with the given `projid`
+    /// connected this tick — `guarded` selects the clean-hit vs guard counter
+    /// (contact is always recorded) — feeding the `ProjContact<id>` / `ProjHit<id>`
+    /// / `ProjGuarded<id>` / `Proj*Time<id>` triggers (T026).
+    ///
+    /// The round coordinator (`fp-engine`) is the writer: when a projectile's
+    /// `resolve_attack` connects it calls this on the **owning** character (the
+    /// projectile slot-map lives with the `Player`, not on this self-only
+    /// `Character`). Resets the id's contact time to `0` (and its hit *or* guard
+    /// time to `0`); a not-yet-tracked id is inserted. Bounded by
+    /// [`MAX_PROJ_IDS`](Self::MAX_PROJ_IDS) so a pathological stream of distinct
+    /// ids can never grow the map without limit (the cap is generous; once full,
+    /// only already-tracked ids keep updating). Never panics.
+    pub fn record_proj_event(&mut self, projid: i32, guarded: bool) {
+        // An already-tracked id is always updated; a NEW id is only inserted while
+        // the map is under its cap, so a pathological stream of distinct ids can
+        // never grow `proj_events` without bound.
+        let known = self.proj_events.contains_key(&projid);
+        if known || self.proj_events.len() < Self::MAX_PROJ_IDS {
+            self.proj_events.entry(projid).or_default().record(guarded);
+        }
+    }
+
+    /// A hard cap on the number of distinct projectile ids tracked for the
+    /// `Proj*<id>` triggers, so a runaway spawner cycling through ever-new ids can
+    /// never grow [`proj_events`](Self::proj_events) without bound. Generous (a
+    /// character realistically uses a handful of `projid`s).
+    pub const MAX_PROJ_IDS: usize = 64;
+
+    /// The tracker for projectile id `projid`, or the empty "never" tracker when
+    /// the id has had no contact/hit/guard yet (T026). The read seam the
+    /// `Proj*<id>` triggers resolve through.
+    #[must_use]
+    fn proj_tracker(&self, projid: i32) -> ProjContactTracker {
+        self.proj_events.get(&projid).copied().unwrap_or_default()
     }
 
     /// Returns the number of hit-pause (impact-freeze) ticks this character still
@@ -2917,10 +3087,97 @@ impl Character {
     }
 }
 
+/// Which member of the projectile-trigger family a `Proj*<id>` trigger names, and
+/// whether it is the "time since" (`*Time`) form (T026).
+///
+/// `ProjContact2000` → `(Contact, time = false)`; `ProjHitTime2000` →
+/// `(Hit, time = true)`. The owner's [`EvalContext::trigger`] resolves the value
+/// from the [`ProjContactTracker`] keyed by the parsed id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjTriggerKind {
+    Contact,
+    Hit,
+    Guarded,
+}
+
+/// Parses a bare projectile-info trigger name into its family, whether it is the
+/// `*Time` form, and the trailing projectile id — `None` if `name` is not a
+/// projectile-info trigger (T026).
+///
+/// MUGEN writes these as a fixed base name with the `projid` appended, e.g.
+/// `ProjContact2000`, `ProjHitTime340`, `ProjGuarded5`. The match is
+/// case-insensitive on the base and requires a parseable integer id suffix; a
+/// negative id (`ProjContact-1`) and a missing/garbage suffix are rejected
+/// (returns `None`), so a malformed name falls through to the ordinary trigger
+/// path and the engine-wide "unknown trigger → 0" default. Longest bases are
+/// tested first so `projcontacttime` is preferred over `projcontact`.
+fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
+    let lower = name.to_ascii_lowercase();
+    // (base, kind, is_time) — `*time` variants listed first so they win the
+    // prefix test over their non-time counterparts.
+    const BASES: [(&str, ProjTriggerKind, bool); 6] = [
+        ("projcontacttime", ProjTriggerKind::Contact, true),
+        ("projguardedtime", ProjTriggerKind::Guarded, true),
+        ("projhittime", ProjTriggerKind::Hit, true),
+        ("projcontact", ProjTriggerKind::Contact, false),
+        ("projguarded", ProjTriggerKind::Guarded, false),
+        ("projhit", ProjTriggerKind::Hit, false),
+    ];
+    for (base, kind, is_time) in BASES {
+        if let Some(suffix) = lower.strip_prefix(base) {
+            // The id suffix must be a non-negative integer; anything else (empty,
+            // signed, non-numeric) is not a projectile-info trigger.
+            return suffix.parse::<i32>().ok().map(|id| (kind, is_time, id));
+        }
+    }
+    None
+}
+
+impl Character {
+    /// Resolves a bare projectile-info trigger (`ProjContact<id>` / `ProjHit<id>`
+    /// / `ProjGuarded<id>` / `Proj*Time<id>`) against this owner's
+    /// [`proj_events`](Self::proj_events) tracker (T026), or `None` when `name` is
+    /// not such a trigger.
+    ///
+    /// The `*Time` form returns the ticks since the event for that id
+    /// ([`ProjContactTracker::NEVER`] = `-1` if it never happened). The boolean
+    /// form (`ProjContact<id>`) returns `1` iff the event happened **this tick**
+    /// (the stored time is `0`), else `0` — the comma-tail
+    /// `ProjContact<id> = v, op t` form (handled in the evaluator) reads the
+    /// `*Time` value to compare against a window. Never panics.
+    fn proj_trigger(&self, name: &str) -> Option<Value> {
+        let (kind, is_time, id) = parse_proj_trigger(name)?;
+        let tracker = self.proj_tracker(id);
+        let time = match kind {
+            ProjTriggerKind::Contact => tracker.contact_time(),
+            ProjTriggerKind::Hit => tracker.hit_time(),
+            ProjTriggerKind::Guarded => tracker.guarded_time(),
+        };
+        Some(if is_time {
+            Value::Int(time)
+        } else {
+            // Bare boolean form: true only on the exact tick of the event.
+            Value::from(time == 0)
+        })
+    }
+}
+
 impl EvalContext for Character {
     fn trigger(&self, name: &str, args: &[Value]) -> Value {
         // Helper: first arg coerced to i32 (used by indexed/axis triggers).
         let first_int = || args.first().map(|v| v.to_int());
+
+        // Projectile-info triggers: `ProjContact<id>`, `ProjHit<id>`,
+        // `ProjGuarded<id>`, and their `*Time<id>` variants (T026). These parse as
+        // a bare `Ident` (the id is part of the name), so they arrive here with no
+        // args; resolve them against this owner's per-id contact tracker. The
+        // comma-tail `ProjContact<id> = v, op t` form is folded by the parser into
+        // an `Expr::ProjTail` and reads the `*Time` value through this same seam.
+        if args.is_empty() {
+            if let Some(v) = self.proj_trigger(name) {
+                return v;
+            }
+        }
 
         // Bare letter tokens (right-hand side of `StateType = A`, etc.).
         if args.is_empty() {
@@ -3537,6 +3794,18 @@ pub struct EntityGraph<'a> {
     /// root with no helpers (and for a bare/test context), in which case
     /// `NumHelper` reports `0`.
     own_helper_ids: &'a [i32],
+    /// The owning player's full live-projectile id list — the `proj_id` of every
+    /// projectile the *owning player* currently has alive, for the `NumProj`
+    /// count trigger (T026).
+    ///
+    /// Built once per tick by the owner (`fp-engine`) from its projectile
+    /// slot-map and installed on the context, exactly as
+    /// [`own_helper_ids`](Self::own_helper_ids) is for `NumHelper`. Bare `NumProj`
+    /// reports its length (the total live count). Empty for a player with no live
+    /// projectiles (and for a bare/test context), in which case `NumProj` is `0`.
+    /// (MUGEN's `NumProjID(id)` per-id form is not exposed by the parser today;
+    /// the slice is id-keyed so it can be added without a shape change.)
+    own_proj_ids: &'a [i32],
 }
 
 impl<'a> EntityGraph<'a> {
@@ -3564,6 +3833,7 @@ impl<'a> EntityGraph<'a> {
             partner: None,
             players: &[],
             own_helper_ids: &[],
+            own_proj_ids: &[],
         }
     }
 
@@ -3606,6 +3876,33 @@ impl<'a> EntityGraph<'a> {
     pub fn with_own_helper_ids(mut self, own_helper_ids: &'a [i32]) -> Self {
         self.own_helper_ids = own_helper_ids;
         self
+    }
+
+    /// Installs the owning player's full live-projectile id list — the source for
+    /// the `NumProj` count trigger (T026), returning the updated graph.
+    ///
+    /// The owner (`fp-engine`) builds this once per tick from its projectile
+    /// slot-map, exactly as [`with_own_helper_ids`](Self::with_own_helper_ids) does
+    /// for helpers. The slice must outlive the [`EvalCtx`] the graph is installed
+    /// on. A builder method so existing [`EntityGraph::new`] call sites keep
+    /// working unchanged.
+    #[must_use]
+    pub fn with_own_proj_ids(mut self, own_proj_ids: &'a [i32]) -> Self {
+        self.own_proj_ids = own_proj_ids;
+        self
+    }
+
+    /// Counts the owning player's live projectiles for the `NumProj` trigger
+    /// (T026): the total number alive. Returns `0` when the owner has none (or
+    /// wired no list — e.g. a bare/test context); never panics.
+    ///
+    /// Counts the flat [`own_proj_ids`](Self::own_proj_ids) slice the owner
+    /// installs, so the answer is the owning player's live-projectile count.
+    #[must_use]
+    pub fn num_proj(&self) -> i32 {
+        // The slot-map is bounded (`MAX_PROJECTILES_PER_PLAYER`), so this never
+        // overflows i32; saturate defensively anyway rather than risk a panic.
+        i32::try_from(self.own_proj_ids.len()).unwrap_or(i32::MAX)
     }
 
     /// Counts the owning player's live helpers for the `NumHelper` triggers
@@ -3887,6 +4184,16 @@ impl<'a> EvalCtx<'a> {
         if name.eq_ignore_ascii_case("NumHelper") {
             let id = args.first().map(|v| v.to_int());
             return Some(Value::Int(self.graph.num_helpers(id)));
+        }
+
+        // `NumProj` — the count of the owning player's live projectiles (T026).
+        // Resolved here (not on the self-only `Character`) because the projectile
+        // slot-map lives with the entity owner (`fp-engine`'s `Player`); the owner
+        // installs its full live-projectile id list on the graph each tick (see
+        // [`EntityGraph::with_own_proj_ids`]). A player with no live projectiles —
+        // or any context with no list wired — reports `0`. Never panics.
+        if name.eq_ignore_ascii_case("NumProj") {
+            return Some(Value::Int(self.graph.num_proj()));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -7022,6 +7329,123 @@ mod tests {
         assert_eq!(ev_graph("NumHelper(3)", &me, graph), Value::Int(0));
         // The open guard reads true while there are no helpers of that id.
         assert_eq!(ev_graph("NumHelper(3) = 0", &me, graph), Value::Int(1));
+    }
+
+    // =====================================================================
+    // T026 — projectile contact/hit/guard triggers (Proj*<id> / NumProj) read
+    // the owner's per-id tracker / live-projectile list through the same VM eval
+    // path the executor uses.
+    // =====================================================================
+
+    /// T026 (AC1/AC3): the `Proj*<id>` / `Proj*Time<id>` triggers report the
+    /// owner's per-id tracker across a projectile lifecycle —
+    /// before any contact, on the connecting tick, and as the time-since ages.
+    #[test]
+    fn proj_triggers_track_contact_hit_guard_over_lifecycle() {
+        let mut me = Character::new();
+
+        // Before any contact: every trigger reads "no event".
+        assert_eq!(ev("ProjContact2000", &me), Value::Int(0));
+        assert_eq!(ev("ProjHit2000", &me), Value::Int(0));
+        assert_eq!(ev("ProjGuarded2000", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjContactTime2000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+        assert_eq!(
+            ev("ProjHitTime2000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // A projectile id 2000 lands a CLEAN HIT this tick.
+        me.record_proj_event(2000, false);
+        // On the connecting tick: contact and hit fire (time 0), guard does not.
+        assert_eq!(ev("ProjContact2000", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit2000", &me), Value::Int(1));
+        assert_eq!(ev("ProjGuarded2000", &me), Value::Int(0));
+        assert_eq!(ev("ProjContactTime2000", &me), Value::Int(0));
+        assert_eq!(ev("ProjHitTime2000", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjGuardedTime2000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // The window form fires while the contact is recent.
+        assert_eq!(ev("ProjContact2000 = 1, <= 4", &me), Value::Int(1));
+
+        // Age two ticks: the boolean form stops firing (time != 0) but the time
+        // counts up and the window form still matches.
+        me.tick_proj_events();
+        me.tick_proj_events();
+        assert_eq!(ev("ProjContact2000", &me), Value::Int(0));
+        assert_eq!(ev("ProjContactTime2000", &me), Value::Int(2));
+        assert_eq!(ev("ProjHitTime2000", &me), Value::Int(2));
+        assert_eq!(ev("ProjContact2000 = 1, <= 4", &me), Value::Int(1));
+        assert_eq!(ev("ProjContact2000 = 1, < 2", &me), Value::Int(0));
+
+        // A different id is independent: untouched id 2001 still reads "never".
+        assert_eq!(
+            ev("ProjContactTime2001", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+    }
+
+    /// T026: a GUARDED projectile sets the guard counter (not the hit counter);
+    /// contact fires for both hit and guard.
+    #[test]
+    fn proj_guarded_event_sets_guard_not_hit() {
+        let mut me = Character::new();
+        me.record_proj_event(42, true); // guarded
+        assert_eq!(ev("ProjContact42", &me), Value::Int(1));
+        assert_eq!(ev("ProjGuarded42", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit42", &me), Value::Int(0));
+        assert_eq!(ev("ProjGuardedTime42", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjHitTime42", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+    }
+
+    /// T026 (AC2): `NumProj` reports the owner's live-projectile count, surfaced
+    /// through the [`EntityGraph`] exactly like `NumHelper`.
+    #[test]
+    fn num_proj_counts_owning_players_live_projectiles() {
+        let me = Character::new();
+
+        // No live projectiles: bare context reads 0.
+        assert_eq!(
+            ev_graph("NumProj", &me, EntityGraph::default()),
+            Value::Int(0)
+        );
+
+        // Owner has three live projectiles (ids are immaterial to the bare count).
+        let own_proj_ids: [i32; 3] = [2000, 2000, 2001];
+        let graph = EntityGraph::default().with_own_proj_ids(&own_proj_ids);
+        assert_eq!(graph.num_proj(), 3, "direct accessor: 3 live projectiles");
+        assert_eq!(ev_graph("NumProj", &me, graph), Value::Int(3));
+        // The spawn-once guard: `NumProj = 0` is false while projectiles are live.
+        assert_eq!(ev_graph("NumProj = 0", &me, graph), Value::Int(0));
+    }
+
+    /// T026: the per-id tracker is bounded — a flood of distinct ids cannot grow
+    /// the map past [`Character::MAX_PROJ_IDS`], and an already-tracked id keeps
+    /// updating even once the cap is reached.
+    #[test]
+    fn proj_events_map_is_bounded() {
+        let mut me = Character::new();
+        // Record one event for an id we will keep checking.
+        me.record_proj_event(0, false);
+        // Flood far past the cap with distinct ids.
+        for id in 1..(Character::MAX_PROJ_IDS as i32 + 100) {
+            me.record_proj_event(id, false);
+        }
+        assert!(
+            me.proj_events.len() <= Character::MAX_PROJ_IDS,
+            "the tracker map never exceeds the cap"
+        );
+        // The already-tracked id 0 still updates (a guard event after the flood).
+        me.record_proj_event(0, true);
+        assert_eq!(ev("ProjGuarded0", &me), Value::Int(1));
     }
 
     // =====================================================================

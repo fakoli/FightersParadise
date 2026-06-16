@@ -1209,11 +1209,16 @@ impl Player {
         // `helper(id)` lookup) can be handed the identical list — see
         // [`Player::tick_helpers`].
         let own_helper_ids: Vec<i32> = self.helpers.iter().map(|h| h.helper_id).collect();
+        // (T026) The owning player's full live-projectile id list, for the root's
+        // `NumProj` trigger — built from the projectile slot-map, an id-only slice
+        // threaded through the `Copy` graph exactly like `own_helper_ids`.
+        let own_proj_ids: Vec<i32> = self.projectiles.iter().map(|p| p.proj_id).collect();
         let graph = EntityGraph::new(None, None, &lookup)
             .with_target(relations.target)
             .with_partner(relations.partner)
             .with_players(relations.players)
-            .with_own_helper_ids(&own_helper_ids);
+            .with_own_helper_ids(&own_helper_ids)
+            .with_own_proj_ids(&own_proj_ids);
         self.character
             .tick_as_helper(&self.loaded, opponent, stage, graph)
     }
@@ -2054,6 +2059,17 @@ impl Match {
         let view = self.round_view();
         self.p1.character.set_round_view(view);
         self.p2.character.set_round_view(view);
+
+        // (0b) Age each player's per-projectile-id contact/hit/guard counters one
+        //      tick BEFORE the state machines run (T026), so a projectile that
+        //      connected on a PRIOR frame reads an incremented "ticks since" this
+        //      frame, while a connection recorded later this frame (in combat
+        //      resolution, step 3) reads `0` until the next tick ages it. This is
+        //      what makes `ProjContactTime<id>` count up from `0` and the
+        //      `ProjContact<id> = 1, op t` window form compare against the right
+        //      elapsed time.
+        self.p1.character.tick_proj_events();
+        self.p2.character.tick_proj_events();
 
         // (1) Feed inputs into each character's command source, facing-relative.
         //     Inputs only drive the fighters once the round is live; during the
@@ -3103,28 +3119,40 @@ fn resolve_projectile_hits(attacker: &mut Player, defender: &mut Player) {
     // attacker it is given), but the projectile is reaped, so the flag is lifted
     // onto the owning player here.
     let mut owner_connected = false;
+    // Connections recorded this pass, lifted onto the owner's per-id projectile
+    // tracker after the `retain_mut` (which only borrows `attacker.projectiles`,
+    // not `attacker.character`): `(proj_id, guarded)` for the `ProjContact<id>` /
+    // `ProjHit<id>` / `ProjGuarded<id>` / `Proj*Time<id>` trigger family (T026).
+    let mut proj_events: Vec<(i32, bool)> = Vec::new();
     attacker.projectiles.retain_mut(|proj| {
         // `resolve_attack` returns `Some(..)` only on an effective hit/guard; on a
         // connection the projectile is consumed (single-hit), else it lives on.
-        let connected = resolve_attack(
+        let outcome = resolve_attack(
             &mut proj.character,
             owner_air,
             &mut defender.character,
             defender_air,
             defender_states,
-        )
-        .is_some();
-        if connected {
+        );
+        if let Some(res) = outcome {
             owner_connected = true;
+            let guarded = matches!(res.result, fp_combat::HitResult::Guard);
+            proj_events.push((proj.proj_id, guarded));
             tracing::debug!(
-                "projectile id={} connected; reaping (single-hit)",
-                proj.proj_id
+                "projectile id={} connected ({}); reaping (single-hit)",
+                proj.proj_id,
+                if guarded { "guarded" } else { "hit" }
             );
         }
-        !connected
+        outcome.is_none()
     });
     if owner_connected {
         attacker.character.has_target = true;
+    }
+    // Record the connections on the owner so its `ProjContact<id>` / `ProjHit<id>`
+    // / `ProjGuarded<id>` triggers fire this tick (T026).
+    for (proj_id, guarded) in proj_events {
+        attacker.character.record_proj_event(proj_id, guarded);
     }
 }
 
@@ -3324,6 +3352,9 @@ fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
     c.shaketime = 0;
     c.get_hit_vars = fp_character::GetHitVars::default();
     c.move_connect.reset();
+    // Per-id projectile contact/hit/guard timing does not survive a round
+    // boundary (the projectiles themselves are cleared too — T026).
+    c.proj_events.clear();
 
     // Drop any stale commands so nothing fires before the next round goes live.
     c.set_command_source(Box::new(fp_character::NoCommands));
@@ -3712,7 +3743,8 @@ mod tests {
     use super::*;
     use fp_character::{
         Character, CharacterConstants, CompiledController, CompiledExpr, CompiledParam,
-        CompiledState, CompiledTriggerGroup, Facing, LoadedCharacter, MoveType, StateType,
+        CompiledState, CompiledTriggerGroup, Facing, LoadedCharacter, MoveType, ProjContactTracker,
+        StateType,
     };
     use fp_combat::{Damage, HitDef, HitFlags, HitTimes, PauseTime, Priority, PriorityType};
     use fp_core::{Rect, SpriteId, Vec2};
@@ -9954,6 +9986,83 @@ time = 1
             m.p1().projectiles().is_empty(),
             "the connecting projectile was reaped (single-hit)"
         );
+    }
+
+    /// T026 (AC1/AC2/AC3): the owner's per-id projectile contact/hit/guard tracker
+    /// is populated across a real projectile lifecycle inside a `Match` — no live
+    /// projectile before spawn, one live after spawn (the `NumProj` source), then a
+    /// recorded clean-hit event once the projectile connects, and the
+    /// `ProjContactTime`/`ProjHitTime` counters age each subsequent tick.
+    #[test]
+    fn proj_triggers_populate_across_match_lifecycle() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(200.0, 0.0);
+        p2c.facing = Facing::Left;
+        let p1 = Player::new(p1c, projectile_owner_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-400.0, 400.0));
+
+        // Before any tick: no live projectiles (the `NumProj` source is empty) and
+        // the owner has tracked no contact for the fixture's projid (9001).
+        assert!(m.p1().projectiles().is_empty());
+        assert!(
+            !m.p1().character.proj_events.contains_key(&9001),
+            "no contact tracked before spawn"
+        );
+
+        into_fight(&mut m);
+
+        // After the spawn fires: exactly one live projectile — the count `NumProj`
+        // reports — and still no contact recorded (it has not reached P2 yet).
+        assert_eq!(
+            m.p1().projectiles().len(),
+            1,
+            "one live projectile (the NumProj count)"
+        );
+        assert!(
+            !m.p1().character.proj_events.contains_key(&9001),
+            "no contact yet — the projectile is still in flight"
+        );
+
+        // Fly the projectile into the opponent.
+        let mut connected_tick = None;
+        for t in 0..40 {
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.p1().character.proj_events.contains_key(&9001) {
+                connected_tick = Some(t);
+                break;
+            }
+        }
+        assert!(
+            connected_tick.is_some(),
+            "the projectile connected and recorded a Proj* event"
+        );
+
+        // On the connecting tick the clean-hit + contact counters read 0 (it was a
+        // hit, not a guard — defender_loaded does not block), guard reads "never".
+        let tracker = m.p1().character.proj_events[&9001];
+        assert_eq!(tracker.contact_time(), 0, "ProjContactTime9001 == 0 on hit");
+        assert_eq!(tracker.hit_time(), 0, "ProjHitTime9001 == 0 on hit");
+        assert_eq!(
+            tracker.guarded_time(),
+            ProjContactTracker::NEVER,
+            "ProjGuardedTime9001 stays -1 (not guarded)"
+        );
+        // The single-hit projectile was reaped, so `NumProj` drops back to 0.
+        assert!(
+            m.p1().projectiles().is_empty(),
+            "single-hit projectile reaped"
+        );
+
+        // The counters age on each subsequent tick (the `ProjContactTime` clock).
+        m.tick(MatchInput::none(), MatchInput::none());
+        let aged = m.p1().character.proj_events[&9001];
+        assert_eq!(aged.contact_time(), 1, "contact time advanced one tick");
+        assert_eq!(aged.hit_time(), 1, "hit time advanced one tick");
     }
 
     /// A projectile that never reaches the opponent is eventually reaped when it
