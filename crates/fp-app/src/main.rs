@@ -71,8 +71,8 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds, TeamMatch,
-    TeamMode, Winner, DEFAULT_MATCH_SEED,
+    derive_player_seed, EffectSide, Match, MatchInput, Player, PlayerDriver, RoundState,
+    StageBounds, TeamMatch, TeamMode, Winner, DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
@@ -3463,6 +3463,13 @@ fn load_match_with_backdrop(
 ) -> Mode {
     match build_team_match(p1_def, p2_def, pal, team_mode) {
         Ok(mut m) => {
+            // Declare each side's input driver so the engine assigns the right
+            // `AILevel` (T052): P1 is the human at the keyboard (level 0), P2 is
+            // the baseline CPU AI at the same difficulty the `CpuAi` below runs
+            // (`AiDifficulty::Normal` -> level 4). A second human controller still
+            // overrides the CPU's inputs per-frame in `tick_match_run`, but the
+            // identity (and thus `AILevel`) is set once here at construction.
+            m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the team's inner
             // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle

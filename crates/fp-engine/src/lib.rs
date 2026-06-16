@@ -66,8 +66,8 @@ use fp_combat::{
 use fp_core::{Rect, SpriteId, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
-    logical_direction, AiObservation, Button, CommandDef, CommandMatcher, Direction, InputBuffer,
-    InputState,
+    logical_direction, AiDifficulty, AiObservation, Button, CommandDef, CommandMatcher, Direction,
+    InputBuffer, InputState,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
@@ -711,6 +711,38 @@ struct RedirectRelations<'a> {
     /// is intentionally omitted to avoid aliasing its `&mut` tick — its own state
     /// is already reachable through self-triggers).
     players: &'a [(i32, &'a Character)],
+}
+
+/// What drives one side of a [`Match`]: a human input device or the baseline CPU
+/// AI at a chosen difficulty (T052).
+///
+/// The coordinator uses this only to derive each fighter's
+/// [`Character::ai_level`](fp_character::Character::ai_level) at construction — a
+/// human ([`Human`](PlayerDriver::Human)) maps to level `0` and a
+/// [`Cpu`](PlayerDriver::Cpu) maps to its [`AiDifficulty::ai_level`] (`1..=8`). It
+/// does **not** itself produce inputs (the caller still feeds inputs each tick); it
+/// is a one-time identity declaration so the CNS `AILevel` trigger reads the right
+/// value. [`Human`](PlayerDriver::Human) is the [`Default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayerDriver {
+    /// A human player (keyboard or gamepad). AI level `0`.
+    #[default]
+    Human,
+    /// The baseline CPU AI at the given difficulty. AI level `1..=8`.
+    Cpu(AiDifficulty),
+}
+
+impl PlayerDriver {
+    /// The [`Character::ai_level`](fp_character::Character::ai_level) this driver
+    /// implies: `0` for a [`Human`](Self::Human), or the CPU difficulty's
+    /// [`AiDifficulty::ai_level`] (`1..=8`) for [`Cpu`](Self::Cpu).
+    #[must_use]
+    pub fn ai_level(self) -> u8 {
+        match self {
+            PlayerDriver::Human => 0,
+            PlayerDriver::Cpu(difficulty) => difficulty.ai_level(),
+        }
+    }
 }
 
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
@@ -1806,6 +1838,20 @@ impl Match {
         self.p2
             .character
             .seed_rng(derive_player_seed(match_seed, 1));
+    }
+
+    /// Assigns each player's [`Character::ai_level`](fp_character::Character::ai_level)
+    /// from its input [`PlayerDriver`] (T052).
+    ///
+    /// A human driver ([`PlayerDriver::Human`]) sets level `0`; a
+    /// [`PlayerDriver::Cpu`] sets the difficulty's [`AiDifficulty::ai_level`]
+    /// (`1..=8`). This is a one-time identity assignment (the level never changes
+    /// mid-match), so the CNS `AILevel` trigger reads the correct value for each
+    /// side. Call it once right after construction. With no call, both fighters
+    /// keep the human default (`0`), so a bare match is a two-human match.
+    pub fn set_drivers(&mut self, p1_driver: PlayerDriver, p2_driver: PlayerDriver) {
+        self.p1.character.set_ai_level(p1_driver.ai_level());
+        self.p2.character.set_ai_level(p2_driver.ai_level());
     }
 
     /// Constructs a match (default round length / best-of-N) and immediately seeds
@@ -11702,5 +11748,113 @@ time = 1
             "fewer than half of evilken's from-neutral declared moves were performable \
              ({fired}/{attempted}); the synthesizer→Match move-execution path regressed"
         );
+    }
+
+    // ---- T052: ai_level entity field + match/CPU plumbing -------------------
+
+    /// `PlayerDriver::ai_level` maps humans to 0 and CPU difficulties to 1..=8.
+    #[test]
+    fn player_driver_ai_level_mapping() {
+        assert_eq!(PlayerDriver::Human.ai_level(), 0);
+        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Easy).ai_level(), 2);
+        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Normal).ai_level(), 4);
+        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Hard).ai_level(), 7);
+        // The human default is level 0 (a human is never mistaken for the CPU).
+        assert_eq!(PlayerDriver::default().ai_level(), 0);
+    }
+
+    /// A bare, freshly-built `Character` (no coordinator) defaults to `ai_level == 0`.
+    #[test]
+    fn bare_character_ai_level_defaults_to_zero() {
+        assert_eq!(Character::new().ai_level(), 0);
+    }
+
+    /// `Match::set_drivers` assigns each side's `ai_level` from its driver:
+    /// human P1 stays level 0, CPU(Hard) P2 reads 7.
+    #[test]
+    fn match_with_drivers_sets_ai_level_per_side() {
+        let mut m = Match::new(
+            tests_support::make_player(-50.0),
+            tests_support::make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Hard));
+        assert_eq!(m.p1().character.ai_level(), 0, "human P1 must be level 0");
+        assert_eq!(
+            m.p2().character.ai_level(),
+            7,
+            "CPU(Hard) P2 must be level 7"
+        );
+    }
+
+    /// A plain `Match::new` (no driver declared) leaves both sides at the human
+    /// default (`0`), so a bare two-human match is unaffected.
+    #[test]
+    fn match_without_drivers_keeps_human_default_ai_level() {
+        let m = Match::new(
+            tests_support::make_player(-50.0),
+            tests_support::make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        assert_eq!(m.p1().character.ai_level(), 0);
+        assert_eq!(m.p2().character.ai_level(), 0);
+    }
+
+    /// `TeamMatch::set_drivers` propagates each side's driver to its whole roster:
+    /// the active lead AND every reserve inherit the side's `ai_level`.
+    #[test]
+    fn team_match_drivers_propagate_to_whole_roster() {
+        let mut tm = TeamMatch::with_mode(
+            vec![
+                tests_support::make_player(-60.0),
+                tests_support::make_player(-90.0),
+            ],
+            vec![
+                tests_support::make_player(60.0),
+                tests_support::make_player(90.0),
+            ],
+            StageBounds::new(-200.0, 200.0),
+            TeamMode::Simul,
+        );
+        tm.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
+
+        // P1 side (human): active lead + reserve both level 0.
+        assert_eq!(tm.active_player(Side::P1).character.ai_level(), 0);
+        for r in tm.reserves(Side::P1) {
+            assert_eq!(r.character.ai_level(), 0, "human reserve must stay level 0");
+        }
+        // P2 side (CPU Normal -> 4): active lead + reserve both level 4.
+        assert_eq!(tm.active_player(Side::P2).character.ai_level(), 4);
+        for r in tm.reserves(Side::P2) {
+            assert_eq!(
+                r.character.ai_level(),
+                4,
+                "CPU reserve must inherit level 4"
+            );
+        }
+    }
+
+    /// `ai_level` is part of `CharacterSnapshot` and survives a bincode round-trip
+    /// (the snapshot path the whole-Match replay / rollback proofs depend on).
+    #[test]
+    fn ai_level_survives_character_snapshot_bincode_round_trip() {
+        let mut ch = Character::new();
+        ch.set_ai_level(7);
+        let snap = ch.snapshot();
+        assert_eq!(snap.ai_level, 7);
+
+        let bytes = bincode::serialize(&snap).expect("serialize snapshot");
+        let decoded: fp_character::CharacterSnapshot =
+            bincode::deserialize(&bytes).expect("deserialize snapshot");
+        assert_eq!(
+            decoded.ai_level, 7,
+            "ai_level must survive a bincode round-trip"
+        );
+
+        // And applying the decoded snapshot restores ai_level onto a fresh character.
+        let mut restored = Character::new();
+        assert_eq!(restored.ai_level(), 0);
+        restored.restore_from_snapshot(&decoded);
+        assert_eq!(restored.ai_level(), 7);
     }
 }

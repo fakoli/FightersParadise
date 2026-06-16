@@ -1983,6 +1983,21 @@ pub struct Character {
     /// no coordinator in view. See [`RoundView`].
     pub round_view: RoundView,
 
+    /// The engine-assigned AI difficulty level this character runs at, `0` for a
+    /// human-controlled fighter and `1..=8` for a CPU opponent (the value the
+    /// MUGEN `AILevel` trigger reads — higher = stronger CPU, T052).
+    ///
+    /// Like [`round_view`](Self::round_view), this is **owned by the round
+    /// coordinator** (`fp-engine`'s `Match`/`TeamMatch`), which sets it once at
+    /// match construction from the player's input driver (keyboard / gamepad → `0`;
+    /// a [`fp_input::CpuAi`] → its [`fp_input::AiDifficulty`] mapped to `1..=8`).
+    /// The character never assigns it itself — it is a read-only identity bit the
+    /// CNS reads to gate cheap-AI-only behaviour. A bare /
+    /// freshly-[`new`](Self::new)'d `Character` (no coordinator) defaults to `0`,
+    /// so a human is never mistaken for the CPU. Set it via
+    /// [`Character::set_ai_level`] and read it via [`Character::ai_level`].
+    pub ai_level: u8,
+
     /// The selected external `.act` palette override, as a 0-based index into the
     /// owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes), or
     /// `None` to render with the SFF-embedded palette (the default).
@@ -2353,6 +2368,9 @@ impl Default for Character {
             // Safe default round clock (intro / time 0 / not over) until a
             // coordinator pushes the live view in via `set_round_view`.
             round_view: RoundView::default(),
+            // Human by default (level 0); the coordinator raises it for a CPU
+            // opponent via `set_ai_level`. A bare character is never the CPU.
+            ai_level: 0,
             // No external palette override by default: render with the
             // SFF-embedded palette, byte-identical to today.
             active_palette: None,
@@ -2409,6 +2427,28 @@ impl Character {
         // Round-trip through `Rng::new` so the stored cell is always a valid,
         // in-range Park–Miller state regardless of the caller's seed.
         self.rng_seed.set(Rng::new(seed).seed());
+    }
+
+    /// The engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU) this
+    /// character runs at — the value the MUGEN `AILevel` trigger reads (T052).
+    ///
+    /// A freshly-[`new`](Self::new)'d character (no coordinator) returns `0`, so a
+    /// human is never mistaken for the CPU. See [`Character::ai_level`](Self::ai_level)
+    /// (the field) and [`Character::set_ai_level`].
+    #[must_use]
+    pub fn ai_level(&self) -> u8 {
+        self.ai_level
+    }
+
+    /// Sets the engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU).
+    ///
+    /// Owned by the round coordinator (`fp-engine`'s `Match`/`TeamMatch`), which
+    /// calls this once at match construction from the player's input driver. The
+    /// character never assigns it itself — it is a read-only identity bit the CNS
+    /// reads (the `AILevel` trigger). Read it back with
+    /// [`Character::ai_level`](Self::ai_level).
+    pub fn set_ai_level(&mut self, level: u8) {
+        self.ai_level = level;
     }
 
     /// Returns the selected external `.act` palette override as a 0-based index

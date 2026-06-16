@@ -40,7 +40,7 @@ use fp_character::StageView;
 use fp_formats::air::AirFile;
 use serde::{Deserialize, Serialize};
 
-use crate::{Match, MatchInput, Player, StageBounds, Winner};
+use crate::{Match, MatchInput, Player, PlayerDriver, StageBounds, Winner};
 
 /// How a [`TeamMatch`]'s two rosters are fought.
 ///
@@ -225,6 +225,31 @@ impl TeamMatch {
             state: TeamMatchState::InProgress,
             outcome: None,
             common_fx: None,
+        }
+    }
+
+    /// Assigns every fighter's [`Character::ai_level`](fp_character::Character::ai_level)
+    /// from its **side's** input [`PlayerDriver`] (T052).
+    ///
+    /// All members of a side — the active lead **and** its reserves — inherit that
+    /// side's driver, so a CPU team's whole roster reads its difficulty's
+    /// [`AiDifficulty::ai_level`](fp_input::AiDifficulty::ai_level) (`1..=8`) from
+    /// the `AILevel` trigger, while a human side's roster stays at level `0`. The
+    /// level is a one-time identity assignment that survives a Turns hand-off
+    /// (the reserve was set here before it ever enters the inner match). Call once
+    /// after construction; with no call both sides keep the human default (`0`).
+    pub fn set_drivers(&mut self, p1_driver: PlayerDriver, p2_driver: PlayerDriver) {
+        // The active pair lives in the inner 1v1 match.
+        self.inner_mut().set_drivers(p1_driver, p2_driver);
+        // Every reserve inherits its side's driver, so a Turns hand-off promotes a
+        // fighter that already carries the correct AI level.
+        let p1_level = p1_driver.ai_level();
+        let p2_level = p2_driver.ai_level();
+        for reserve in &mut self.reserves.0 {
+            reserve.character.set_ai_level(p1_level);
+        }
+        for reserve in &mut self.reserves.1 {
+            reserve.character.set_ai_level(p2_level);
         }
     }
 

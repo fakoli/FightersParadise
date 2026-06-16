@@ -173,6 +173,10 @@ pub struct CharacterSnapshot {
     // ---- RNG + round clock -------------------------------------------------
     /// Raw Park–Miller RNG state (the `Cell<i32>` read out as a plain `i32`).
     pub rng_seed: i32,
+    /// The engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU), the
+    /// value the `AILevel` trigger reads (T052). Stored as a plain `u8` alongside
+    /// the RNG seed so a snapshot round-trips a fighter's CPU identity.
+    pub ai_level: u8,
     /// The engine-global round / match clock view.
     pub round_view: RoundView,
 }
@@ -249,6 +253,7 @@ impl CharacterSnapshot {
             afterimage: ch.afterimage.clone(),
             hit_overrides: ch.hit_overrides.clone(),
             rng_seed: ch.rng_seed.get(),
+            ai_level: ch.ai_level,
             round_view: ch.round_view,
         }
     }
@@ -311,6 +316,7 @@ impl CharacterSnapshot {
         ch.afterimage = self.afterimage.clone();
         ch.hit_overrides = self.hit_overrides.clone();
         ch.rng_seed.set(self.rng_seed);
+        ch.ai_level = self.ai_level;
         ch.round_view = self.round_view;
     }
 }
@@ -362,6 +368,7 @@ mod tests {
         ch.hitpause = 6;
         ch.juggle_points = 9;
         ch.attack_mul = 1.5;
+        ch.set_ai_level(7);
         ch.seed_rng(12345);
         // Advance the RNG so the stored seed is non-default.
         let _ = fp_vm::EvalContext::random(&ch);

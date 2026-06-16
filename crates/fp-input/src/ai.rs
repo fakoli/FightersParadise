@@ -90,6 +90,26 @@ pub enum AiDifficulty {
     Hard,
 }
 
+impl AiDifficulty {
+    /// Maps this coarse difficulty onto the MUGEN `AILevel` scale (`1..=8`),
+    /// the value the engine assigns a CPU-controlled fighter so its CNS can gate
+    /// AI-only behaviour on the `AILevel` trigger (T052).
+    ///
+    /// `Easy → 2`, `Normal → 4`, `Hard → 7` — three well-separated points inside
+    /// the `1..=8` band (never `0`, which is reserved for a human player). The
+    /// coordinator (`fp-engine`) calls this when a side is driven by a
+    /// [`CpuAi`](crate::CpuAi) and pushes the result onto the character via
+    /// `Character::set_ai_level`.
+    #[must_use]
+    pub fn ai_level(self) -> u8 {
+        match self {
+            AiDifficulty::Easy => 2,
+            AiDifficulty::Normal => 4,
+            AiDifficulty::Hard => 7,
+        }
+    }
+}
+
 /// The numeric behaviour parameters the [`CpuAi`] reads each frame, derived from
 /// an [`AiDifficulty`] (or supplied directly for fine control / tests).
 ///
@@ -490,6 +510,19 @@ mod tests {
             AiTuning::for_difficulty(AiDifficulty::Normal)
         );
         assert_eq!(AiDifficulty::default(), AiDifficulty::Normal);
+    }
+
+    /// `AiDifficulty::ai_level` maps the three coarse levels onto fixed, distinct
+    /// points inside the MUGEN `AILevel` 1..=8 band (never 0, the human value) (T052).
+    #[test]
+    fn ai_level_maps_into_one_to_eight() {
+        assert_eq!(AiDifficulty::Easy.ai_level(), 2);
+        assert_eq!(AiDifficulty::Normal.ai_level(), 4);
+        assert_eq!(AiDifficulty::Hard.ai_level(), 7);
+        for d in [AiDifficulty::Easy, AiDifficulty::Normal, AiDifficulty::Hard] {
+            let lvl = d.ai_level();
+            assert!((1..=8).contains(&lvl), "{d:?} -> {lvl} must be in 1..=8");
+        }
     }
 
     /// Observation helpers behave as documented.
