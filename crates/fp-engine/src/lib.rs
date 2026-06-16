@@ -78,7 +78,7 @@ mod team;
 
 pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
-pub use team::{Side, TeamMatch, TeamMatchState, TeamMode};
+pub use team::{Side, TeamMatch, TeamMatchState, TeamMode, TeamOutcome};
 
 /// The horizontal extent of the playfield, in world pixels.
 ///
@@ -1545,6 +1545,20 @@ pub struct Match {
     /// behavior). Install it with [`Match::set_common_fx`]; a renderer pairs it
     /// with the matching `fightfx.sff` it loaded separately.
     common_fx: Option<AirFile>,
+    /// Single-round / no-life-restore mode (T028). `false` (the default) runs the
+    /// normal best-of-N flow with a full life/position reset between rounds. When
+    /// `true` the **first decided round ends the match** — there is no
+    /// [`reset_for_next_round`](Match::reset_for_next_round), so a KO'd fighter's
+    /// life is never restored — and a double-KO (or equal-life time over) is
+    /// recorded as a genuine [`Winner::Draw`] match result rather than the
+    /// best-of-N "draws just continue" rule.
+    ///
+    /// This is what a [`TeamMatch`] in [`TeamMode::Simul`]/[`TeamMode::Turns`] sets
+    /// on its inner match so a team-level defeat is decided by remaining-fighter
+    /// counts, not masked by the inner round restarting and healing a downed
+    /// fighter. The bare 1v1 [`Match`] leaves it `false`, so 1v1 behaviour is
+    /// unchanged.
+    single_round: bool,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -1706,6 +1720,7 @@ impl Match {
             freeze: Freeze::inactive(),
             effects: Vec::new(),
             common_fx: None,
+            single_round: false,
         }
     }
 
@@ -1744,6 +1759,29 @@ impl Match {
     /// decided, so the terminal result stands.
     pub fn set_rounds_to_win(&mut self, rounds_to_win: i32) {
         self.rounds_to_win = rounds_to_win.max(1);
+    }
+
+    /// Enables or disables single-round / no-life-restore mode (T028).
+    ///
+    /// In single-round mode the **first decided round ends the match** with no
+    /// between-round reset, so a knocked-out fighter's life is never restored, and
+    /// a double-KO (or equal-life time over) is recorded as a genuine
+    /// [`Winner::Draw`] in [`match_winner`](Self::match_winner). This is what a
+    /// [`TeamMatch`] in [`TeamMode::Simul`]/[`TeamMode::Turns`] sets on its inner
+    /// match so team-level defeat is decided by surviving-fighter counts rather
+    /// than masked by the inner round restarting and healing a downed fighter.
+    ///
+    /// Leaving it `false` (the default) preserves the normal best-of-N round flow
+    /// exactly, so a bare 1v1 [`Match`] is unaffected.
+    pub fn set_single_round(&mut self, single_round: bool) {
+        self.single_round = single_round;
+    }
+
+    /// Whether this match is in single-round / no-life-restore mode (T028). See
+    /// [`Match::set_single_round`].
+    #[must_use]
+    pub fn single_round(&self) -> bool {
+        self.single_round
     }
 
     /// Seeds the two fighters' `random` streams **distinctly** from a single match
@@ -1989,8 +2027,14 @@ impl Match {
     ///
     /// Becomes `Some(Winner::P1)`/`Some(Winner::P2)` the moment a player reaches
     /// [`Match::rounds_to_win`] round wins (at which point [`Match::match_state`]
-    /// is [`MatchState::Over`]). A match is never a draw: a drawn round credits
-    /// neither player, so this never returns `Some(Winner::Draw)`.
+    /// is [`MatchState::Over`]). In the normal best-of-N flow a match is never a
+    /// draw: a drawn round credits neither player, so this never returns
+    /// `Some(Winner::Draw)`.
+    ///
+    /// The one exception is single-round / no-life-restore mode
+    /// ([`Match::single_round`], T028): there a genuine double-KO (or equal-life
+    /// time over) ends the match as `Some(Winner::Draw)`, which is exactly how a
+    /// wrapping [`TeamMatch`] recognises a team-level draw.
     #[must_use]
     pub fn match_winner(&self) -> Option<Winner> {
         self.match_winner
@@ -2042,7 +2086,35 @@ impl Match {
     /// machine ticks, combat both directions, player-push + bound clamp, baseline
     /// face-the-opponent, and round-state/timer advance. See the
     /// [crate-level overview](crate) for the full description. Never panics.
+    ///
+    /// In a 1v1 [`Match`] neither fighter has a teammate, so the `partner` redirect
+    /// resolves to nothing; a [`TeamMatch`] in [`TeamMode::Simul`] supplies the live
+    /// teammates via [`Match::tick_with_partners`], which this delegates to with no
+    /// partner on either side.
     pub fn tick(&mut self, p1_input: MatchInput, p2_input: MatchInput) {
+        self.tick_with_partners(p1_input, p2_input, None, None);
+    }
+
+    /// Like [`Match::tick`] but with each side's live **teammate** supplied for the
+    /// `partner` redirect (T027).
+    ///
+    /// `p1_partner`/`p2_partner` are the active fighter's teammate on each side (the
+    /// `partner` redirect target), or [`None`] in a 1v1 / when the side fields a
+    /// single fighter. A [`TeamMatch`] in [`TeamMode::Simul`] passes its reserve
+    /// teammates here so a fighter's `partner, …` triggers resolve to a *live* ally
+    /// rather than collapsing to `0`; everything else is identical to [`Match::tick`].
+    ///
+    /// The partner references must borrow characters that are **not** either of this
+    /// match's own players (the coordinator owns its players mutably this tick); the
+    /// only caller, [`TeamMatch`], passes characters from its separate reserve
+    /// rosters, which are distinct storage. Never panics.
+    pub fn tick_with_partners(
+        &mut self,
+        p1_input: MatchInput,
+        p2_input: MatchInput,
+        p1_partner: Option<&Character>,
+        p2_partner: Option<&Character>,
+    ) {
         // (F) Whole-match freeze (`Pause`/`SuperPause`, audit #24). While a freeze
         //     is active the engine holds the frozen players' simulation, the round
         //     timer, AND `GameTime` still; only the `SuperPause` triggerer (if any)
@@ -2125,7 +2197,9 @@ impl Match {
         let p1_players: [(i32, &Character); 1] = [(MUGEN_PLAYER_ID_P2, &self.p2.character)];
         let p1_relations = RedirectRelations {
             target: p1_target,
-            partner: None,
+            // (T027) P1's live teammate, supplied by a wrapping `TeamMatch` in Simul
+            // (a reserve on P1's side); `None` in a 1v1 → `partner, …` resolves to 0.
+            partner: p1_partner,
             players: &p1_players,
         };
         let mut p1_report = self
@@ -2168,7 +2242,8 @@ impl Match {
         let p2_players: [(i32, &Character); 1] = [(MUGEN_PLAYER_ID_P1, &self.p1.character)];
         let p2_relations = RedirectRelations {
             target: p2_target,
-            partner: None,
+            // (T027) P2's live teammate (a reserve on P2's side in Simul); `None` 1v1.
+            partner: p2_partner,
             players: &p2_players,
         };
         let mut p2_report = self
@@ -2712,9 +2787,22 @@ impl Match {
     /// At the end of a decided round ([`RoundState::Win`]): if a player has
     /// reached [`Match::rounds_to_win`], end the match; otherwise reset for the
     /// next round and resume fighting.
+    ///
+    /// In single-round / no-life-restore mode ([`Match::single_round`], T028) this
+    /// **always** ends the match on the first decided round — with that round's
+    /// genuine [`Winner`] (a double-KO / equal-life time over yields
+    /// [`Winner::Draw`]) — and never resets, so a knocked-out fighter is not healed.
     fn resolve_match_or_next_round(&mut self) {
         // Already terminal — nothing changes once the match is over.
         if self.match_state == MatchState::Over {
+            return;
+        }
+
+        // (T028) Single-round mode: the first decided round is final. End the match
+        // with the round's actual verdict (Draw-capable) and skip the life-restoring
+        // reset, so a wrapping `TeamMatch` sees the true post-round life/KO state.
+        if self.single_round {
+            self.end_match(self.winner.unwrap_or(Winner::Draw));
             return;
         }
 
@@ -11027,5 +11115,211 @@ time = 1
             m.p1().explods().is_empty(),
             "explods do not survive a round boundary"
         );
+    }
+
+    // ---- T027 / T028: TeamMatch Simul partner redirect + single-round flow ----
+
+    /// A plain headless [`Player`] at world X `x` over the synthetic
+    /// [`defender_loaded`] assets, facing in toward stage center. Mirrors the
+    /// `tests_support::make_player` helper the team-flow tests use, kept local to
+    /// `mod tests` so these tests stay self-contained (no asset dependency).
+    fn team_player(x: f32) -> Player {
+        let mut c = Character::new();
+        c.pos = Vec2::new(x, 0.0);
+        c.facing = if x < 0.0 { Facing::Right } else { Facing::Left };
+        c.state_type = StateType::Standing;
+        c.move_type = MoveType::Idle;
+        Player::new(c, defender_loaded())
+    }
+
+    /// A standing [`LoadedCharacter`] whose state 0 sets `var(4) = 1` only when its
+    /// `partner` redirect resolves to a teammate whose life equals `mate_life`.
+    ///
+    /// The check is gated through a controller TRIGGER (a full expression, unlike a
+    /// param value which splits on the top-level comma — see
+    /// [`match_tick_resolves_redirect_through_a_trigger`]), so the `partner, life`
+    /// redirect is exercised end-to-end through the (team-wired) tick: `var(4)` stays
+    /// `0` unless a live teammate of exactly that life is installed in the graph.
+    fn partner_probe_loaded(mate_life: i32) -> LoadedCharacter {
+        let probe = CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("VarSet".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile(&format!(
+                    "(partner, life) = {mate_life}"
+                ))],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [("var(4)".to_string(), CompiledParam::compile("1"))]
+                .into_iter()
+                .collect(),
+        };
+        let mut loaded = defender_loaded();
+        loaded.states.insert(0, state_with(0, vec![probe]));
+        loaded
+    }
+
+    /// AC2 (T027): in a Simul [`TeamMatch`] the active fighter's `partner` redirect
+    /// resolves to its **live teammate** (a reserve on its side), not the `0`
+    /// default. Proven by gating a VarSet on `(partner, life) = <mate's life>` and
+    /// reading the var back after a Simul tick — exercising the partner wiring
+    /// through the real team coordinator, not just `EntityGraph::with_partner`.
+    #[test]
+    fn simul_partner_redirect_resolves_to_live_teammate() {
+        const MATE_LIFE: i32 = 654;
+
+        // P1's lead fighter runs the partner probe; its teammate carries the
+        // distinctive life the probe checks for.
+        let mut lead = Character::new();
+        lead.pos = Vec2::new(-60.0, 0.0);
+        lead.facing = Facing::Right;
+        lead.state_no = 0;
+        let lead_player = Player::new(lead, partner_probe_loaded(MATE_LIFE));
+
+        let mut mate = Character::new();
+        mate.pos = Vec2::new(-80.0, 0.0);
+        mate.facing = Facing::Right;
+        mate.life = MATE_LIFE;
+        let mate_player = Player::new(mate, defender_loaded());
+
+        let p2_team = vec![team_player(60.0), team_player(80.0)];
+        let mut m = TeamMatch::with_mode(
+            vec![lead_player, mate_player],
+            p2_team,
+            StageBounds::new(-220.0, 220.0),
+            TeamMode::Simul,
+        );
+
+        // One tick is enough: the lead's state-0 probe runs and reads its partner.
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(
+            m.active_player(Side::P1).character.vars[4],
+            1,
+            "the active P1's `partner` redirect must resolve to its live teammate \
+             (life {MATE_LIFE}) in Simul, not the 1v1 `0` default"
+        );
+    }
+
+    /// AC2 (negative control): a 1v1 [`Match`] has no teammate, so the same
+    /// `partner` probe never fires — confirming the var only flips because of the
+    /// Simul partner wiring, and that 1v1 partner behaviour is unchanged (`0`).
+    #[test]
+    fn one_v_one_partner_redirect_stays_zero() {
+        const MATE_LIFE: i32 = 654;
+        let mut lead = Character::new();
+        lead.pos = Vec2::new(-60.0, 0.0);
+        lead.facing = Facing::Right;
+        lead.state_no = 0;
+        let mut m = Match::new(
+            Player::new(lead, partner_probe_loaded(MATE_LIFE)),
+            team_player(60.0),
+            StageBounds::new(-220.0, 220.0),
+        );
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.vars[4],
+            0,
+            "a 1v1 match has no partner, so the redirect stays 0 and the probe never fires"
+        );
+    }
+
+    /// AC3 (T028): the inner match of a Simul/Turns [`TeamMatch`] runs in
+    /// single-round / no-life-restore mode, so a KO'd active fighter is **not**
+    /// healed by an inner round reset. (A bare 1v1 `Match` keeps the normal flow.)
+    #[test]
+    fn team_inner_match_is_single_round_no_restore() {
+        // Simul + Turns wrap the inner match in single-round mode; Single does not.
+        let simul = TeamMatch::with_mode(
+            vec![team_player(-60.0), team_player(-80.0)],
+            vec![team_player(60.0), team_player(80.0)],
+            StageBounds::default(),
+            TeamMode::Simul,
+        );
+        assert!(
+            simul.active().single_round(),
+            "a Simul inner match must be single-round so a KO is not masked by a restart"
+        );
+        let turns = TeamMatch::with_mode(
+            vec![team_player(-60.0)],
+            vec![team_player(60.0), team_player(80.0)],
+            StageBounds::default(),
+            TeamMode::Turns,
+        );
+        assert!(
+            turns.active().single_round(),
+            "a Turns inner match is single-round too"
+        );
+        let single = TeamMatch::new(
+            team_player(-60.0),
+            team_player(60.0),
+            StageBounds::default(),
+        );
+        assert!(
+            !single.active().single_round(),
+            "a 1v1 / Single inner match keeps the normal best-of-N flow (life restored each round)"
+        );
+
+        // End-to-end: KO P2's active in a Simul match (P2 still has a reserve, so
+        // the team continues). The inner match must NOT heal the downed fighter, even
+        // after the full KO->Win round-flow hold elapses.
+        let mut m = TeamMatch::with_mode(
+            vec![team_player(-60.0), team_player(-80.0)],
+            vec![team_player(60.0), team_player(80.0)],
+            StageBounds::default(),
+            TeamMode::Simul,
+        );
+        for _ in 0..(INTRO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        m.kill_active(Side::P2);
+        // Drive well past KO_FRAMES so a (non-single-round) match would have reset
+        // and healed P2 by now.
+        for _ in 0..(KO_FRAMES + 10) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert!(
+            m.active_player(Side::P2).life() <= 0,
+            "the KO'd active fighter must stay down — its life is never restored by inner round flow"
+        );
+        assert_eq!(
+            m.state(),
+            TeamMatchState::InProgress,
+            "the team match continues (P2 still has a living reserve)"
+        );
+    }
+
+    /// AC4 (T028): a genuine double-KO ends a Simul [`TeamMatch`] as a real
+    /// [`TeamOutcome::Draw`] — not an automatic P1 win. Wipes BOTH sides on the same
+    /// frame (active + reserve each) so neither has a fighter left standing.
+    #[test]
+    fn simul_double_ko_is_a_draw() {
+        let mut m = TeamMatch::with_mode(
+            vec![team_player(-60.0), team_player(-80.0)],
+            vec![team_player(60.0), team_player(80.0)],
+            StageBounds::default(),
+            TeamMode::Simul,
+        );
+        for _ in 0..(INTRO_FRAMES + 1) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        // Eliminate every fighter on both sides simultaneously.
+        m.kill_active(Side::P1);
+        m.kill_active(Side::P2);
+        m.kill_reserve(Side::P1, 0);
+        m.kill_reserve(Side::P2, 0);
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert_eq!(m.state(), TeamMatchState::Over);
+        assert_eq!(
+            m.outcome(),
+            Some(TeamOutcome::Draw),
+            "a double-KO must be a genuine Draw, not a P1-biased tiebreak"
+        );
+        assert_eq!(m.winner(), None, "a drawn team match has no winning side");
     }
 }

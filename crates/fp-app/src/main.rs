@@ -71,8 +71,8 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds, Winner,
-    DEFAULT_MATCH_SEED,
+    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds, TeamMatch,
+    TeamMode, Winner, DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
@@ -677,6 +677,50 @@ fn build_two_player_match(
         p2,
         StageBounds::new(-STAGE_HALF_WIDTH, STAGE_HALF_WIDTH),
     ))
+}
+
+/// Builds a [`fp_engine::TeamMatch`] for two characters in the requested
+/// [`TeamMode`] (T027).
+///
+/// [`TeamMode::Single`] (the default) fields **one** fighter per side — identical
+/// to a bare [`Match`] wrapped in a single-fighter team, so the 1v1 path is
+/// unchanged. [`TeamMode::Simul`] / [`TeamMode::Turns`] field **two** fighters per
+/// side: the second of each side reuses the same `.def` as the first (the engine
+/// has no separate roster picker yet), positioned slightly behind the lead so the
+/// Simul teammates do not stack exactly. Returns an error only if a character truly
+/// cannot be loaded; the caller degrades to the test pattern on `Err`.
+fn build_team_match(
+    p1_def: &Path,
+    p2_def: &Path,
+    pal: PalSelection,
+    mode: TeamMode,
+) -> fp_core::FpResult<TeamMatch> {
+    match mode {
+        // The 1v1 default reuses the shared single-match construction path (also
+        // exercised by the headless integration tests) and wraps it in a
+        // single-fighter team, which behaves identically to a bare `Match`.
+        TeamMode::Single => {
+            let inner = build_two_player_match(p1_def, p2_def, pal)?;
+            let bounds = inner.bounds();
+            let (p1, p2) = inner.into_players();
+            Ok(TeamMatch::new(p1, p2, bounds))
+        }
+        TeamMode::Simul | TeamMode::Turns => {
+            let bounds = StageBounds::new(-STAGE_HALF_WIDTH, STAGE_HALF_WIDTH);
+            let p1_lead = build_player(p1_def, P1_START_X, pal.p1)?;
+            let p2_lead = build_player(p2_def, P2_START_X, pal.p2)?;
+            // A second fighter per side (same `.def`), placed a bit further out so
+            // the Simul teammates start visibly offset rather than overlapping.
+            let p1_mate = build_player(p1_def, P1_START_X - 30.0, pal.p1)?;
+            let p2_mate = build_player(p2_def, P2_START_X + 30.0, pal.p2)?;
+            Ok(TeamMatch::with_mode(
+                vec![p1_lead, p1_mate],
+                vec![p2_lead, p2_mate],
+                bounds,
+                mode,
+            ))
+        }
+    }
 }
 
 /// Loads one character `.def` into a [`Player`] positioned at `start_x`,
@@ -1693,7 +1737,8 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
     // Collect (side, sprite) pairs first to avoid borrowing the match while the
     // per-side caches are mutated.
     let effects: Vec<(EffectSide, SpriteId)> = run
-        .m
+        .team
+        .active()
         .effects()
         .iter()
         .map(|fx| (fx.side, fx.sprite))
@@ -1704,12 +1749,22 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
         // with a fighter's body sprites, so sharing the per-side cache is safe.
         match side {
             EffectSide::P1 => {
-                run.p1_render
-                    .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer, None);
+                // Field access (`run.team`), not the `m()` method, so the immutable
+                // active-match borrow stays disjoint from `&mut run.p1_render`.
+                run.p1_render.get_or_create_sprite(
+                    &run.team.active().p1().loaded.sff,
+                    sprite,
+                    renderer,
+                    None,
+                );
             }
             EffectSide::P2 => {
-                run.p2_render
-                    .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer, None);
+                run.p2_render.get_or_create_sprite(
+                    &run.team.active().p2().loaded.sff,
+                    sprite,
+                    renderer,
+                    None,
+                );
             }
             // A common spark draws from the shipped common-fx SFF into its own
             // cache. A no-op when no common-fx asset is loaded (no such effects
@@ -1731,15 +1786,38 @@ fn cache_effect_sprites(run: &mut MatchRun, renderer: &Renderer) {
 /// into that owner's per-character cache. A missing/undecodable sprite is a no-op
 /// (logged once by the cache).
 fn cache_explod_sprites(run: &mut MatchRun, renderer: &Renderer) {
-    let p1: Vec<SpriteId> = run.m.p1().explods().iter().map(|e| e.sprite).collect();
-    let p2: Vec<SpriteId> = run.m.p2().explods().iter().map(|e| e.sprite).collect();
+    let p1: Vec<SpriteId> = run
+        .team
+        .active()
+        .p1()
+        .explods()
+        .iter()
+        .map(|e| e.sprite)
+        .collect();
+    let p2: Vec<SpriteId> = run
+        .team
+        .active()
+        .p2()
+        .explods()
+        .iter()
+        .map(|e| e.sprite)
+        .collect();
     for sprite in p1 {
-        run.p1_render
-            .get_or_create_sprite(&run.m.p1().loaded.sff, sprite, renderer, None);
+        // Field access keeps the active-match read disjoint from `&mut run.p1_render`.
+        run.p1_render.get_or_create_sprite(
+            &run.team.active().p1().loaded.sff,
+            sprite,
+            renderer,
+            None,
+        );
     }
     for sprite in p2 {
-        run.p2_render
-            .get_or_create_sprite(&run.m.p2().loaded.sff, sprite, renderer, None);
+        run.p2_render.get_or_create_sprite(
+            &run.team.active().p2().loaded.sff,
+            sprite,
+            renderer,
+            None,
+        );
     }
 }
 
@@ -2984,6 +3062,30 @@ fn parse_motif_flag(args: &[String]) -> (Option<String>, Vec<String>) {
     (motif, rest)
 }
 
+/// Parses (and strips) the team-mode flag from `args` (T027), returning the chosen
+/// [`TeamMode`] plus the remaining positional args.
+///
+/// `--simul` selects [`TeamMode::Simul`] (both sides field all fighters at once);
+/// `--turns` selects [`TeamMode::Turns`] (sequential KO hand-off). With neither
+/// flag the default is [`TeamMode::Single`] — the classic 1v1 — so omitting them is
+/// byte-identical to before this feature. Both flags take no value; an unknown
+/// `--…` token passes through untouched. The last team flag wins if both are given.
+/// Pure — unit-tested without a window.
+fn parse_team_flag(args: &[String]) -> (TeamMode, Vec<String>) {
+    let mut mode = TeamMode::Single;
+    let mut rest: Vec<String> = Vec::new();
+    for arg in args {
+        if arg.eq_ignore_ascii_case("--simul") {
+            mode = TeamMode::Simul;
+        } else if arg.eq_ignore_ascii_case("--turns") {
+            mode = TeamMode::Turns;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    (mode, rest)
+}
+
 /// The two-player [`Match`] run state: the match plus the per-run rendering and
 /// audio resources held alongside it (per-side texture caches, the shared audio
 /// system, and per-side decoded-sound caches).
@@ -2991,8 +3093,12 @@ fn parse_motif_flag(args: &[String]) -> (Option<String>, Vec<String>) {
 /// Bundled into one struct (rather than a wide enum tuple) so the audio layer
 /// sits next to the renderer caches without making the `match` arms unwieldy.
 struct MatchRun {
-    /// The two-player match coordinator.
-    m: Box<Match>,
+    /// The team-match coordinator (T027). In the default 1v1 it holds a single
+    /// fighter per side in [`TeamMode::Single`], which behaves identically to a bare
+    /// [`Match`]; a `--simul`/`--turns` CLI flag builds a multi-fighter roster in the
+    /// matching mode. The renderer/HUD/audio read the **active pair** through the
+    /// inner [`Match`] via [`MatchRun::m`]; the tick drives the whole team.
+    team: Box<TeamMatch>,
     /// P1's per-character GPU sprite cache.
     p1_render: FighterRender,
     /// P2's per-character GPU sprite cache.
@@ -3087,13 +3193,22 @@ fn active_storyboard(
 }
 
 impl MatchRun {
+    /// The inner 1v1 [`Match`] fighting the **active pair** — the lead pair in 1v1 /
+    /// Simul, or whichever fighters are currently front-line in Turns. The
+    /// renderer, HUD, and audio all read the two visible fighters and round state
+    /// from here exactly as for a plain 1v1 match (in [`TeamMode::Single`] it *is*
+    /// the only pair).
+    fn m(&self) -> &Match {
+        self.team.active()
+    }
+
     /// Which overlay is active this frame (the gating decision), reading the live
     /// [`Match`] state and this run's loaded-overlay / done flags.
     fn active_storyboard(&self) -> ActiveStoryboard {
         active_storyboard(
-            self.m.round_state(),
-            self.m.round_number(),
-            self.m.match_winner().is_some(),
+            self.m().round_state(),
+            self.m().round_number(),
+            self.m().match_winner().is_some(),
             self.intro_storyboard_done,
             self.intro_storyboard.is_some(),
             self.ending_storyboard.is_some(),
@@ -3168,7 +3283,12 @@ enum Mode {
 /// `args` are the **positional** args with the `--p1-pal`/`--p2-pal` flags
 /// already stripped (see [`parse_pal_flags`]); `pal` carries those per-player
 /// `.act` palette selections, applied to the two fighters in the match modes.
-fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode {
+fn select_mode(
+    args: &[String],
+    pal: PalSelection,
+    team_mode: TeamMode,
+    renderer: &Renderer,
+) -> Mode {
     match args.len() {
         // <p1.def> <p2.def> [stage.def] → two-player match from two characters.
         n if n >= 3 && is_def_path(&args[1]) && is_def_path(&args[2]) => {
@@ -3178,6 +3298,7 @@ fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode 
                 Path::new(&args[2]),
                 stage,
                 pal,
+                team_mode,
                 renderer,
             )
         }
@@ -3200,7 +3321,7 @@ fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode 
         n if n >= 2 && is_def_path(&args[1]) => {
             let def = Path::new(&args[1]);
             let stage = stage_arg(args, 2);
-            load_match_or_fallback(def, def, stage, pal, renderer)
+            load_match_or_fallback(def, def, stage, pal, team_mode, renderer)
         }
         // <sff> → legacy static sprite.
         2 => match load_sff_sprite(renderer, Path::new(&args[1])) {
@@ -3218,7 +3339,7 @@ fn select_mode(args: &[String], pal: PalSelection, renderer: &Renderer) -> Mode 
                 tracing::info!("No files provided; loading two-KFM match from {DEFAULT_DEF}");
                 // No default stage ships (clean-room / asset-blocked), so the
                 // default match renders over the flat clear color.
-                load_match_or_fallback(&def, &def, None, pal, renderer)
+                load_match_or_fallback(&def, &def, None, pal, team_mode, renderer)
             } else {
                 tracing::info!("No files and no default character; showing test pattern");
                 tracing::info!("Usage: fp-app [p1.def [p2.def]] | <file.sff> [file.air]");
@@ -3312,9 +3433,18 @@ fn load_match_or_fallback(
     p2_def: &Path,
     stage_def: Option<&Path>,
     pal: PalSelection,
+    team_mode: TeamMode,
     renderer: &Renderer,
 ) -> Mode {
-    load_match_with_backdrop(p1_def, p2_def, stage_def, DEFAULT_STAGE_BG, pal, renderer)
+    load_match_with_backdrop(
+        p1_def,
+        p2_def,
+        stage_def,
+        DEFAULT_STAGE_BG,
+        pal,
+        team_mode,
+        renderer,
+    )
 }
 
 /// Like [`load_match_or_fallback`] but with an explicit full-window backdrop
@@ -3328,14 +3458,15 @@ fn load_match_with_backdrop(
     stage_def: Option<&Path>,
     backdrop_path: &str,
     pal: PalSelection,
+    team_mode: TeamMode,
     renderer: &Renderer,
 ) -> Mode {
-    match build_two_player_match(p1_def, p2_def, pal) {
+    match build_team_match(p1_def, p2_def, pal, team_mode) {
         Ok(mut m) => {
             // The shipped common-effects (`fightfx`) set is loaded best-effort
-            // (audit #17): when present, its AIR is installed on the match so
-            // common (`fightfx`) hit-sparks spawn, and its SFF render bundle is
-            // kept for drawing them; absent/bad, common sparks simply don't render
+            // (audit #17): when present, its AIR is installed on the team's inner
+            // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle
+            // is kept for drawing them; absent/bad, common sparks simply don't render
             // (no panic, no regression).
             let common_fx = match load_common_fx() {
                 Some((air, render)) => {
@@ -3367,7 +3498,7 @@ fn load_match_with_backdrop(
             let intro_storyboard = load_character_storyboard(p1_def, StoryboardKind::Intro);
             let ending_storyboard = load_character_storyboard(p1_def, StoryboardKind::Ending);
             Mode::Match(Box::new(MatchRun {
-                m: Box::new(m),
+                team: Box::new(m),
                 p1_render: FighterRender::default(),
                 p2_render: FighterRender::default(),
                 // The default constructor opens a real device when present and
@@ -4030,6 +4161,9 @@ fn build_match_run(
         stage_def,
         backdrop,
         PalSelection::default(),
+        // The in-app menu fights 1v1; the team modes are reachable via the
+        // `--simul`/`--turns` direct-CLI flag (T027).
+        TeamMode::Single,
         renderer,
     ) {
         Mode::Match(run) => Some(*run),
@@ -4281,7 +4415,7 @@ fn pick_p2_input(
 /// the live observation off the run.
 fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
     // Observe BEFORE borrowing the AI mutably (both live on `run`).
-    let obs = run.m.ai_observation_for_p2();
+    let obs = run.team.active().ai_observation_for_p2();
     pick_p2_input(p2_human, run.cpu_ai.as_mut(), obs)
 }
 
@@ -4296,14 +4430,24 @@ fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
 /// overrides the AI on any frame it presses something.
 fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput) {
     let p2_input = resolve_p2_input(run, p2_input);
-    run.m.tick(p1_input, p2_input);
+    // Drive the whole team (in 1v1 / Single this is exactly one pair). The renderer
+    // and audio below read the active pair through `run.m()`.
+    run.team.tick(p1_input, p2_input);
     // AFTER the tick: play this frame's surfaced sound requests, P1 then P2, each
     // from its own decoded-sound cache. Graceful throughout — a silent backend or
     // a missing sound is a no-op.
-    run.p1_audio
-        .play_requests(&mut run.audio, run.m.p1(), run.m.p1_sound_requests());
-    run.p2_audio
-        .play_requests(&mut run.audio, run.m.p2(), run.m.p2_sound_requests());
+    // Field access (`run.team`) keeps the active-match reads disjoint from the
+    // `&mut run.audio` mixer borrow.
+    run.p1_audio.play_requests(
+        &mut run.audio,
+        run.team.active().p1(),
+        run.team.active().p1_sound_requests(),
+    );
+    run.p2_audio.play_requests(
+        &mut run.audio,
+        run.team.active().p2(),
+        run.team.active().p2_sound_requests(),
+    );
 
     // Advance each stage background's auto-scroll offset one tick. The cached GPU
     // sprite size (when already decoded) lets the offset wrap within one tile
@@ -4324,8 +4468,10 @@ fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput
 /// because decoding needs `&Renderer`, which a live `RenderFrame` holds borrowed.
 /// Factored out of the run loop so the Fight screen caches identically.
 fn cache_match_run(run: &mut MatchRun, renderer: &Renderer) {
-    cache_player_sprite(&mut run.p1_render, run.m.p1(), renderer);
-    cache_player_sprite(&mut run.p2_render, run.m.p2(), renderer);
+    // Field access (`run.team`) keeps the active-match read disjoint from the
+    // `&mut run.pN_render` caches passed alongside it.
+    cache_player_sprite(&mut run.p1_render, run.team.active().p1(), renderer);
+    cache_player_sprite(&mut run.p2_render, run.team.active().p2(), renderer);
     cache_effect_sprites(run, renderer);
     cache_explod_sprites(run, renderer);
     if let Some(stage) = run.stage.as_mut() {
@@ -4355,9 +4501,9 @@ fn draw_match_run(
         .map(|s| {
             (
                 s.stage
-                    .camera_follow_x(run.m.p1().pos().x, run.m.p2().pos().x),
+                    .camera_follow_x(run.m().p1().pos().x, run.m().p2().pos().x),
                 s.stage
-                    .camera_follow_y(run.m.p1().pos().y, run.m.p2().pos().y),
+                    .camera_follow_y(run.m().p1().pos().y, run.m().p2().pos().y),
             )
         })
         .unwrap_or((0.0, 0.0));
@@ -4377,14 +4523,42 @@ fn draw_match_run(
     // audit #16): the lower priority is drawn FIRST (behind), the higher OVER it.
     // A tie keeps P1 behind P2 (stable, deterministic order).
     if p1_draws_behind_p2(
-        run.m.p1().character.cur_sprpriority,
-        run.m.p2().character.cur_sprpriority,
+        run.m().p1().character.cur_sprpriority,
+        run.m().p2().character.cur_sprpriority,
     ) {
-        draw_player(frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
-        draw_player(frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
+        draw_player(
+            frame,
+            &run.p1_render,
+            run.m().p1(),
+            camera_x,
+            win_wf,
+            win_hf,
+        );
+        draw_player(
+            frame,
+            &run.p2_render,
+            run.m().p2(),
+            camera_x,
+            win_wf,
+            win_hf,
+        );
     } else {
-        draw_player(frame, &run.p2_render, run.m.p2(), camera_x, win_wf, win_hf);
-        draw_player(frame, &run.p1_render, run.m.p1(), camera_x, win_wf, win_hf);
+        draw_player(
+            frame,
+            &run.p2_render,
+            run.m().p2(),
+            camera_x,
+            win_wf,
+            win_hf,
+        );
+        draw_player(
+            frame,
+            &run.p1_render,
+            run.m().p1(),
+            camera_x,
+            win_wf,
+            win_hf,
+        );
     }
 
     // Hit-spark effects (audit #17), drawn OVER both fighters, under front BG/HUD.
@@ -4395,7 +4569,7 @@ fn draw_match_run(
             p2_render: &run.p2_render,
             common_render: run.common_fx.as_ref().map(|c| &c.render),
         },
-        &run.m,
+        run.m(),
         camera_x,
         win_wf,
         win_hf,
@@ -4407,7 +4581,7 @@ fn draw_match_run(
         frame,
         &run.p1_render,
         &run.p2_render,
-        &run.m,
+        run.m(),
         camera_x,
         win_wf,
         win_hf,
@@ -4420,17 +4594,17 @@ fn draw_match_run(
 
     // Optional Clsn debug overlay (F1).
     if overlay_enabled {
-        draw_player_clsn(frame, run.m.p1(), camera_x, win_wf, win_hf);
-        draw_player_clsn(frame, run.m.p2(), camera_x, win_wf, win_hf);
+        draw_player_clsn(frame, run.m().p1(), camera_x, win_wf, win_hf);
+        draw_player_clsn(frame, run.m().p2(), camera_x, win_wf, win_hf);
     }
 
     // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
     match run.screenpack.as_ref() {
         Some(screenpack) => {
-            let state = match_hud_state(&run.m);
+            let state = match_hud_state(run.m());
             screenpack.draw(frame, &state);
         }
-        None => hud.draw(frame, win_wf, &run.m),
+        None => hud.draw(frame, win_wf, run.m()),
     }
 
     // Intro/ending storyboard overlay (audit #32), drawn LAST and only while one
@@ -4496,6 +4670,9 @@ fn run() -> fp_core::FpResult<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let (pal, args) = parse_pal_flags(&raw_args);
     let (motif_selector, args) = parse_motif_flag(&args);
+    // Team mode (T027): `--simul`/`--turns` select a multi-fighter match on the
+    // direct-CLI path; the default is the classic 1v1 (`TeamMode::Single`).
+    let (team_mode, args) = parse_team_flag(&args);
 
     // The top-level launch route: no file args (or an explicit `menu`) launches
     // the in-app Title menu; a directory argument scans it for a character roster
@@ -4520,7 +4697,7 @@ fn run() -> fp_core::FpResult<()> {
     };
     // The direct-CLI content mode, only built on the Direct route.
     let mut mode = match &route {
-        CliRoute::Direct => Some(select_mode(&args, pal, &renderer)),
+        CliRoute::Direct => Some(select_mode(&args, pal, team_mode, &renderer)),
         CliRoute::Menu | CliRoute::Directory(_) => None,
     };
 
@@ -4799,7 +4976,7 @@ fn run() -> fp_core::FpResult<()> {
         // transition happens once per real frame, after all sub-ticks.
         if let Some(app) = menu_app.as_mut() {
             if let RunScreen::Fight(run) = &app.screen {
-                if run.m.match_winner().is_some() {
+                if run.m().match_winner().is_some() {
                     tracing::info!("Match over; returning to title menu");
                     app.return_to_title();
                 }
@@ -8290,6 +8467,45 @@ mod tests {
         let (sel, rest) = parse_motif_flag(&["fp-app".to_string(), "--motif".to_string()]);
         assert_eq!(sel, None);
         assert_eq!(rest, vec!["fp-app".to_string()]);
+    }
+
+    /// T027: `--simul`/`--turns` select the team mode and are stripped from the
+    /// positional args; with neither flag the default is the classic 1v1
+    /// (`TeamMode::Single`), so the existing CLI is unchanged.
+    #[test]
+    fn parse_team_flag_selects_mode_and_strips_it() {
+        // No flag -> Single, args untouched (1v1 default preserved).
+        let (mode, rest) = parse_team_flag(&["fp-app".to_string(), "kfm.def".to_string()]);
+        assert_eq!(mode, TeamMode::Single);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // --simul -> Simul, flag stripped, the .def passes through.
+        let (mode, rest) = parse_team_flag(&[
+            "fp-app".to_string(),
+            "--simul".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, TeamMode::Simul);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // --turns (case-insensitive) -> Turns, flag stripped.
+        let (mode, rest) = parse_team_flag(&[
+            "fp-app".to_string(),
+            "--TURNS".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, TeamMode::Turns);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // The last team flag wins if both are given (both are stripped).
+        let (mode, rest) = parse_team_flag(&[
+            "fp-app".to_string(),
+            "--simul".to_string(),
+            "--turns".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, TeamMode::Turns);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
     }
 
     /// T045: `resolve_motif_system_def` resolves a directory holding a
