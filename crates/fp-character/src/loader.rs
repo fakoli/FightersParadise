@@ -2461,6 +2461,52 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn merge_cns_shift_jis_state_file_feeds_states_not_skipped() {
+        // T034: a Shift-JIS-encoded CNS state file (non-UTF-8) must still merge
+        // its states into the graph. Before the encoding fix the UTF-8 read
+        // failed, the file was warn-skipped, and a character with only such files
+        // loaded ZERO states (the test-pattern / "no CNS states" failure). The
+        // bytes are synthesized here (clean-room: no external content).
+        let dir = scratch_dir("merge_sjis");
+        let utf8 = "\
+; 必殺技ステート
+[Statedef 0]
+type = S
+anim = 0
+
+[Statedef 1000]
+type = A
+anim = 1000
+
+[State 1000, 波動拳]
+type = HitDef
+trigger1 = AnimElem = 3
+damage = 60, 0
+";
+        let (sjis, _enc, had_errors) = encoding_rs::SHIFT_JIS.encode(utf8);
+        assert!(!had_errors, "fixture must be Shift-JIS-encodable");
+        assert!(
+            std::str::from_utf8(&sjis).is_err(),
+            "Shift-JIS fixture should be invalid UTF-8"
+        );
+        let path = dir.join("sjis.cns");
+        fs::write(&path, &sjis).expect("write Shift-JIS cns");
+
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        merge_cns(&mut states, &path, "sjis.cns");
+
+        // The states were NOT skipped: both statedefs are present and playable.
+        assert!(
+            !states.is_empty(),
+            "Shift-JIS CNS must yield states (no encoding-only skip)"
+        );
+        assert!(states.contains_key(&0));
+        assert!(states.contains_key(&1000));
+        assert_eq!(states[&1000].state_type.as_deref(), Some("A"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // ---- AC2: load_optional never panics on absent / empty / unloadable refs --
 
     #[test]

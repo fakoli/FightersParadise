@@ -14,6 +14,9 @@
 //! - [`def`] — DEF configuration files — simple INI-like key/value config
 //! - [`snd`] — Sound container format — WAV/PCM blobs addressed by (group, sample)
 //! - [`fnt`] — FNT bitmap font format (v1) — embedded PCX glyph strip + glyph map
+//! - [`text`] — legacy-encoding-tolerant text decoding (Shift-JIS, ...) shared by
+//!   the text parsers above so non-UTF-8 community files parse instead of being
+//!   skipped
 
 #![warn(missing_docs)]
 
@@ -25,3 +28,4 @@ pub mod def;
 pub mod fnt;
 pub mod sff;
 pub mod snd;
+pub mod text;

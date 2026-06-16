@@ -45,6 +45,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nom = "7"
 png = "0.17"
+# Legacy text-encoding transcoding for non-UTF-8 community content. Many MUGEN
+# characters ship Shift-JIS-encoded CNS/CMD files; encoding_rs lets the text
+# parsers detect and transcode those to UTF-8 instead of failing the read.
+encoding_rs = "0.8"
 wgpu = "24"
 sdl2 = { version = "0.37", features = ["raw-window-handle"] }
 bytemuck = { version = "1", features = ["derive"] }
