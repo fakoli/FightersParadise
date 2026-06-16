@@ -718,32 +718,28 @@ struct RedirectRelations<'a> {
 ///
 /// The coordinator uses this only to derive each fighter's
 /// [`Character::ai_level`](fp_character::Character::ai_level) at construction — a
-/// human ([`Keyboard`](PlayerDriver::Keyboard)/[`Gamepad`](PlayerDriver::Gamepad))
-/// maps to level `0` and a [`Cpu`](PlayerDriver::Cpu) maps to its
-/// [`AiDifficulty::ai_level`] (`1..=8`). It does **not** itself produce inputs (the
-/// caller still feeds inputs each tick); it is a one-time identity declaration so
-/// the CNS `AILevel` trigger reads the right value. [`Keyboard`](PlayerDriver::Keyboard)
-/// is the [`Default`].
+/// human ([`Human`](PlayerDriver::Human)) maps to level `0` and a
+/// [`Cpu`](PlayerDriver::Cpu) maps to its [`AiDifficulty::ai_level`] (`1..=8`). It
+/// does **not** itself produce inputs (the caller still feeds inputs each tick); it
+/// is a one-time identity declaration so the CNS `AILevel` trigger reads the right
+/// value. [`Human`](PlayerDriver::Human) is the [`Default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerDriver {
-    /// A human at the keyboard. AI level `0`.
+    /// A human player (keyboard or gamepad). AI level `0`.
     #[default]
-    Keyboard,
-    /// A human on a game controller. AI level `0`.
-    Gamepad,
+    Human,
     /// The baseline CPU AI at the given difficulty. AI level `1..=8`.
     Cpu(AiDifficulty),
 }
 
 impl PlayerDriver {
     /// The [`Character::ai_level`](fp_character::Character::ai_level) this driver
-    /// implies: `0` for a human ([`Keyboard`](Self::Keyboard)/[`Gamepad`](Self::Gamepad)),
-    /// or the CPU difficulty's [`AiDifficulty::ai_level`] (`1..=8`) for
-    /// [`Cpu`](Self::Cpu).
+    /// implies: `0` for a [`Human`](Self::Human), or the CPU difficulty's
+    /// [`AiDifficulty::ai_level`] (`1..=8`) for [`Cpu`](Self::Cpu).
     #[must_use]
     pub fn ai_level(self) -> u8 {
         match self {
-            PlayerDriver::Keyboard | PlayerDriver::Gamepad => 0,
+            PlayerDriver::Human => 0,
             PlayerDriver::Cpu(difficulty) => difficulty.ai_level(),
         }
     }
@@ -1847,37 +1843,15 @@ impl Match {
     /// Assigns each player's [`Character::ai_level`](fp_character::Character::ai_level)
     /// from its input [`PlayerDriver`] (T052).
     ///
-    /// A human driver ([`PlayerDriver::Keyboard`]/[`PlayerDriver::Gamepad`]) sets
-    /// level `0`; a [`PlayerDriver::Cpu`] sets the difficulty's
-    /// [`AiDifficulty::ai_level`] (`1..=8`). This is a one-time identity assignment
-    /// (the level never changes mid-match), so the CNS `AILevel` trigger reads the
-    /// correct value for each side. Call it once right after construction (the
-    /// convenience [`Match::with_drivers`] does both). With no call, both fighters
+    /// A human driver ([`PlayerDriver::Human`]) sets level `0`; a
+    /// [`PlayerDriver::Cpu`] sets the difficulty's [`AiDifficulty::ai_level`]
+    /// (`1..=8`). This is a one-time identity assignment (the level never changes
+    /// mid-match), so the CNS `AILevel` trigger reads the correct value for each
+    /// side. Call it once right after construction. With no call, both fighters
     /// keep the human default (`0`), so a bare match is a two-human match.
     pub fn set_drivers(&mut self, p1_driver: PlayerDriver, p2_driver: PlayerDriver) {
         self.p1.character.set_ai_level(p1_driver.ai_level());
         self.p2.character.set_ai_level(p2_driver.ai_level());
-    }
-
-    /// Constructs a match (default round length / best-of-N) and assigns each
-    /// player's [`Character::ai_level`](fp_character::Character::ai_level) from its
-    /// [`PlayerDriver`] (T052).
-    ///
-    /// A convenience wrapper around [`Match::new`] + [`Match::set_drivers`]: the
-    /// human side ends up at level `0` and a CPU side at its difficulty's
-    /// `1..=8` level, so the CNS `AILevel` trigger reads correctly from the first
-    /// tick.
-    #[must_use]
-    pub fn with_drivers(
-        p1: Player,
-        p2: Player,
-        bounds: StageBounds,
-        p1_driver: PlayerDriver,
-        p2_driver: PlayerDriver,
-    ) -> Self {
-        let mut m = Self::new(p1, p2, bounds);
-        m.set_drivers(p1_driver, p2_driver);
-        m
     }
 
     /// Constructs a match (default round length / best-of-N) and immediately seeds
@@ -11781,8 +11755,7 @@ time = 1
     /// `PlayerDriver::ai_level` maps humans to 0 and CPU difficulties to 1..=8.
     #[test]
     fn player_driver_ai_level_mapping() {
-        assert_eq!(PlayerDriver::Keyboard.ai_level(), 0);
-        assert_eq!(PlayerDriver::Gamepad.ai_level(), 0);
+        assert_eq!(PlayerDriver::Human.ai_level(), 0);
         assert_eq!(PlayerDriver::Cpu(AiDifficulty::Easy).ai_level(), 2);
         assert_eq!(PlayerDriver::Cpu(AiDifficulty::Normal).ai_level(), 4);
         assert_eq!(PlayerDriver::Cpu(AiDifficulty::Hard).ai_level(), 7);
@@ -11796,17 +11769,16 @@ time = 1
         assert_eq!(Character::new().ai_level(), 0);
     }
 
-    /// `Match::with_drivers` / `set_drivers` assign each side's `ai_level` from its
-    /// driver: keyboard P1 stays human (0), CPU(Hard) P2 reads 7.
+    /// `Match::set_drivers` assigns each side's `ai_level` from its driver:
+    /// human P1 stays level 0, CPU(Hard) P2 reads 7.
     #[test]
     fn match_with_drivers_sets_ai_level_per_side() {
-        let m = Match::with_drivers(
+        let mut m = Match::new(
             tests_support::make_player(-50.0),
             tests_support::make_player(50.0),
             StageBounds::new(-200.0, 200.0),
-            PlayerDriver::Keyboard,
-            PlayerDriver::Cpu(AiDifficulty::Hard),
         );
+        m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Hard));
         assert_eq!(m.p1().character.ai_level(), 0, "human P1 must be level 0");
         assert_eq!(
             m.p2().character.ai_level(),
@@ -11844,10 +11816,7 @@ time = 1
             StageBounds::new(-200.0, 200.0),
             TeamMode::Simul,
         );
-        tm.set_drivers(
-            PlayerDriver::Keyboard,
-            PlayerDriver::Cpu(AiDifficulty::Normal),
-        );
+        tm.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
 
         // P1 side (human): active lead + reserve both level 0.
         assert_eq!(tm.active_player(Side::P1).character.ai_level(), 0);

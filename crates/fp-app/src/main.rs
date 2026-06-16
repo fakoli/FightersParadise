@@ -3469,10 +3469,7 @@ fn load_match_with_backdrop(
             // (`AiDifficulty::Normal` -> level 4). A second human controller still
             // overrides the CPU's inputs per-frame in `tick_match_run`, but the
             // identity (and thus `AILevel`) is set once here at construction.
-            m.set_drivers(
-                PlayerDriver::Keyboard,
-                PlayerDriver::Cpu(AiDifficulty::Normal),
-            );
+            m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the team's inner
             // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle
