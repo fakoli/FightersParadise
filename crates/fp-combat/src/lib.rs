@@ -358,6 +358,34 @@ impl Default for HitType {
     }
 }
 
+impl HitType {
+    /// Returns MUGEN's `GetHitVar(type)` integer encoding for this hit type:
+    /// `None = 0`, `High = 1`, `Low = 2`, `Trip = 3`.
+    ///
+    /// This is the value the defender's get-hit logic reads via
+    /// `GetHitVar(type)` to know whether it was hit high, low, or tripped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fp_combat::HitType;
+    ///
+    /// assert_eq!(HitType::None.code(), 0);
+    /// assert_eq!(HitType::High.code(), 1);
+    /// assert_eq!(HitType::Low.code(), 2);
+    /// assert_eq!(HitType::Trip.code(), 3);
+    /// ```
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            HitType::None => 0,
+            HitType::High => 1,
+            HitType::Low => 2,
+            HitType::Trip => 3,
+        }
+    }
+}
+
 /// The MUGEN `animtype` / `air.animtype` of a hit — which **get-hit reaction
 /// animation** the defender plays.
 ///

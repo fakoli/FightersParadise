@@ -30,7 +30,7 @@ use fp_combat::{detect_hit, resolve_hit, ClsnBox, ClsnFacing, DefenderState, Hit
 use fp_core::{Rect, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 
-use crate::{Character, Facing, StateType};
+use crate::{Character, Facing, MoveType, StateType};
 
 /// What [`resolve_attack`] decided and applied for one attacker → defender tick.
 ///
@@ -313,7 +313,38 @@ pub fn resolve_attack(
     // Populate the defender's GetHitVars from the resolved outcome before the
     // ChangeState, so the get-hit state's entry expressions can read them.
     let guarded = matches!(outcome.result, HitResult::Guard);
+
+    // GetHitVar(hitcount): the running combo count on this defender (T079). A
+    // combo is "live" while the defender is still in hit-stun — its `move_type`
+    // is `BeingHit` at this point, since the get-hit `change_state` that would
+    // refresh it has not run yet. So a hit that connects while the defender is
+    // already being hit increments the running count; a hit that lands on a
+    // neutral (recovered) defender starts a fresh combo at `1`. A *guarded* hit
+    // never combos, so it neither starts nor extends the count. This is the
+    // single source of truth the HUD combo counter reads (`active_combo_count`).
+    let combo_live = defender.move_type == MoveType::BeingHit;
+    let new_hitcount = if guarded {
+        defender.get_hit_vars.hitcount
+    } else if combo_live {
+        defender.get_hit_vars.hitcount.saturating_add(1)
+    } else {
+        1
+    };
+
+    // GetHitVar(isbound): non-zero while the defender is held by a binder's
+    // `TargetBind` (T079). `bound_time` is set by the engine when a Bind op is
+    // applied and counts down per tick, so a positive value means "still bound".
+    let isbound = i32::from(defender.bound_time != 0);
+
+    // GetHitVar(type): the ground hit-reaction type code of the hit
+    // (`None=0`, `High=1`, `Low=2`, `Trip=3`) — what the defender reads to know
+    // whether it was hit high, low, or tripped (T079).
+    let hit_type = hitdef.ground_type.code();
+
     let gh = &mut defender.get_hit_vars;
+    gh.hitcount = new_hitcount;
+    gh.isbound = isbound;
+    gh.hit_type = hit_type;
     gh.xvel = knockback.x;
     gh.yvel = knockback.y;
     // On a guard there is no fall/airborne arc (yvel and fall are forced to 0), so
@@ -654,6 +685,96 @@ mod tests {
         // Attacker move flagged connected (MoveHit / MoveContact).
         assert!(a.move_connect.hit);
         assert!(a.move_connect.contact());
+    }
+
+    /// T079: the three formerly-unpopulated GetHitVars (`type`, `hitcount`,
+    /// `isbound`) are now written by `resolve_attack`, completing the 15-member
+    /// set. Exercises:
+    /// - `GetHitVar(type)` mirrors the HitDef's `ground.type` code.
+    /// - `GetHitVar(hitcount)` runs a 3-hit combo to `3` (only while the defender
+    ///   stays in hit-stun) and resets to `1` once it recovers to neutral.
+    /// - `GetHitVar(isbound)` is `1` when the defender is target-bound, `0` otherwise.
+    #[test]
+    fn gethitvar_completeness() {
+        let states = HashMap::new();
+
+        // ---- GetHitVar(type): High (default ground.type) -> code 1 ----
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("first hit connects");
+        assert_eq!(
+            d.get_hit_vars.hit_type,
+            fp_combat::HitType::High.code(),
+            "GetHitVar(type) mirrors the HitDef ground.type code"
+        );
+        // First hit on a neutral defender starts a fresh combo at 1, unbound.
+        assert_eq!(d.get_hit_vars.hitcount, 1, "fresh combo starts at 1");
+        assert_eq!(
+            d.get_hit_vars.isbound, 0,
+            "an unbound defender reports isbound = 0"
+        );
+
+        // ---- GetHitVar(hitcount): 3-hit combo while in hit-stun ----
+        // Simulate the defender still being in its get-hit state (the empty
+        // `states` map above means `change_state(5000)` didn't set movetype, so we
+        // pin it explicitly — exactly what a real common1 5000 state does).
+        for expected in [2, 3] {
+            d.move_type = MoveType::BeingHit;
+            // Re-arm a fresh HitDef and clear the prior connection so the next hit
+            // is allowed (hitonce resets between distinct HitDefs).
+            a.active_hitdef = Some(sample_hitdef());
+            a.move_connect = MoveConnect::default();
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states)
+                .expect("combo hit connects while defender is in hit-stun");
+            assert_eq!(
+                d.get_hit_vars.hitcount, expected,
+                "combo count increments while the defender stays in hit-stun"
+            );
+        }
+
+        // Recover to neutral, then a fresh hit restarts the combo at 1.
+        d.move_type = MoveType::Idle;
+        a.active_hitdef = Some(sample_hitdef());
+        a.move_connect = MoveConnect::default();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("post-neutral hit connects");
+        assert_eq!(
+            d.get_hit_vars.hitcount, 1,
+            "combo count resets to 1 once the defender recovers to neutral"
+        );
+
+        // ---- GetHitVar(isbound): set when the defender is bound ----
+        let (mut a2, a2_air) = make_attacker();
+        let (mut d2, d2_air) = make_defender();
+        d2.bound_time = 5; // a binder's TargetBind would set this
+        resolve_attack(&mut a2, &a2_air, &mut d2, &d2_air, &states)
+            .expect("hit on a bound defender connects");
+        assert_eq!(
+            d2.get_hit_vars.isbound, 1,
+            "GetHitVar(isbound) is 1 while the defender is target-bound"
+        );
+
+        // A "bind forever" (-1) also reads as bound.
+        let (mut a3, a3_air) = make_attacker();
+        let (mut d3, d3_air) = make_defender();
+        d3.bound_time = -1;
+        resolve_attack(&mut a3, &a3_air, &mut d3, &d3_air, &states)
+            .expect("hit on a forever-bound defender connects");
+        assert_eq!(
+            d3.get_hit_vars.isbound, 1,
+            "a forever-bind (-1) also reports isbound = 1"
+        );
+
+        // Guarded hits never extend the combo count (sanity: a block isn't a combo).
+        let (mut ag, ag_air) = make_attacker();
+        let (mut dg, dg_air) = make_defender();
+        dg.holding_back = true; // guardflag MA admits a standing block
+        let pre = dg.get_hit_vars.hitcount;
+        resolve_attack(&mut ag, &ag_air, &mut dg, &dg_air, &states).expect("guarded hit connects");
+        assert!(dg.get_hit_vars.guarded != 0, "the defender blocked");
+        assert_eq!(
+            dg.get_hit_vars.hitcount, pre,
+            "a guarded hit does not increment the combo count"
+        );
     }
 
     #[test]
