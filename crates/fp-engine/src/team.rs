@@ -40,7 +40,7 @@ use fp_character::StageView;
 use fp_formats::air::AirFile;
 use serde::{Deserialize, Serialize};
 
-use crate::{Match, MatchInput, Player, PlayerDriver, StageBounds, Winner};
+use crate::{GameMode, Match, MatchInput, Player, PlayerDriver, StageBounds, Winner};
 
 /// How a [`TeamMatch`]'s two rosters are fought.
 ///
@@ -160,6 +160,12 @@ pub struct TeamMatch {
     /// [`TeamMatch::set_common_fx`]; `None` means the inner match has no common set
     /// (the pre-asset behaviour — common sparks are a best-effort skip).
     common_fx: Option<AirFile>,
+    /// The match-time [`GameMode`] (F027 / T066) to install on the inner
+    /// [`Match`]. Kept here so a Turns hand-off rebuild re-seeds the new inner
+    /// match with it. Defaults to [`GameMode::Versus`]; set via
+    /// [`TeamMatch::set_game_mode`]. Training is reachable from the 1v1 menu path
+    /// ([`TeamMode::Single`]); the multi-fighter team modes leave it `Versus`.
+    game_mode: GameMode,
 }
 
 impl TeamMatch {
@@ -225,6 +231,7 @@ impl TeamMatch {
             state: TeamMatchState::InProgress,
             outcome: None,
             common_fx: None,
+            game_mode: GameMode::Versus,
         }
     }
 
@@ -262,6 +269,18 @@ impl TeamMatch {
     pub fn set_common_fx(&mut self, air: AirFile) {
         self.inner_mut().set_common_fx(air.clone());
         self.common_fx = Some(air);
+    }
+
+    /// Sets the match-time [`GameMode`] (F027 / T066) on the inner [`Match`].
+    ///
+    /// Stored on the team match so a Turns hand-off rebuild re-seeds the new inner
+    /// match with the same mode. [`GameMode::Versus`] (the default) keeps the
+    /// normal round flow; [`GameMode::Training`] disables round termination so the
+    /// Lab fight runs indefinitely. Training is used only on the 1v1 menu path
+    /// ([`TeamMode::Single`]); the multi-fighter team modes leave it `Versus`.
+    pub fn set_game_mode(&mut self, mode: GameMode) {
+        self.inner_mut().set_game_mode(mode);
+        self.game_mode = mode;
     }
 
     /// The inner 1v1 [`Match`] (always present between ticks). Panics only if the
@@ -535,6 +554,10 @@ impl TeamMatch {
         // it (and the survivor must not be healed) rather than restart a 1v1 round.
         let mut rebuilt = Match::new(p1_active, p2_active, bounds);
         rebuilt.set_single_round(true);
+        // Re-seed the match-time mode (T066) so a hand-off keeps the team's
+        // configured mode. (Training is 1v1-only, so this is `Versus` in practice
+        // for Turns, but keeping the field authoritative avoids a latent bug.)
+        rebuilt.set_game_mode(self.game_mode);
         // Re-seed the shared common-effects set so hit-sparks keep rendering after a
         // hand-off (the old inner match is consumed; this set is owned by the team).
         if let Some(air) = self.common_fx.clone() {

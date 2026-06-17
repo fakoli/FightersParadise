@@ -301,6 +301,36 @@ impl RoundState {
     }
 }
 
+/// How the round flow behaves — the **match-time mode** selected from the menu
+/// (F027 / T066).
+///
+/// This is a *configuration* flag (not part of the per-tick simulation state):
+/// it changes only which round-flow side-effects fire, never the tick/snapshot
+/// machinery. It is deliberately **not** captured in
+/// [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so the deterministic
+/// record/playback fingerprint is unaffected and the Versus path stays
+/// byte-equal.
+///
+/// - [`GameMode::Versus`] (the default) — the normal best-of-N round flow: the
+///   round timer counts down and expires, and a KO ends the round.
+/// - [`GameMode::Training`] — the Lab: the round timer does **not** expire and a
+///   KO does **not** auto-end the round, so both fighters keep ticking
+///   indefinitely (the dummy-control, infinite-life, and record/playback layers
+///   in F027 build on top of this). The tick and snapshot machinery is otherwise
+///   identical to Versus, so record/playback still works in Training.
+// ponytail: no serde derive — GameMode is a config flag, deliberately excluded
+// from MatchSnapshot and not serialized anywhere. Upgrade path: add
+// `Serialize, Deserialize` if it ever needs to round-trip through a save format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GameMode {
+    /// Normal versus play: the timer expires and a KO decides the round.
+    #[default]
+    Versus,
+    /// Training / the Lab: round termination (timeout + KO) is disabled so the
+    /// fight runs indefinitely; the tick/snapshot machinery is unchanged.
+    Training,
+}
+
 /// Which player won the round, once it reaches [`RoundState::Win`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Winner {
@@ -1726,6 +1756,14 @@ pub struct Match {
     /// fighter. The bare 1v1 [`Match`] leaves it `false`, so 1v1 behaviour is
     /// unchanged.
     single_round: bool,
+    /// The match-time mode (F027 / T066). [`GameMode::Versus`] (the default) runs
+    /// the normal round flow; [`GameMode::Training`] disables round termination
+    /// (timeout + KO) so the fight runs indefinitely in the Lab. A *configuration*
+    /// flag, not simulation state: it is not captured in
+    /// [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so the Versus path stays
+    /// byte-equal. Set with [`Match::set_game_mode`]; read via
+    /// [`Match::game_mode`].
+    game_mode: GameMode,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -1888,6 +1926,7 @@ impl Match {
             effects: Vec::new(),
             common_fx: None,
             single_round: false,
+            game_mode: GameMode::Versus,
         };
         // Drive each fighter through its round-init state (5900) for round 1, the
         // same way [`Match::reset_for_next_round`] does for every later round.
@@ -1953,6 +1992,25 @@ impl Match {
     #[must_use]
     pub fn single_round(&self) -> bool {
         self.single_round
+    }
+
+    /// Sets the match-time [`GameMode`] (F027 / T066).
+    ///
+    /// [`GameMode::Versus`] (the default) runs the normal round flow;
+    /// [`GameMode::Training`] disables round termination (the timer never expires
+    /// and a KO does not auto-end the round) so the fight runs indefinitely in the
+    /// Lab. This is a configuration flag, not simulation state: it is not captured
+    /// in [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so leaving it
+    /// [`GameMode::Versus`] keeps the deterministic record/playback path
+    /// byte-equal.
+    pub fn set_game_mode(&mut self, mode: GameMode) {
+        self.game_mode = mode;
+    }
+
+    /// The match-time [`GameMode`] (F027 / T066). See [`Match::set_game_mode`].
+    #[must_use]
+    pub fn game_mode(&self) -> GameMode {
+        self.game_mode
     }
 
     /// Seeds the two fighters' `random` streams **distinctly** from a single match
@@ -2909,6 +2967,15 @@ impl Match {
                 }
             }
             RoundState::Fight => {
+                // (T066) Training / the Lab disables round termination entirely:
+                // the round timer does not count down (so it never expires) and a
+                // KO does not auto-end the round, so both fighters keep ticking
+                // indefinitely. Only the round-flow side-effects are gated — the
+                // tick/snapshot machinery above is untouched, so record/playback
+                // still works in Training. The Versus path is unchanged.
+                if self.game_mode == GameMode::Training {
+                    return;
+                }
                 if self.timer > 0 {
                     self.timer -= 1;
                 }
@@ -4999,6 +5066,120 @@ time = 1
         }
         assert_eq!(m.round_state(), RoundState::Win);
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    // ---- T066: GameMode::Training round-flow gating -----------------------
+
+    #[test]
+    fn default_game_mode_is_versus() {
+        let m = basic_match();
+        assert_eq!(m.game_mode(), GameMode::Versus);
+        assert_eq!(GameMode::default(), GameMode::Versus);
+    }
+
+    #[test]
+    fn set_game_mode_round_trips() {
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Training);
+        assert_eq!(m.game_mode(), GameMode::Training);
+        m.set_game_mode(GameMode::Versus);
+        assert_eq!(m.game_mode(), GameMode::Versus);
+    }
+
+    #[test]
+    fn training_timer_never_expires() {
+        // A 1-second round (60 frames) would normally time out almost immediately
+        // once the fight begins; in Training the timer must not count down at all.
+        let p1 = tests_support::make_player(-50.0);
+        let p2 = tests_support::make_player(50.0);
+        let mut m = Match::with_round_seconds(p1, p2, StageBounds::new(-200.0, 200.0), 1);
+        m.set_game_mode(GameMode::Training);
+        into_fight(&mut m);
+        let timer_at_fight = m.timer();
+        // Tick well past the 60-frame clock; a Versus match would have timed out.
+        for _ in 0..600 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.round_state(),
+            RoundState::Fight,
+            "Training mode keeps the round in Fight indefinitely"
+        );
+        assert_eq!(
+            m.timer(),
+            timer_at_fight,
+            "Training mode freezes the round timer (no time-over)"
+        );
+        assert_eq!(m.winner(), None, "no winner is decided in Training");
+    }
+
+    #[test]
+    fn training_ko_does_not_end_round() {
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Training);
+        into_fight(&mut m);
+        // Force a lethal life on P2: in Versus this is an immediate KO that ends
+        // the round; in Training the round must stay live.
+        m.p2.character.life = 0;
+        for _ in 0..120 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.round_state(),
+            RoundState::Fight,
+            "a KO does not auto-end the round in Training"
+        );
+        assert_eq!(m.winner(), None, "no round winner is credited in Training");
+    }
+
+    #[test]
+    fn versus_path_unchanged_with_explicit_versus_mode() {
+        // Explicitly setting Versus (the default) must leave the normal round flow
+        // intact: the timer counts down and a KO ends the round.
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Versus);
+        into_fight(&mut m);
+        let timer_at_fight = m.timer();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.timer(),
+            timer_at_fight - 1,
+            "Versus mode still counts the round timer down"
+        );
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.round_state(),
+            RoundState::Ko,
+            "Versus mode still ends the round on a KO"
+        );
+        assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    #[test]
+    fn training_does_not_leak_into_snapshot_fingerprint() {
+        // The Versus and Training matches start from identical state; because
+        // GameMode is a config flag (not captured in MatchSnapshot), their initial
+        // snapshots are byte-identical — Training must not perturb the
+        // deterministic fingerprint.
+        let versus = {
+            let p1 = tests_support::make_player(-50.0);
+            let p2 = tests_support::make_player(50.0);
+            Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+        };
+        let training = {
+            let p1 = tests_support::make_player(-50.0);
+            let p2 = tests_support::make_player(50.0);
+            let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+            m.set_game_mode(GameMode::Training);
+            m
+        };
+        let vb = versus.snapshot().expect("versus snapshot");
+        let tb = training.snapshot().expect("training snapshot");
+        assert_eq!(
+            vb, tb,
+            "GameMode must not leak into the MatchSnapshot fingerprint"
+        );
     }
 
     // ---- Audit #21: RoundState / GameTime / MatchOver threaded to triggers ----
