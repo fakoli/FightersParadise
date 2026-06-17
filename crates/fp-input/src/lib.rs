@@ -14,7 +14,7 @@ pub mod display;
 pub mod state;
 pub mod synth;
 
-pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
+pub use ai::{AiDifficulty, AiObservation, AiTuning, BehaviorMode, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
 pub use command::{
     compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,

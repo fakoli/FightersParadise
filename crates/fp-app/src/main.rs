@@ -10404,11 +10404,7 @@ mod tests {
             x: true,
             ..MatchInput::none()
         };
-        let got = pick_p2_input(
-            human,
-            Some(&mut ai),
-            fp_input::AiObservation { opponent_dx: 5.0 },
-        );
+        let got = pick_p2_input(human, Some(&mut ai), fp_input::AiObservation::at(5.0));
         assert_eq!(got, human, "a pressed human input must override the AI");
     }
 
@@ -10423,7 +10419,7 @@ mod tests {
         let got = pick_p2_input(
             MatchInput::none(),
             Some(&mut ai),
-            fp_input::AiObservation { opponent_dx: 300.0 },
+            fp_input::AiObservation::at(300.0),
         );
         assert!(
             got.right && !got.left,
@@ -10433,11 +10429,7 @@ mod tests {
 
     #[test]
     fn pick_p2_input_no_ai_idle_human_stays_idle() {
-        let got = pick_p2_input(
-            MatchInput::none(),
-            None,
-            fp_input::AiObservation { opponent_dx: 5.0 },
-        );
+        let got = pick_p2_input(MatchInput::none(), None, fp_input::AiObservation::at(5.0));
         assert_eq!(got, MatchInput::none(), "no AI + idle human => P2 idle");
     }
 

@@ -1603,6 +1603,72 @@ impl Player {
     }
 }
 
+/// Builds the [`AiObservation`] a CPU brain controlling `me` sees of its
+/// `opponent` this frame, populating both the relative position and the
+/// situational flags the teaching [`fp_input::BehaviorMode`]s react to (T070).
+///
+/// The flags are derived from the live characters:
+/// - `opponent_attacking` — opponent's `MoveType` is `Attack` (it is committed to
+///   an offensive state, the cue [`PureBlocker`](fp_input::BehaviorMode::PureBlocker)
+///   guards against);
+/// - `opponent_airborne` — opponent's `StateType` is `Air` (the anti-air cue for
+///   [`ReactiveDP`](fp_input::BehaviorMode::ReactiveDP));
+/// - `opponent_recovering` — opponent is in attack recovery: its current move is
+///   past its active frames (the punish window for
+///   [`WhiffPunisher`](fp_input::BehaviorMode::WhiffPunisher));
+/// - `self_waking_up` — `me` is in the engine-common downed/getup window
+///   (states `5120`/`5160`), the wakeup-reversal cue for `ReactiveDP`.
+///
+/// All reads are cheap field reads; the function never mutates and never panics.
+fn observe(me: &Player, opponent: &Player) -> AiObservation {
+    let opp = &opponent.character;
+    AiObservation {
+        opponent_dx: opponent.pos().x - me.pos().x,
+        opponent_attacking: opp.move_type == MoveType::Attack,
+        opponent_airborne: opp.state_type == StateType::Air,
+        opponent_recovering: opponent_is_recovering(opponent),
+        self_waking_up: is_waking_up(&me.character),
+    }
+}
+
+/// Whether `p` is in the **recovery** phase of an attack — committed to an attack
+/// state (`MoveType = A`) but past its active frames, so it can be whiff-punished.
+///
+/// Best-effort from the per-move [`MoveFrameData`] of the current animation: if
+/// the action carries no countable attack frame (not really an attack) or the
+/// action is missing, it is not treated as recovering. Conservatively avoids
+/// false positives so the punisher only strikes a genuinely committed, recovering
+/// opponent.
+fn opponent_is_recovering(p: &Player) -> bool {
+    let c = &p.character;
+    if c.move_type != MoveType::Attack {
+        return false;
+    }
+    let Some(action) = p.loaded.air.action(c.anim) else {
+        return false;
+    };
+    let Some(fd) = MoveFrameData::compute(action) else {
+        return false;
+    };
+    // Elapsed ticks within the current action = ticks of all elements before the
+    // current one + ticks spent in the current element.
+    let prior_ticks: i32 = action
+        .frames
+        .iter()
+        .take(c.anim_elem.max(0) as usize)
+        .map(|f| f.ticks.max(0))
+        .sum();
+    let elapsed = prior_ticks.saturating_add(c.anim_elem_time.max(0));
+    elapsed >= fd.startup.saturating_add(fd.active)
+}
+
+/// Whether `c` is in the engine-common downed/getup window (waking up), the cue
+/// for a wakeup reversal. Matches the common1 lying-down (`5120`) and get-up
+/// (`5160`) states.
+fn is_waking_up(c: &Character) -> bool {
+    matches!(c.state_no, 5120 | 5160)
+}
+
 /// Converts an [`fp_character::Facing`] to the [`fp_physics::Facing`] the push /
 /// clamp primitives expect (they are distinct types in distinct crates).
 fn to_phys_facing(facing: Facing) -> PhysFacing {
@@ -2248,9 +2314,7 @@ impl Match {
     /// glue that lets an idle P2 slot be driven by the baseline AI.
     #[must_use]
     pub fn ai_observation_for_p2(&self) -> AiObservation {
-        AiObservation {
-            opponent_dx: self.p1.pos().x - self.p2.pos().x,
-        }
+        observe(&self.p2, &self.p1)
     }
 
     /// The [`fp_input::AiObservation`] a CPU AI controlling **player 1** sees this
@@ -2258,9 +2322,7 @@ impl Match {
     /// [`Match::ai_observation_for_p2`], for an AI-vs-AI / demo match).
     #[must_use]
     pub fn ai_observation_for_p1(&self) -> AiObservation {
-        AiObservation {
-            opponent_dx: self.p2.pos().x - self.p1.pos().x,
-        }
+        observe(&self.p1, &self.p2)
     }
 
     /// Consumes the match and returns its two [`Player`]s as `(p1, p2)`, dropping
