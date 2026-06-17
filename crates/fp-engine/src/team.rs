@@ -283,12 +283,6 @@ impl TeamMatch {
         self.game_mode = mode;
     }
 
-    /// The match-time [`GameMode`] (F027 / T066). See [`TeamMatch::set_game_mode`].
-    #[must_use]
-    pub fn game_mode(&self) -> GameMode {
-        self.game_mode
-    }
-
     /// The inner 1v1 [`Match`] (always present between ticks). Panics only if the
     /// match was left taken out across a tick boundary, which the hand-off path
     /// never does — it takes and re-installs within a single `tick`.

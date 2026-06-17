@@ -318,7 +318,10 @@ impl RoundState {
 ///   indefinitely (the dummy-control, infinite-life, and record/playback layers
 ///   in F027 build on top of this). The tick and snapshot machinery is otherwise
 ///   identical to Versus, so record/playback still works in Training.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+// ponytail: no serde derive — GameMode is a config flag, deliberately excluded
+// from MatchSnapshot and not serialized anywhere. Upgrade path: add
+// `Serialize, Deserialize` if it ever needs to round-trip through a save format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GameMode {
     /// Normal versus play: the timer expires and a KO decides the round.
     #[default]
