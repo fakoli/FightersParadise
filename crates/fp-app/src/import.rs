@@ -44,16 +44,8 @@ use serde::Serialize;
 
 /// The kind of repair applied to a single CNS/CMD line.
 ///
-/// Each variant corresponds to exactly one of the parser's recoverable
-/// `CNS:`-warning shapes; the overlay rewrites the line so that shape no longer
-/// warns on re-parse.
-// Several variants below (`PartialSff`/`PartialSnd`/`Transcoded`/`AiVarHint`, and
-// the `JunkColumn`/`DeadFrame` aliases for the AIR-overlay categories) are the
-// stable forward model T082 defines for the import pipeline; the binary does not
-// yet construct every one (later F034 passes do), so they are dead in the bin
-// target only. They are part of the deliberate public model, not accidental dead
-// code — keep them.
-#[allow(dead_code)]
+/// Each variant corresponds to one recoverable problem the import classifies —
+/// the CNS/CMD text-overlay shapes plus the character-graph findings T082 adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RepairKind {
     /// A non-blank line with no `=` that is not a section header (e.g. a stray
@@ -76,16 +68,10 @@ pub enum RepairKind {
     /// trigger would never fire / the parameter reads `0`; a human must look —
     /// recorded under [`Tier::Flagged`].
     TruncatedExpr,
-    /// A frame line carried a column with trailing junk (e.g. the `2..A` ticks
-    /// column); the column was salvaged to its leading integer. [`Tier::Repaired`].
-    JunkColumn,
     /// A well-formed, parseable header that uses a colon as its number/label
     /// separator (e.g. `[State 9999: Foo]`). The colon is rewritten to a comma
     /// **in the header only**.
     ColonHeader,
-    /// A dead AIR frame (sprite absent / degenerate) that `--prune` removed from
-    /// the overlay. [`Tier::Repaired`].
-    DeadFrame,
     /// An SFF sprite with degenerate `0×0` dimensions that is **not** linked to a
     /// real sprite (it owns no pixels and renders nothing). An advisory: the
     /// engine already treats a missing/empty sprite as invisible, so it is recorded
@@ -94,17 +80,6 @@ pub enum RepairKind {
     /// An AIR frame references a `(group, image)` the SFF does not contain (the
     /// frame would draw nothing). Recorded under [`Tier::Flagged`].
     MissingSpriteRef,
-    /// An SFF that parsed only partially (a recoverable structural problem the
-    /// loader skipped past). [`Tier::Flagged`].
-    PartialSff,
-    /// A SND that parsed only partially. [`Tier::Flagged`].
-    PartialSnd,
-    /// Content that was transcoded from a non-UTF-8 encoding (e.g. Shift-JIS) on
-    /// load. An advisory note. [`Tier::Advisory`].
-    Transcoded,
-    /// A heuristic hint that an AI-difficulty `var(...)` slot may need attention.
-    /// An advisory note. [`Tier::Advisory`].
-    AiVarHint,
 }
 
 impl RepairKind {
@@ -119,15 +94,9 @@ impl RepairKind {
             RepairKind::EmptyKey => "EmptyKey",
             RepairKind::EmptyExpr => "EmptyExpr",
             RepairKind::TruncatedExpr => "TruncatedExpr",
-            RepairKind::JunkColumn => "JunkColumn",
             RepairKind::ColonHeader => "ColonHeader",
-            RepairKind::DeadFrame => "DeadFrame",
             RepairKind::ZeroDimSprite => "ZeroDimSprite",
             RepairKind::MissingSpriteRef => "MissingSpriteRef",
-            RepairKind::PartialSff => "PartialSff",
-            RepairKind::PartialSnd => "PartialSnd",
-            RepairKind::Transcoded => "Transcoded",
-            RepairKind::AiVarHint => "AiVarHint",
         }
     }
 
@@ -141,16 +110,9 @@ impl RepairKind {
             | RepairKind::MalformedHeader
             | RepairKind::EmptyKey
             | RepairKind::EmptyExpr
-            | RepairKind::JunkColumn
-            | RepairKind::ColonHeader
-            | RepairKind::DeadFrame => Tier::Repaired,
-            RepairKind::TruncatedExpr
-            | RepairKind::MissingSpriteRef
-            | RepairKind::PartialSff
-            | RepairKind::PartialSnd => Tier::Flagged,
-            RepairKind::ZeroDimSprite | RepairKind::Transcoded | RepairKind::AiVarHint => {
-                Tier::Advisory
-            }
+            | RepairKind::ColonHeader => Tier::Repaired,
+            RepairKind::TruncatedExpr | RepairKind::MissingSpriteRef => Tier::Flagged,
+            RepairKind::ZeroDimSprite => Tier::Advisory,
         }
     }
 }
@@ -851,10 +813,6 @@ impl ImportReport {
             "DeadFrame",
             "ZeroDimSprite",
             "MissingSpriteRef",
-            "PartialSff",
-            "PartialSnd",
-            "Transcoded",
-            "AiVarHint",
         ];
         CATS.iter()
             .filter_map(|cat| {
@@ -971,24 +929,6 @@ impl ImportReport {
         self.entries.iter().filter(|e| e.kind == cat).count()
     }
 
-    /// Folds a single [`CoreRepair`] into the report (its tier comes from the
-    /// [`RepairKind`]). Re-sorts so the report stays canonical.
-    ///
-    /// Part of the import-core ingestion API; later F034 passes (SFF/SND partial
-    /// parse, transcode notes) feed repairs through here.
-    #[allow(dead_code)]
-    pub fn add_repair(&mut self, repair: CoreRepair) {
-        self.entries.push(ReportEntry {
-            file: repair.file,
-            line_no: repair.line_no,
-            tier: repair.kind.tier(),
-            kind: repair.kind.category().to_string(),
-            original: repair.original,
-            replacement: repair.replacement,
-        });
-        self.resort();
-    }
-
     /// Builds a fresh import report for a loaded character, attributing every
     /// repair to `file` (the user-facing `.def` path).
     ///
@@ -1081,32 +1021,6 @@ impl ImportReport {
 
         self.resort();
     }
-}
-
-/// A single repair the import collected, in the import-core (`T082`) shape.
-///
-/// This is the input form for [`ImportReport::add_repair`]; the report stores it
-/// internally as a [`ReportEntry`] (whose `tier` is derived from the kind). It is
-/// the documented model shape: `file`, an optional source `line_no`, the
-/// [`RepairKind`], the `original` text, and an optional `replacement`.
-///
-/// Part of the import-core public model; populated by later F034 passes and by
-/// callers feeding [`ImportReport::add_repair`].
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreRepair {
-    /// The source file the repair was found in (as the user named it on the CLI).
-    pub file: String,
-    /// 1-based source line number, or `None` for a finding with no single owning
-    /// line (e.g. a whole-character graph-walk finding).
-    pub line_no: Option<usize>,
-    /// The repair category.
-    pub kind: RepairKind,
-    /// The original text / a description of what was found.
-    pub original: String,
-    /// The replacement text, when the repair substituted one; `None` for a drop,
-    /// a flag, or an advisory.
-    pub replacement: Option<String>,
 }
 
 #[cfg(test)]
@@ -1785,9 +1699,8 @@ type = Null
 
     #[test]
     fn import_core_repair_kind_model_is_complete_and_stable() {
-        // Every RepairKind in the T082 model maps to a stable category label and a
-        // tier. Asserting the full set here both documents the contract and keeps
-        // the public enum exercised (no variant is dead in the model).
+        // Every RepairKind maps to a stable category label and a tier. Asserting
+        // the full set documents the contract and keeps the public enum exercised.
         let all = [
             (RepairKind::StrayLine, "StrayLine", Tier::Repaired),
             (
@@ -1798,58 +1711,18 @@ type = Null
             (RepairKind::EmptyKey, "EmptyKey", Tier::Repaired),
             (RepairKind::EmptyExpr, "EmptyExpr", Tier::Repaired),
             (RepairKind::TruncatedExpr, "TruncatedExpr", Tier::Flagged),
-            (RepairKind::JunkColumn, "JunkColumn", Tier::Repaired),
             (RepairKind::ColonHeader, "ColonHeader", Tier::Repaired),
-            (RepairKind::DeadFrame, "DeadFrame", Tier::Repaired),
             (RepairKind::ZeroDimSprite, "ZeroDimSprite", Tier::Advisory),
             (
                 RepairKind::MissingSpriteRef,
                 "MissingSpriteRef",
                 Tier::Flagged,
             ),
-            (RepairKind::PartialSff, "PartialSff", Tier::Flagged),
-            (RepairKind::PartialSnd, "PartialSnd", Tier::Flagged),
-            (RepairKind::Transcoded, "Transcoded", Tier::Advisory),
-            (RepairKind::AiVarHint, "AiVarHint", Tier::Advisory),
         ];
-        let mut report = ImportReport::new();
         for (kind, label, tier) in all {
             assert_eq!(kind.category(), label, "stable category label");
             assert_eq!(kind.tier(), tier, "tier mapping for {label}");
-            report.add_repair(CoreRepair {
-                file: "model.def".to_string(),
-                line_no: None,
-                kind,
-                original: label.to_string(),
-                replacement: None,
-            });
-            assert_eq!(report.count_kind(kind), 1, "{label} counted once");
         }
-        // Four kinds are flags (TruncatedExpr, MissingSpriteRef, PartialSff, PartialSnd).
-        assert!(report.has_flags());
-    }
-
-    #[test]
-    fn import_core_add_repair_derives_tier_from_kind() {
-        let mut report = ImportReport::new();
-        report.add_repair(CoreRepair {
-            file: "x.cns".to_string(),
-            line_no: Some(3),
-            kind: RepairKind::Transcoded,
-            original: "shift-jis content".to_string(),
-            replacement: None,
-        });
-        report.add_repair(CoreRepair {
-            file: "x.sff".to_string(),
-            line_no: None,
-            kind: RepairKind::PartialSff,
-            original: "truncated trailer".to_string(),
-            replacement: None,
-        });
-        // Transcoded is advisory (no flag); PartialSff is a flag.
-        assert!(report.has_flags(), "PartialSff is a flag");
-        assert_eq!(report.count_kind(RepairKind::Transcoded), 1);
-        assert_eq!(report.count_kind(RepairKind::PartialSff), 1);
     }
 
     /// Asset-gated: the shipped `assets/trainingdummy` imports with zero Flagged.
