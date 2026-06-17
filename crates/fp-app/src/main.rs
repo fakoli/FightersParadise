@@ -5312,7 +5312,10 @@ fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
     {
         let active = run.team.active();
         let opponent_on_right = obs.opponent_on_right();
-        let was_hit = active.p2_was_hit();
+        // Use the sticky per-combo latch (not the per-tick `p2_was_hit` edge):
+        // BlockAfterFirst must keep guarding across the non-damage frames between
+        // a combo's hits, not drop its guard on the gap and eat the next hit.
+        let was_hit = active.p2_hit_latched();
         return dummy_input(run.dummy_mode, opponent_on_right, was_hit, run.dummy_tick);
     }
     pick_p2_input(p2_human, run.cpu_ai.as_mut(), obs)

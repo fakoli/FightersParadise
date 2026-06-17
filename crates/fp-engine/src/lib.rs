@@ -1783,11 +1783,19 @@ pub struct Match {
     /// When `true`, P2's `power` is restored to `power_max` after each tick.
     p2_infinite_meter: bool,
     /// Whether P2 took a connecting hit on the most recent [`Match::tick`]
-    /// (recomputed every tick). Read via [`Match::p2_was_hit`]; the training
-    /// dummy ([`DummyMode::BlockAfterFirst`], always P2) latches on it to start
-    /// guarding once the first hit lands. P1 is always the controller, so no
-    /// symmetric P1 signal is tracked.
+    /// (recomputed every tick — true ONLY on a frame P2's life dropped). Read via
+    /// [`Match::p2_was_hit`]. A per-tick edge signal, NOT a combo latch; the
+    /// training dummy uses [`Match::p2_hit_latched`] instead. P1 is always the
+    /// controller, so no symmetric P1 signal is tracked.
     p2_was_hit: bool,
+    /// Sticky "P2 has been hit this combo" latch (F027 / T067). Set the first
+    /// frame P2's life drops and stays set across the non-damage frames between a
+    /// combo's hits; cleared only on [`Match::reset_positions`] and at the start
+    /// of each round. Read via [`Match::p2_hit_latched`]; the training dummy
+    /// ([`DummyMode::BlockAfterFirst`], always P2) latches on it to start guarding
+    /// once the first hit lands and keep guarding the rest of the combo — unlike
+    /// the per-tick [`Match::p2_was_hit`], which goes false on combo gaps.
+    p2_hit_latched: bool,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -1956,6 +1964,7 @@ impl Match {
             p1_infinite_meter: false,
             p2_infinite_meter: false,
             p2_was_hit: false,
+            p2_hit_latched: false,
         };
         // Drive each fighter through its round-init state (5900) for round 1, the
         // same way [`Match::reset_for_next_round`] does for every later round.
@@ -2096,6 +2105,20 @@ impl Match {
         self.p2_was_hit
     }
 
+    /// Whether player 2 has been hit at least once in the current combo /
+    /// since the last reset (F027 / T067). Unlike [`Match::p2_was_hit`] (a
+    /// per-tick edge that goes false on the non-damage frames between a combo's
+    /// hits), this is a **sticky latch**: it is set the first frame P2's life
+    /// drops and stays set until [`Match::reset_positions`] or the next round.
+    /// The training dummy's [`DummyMode::BlockAfterFirst`] reads this so it keeps
+    /// guarding the rest of a multi-hit combo instead of dropping its guard on the
+    /// gap between active frames and eating the next hit. P1 is always the
+    /// controller, so there is no P1 signal.
+    #[must_use]
+    pub fn p2_hit_latched(&self) -> bool {
+        self.p2_hit_latched
+    }
+
     /// Resets both fighters to their round-start positions, facing, full life, and
     /// neutral stand **without** advancing the round counter or wins — the training
     /// "reset position" key (F027 / T067).
@@ -2122,6 +2145,7 @@ impl Match {
         self.p1_sound_requests.clear();
         self.p2_sound_requests.clear();
         self.p2_was_hit = false;
+        self.p2_hit_latched = false;
 
         tracing::info!("training: reset fighters to start positions");
     }
@@ -2850,6 +2874,10 @@ impl Match {
         // before the heal so `BlockAfterFirst` still latches even with infinite
         // life on, and the heal then masks the damage as intended.
         self.p2_was_hit = self.p2.character.life < p2_life_before;
+        // Sticky combo latch: once set, stays set across the non-damage frames
+        // between a combo's hits (cleared only on reset / round start), so the
+        // dummy keeps guarding the rest of a multi-hit combo.
+        self.p2_hit_latched |= self.p2_was_hit;
         self.apply_training_clamps();
 
         // (3c) Advance the live hit-spark effects (audit #17): step each spark's
@@ -3288,6 +3316,11 @@ impl Match {
         // Live explods do not survive a round boundary either (T033).
         self.p1.explods.clear();
         self.p2.explods.clear();
+
+        // Clear the training "was hit" signal + combo latch so the dummy starts
+        // the new round un-hit (BlockAfterFirst stands again until the first hit).
+        self.p2_was_hit = false;
+        self.p2_hit_latched = false;
 
         // Drive each fighter through its round-init state (5900) so its authored
         // convergence runs on top of the field reset just applied (see
@@ -12857,7 +12890,7 @@ time = 1
         // Tick 1: not yet hit, so BlockAfterFirst stands and eats the first hit.
         arm_p1_punch(&mut m);
         let on_right = m.ai_observation_for_p2().opponent_on_right();
-        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_was_hit(), 0);
+        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 0);
         assert_eq!(in1, MatchInput::none(), "stands before the first hit lands");
         m.tick(MatchInput::none(), in1);
         assert_eq!(
@@ -12865,19 +12898,73 @@ time = 1
             start - 30,
             "the first hit lands cleanly (full 30 damage)"
         );
-        assert!(m.p2_was_hit(), "the first hit latches the was-hit signal");
+        assert!(m.p2_hit_latched(), "the first hit sets the combo latch");
 
         // Tick 2: now hit — BlockAfterFirst guards, so the second hit is chip only.
         let after_first = m.p2().life();
         arm_p1_punch(&mut m);
         let on_right = m.ai_observation_for_p2().opponent_on_right();
-        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_was_hit(), 1);
+        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 1);
         assert!(in2.left || in2.right, "guards after the first hit");
         m.tick(MatchInput::none(), in2);
         assert_eq!(
             m.p2().life(),
             after_first - 5,
             "the second hit is blocked: guard chip only"
+        );
+    }
+
+    #[test]
+    fn block_after_first_keeps_guarding_across_a_combo_gap() {
+        // Regression for the per-tick-vs-latch bug: real combos have non-damage
+        // frames between active frames. The dummy must keep guarding across that
+        // gap (driven by the sticky `p2_hit_latched`), not drop its guard the
+        // instant `p2_was_hit` (per-tick) goes false and eat the next hit fully.
+        let mut m = dummy_match();
+        let start = m.p2().life();
+
+        // Hit 1 lands cleanly (BlockAfterFirst stands until first hit).
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 0);
+        assert_eq!(in1, MatchInput::none(), "stands before the first hit lands");
+        m.tick(MatchInput::none(), in1);
+        assert_eq!(m.p2().life(), start - 30, "first hit lands full");
+        assert!(m.p2_hit_latched(), "combo latch is set after the first hit");
+
+        // Combo GAP: a few non-damage frames (no active HitDef on P1). The per-tick
+        // signal goes false, but the latch must stay set and the dummy keep guarding.
+        let after_first = m.p2().life();
+        for tick in 1..4u64 {
+            m.p1.character.active_hitdef = None;
+            m.p1.character.move_type = MoveType::Idle;
+            let on_right = m.ai_observation_for_p2().opponent_on_right();
+            let gap_in = dummy_input(
+                DummyMode::BlockAfterFirst,
+                on_right,
+                m.p2_hit_latched(),
+                tick,
+            );
+            assert!(
+                gap_in.left || gap_in.right,
+                "STILL guarding on a non-damage combo-gap frame (latch holds)"
+            );
+            m.tick(MatchInput::none(), gap_in);
+            assert!(!m.p2_was_hit(), "per-tick signal is false on a gap frame");
+            assert!(m.p2_hit_latched(), "combo latch survives the gap");
+            assert_eq!(m.p2().life(), after_first, "no damage during the gap");
+        }
+
+        // Hit 2 arrives after the gap — the still-raised guard blocks it (chip only).
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 4);
+        assert!(in2.left || in2.right, "guards the post-gap hit");
+        m.tick(MatchInput::none(), in2);
+        assert_eq!(
+            m.p2().life(),
+            after_first - 5,
+            "post-gap hit is blocked (guard chip only), not eaten full"
         );
     }
 
@@ -12940,6 +13027,7 @@ time = 1
         m.p1.character.pos = Vec2::new(-150.0, 0.0);
         m.p2.character.pos = Vec2::new(150.0, 0.0);
         m.p2_was_hit = true;
+        m.p2_hit_latched = true;
 
         m.reset_positions();
 
@@ -12950,7 +13038,8 @@ time = 1
             m.p2().character.life_max,
             "reset restores full life"
         );
-        assert!(!m.p2_was_hit(), "reset clears the was-hit latch");
+        assert!(!m.p2_was_hit(), "reset clears the was-hit signal");
+        assert!(!m.p2_hit_latched(), "reset clears the combo latch");
         assert_eq!(
             m.round_number(),
             round_before,
