@@ -70,6 +70,7 @@
 
 pub mod combat;
 pub mod executor;
+pub mod framedata;
 pub mod identity;
 pub mod invuln;
 pub mod loader;
@@ -80,6 +81,7 @@ pub use executor::{
     ExplodOp, ExplodPosType, ExplodSpawn, FreezeKind, FreezeRequest, HelperPosType, HelperSpawn,
     ProjectileSpawn, SoundRequest, TargetOp, TickReport,
 };
+pub use framedata::{frame_advantage, MoveFrameData};
 pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
 pub use snapshot::CharacterSnapshot;

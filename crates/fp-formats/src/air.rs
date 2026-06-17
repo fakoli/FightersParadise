@@ -77,6 +77,18 @@ pub struct AnimFrame {
     pub clsn2: Vec<Rect>,
 }
 
+impl AnimFrame {
+    /// Returns `true` if this frame carries at least one attack box (Clsn1),
+    /// i.e. it is an *active* attack frame.
+    ///
+    /// Used by frame-data analysis to delimit a move's active window (the
+    /// contiguous run of attack frames between startup and recovery).
+    #[must_use]
+    pub fn is_attack(&self) -> bool {
+        !self.clsn1.is_empty()
+    }
+}
+
 /// Which transforms a frame interpolates from the previous frame.
 ///
 /// MUGEN AIR allows standalone `Interpolate Offset` / `Interpolate Scale` /
