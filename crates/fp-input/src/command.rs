@@ -1181,6 +1181,99 @@ mod tests {
         );
     }
 
+    /// T058 acceptance: `~NN`/`/NN` charge tokens parse the digit run into
+    /// `min_hold` instead of gluing it onto the token and hitting the
+    /// `unknown command token` error.
+    ///
+    /// Covers every acceptance criterion of T058:
+    /// - `~60$B` → a `Release` direction element with `min_hold == 60` on `$B`.
+    /// - `~D` (no digits) keeps `min_hold == 0` (negative-edge behaviour intact).
+    /// - `command = ~60$B, F, x` compiles to a real (non-empty) element list, so
+    ///   it never falls back to the const-0 "unknown command token" path.
+    #[test]
+    fn parse_charge_token() {
+        // `~60$B` parses to a charged Release on `$B` carrying `min_hold == 60`.
+        assert_eq!(
+            compile_command("~60$B").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+
+        // `~D` (release, no digits) keeps `min_hold == 0`.
+        assert_eq!(
+            compile_command("~D").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::D,
+                modifier: InputModifier::Release,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+
+        // The `/NN` (hold) form parses its digit run too, e.g. `/40F`.
+        assert_eq!(
+            compile_command("/40F").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Hold,
+                detect: false,
+                strict: false,
+                min_hold: 40,
+            }
+        );
+
+        // A charge on a button (`~30a`) parses its digits too.
+        assert_eq!(
+            compile_command("~30a").unwrap()[0],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Release,
+                strict: false,
+                min_hold: 30,
+            }
+        );
+
+        // The full `command = ~60$B, F, x` compiles without the
+        // `unknown command token` error: three elements, none a fallback.
+        let cmd = compile_command("~60$B, F, x").unwrap();
+        assert_eq!(cmd.len(), 3, "~60$B, F, x must compile to three elements");
+        assert_eq!(
+            cmd[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+        assert_eq!(
+            cmd[1],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+        assert_eq!(
+            cmd[2],
+            CommandElement::Button {
+                button: Button::X,
+                modifier: InputModifier::Press,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+    }
+
     /// Builds a hardware Back direction (logical Back when facing right).
     fn back_dir() -> Direction {
         Direction {
