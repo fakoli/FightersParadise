@@ -81,12 +81,6 @@ pub fn cache_stats() -> (u64, u64) {
     )
 }
 
-/// Resets the process-wide cache hit/miss counters to zero (test helper).
-pub fn reset_cache_stats() {
-    CACHE_HITS.store(0, Ordering::Relaxed);
-    CACHE_MISSES.store(0, Ordering::Relaxed);
-}
-
 /// One referenced source input: its path (as written in the `.def`, used as the
 /// stable sort key) and the sha256 of its current bytes.
 ///
@@ -232,7 +226,7 @@ impl IrCacheHeader {
 
 /// What gets bincode-encoded into a `.fpir` blob: the header followed by the
 /// caller's payload `T`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope<T> {
     header: IrCacheHeader,
     payload: T,

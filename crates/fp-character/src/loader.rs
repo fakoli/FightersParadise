@@ -544,8 +544,10 @@ impl LoadedCharacter {
         let ir_cache =
             workspace_root_for(def_path).and_then(|root| crate::ir_cache::IrCache::resolve(&root));
         if let Some(cache) = ir_cache.as_ref() {
-            // Probe for the manifest payload. A hit records that the inputs are
-            // unchanged; a miss (cold/corrupt/stale) falls through to full load.
+            // ponytail: read-and-discard probe. Ceiling: no load speedup today —
+            // the manifest can't replace the parse until the compiled-IR graph is
+            // serde-serializable (T086). Upgrade path: when T086 lands, return the
+            // deserialized IR here and short-circuit the parse below.
             let _: Option<crate::ir_cache::CachedManifest> = cache.read(&cache_key);
         }
 
