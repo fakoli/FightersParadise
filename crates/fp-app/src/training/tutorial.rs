@@ -40,14 +40,10 @@ pub enum DummyMode {
     /// Dummy stands idle and takes hits (default).
     #[default]
     Stand,
-    /// Dummy crouches (low guard / low-hit practice).
-    Crouch,
     /// Dummy jumps repeatedly (anti-air practice).
     Jump,
     /// Dummy guards all incoming attacks (block-string / RPS practice).
     GuardAll,
-    /// Dummy crouch-guards (low-block practice).
-    GuardLow,
     /// Dummy attacks on a fixed cadence (attack-block-throw RPS practice).
     Attack,
 }
@@ -59,10 +55,8 @@ impl DummyMode {
     /// an error — bad content must not break a lesson).
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "crouch" => DummyMode::Crouch,
             "jump" => DummyMode::Jump,
             "guardall" | "guard" | "block" => DummyMode::GuardAll,
-            "guardlow" | "blocklow" => DummyMode::GuardLow,
             "attack" => DummyMode::Attack,
             _ => DummyMode::Stand,
         }
