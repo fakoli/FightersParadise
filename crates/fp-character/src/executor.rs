@@ -456,12 +456,6 @@ pub struct SuperPauseEffect {
     pub remaining: i32,
 }
 
-impl Default for SuperPauseEffect {
-    fn default() -> Self {
-        Self::inactive()
-    }
-}
-
 impl SuperPauseEffect {
     /// The inactive window: not unhittable, neutral (`1.0`) defence multiplier, no
     /// ticks remaining. Blocks nothing and scales damage by `1.0`.
