@@ -72,7 +72,7 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, Match, MatchInput, Player, PlayerDriver, RoundState,
+    derive_player_seed, EffectSide, GameMode, Match, MatchInput, Player, PlayerDriver, RoundState,
     StageBounds, TeamMatch, TeamMode, Winner, DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
@@ -4846,10 +4846,13 @@ impl MenuApp {
         &mut self,
         pick: &screens::MatchPick,
         stage: &screens::StageChoice,
+        mode: screens::SelectMode,
         renderer: &Renderer,
     ) {
+        let game_mode = game_mode_for(mode);
         tracing::info!(
-            "Starting match: P1={} ({}) vs P2={} ({}) on stage {} ({})",
+            "Starting match ({:?}): P1={} ({}) vs P2={} ({}) on stage {} ({})",
+            game_mode,
             pick.p1_name,
             pick.p1_def.display(),
             pick.p2_name,
@@ -4859,6 +4862,10 @@ impl MenuApp {
         );
         match build_match_run(&pick.p1_def, &pick.p2_def, stage, renderer) {
             Some(mut run) => {
+                // (T066) Flag the match's mode so Training disables round
+                // termination (no timeout, no auto-KO end) while Versus runs the
+                // normal round flow. A no-op for Versus (the engine default).
+                run.team.set_game_mode(game_mode);
                 // Apply the player's HUD-customization overrides (T046) to the
                 // match's screenpack HUD, if one loaded. With the default (no-op)
                 // config this leaves the HUD byte-for-byte unchanged.
@@ -4908,6 +4915,17 @@ impl MenuApp {
     /// Returns to the Title screen (fresh cursor).
     fn return_to_title(&mut self) {
         self.screen = RunScreen::Title(screens::TitleMenu::from_system(&self.motif.system));
+    }
+}
+
+/// Maps a character-select [`screens::SelectMode`] to the match-time
+/// [`GameMode`] it implies (T066): the Training select flow enters a
+/// [`GameMode::Training`] match (round termination disabled — the Lab), while
+/// the Versus flow enters a normal [`GameMode::Versus`] match.
+fn game_mode_for(mode: screens::SelectMode) -> GameMode {
+    match mode {
+        screens::SelectMode::Training => GameMode::Training,
+        screens::SelectMode::Versus => GameMode::Versus,
     }
 }
 
@@ -5839,7 +5857,7 @@ fn run() -> fp_core::FpResult<()> {
                         // Cancel from stage-select goes back to character-select.
                         screens::StageOutcome::Cancelled => app.return_to_select(mode),
                         screens::StageOutcome::Done(stage) => {
-                            app.enter_fight(&pick, &stage, &renderer);
+                            app.enter_fight(&pick, &stage, mode, &renderer);
                         }
                     }
                 }
@@ -10257,5 +10275,25 @@ mod tests {
             fp_input::AiObservation { opponent_dx: 5.0 },
         );
         assert_eq!(got, MatchInput::none(), "no AI + idle human => P2 idle");
+    }
+
+    // ---- T066: select-mode -> match-time GameMode mapping -----------------
+
+    #[test]
+    fn training_select_maps_to_training_game_mode() {
+        assert_eq!(
+            game_mode_for(screens::SelectMode::Training),
+            GameMode::Training,
+            "the Training select flow enters a Training match"
+        );
+    }
+
+    #[test]
+    fn versus_select_maps_to_versus_game_mode() {
+        assert_eq!(
+            game_mode_for(screens::SelectMode::Versus),
+            GameMode::Versus,
+            "the Versus select flow enters a normal match"
+        );
     }
 }
