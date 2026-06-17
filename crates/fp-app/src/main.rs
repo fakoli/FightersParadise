@@ -429,12 +429,23 @@ fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
 fn run_import(args: &[String]) -> i32 {
     let Some(parsed) = parse_import_args(args) else {
         eprintln!(
-            "usage: fp-app import <file.cns|.cmd|.air> [<overlay-out>] \
+            "usage: fp-app import <file.cns|.cmd|.air|char.def> [<overlay-out>] \
              [--prune] [--report] [--report-json <path>] [--strict]"
         );
         return 2;
     };
     let src = Path::new(&parsed.src);
+
+    // A `.def` is a whole **character** import: load it through the live loader,
+    // then walk the compiled graph + assets for repairs (T082). It never produces
+    // a text overlay (there is no single file to rewrite), so `<overlay-out>` is
+    // ignored for a `.def`.
+    if src
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("def"))
+    {
+        return run_import_char(src, &parsed);
+    }
 
     let text = match fp_formats::text::read_text_file(src) {
         Ok(t) => t,
@@ -474,6 +485,124 @@ fn run_import(args: &[String]) -> i32 {
     }
 
     // `--strict` is the only flag-tied exit-code behavior.
+    if parsed.strict && report.has_flags() {
+        eprintln!("import: --strict failed — the report contains flagged entries");
+        return 1;
+    }
+    0
+}
+
+/// Resolves the character's text state files (`cmd`, `cns`, `st`/`st0`..`st9`,
+/// `stcommon`) from its `.def`'s `[Files]` section, each as a
+/// `(display-relpath, absolute-path)` pair, for the import text-overlay pass.
+///
+/// `stcommon` is included so an authored common-state library is overlaid too;
+/// the engine's built-in clean-room fallback (a `stcommon` that resolves to a
+/// missing file) simply does not exist on disk and is skipped by the caller. A
+/// `.def` that fails to parse yields an empty list (the graph-walk pass still
+/// runs). De-duplicates case-insensitively so a file named under two keys is
+/// overlaid once.
+fn character_text_files(def_path: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(def) = fp_formats::def::DefFile::load(def_path) else {
+        return Vec::new();
+    };
+    let mut rels: Vec<String> = Vec::new();
+    let mut push = |v: Option<&str>| {
+        if let Some(s) = v {
+            let s = s.trim();
+            if !s.is_empty() && !rels.iter().any(|r| r.eq_ignore_ascii_case(s)) {
+                rels.push(s.to_string());
+            }
+        }
+    };
+    push(def.get("Files", "cmd"));
+    push(def.get("Files", "cns"));
+    push(def.get("Files", "st"));
+    for i in 0..=9 {
+        push(def.get("Files", &format!("st{i}")));
+    }
+    push(def.get("Files", "stcommon"));
+    rels.into_iter()
+        .map(|rel| {
+            let resolved = fp_formats::def::DefFile::resolve_path(def_path, &rel);
+            (rel, resolved)
+        })
+        .collect()
+}
+
+/// The character (`.def`) branch of [`run_import`] — the import core (T082).
+///
+/// Loads the character through the live [`fp_character::LoadedCharacter::load`]
+/// path (the same one the match uses), then builds an [`import::ImportReport`]
+/// from the compiled state graph + assets (failed-compile expressions, AIR frames
+/// referencing absent sprites, degenerate `0×0` sprites). It writes **no** overlay
+/// — a character is many files, not one rewritable text — so `<overlay-out>` is
+/// ignored here.
+///
+/// Per the import contract the process **exits 0 even with flags** (the report
+/// body carries them); `--strict` is the only flag that turns flags into a
+/// non-zero exit. A `.def` that cannot be loaded at all (a missing required
+/// SFF/AIR) is exit `1`.
+fn run_import_char(src: &Path, parsed: &ImportArgs) -> i32 {
+    let loaded = match fp_character::LoadedCharacter::load(src) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("import: cannot load character {}: {e}", src.display());
+            eprintln!("import: failed to load character {}: {e}", src.display());
+            return 1;
+        }
+    };
+
+    // (1) Compiled-graph + asset walk (failed exprs, missing/zero-dim sprites).
+    let mut report = import::ImportReport::from_character(&parsed.src, &loaded);
+    // (2) Text-overlay repairs over the character's own CNS/CMD source files
+    // (stray lines, empty keys, colon/malformed headers). Re-read each `[Files]`
+    // state file relative to the `.def`; a missing/unreadable file is skipped.
+    for (rel, path) in character_text_files(src) {
+        match fp_formats::text::read_text_file(&path) {
+            Ok(text) => report.add_cns(&rel, &import::repair_cns_text(&text)),
+            Err(e) => tracing::warn!(
+                "import: skipping text-overlay of {} ({}): {e}",
+                rel,
+                path.display()
+            ),
+        }
+    }
+
+    // Emit the report face(s). `import --report <char.def>` prints the human
+    // report; `--report-json <path>` writes the stable JSON. With neither flag the
+    // command is a quiet load-and-classify (findings still log through tracing).
+    if parsed.report {
+        print!("{}", report.render());
+    } else {
+        // No --report: surface a one-line summary so the run is not silent.
+        let missing = report.count_kind(import::RepairKind::MissingSpriteRef);
+        let truncated = report.count_kind(import::RepairKind::TruncatedExpr);
+        if report.is_flag_free() {
+            tracing::info!(
+                "import: {} imported with no flags ({} entr(y/ies) total)",
+                src.display(),
+                report.entries.len()
+            );
+        } else {
+            tracing::warn!(
+                "import: {} imported with flags ({} missing-sprite, {} truncated-expr); \
+                 pass --report to see them",
+                src.display(),
+                missing,
+                truncated
+            );
+        }
+    }
+    if let Some(json_path) = &parsed.report_json {
+        if let Err(e) = report.write_json(Path::new(json_path)) {
+            tracing::error!("import: cannot write report JSON {json_path}: {e}");
+            eprintln!("import: failed to write report JSON {json_path}: {e}");
+            return 1;
+        }
+        tracing::info!("import: wrote report JSON {json_path}");
+    }
+
     if parsed.strict && report.has_flags() {
         eprintln!("import: --strict failed — the report contains flagged entries");
         return 1;
