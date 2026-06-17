@@ -4937,6 +4937,33 @@ mod tests {
     }
 
     #[test]
+    fn ailevel_trigger() {
+        // `AILevel` reads `Character::ai_level` as an i32 and takes no args. A
+        // bare/human character defaults to 0, so an `AILevel`-gated controller
+        // never fires for a human — exactly what keeps a cheap-AI trap (e.g.
+        // evilken's `Var(30)=59` under `AILevel`) from triggering for a player
+        // (T052/T054). The engine owns the value via `set_ai_level`; the
+        // character never assigns it.
+        let mut ch = sample();
+
+        // Default: human → AILevel 0. `AILevel = 0` is true, `AILevel != 0`
+        // false, through both the direct trigger call and the VM eval path
+        // (case-insensitive trigger name).
+        assert_eq!(ch.ai_level, 0);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(0));
+        assert_eq!(ch.trigger("ailevel", &[]), Value::Int(0));
+        assert_eq!(ev("AILevel = 0", &ch), Value::Int(1));
+        assert_eq!(ev("AILevel != 0", &ch), Value::Int(0));
+
+        // CPU at difficulty 5 → AILevel returns 5.
+        ch.set_ai_level(5);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(5));
+        assert_eq!(ch.trigger("AILEVEL", &[]), Value::Int(5));
+        assert_eq!(ev("AILevel = 5", &ch), Value::Int(1));
+        assert_eq!(ev("AILevel != 0", &ch), Value::Int(1));
+    }
+
+    #[test]
     fn state_categories_via_letter_tokens() {
         let ch = sample();
         // StateType = A succeeds because both sides resolve to CODE_A.
