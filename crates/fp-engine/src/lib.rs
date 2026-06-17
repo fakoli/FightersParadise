@@ -4863,20 +4863,6 @@ time = 1
 
     // ---- Hitstop strength-scaling (T073, feature F030) -------------------
 
-    /// Builds `sample_hitdef` but with an explicit attacker `pausetime.p1`
-    /// (`p1_pause`). `pausetime.p2` (the defender's shake) is held at a constant
-    /// so the only thing varied across calls is the *attacker's* hit-stop, which
-    /// is exactly what T073 surfaces.
-    fn hitdef_with_attacker_pause(p1_pause: i32) -> HitDef {
-        HitDef {
-            pausetime: PauseTime {
-                p1: p1_pause,
-                p2: 8,
-            },
-            ..sample_hitdef()
-        }
-    }
-
     /// Arms a single connecting punch on a fresh fight-phase match, with the
     /// given attacker `pausetime.p1`, and returns the attacker's `hitpause`
     /// (the impact-freeze duration) observed on the connecting tick.
@@ -4904,7 +4890,14 @@ time = 1
         m.p1.character.anim = 200;
         m.p1.character.anim_elem = 0;
         m.p1.character.move_type = MoveType::Attack;
-        m.p1.character.active_hitdef = Some(hitdef_with_attacker_pause(p1_pause));
+        // Vary only the attacker's pausetime.p1; hold pausetime.p2 constant.
+        m.p1.character.active_hitdef = Some(HitDef {
+            pausetime: PauseTime {
+                p1: p1_pause,
+                p2: 8,
+            },
+            ..sample_hitdef()
+        });
         m.p1.character.move_connect.reset();
         m.p2.character.anim = 0;
         m.p2.character.anim_elem = 0;
