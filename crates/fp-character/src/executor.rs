@@ -6678,6 +6678,59 @@ mod tests {
         assert!(ch.state_no == 0 || ch.state_no == 1);
     }
 
+    #[test]
+    fn cyclic_change_state_is_bounded_on_helper_path() {
+        // T051 regression: the SAME A ↔ B infinite ChangeState loop, but driven
+        // through the HELPER tick path (`tick_as_helper` -> `tick_with_graph` ->
+        // `run_current_with_transitions`) instead of the root `tick`. A community
+        // character whose helper carries a ChangeState cycle must NOT hang the
+        // per-tick simulation — the helper path shares the same
+        // `MAX_TRANSITIONS_PER_TICK` guard the root path uses, so this terminates
+        // (cap hit) instead of spinning forever. Asset-free and runs in the normal
+        // suite, so a future change that lets the helper path bypass the cap would
+        // turn this test into a hang and be caught immediately.
+        let a = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
+        let b = ctrl(
+            1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "0")],
+        );
+        let lc = loaded(
+            vec![stand_n(0, vec![a]), stand_n(1, vec![b])],
+            tiny_air(0, &[5]),
+        );
+        let mut helper = Character::new();
+        helper.state_no = 0;
+        // Drive the graph-aware executor core directly with a non-empty spawning
+        // graph — this is exactly the entry point `tick_as_helper` delegates to
+        // (`tick_with_graph`), so it exercises the live helper tick path. The graph
+        // identity is irrelevant to the cap; what matters is that this entry point
+        // shares the bounded transition loop (`run_current_with_transitions`)
+        // rather than running a state machine unguarded.
+        let report = helper.tick_with_graph(
+            &lc.states,
+            &lc.air,
+            None,
+            StageView::default(),
+            EntityGraph::default(),
+        );
+        assert!(
+            report.transition_cap_hit,
+            "cyclic helper graph must hit the cap on the helper tick path, not hang"
+        );
+        assert!(helper.state_no == 0 || helper.state_no == 1);
+    }
+
     // ---- helper-fn unit coverage ------------------------------------------
 
     #[test]

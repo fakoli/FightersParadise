@@ -107,6 +107,23 @@ const WINDOW_HEIGHT: u32 = 480;
 /// Fixed timestep duration: 1/60th of a second (~16.667ms).
 const TICK_DURATION: Duration = Duration::from_nanos(16_666_667);
 
+/// Maximum number of fixed-timestep sub-ticks the catch-up loop will run for a
+/// single rendered frame (spiral-of-death guard, T051).
+///
+/// The accumulator pattern drains elapsed wall-time in fixed [`TICK_DURATION`]
+/// steps. If a single tick ever costs *more* than the frame budget (e.g. a
+/// community character that legitimately spawns dozens of helpers, so every tick
+/// is expensive), the accumulator grows faster than the loop can drain it: the
+/// loop never exits, the window stops pumping SDL events, and the app **hard
+/// freezes** at 100% CPU. Capping the sub-ticks per frame breaks that spiral —
+/// the simulation degrades to slow-motion under sustained overload (correct,
+/// recoverable behaviour) instead of locking up. Any unspent accumulator beyond
+/// the cap is dropped (clamped below), so the clock cannot keep snowballing.
+///
+/// `5` lets a frame catch up several missed ticks (so a brief hitch still keeps
+/// real-time pace) while bounding the worst case to a handful of ticks.
+const MAX_CATCHUP_TICKS: u32 = 5;
+
 /// Default character `.def` loaded when no CLI argument is given.
 const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 
@@ -6949,7 +6966,13 @@ fn run() -> fp_core::FpResult<()> {
         // a fixed 60Hz here; the Title/Select menu screens are event-driven (no
         // per-tick simulation), so they only need a render below. Viewer/Static/
         // TestPattern tick as before.
-        while accumulator >= TICK_DURATION {
+        // Spiral-of-death guard (T051): cap the sub-ticks per rendered frame. If a
+        // tick is so expensive that it overruns the frame budget every frame, an
+        // uncapped loop would never drain the accumulator — the window would stop
+        // pumping events and hard-freeze at 100% CPU. The cap degrades to
+        // slow-motion under overload instead, keeping the window responsive.
+        let mut catchup = 0u32;
+        while accumulator >= TICK_DURATION && catchup < MAX_CATCHUP_TICKS {
             match mode.as_mut() {
                 Some(Mode::Match(run)) => tick_match_run(run, p1_input, p2_input),
                 // A replay viewer advances one recorded frame per tick only while
@@ -6967,6 +6990,19 @@ fn run() -> fp_core::FpResult<()> {
                 tick_match_run(run, p1_input, p2_input);
             }
             accumulator -= TICK_DURATION;
+            catchup += 1;
+        }
+        // If we hit the catch-up cap there is still unspent time in the
+        // accumulator; drop it so the clock cannot keep snowballing into an
+        // ever-growing backlog (the simulation simply runs slow under sustained
+        // overload rather than trying — and failing — to catch up forever).
+        if catchup >= MAX_CATCHUP_TICKS && accumulator >= TICK_DURATION {
+            tracing::warn!(
+                "tick catch-up cap ({MAX_CATCHUP_TICKS}) hit; dropping {} ms of backlog to keep \
+                 the window responsive (simulation running slow — the match is overloaded)",
+                accumulator.as_millis()
+            );
+            accumulator = Duration::ZERO;
         }
 
         // After the catch-up loop: if the menu's match is over, return to the
