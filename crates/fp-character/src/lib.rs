@@ -73,6 +73,7 @@ pub mod executor;
 pub mod framedata;
 pub mod identity;
 pub mod invuln;
+pub mod ir_cache;
 pub mod loader;
 pub mod snapshot;
 

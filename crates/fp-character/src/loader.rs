@@ -528,6 +528,29 @@ impl LoadedCharacter {
             FpError::parse("DEF", format!("failed to read {}: {e}", def_path.display()))
         })?;
 
+        // ---- IR cache probe (F034 T087) -------------------------------------
+        // Compute a content-addressed key over the `.def` + every file it
+        // references + the parser/compiler version consts, then probe the cache.
+        // A verified hit short-circuits the slow parse/compile path (and its warn
+        // flood). The whole compiled-IR graph (`CompiledState`, SFF, AIR) is not
+        // yet serde-serializable (that lands with T086), so a hit currently still
+        // re-parses; what the cache proves end-to-end today is the keying,
+        // probe/write, invalidation, and corruption-safety. Any cache error is a
+        // silent fall-through — the cache can only speed a load up, never fail it.
+        let cache_key = {
+            let referenced = referenced_source_files(&def, def_path);
+            crate::ir_cache::IrCacheKey::build(def_path, &referenced)
+        };
+        let ir_cache =
+            workspace_root_for(def_path).and_then(|root| crate::ir_cache::IrCache::resolve(&root));
+        if let Some(cache) = ir_cache.as_ref() {
+            // ponytail: read-and-discard probe. Ceiling: no load speedup today —
+            // the manifest can't replace the parse until the compiled-IR graph is
+            // serde-serializable (T086). Upgrade path: when T086 lands, return the
+            // deserialized IR here and short-circuit the parse below.
+            let _: Option<crate::ir_cache::CachedManifest> = cache.read(&cache_key);
+        }
+
         // ---- [Info] ----
         let name = def.get("Info", "name").unwrap_or("").to_string();
         let localcoord = parse_localcoord(def.get("Info", "localcoord"));
@@ -666,6 +689,22 @@ impl LoadedCharacter {
             air.actions.len(),
         );
 
+        // ---- IR cache write (F034 T087) -------------------------------------
+        // The full load succeeded; record a cache entry keyed by `cache_key` so a
+        // subsequent unchanged load can probe it. The write is atomic (temp +
+        // rename) and best-effort — any error is logged at debug and ignored.
+        if let Some(cache) = ir_cache.as_ref() {
+            let manifest = crate::ir_cache::CachedManifest {
+                name: name.clone(),
+                compiled_states: compiled_states as u32,
+                sprite_count: sff.sprites.len() as u32,
+                anim_count: air.actions.len() as u32,
+            };
+            if let Err(e) = cache.write(&cache_key, &manifest) {
+                tracing::debug!("IR cache write skipped: {e}");
+            }
+        }
+
         Ok(Self {
             name,
             localcoord,
@@ -796,6 +835,62 @@ fn push_ref(refs: &mut Vec<String>, value: Option<&str>) {
             refs.push(v.to_string());
         }
     }
+}
+
+/// Enumerates every source file a `.def` references, as `(relpath, resolved)`
+/// pairs, for the IR cache key (F034 T087).
+///
+/// Walks the `[Files]` keys the loader actually consumes — `sprite`, `anim`,
+/// `sound`, `cmd`, `cns`, the `st`/`st0`..`st9` state slots, `stcommon`, and the
+/// `pal1`..`pal12` external palettes — so the cache key changes when **any** of
+/// them is edited (AC2). Each referenced relpath is recorded verbatim (the stable
+/// key) alongside the path it resolves to relative to the `.def` (the bytes that
+/// get hashed). Absent / empty keys are skipped; a referenced-but-missing
+/// optional file is still listed (its hash is all-zero, so creating it later
+/// re-keys). De-duplicates case-insensitively so a relpath named under two keys
+/// is hashed once.
+fn referenced_source_files(def: &DefFile, def_path: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let mut rels: Vec<String> = Vec::new();
+    push_ref(&mut rels, def.get("Files", "sprite"));
+    push_ref(&mut rels, def.get("Files", "anim"));
+    push_ref(&mut rels, def.get("Files", "sound"));
+    push_ref(&mut rels, def.get("Files", "cmd"));
+    push_ref(&mut rels, def.get("Files", "cns"));
+    push_ref(&mut rels, def.get("Files", "st"));
+    for i in 0..=9 {
+        push_ref(&mut rels, def.get("Files", &format!("st{i}")));
+    }
+    push_ref(&mut rels, def.get("Files", "stcommon"));
+    for slot in 1..=MAX_ACT_PALETTE_SLOTS {
+        push_ref(&mut rels, def.get("Files", &format!("pal{slot}")));
+    }
+    rels.into_iter()
+        .map(|rel| {
+            let resolved = DefFile::resolve_path(def_path, &rel);
+            (rel, resolved)
+        })
+        .collect()
+}
+
+/// Resolves the workspace root used as the default IR-cache parent
+/// (`<workspace>/.fp-cache/`), given a character's `.def` path (F034 T087).
+///
+/// Walks up from the `.def` directory looking for a workspace marker — a `.git`
+/// entry or a `Cargo.toml` — and returns the first ancestor that has one. Falls
+/// back to the `.def`'s own directory when no marker is found (so a standalone
+/// content folder still caches next to itself). Returns `None` only when the
+/// `.def` has no parent directory at all. `$FP_CACHE_DIR` overrides this entirely
+/// (handled in [`crate::ir_cache::IrCache::resolve`]).
+fn workspace_root_for(def_path: &Path) -> Option<std::path::PathBuf> {
+    let start = def_path.parent()?;
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() || dir.join("Cargo.toml").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    Some(start.to_path_buf())
 }
 
 /// Loads an optional asset referenced by `value`, returning `None` (with a
@@ -2358,6 +2453,93 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, contents).expect("write scratch file");
         path
+    }
+
+    // ---- IR cache wiring (F034 T087): the loader's key-input enumeration ----
+
+    #[test]
+    fn ir_cache_referenced_source_files_covers_all_files_keys() {
+        // Every `[Files]` slot the loader consumes must be enumerated for the
+        // cache key, so editing any of them re-imports (AC2).
+        let dir = scratch_dir("ircache_refs");
+        let def_text = "\
+[Files]
+sprite = c.sff
+anim = c.air
+sound = c.snd
+cmd = c.cmd
+cns = c.cns
+st = states.cns
+st0 = st0.cns
+stcommon = common1.cns
+pal1 = a.act
+pal3 = b.act
+";
+        let def_path = write_file(&dir, "c.def", def_text);
+        let def = DefFile::load(&def_path).unwrap();
+        let refs = referenced_source_files(&def, &def_path);
+        let rels: Vec<&str> = refs.iter().map(|(r, _)| r.as_str()).collect();
+        for expected in [
+            "c.sff",
+            "c.air",
+            "c.snd",
+            "c.cmd",
+            "c.cns",
+            "states.cns",
+            "st0.cns",
+            "common1.cns",
+            "a.act",
+            "b.act",
+        ] {
+            assert!(
+                rels.contains(&expected),
+                "missing referenced file {expected}"
+            );
+        }
+        // Resolved paths sit next to the .def.
+        assert!(refs.iter().all(|(_, p)| p.starts_with(&dir)));
+    }
+
+    #[test]
+    fn ir_cache_key_changes_when_a_referenced_file_is_edited() {
+        // End-to-end through the loader's own key builder: editing a referenced
+        // CNS must change the cache key (AC2).
+        let dir = scratch_dir("ircache_edit");
+        let def_path = write_file(&dir, "c.def", "[Files]\nsprite=c.sff\ncns=c.cns\n");
+        write_file(&dir, "c.sff", "binary-sff-bytes");
+        write_file(&dir, "c.cns", "[Statedef 0]\n");
+        let def = DefFile::load(&def_path).unwrap();
+        let refs = referenced_source_files(&def, &def_path);
+        let before = crate::ir_cache::IrCacheKey::build(&def_path, &refs).digest_hex();
+
+        write_file(&dir, "c.cns", "[Statedef 0]\n; edited\n");
+        let after = crate::ir_cache::IrCacheKey::build(&def_path, &refs).digest_hex();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn ir_cache_no_cache_env_disables_resolution() {
+        // FP_NO_CACHE=1 disables the cache (AC3). Set/reset around the call; this
+        // mutates a process-global env var, so keep it tightly scoped.
+        let dir = scratch_dir("ircache_nocache");
+        std::env::set_var("FP_NO_CACHE", "1");
+        let resolved = crate::ir_cache::IrCache::resolve(&dir);
+        std::env::remove_var("FP_NO_CACHE");
+        assert!(resolved.is_none(), "FP_NO_CACHE=1 must disable the cache");
+    }
+
+    #[test]
+    fn ir_cache_workspace_root_finds_marker_ancestor() {
+        // `workspace_root_for` walks up to a Cargo.toml/.git ancestor so the
+        // default `.fp-cache/` lands at the workspace root, not in the chars dir.
+        let dir = scratch_dir("ircache_root");
+        let nested = dir.join("chars").join("guy");
+        fs::create_dir_all(&nested).unwrap();
+        write_file(&dir, "Cargo.toml", "[workspace]\n");
+        let def_path = nested.join("guy.def");
+        fs::write(&def_path, "[Files]\nsprite=guy.sff\n").unwrap();
+        let root = workspace_root_for(&def_path).unwrap();
+        assert_eq!(root, dir, "must climb to the Cargo.toml ancestor");
     }
 
     // ---- AC1: CompiledExpr stores the compiled AST and round-trips derives ----
