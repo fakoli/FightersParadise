@@ -91,6 +91,43 @@ pub enum AiDifficulty {
 }
 
 impl AiDifficulty {
+    /// Every difficulty level, in ascending order (Easy → Normal → Hard), as the
+    /// Setup/Options CPU-difficulty selector cycles through them (T069).
+    pub const ALL: [AiDifficulty; 3] =
+        [AiDifficulty::Easy, AiDifficulty::Normal, AiDifficulty::Hard];
+
+    /// A short uppercase label for the level, for a menu/HUD renderer (matches
+    /// the menu font's glyph set). Used by the Setup/Options CPU-difficulty row
+    /// (T069).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            AiDifficulty::Easy => "EASY",
+            AiDifficulty::Normal => "NORMAL",
+            AiDifficulty::Hard => "HARD",
+        }
+    }
+
+    /// The next-harder level, saturating at [`AiDifficulty::Hard`] (no wrap), so a
+    /// menu can step the selector right with Right/Confirm (T069).
+    #[must_use]
+    pub fn harder(self) -> Self {
+        match self {
+            AiDifficulty::Easy => AiDifficulty::Normal,
+            AiDifficulty::Normal | AiDifficulty::Hard => AiDifficulty::Hard,
+        }
+    }
+
+    /// The next-easier level, saturating at [`AiDifficulty::Easy`] (no wrap), so a
+    /// menu can step the selector left (T069).
+    #[must_use]
+    pub fn easier(self) -> Self {
+        match self {
+            AiDifficulty::Hard => AiDifficulty::Normal,
+            AiDifficulty::Normal | AiDifficulty::Easy => AiDifficulty::Easy,
+        }
+    }
+
     /// Maps this coarse difficulty onto the MUGEN `AILevel` scale (`1..=8`),
     /// the value the engine assigns a CPU-controlled fighter so its CNS can gate
     /// AI-only behaviour on the `AILevel` trigger (T052).
@@ -500,6 +537,46 @@ mod tests {
             }
         }
         assert!(jumped, "Hard AI should jump within 200 frames");
+    }
+
+    /// Acceptance criterion (T069): Easy demonstrably blocks and reaches *less*
+    /// than Hard — the difficulty selector's two extremes are strictly ordered on
+    /// both knobs, so picking Easy vs Hard is a real, measurable behaviour change.
+    #[test]
+    fn easy_blocks_and_attacks_less_than_hard() {
+        let easy = AiTuning::for_difficulty(AiDifficulty::Easy);
+        let normal = AiTuning::for_difficulty(AiDifficulty::Normal);
+        let hard = AiTuning::for_difficulty(AiDifficulty::Hard);
+        // Guards (blocks) strictly less often as difficulty drops.
+        assert!(easy.block_chance < normal.block_chance);
+        assert!(normal.block_chance < hard.block_chance);
+        assert!(easy.block_chance < hard.block_chance);
+        // Reaches (attacks at range) strictly less far as difficulty drops.
+        assert!(easy.attack_range < normal.attack_range);
+        assert!(normal.attack_range < hard.attack_range);
+        assert!(easy.attack_range < hard.attack_range);
+    }
+
+    /// The Setup/Options selector cycles Easy → Normal → Hard and saturates at
+    /// each end (no wrap), and its labels match the menu glyph set (T069).
+    #[test]
+    fn difficulty_selector_cycles_and_saturates() {
+        assert_eq!(
+            AiDifficulty::ALL,
+            [AiDifficulty::Easy, AiDifficulty::Normal, AiDifficulty::Hard]
+        );
+        // harder() steps up and clamps at Hard.
+        assert_eq!(AiDifficulty::Easy.harder(), AiDifficulty::Normal);
+        assert_eq!(AiDifficulty::Normal.harder(), AiDifficulty::Hard);
+        assert_eq!(AiDifficulty::Hard.harder(), AiDifficulty::Hard);
+        // easier() steps down and clamps at Easy.
+        assert_eq!(AiDifficulty::Hard.easier(), AiDifficulty::Normal);
+        assert_eq!(AiDifficulty::Normal.easier(), AiDifficulty::Easy);
+        assert_eq!(AiDifficulty::Easy.easier(), AiDifficulty::Easy);
+        // Labels are the uppercase names the menu font can draw.
+        assert_eq!(AiDifficulty::Easy.label(), "EASY");
+        assert_eq!(AiDifficulty::Normal.label(), "NORMAL");
+        assert_eq!(AiDifficulty::Hard.label(), "HARD");
     }
 
     /// A neutral default tuning is the Normal preset.
