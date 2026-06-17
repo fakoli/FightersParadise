@@ -74,11 +74,13 @@ use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
 
 mod dummy;
+mod record;
 mod replay;
 mod snapshot;
 mod team;
 
 pub use dummy::{dummy_input, DummyMode};
+pub use record::{TrainingPlayback, TrainingRecorder, TrainingRecording, RECORDING_FORMAT_VERSION};
 pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
 pub use team::{Side, TeamMatch, TeamMatchState, TeamMode, TeamOutcome};
