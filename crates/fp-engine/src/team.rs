@@ -374,6 +374,41 @@ impl TeamMatch {
         self.inner_ref()
     }
 
+    /// Seeds the active pair's RNG streams from `match_seed` (T076).
+    ///
+    /// Delegates to [`Match::seed_players`] on the inner match. Used by the replay
+    /// viewer, which reproduces a recorded 1v1 ([`TeamMode::Single`]) match from its
+    /// seed + recorded inputs; reserves (none, in Single) are unaffected.
+    pub fn seed_players(&mut self, match_seed: i32) {
+        self.inner_mut().seed_players(match_seed);
+    }
+
+    /// Captures the active 1v1 pair's runtime state as a typed [`MatchSnapshot`]
+    /// (T076), the save-state primitive the replay viewer scrubs with.
+    ///
+    /// Delegates to [`Match::snapshot_state`] on the inner match. For the
+    /// [`TeamMode::Single`] replay path this is the whole observable state; in the
+    /// multi-fighter modes it captures only the active pair (reserves are not part of
+    /// the replay-study surface).
+    #[must_use]
+    pub fn snapshot_active(&self) -> crate::MatchSnapshot {
+        self.inner_ref().snapshot_state()
+    }
+
+    /// Restores a previously [`snapshot_active`](Self::snapshot_active)d state onto
+    /// the active 1v1 pair (T076) — the restore half of the replay viewer's
+    /// seek-via-restore-and-re-sim.
+    ///
+    /// Delegates to [`Match::restore_snapshot_state`] on the inner match.
+    ///
+    /// # Errors
+    ///
+    /// [`fp_core::FpError::Mismatch`] if the snapshot's character fingerprints do not
+    /// match the active fighters (the inner match is left unchanged).
+    pub fn restore_active(&mut self, snap: &crate::MatchSnapshot) -> fp_core::FpResult<()> {
+        self.inner_mut().restore_snapshot_state(snap)
+    }
+
     /// The active (front-line) fighter on the given side.
     #[must_use]
     pub fn active_player(&self, side: Side) -> &Player {
