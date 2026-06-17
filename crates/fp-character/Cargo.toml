@@ -12,24 +12,31 @@ fp-vm.workspace = true
 fp-combat.workspace = true
 fp-input.workspace = true
 tracing.workspace = true
+# IR cache (F034 T087) error type (`IrCacheError`) — every variant is non-fatal
+# (callers fall through to the full load), but a typed `thiserror` enum keeps the
+# cache write path's failure modes explicit.
+thiserror.workspace = true
 # Runtime-state serialization (#38): the per-tick mutable `Character` state is
 # captured into a plain-data `CharacterSnapshot` that derives
 # Serialize/Deserialize for the whole-Match snapshot / replay log. The loaded
 # static data (`LoadedCharacter`: compiled state graph, sprites, AIR, CMD) is
 # NOT serialized — it is reloaded from the `.def`.
 serde.workspace = true
+# Content-import IR cache (F034 T087): `bincode` encodes the cache header +
+# payload to a compact, deterministic little-endian blob; `sha2`/`blake3`
+# content-address the referenced source files into the stable cache key. Offline
+# cache path only (gated by `$FP_CACHE_DIR` / `FP_NO_CACHE`), never on the
+# per-tick runtime path.
+bincode.workspace = true
+sha2.workspace = true
+blake3.workspace = true
 
 # Dev-only: a capturing subscriber lets the 6.2b tests assert that NO spurious
 # "bad expression -> const 0" warning fires for legitimately multi-valued params
 # (AC2), while a genuine malformed component still warns. Test-only, so it never
 # ships in the library.
-#
-# `bincode` (test-only) lets the snapshot determinism test assert true ENCODED
-# byte-equality of a `CharacterSnapshot` (#38), matching the codec `fp-engine`
-# uses for the whole-Match snapshot; it never ships in the library.
 [dev-dependencies]
 tracing-subscriber.workspace = true
-bincode.workspace = true
 # Test-only: synthesizes Shift-JIS-encoded CNS bytes from scratch (clean-room,
 # no external content) to prove a non-UTF-8 state file still feeds states into
 # the merge graph instead of being skipped (T034).

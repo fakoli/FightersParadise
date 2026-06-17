@@ -72,6 +72,7 @@ pub mod combat;
 pub mod executor;
 pub mod identity;
 pub mod invuln;
+pub mod ir_cache;
 pub mod loader;
 pub mod snapshot;
 

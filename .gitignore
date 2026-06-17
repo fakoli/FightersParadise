@@ -40,5 +40,9 @@
 # (third-party assets, e.g. Elecbyte KFM CC BY-NC — never shipped)
 /test-assets
 
+# Hash-keyed local IR cache (F034 T087) — generated, content-addressed cache of
+# parsed character content; never tracked. $FP_CACHE_DIR may relocate it.
+.fp-cache/
+
 # OS
 Thumbs.db
