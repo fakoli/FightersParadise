@@ -1879,6 +1879,20 @@ pub struct Character {
     /// [`combat::resolve_attack`](crate::combat::resolve_attack).
     pub juggle_points: i32,
 
+    /// Remaining ticks this character is held by a binder's `TargetBind`
+    /// (MUGEN's target-bound state; the source of `GetHitVar(isbound)`).
+    ///
+    /// Set to the bind `time` whenever a binder applies a `TargetBind`
+    /// ([`TargetOp::Bind`](crate::TargetOp::Bind)) to this character, and counted
+    /// down one per non-hit-paused tick (like the other per-tick timers). While it
+    /// is positive the character is "bound", so [`combat::resolve_attack`] records
+    /// `GetHitVar(isbound) = 1`; once it reaches `0` the character is free again.
+    /// A `time` of `-1` (MUGEN's "bind forever") is stored verbatim and never
+    /// counts down, so it stays bound until explicitly released. Public only
+    /// because the entity is struct-based; callers other than the engine /
+    /// executor should not touch it.
+    pub bound_time: i32,
+
     /// The air-juggle points the character's **current move** costs when it lands
     /// on an airborne defender (MUGEN `[Statedef] juggle`; faithfulness audit #16).
     ///
@@ -2432,6 +2446,7 @@ impl Default for Character {
             // Seed the juggle pool from the character's `[Data] airjuggle`
             // allowance; refilled whenever the character touches the ground.
             juggle_points: constants.airjuggle,
+            bound_time: 0,
             cur_juggle_cost: 0,
             hitdef_set_this_tick: false,
             // Deterministic fixed seed (never wall-clock); the cell is kept in

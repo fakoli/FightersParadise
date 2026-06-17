@@ -1085,6 +1085,12 @@ impl Character {
         }
         // Not hit-paused: both invuln slots count down this tick.
         self.invuln.tick(false);
+        // Target-bind window (T079): a positive `bound_time` (set by a binder's
+        // `TargetBind`) counts down one per tick, so `GetHitVar(isbound)` is true
+        // only while the bind is live. A `-1` ("bind forever") is left untouched.
+        if self.bound_time > 0 {
+            self.bound_time -= 1;
+        }
         // Armed `HitOverride` slots (#9b) count down their `time` window alongside
         // the other per-tick timers (the `< 0` "forever" slots are untouched).
         self.hit_overrides.tick();

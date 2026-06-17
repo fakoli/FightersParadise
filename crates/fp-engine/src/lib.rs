@@ -4396,6 +4396,13 @@ fn apply_target_ops(
                 );
                 tracing::trace!(time, x = new_pos.x, y = new_pos.y, "target bound to binder");
                 target.pos = new_pos;
+                // Mark the target as bound for `time` ticks so `GetHitVar(isbound)`
+                // reports it (T079). The executor counts this down per tick; a
+                // `time` of `-1` ("bind forever") is stored verbatim and never
+                // counts down. KFM's throws re-emit `TargetBind` every frame of the
+                // hold, so the timer is continually refreshed for the grab's
+                // duration.
+                target.bound_time = time;
             }
             TargetOp::LifeAdd { value, kill } => {
                 let floor = if kill { 0 } else { 1 };
