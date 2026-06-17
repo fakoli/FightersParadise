@@ -898,8 +898,7 @@ pub struct TickReport {
     /// round-flow action (the win-pose / "round over" announcer beat). A
     /// `Character` tick cannot reach into the round-flow/HUD owner, so — exactly
     /// like the other request fields — the controller only *records* that the cue
-    /// fired here (and on [`Character::lifebar_action_announced`] for a single
-    /// character's own readout). The match coordinator (`fp-engine`) reads this
+    /// fired here. The match coordinator (`fp-engine`) reads this
     /// after the tick and surfaces it as its announcer signal. It defaults to
     /// `false` and, like every other request field, never carries across ticks (a
     /// fresh [`TickReport`] is built per tick).
@@ -3694,12 +3693,10 @@ impl Character {
     /// tick cannot reach the round-flow/HUD owner, so (deferred-effects pattern,
     /// like `PlaySnd` / `Pause`) this only *records* the cue: it sets the per-tick
     /// [`TickReport::lifebar_action`] flag for the match coordinator (`fp-engine`)
-    /// to consume after the tick, and latches [`Character::lifebar_action_announced`]
-    /// for a single character's own readout. Cosmetic — it never affects the
-    /// simulation. Never panics.
-    fn ctrl_lifebar_action(&mut self, report: &mut TickReport) {
+    /// to consume after the tick. Cosmetic — it never affects the simulation.
+    /// Never panics.
+    fn ctrl_lifebar_action(&self, report: &mut TickReport) {
         report.lifebar_action = true;
-        self.lifebar_action_announced = true;
     }
 
     /// `PosFreeze`: hold the character's position for this tick (T015).
@@ -16682,9 +16679,8 @@ mod tests {
 
     /// `LifebarAction` is recognized and routed to its real arm (T081): it is NOT
     /// a tracked-deferred controller (so it never hits the WARN no-op), a firing
-    /// `LifebarAction` sets [`TickReport::lifebar_action`] and latches
-    /// [`Character::lifebar_action_announced`], and a tick with no `LifebarAction`
-    /// leaves the flag clear (the negative control).
+    /// `LifebarAction` sets [`TickReport::lifebar_action`], and a tick with no
+    /// `LifebarAction` leaves the flag clear (the negative control).
     #[test]
     fn lifebaraction_recognized() {
         // Not in the deferred set — it has a real arm now, not a tracked no-op.
@@ -16693,21 +16689,13 @@ mod tests {
             "LifebarAction is handled, not deferred"
         );
 
-        // A firing `LifebarAction` sets the per-tick report flag and the latch.
+        // A firing `LifebarAction` sets the per-tick report flag.
         let lc = one_ctrl_synth("LifebarAction", &[]);
         let mut ch = Character::new();
-        assert!(
-            !ch.lifebar_action_announced,
-            "the latch starts clear before any LifebarAction"
-        );
         let report = lc.tick(&mut ch);
         assert!(
             report.lifebar_action,
             "a firing LifebarAction sets TickReport::lifebar_action"
-        );
-        assert!(
-            ch.lifebar_action_announced,
-            "a firing LifebarAction latches Character::lifebar_action_announced"
         );
 
         // Negative control: a tick whose only controller is NOT LifebarAction
@@ -16718,10 +16706,6 @@ mod tests {
         assert!(
             !report2.lifebar_action,
             "no LifebarAction → TickReport::lifebar_action stays false"
-        );
-        assert!(
-            !ch2.lifebar_action_announced,
-            "no LifebarAction → the latch stays clear"
         );
     }
 
