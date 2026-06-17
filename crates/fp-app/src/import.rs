@@ -792,9 +792,10 @@ impl ImportReport {
     }
 
     /// Returns `true` when the report carries no entries at all (nothing repaired,
-    /// nothing flagged) — the input was clean.
+    /// nothing flagged). Stricter than [`ImportReport::is_clean`]; used by `render`
+    /// to decide whether to print the `PASS — no repairs needed` line.
     #[must_use]
-    pub fn is_clean(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -833,7 +834,7 @@ impl ImportReport {
         let mut out = String::new();
         out.push_str("Import report\n");
 
-        if self.is_clean() {
+        if self.is_empty() {
             out.push_str("\nPASS — no repairs needed\n");
         } else {
             out.push_str(&format!(
@@ -914,10 +915,10 @@ impl ImportReport {
     ///
     /// This is the inverse of [`ImportReport::has_flags`]; the shipped
     /// `assets/trainingdummy` imports with zero flags, so this returns `true` for
-    /// it. (Distinct from [`ImportReport::is_clean`], which is the stricter
+    /// it. (Distinct from [`ImportReport::is_empty`], which is the stricter
     /// "no entries at all".)
     #[must_use]
-    pub fn is_flag_free(&self) -> bool {
+    pub fn is_clean(&self) -> bool {
         !self.has_flags()
     }
 
@@ -1428,7 +1429,10 @@ type = Null
             !repaired_only.has_flags(),
             "all-repaired report has no flags"
         );
-        assert!(!repaired_only.is_clean(), "but it is not clean either");
+        // Zero-Flagged is the "clean" predicate, so a Repaired-only report is
+        // clean even though it is not empty.
+        assert!(repaired_only.is_clean(), "no flags -> clean");
+        assert!(!repaired_only.is_empty(), "but it still has entries");
 
         // A report with a flagged missing-sprite trips --strict.
         let flagged = dirty_report();
@@ -1628,10 +1632,7 @@ type = Null
         // Tier placement: EmptyExpr + ZeroDimSprite do NOT flag; TruncatedExpr +
         // MissingSpriteRef do.
         assert!(report.has_flags(), "Truncated/Missing trip the flag gate");
-        assert!(
-            !report.is_flag_free(),
-            "a report with flags is not flag-free"
-        );
+        assert!(!report.is_clean(), "a report with flags is not clean");
     }
 
     #[test]
@@ -1682,7 +1683,7 @@ type = Null
     }
 
     #[test]
-    fn import_core_clean_character_is_flag_free() {
+    fn import_core_clean_character_is_clean() {
         // A character with only good exprs and only renderable sprites flags
         // nothing — the trainingdummy invariant in miniature (no file written).
         let sff = sff_with(&[(0, 0, 8, 8)]);
@@ -1690,8 +1691,8 @@ type = Null
         let controllers = vec![ctrl_with_trigger("Null", "1")];
         let report = ImportReport::from_character("clean.def", &loaded_char(sff, air, controllers));
 
-        assert!(report.is_clean(), "no repairs at all: {report:?}");
-        assert!(report.is_flag_free(), "zero Flagged -> import-core clean");
+        assert!(report.is_empty(), "no entries at all: {report:?}");
+        assert!(report.is_clean(), "zero Flagged -> import-core clean");
         assert_eq!(report.count_kind(RepairKind::EmptyExpr), 0);
         assert_eq!(report.count_kind(RepairKind::ZeroDimSprite), 0);
         assert_eq!(report.count_kind(RepairKind::MissingSpriteRef), 0);
@@ -1729,7 +1730,7 @@ type = Null
     /// Runs only when the fixture is present (it is shipped + CI-tracked, so this
     /// is not gated away on CI). No file is written.
     #[test]
-    fn import_core_trainingdummy_is_flag_free() {
+    fn import_core_trainingdummy_is_clean() {
         // Locate the workspace `assets/trainingdummy/trainingdummy.def` from the
         // crate dir (CARGO_MANIFEST_DIR == crates/fp-app).
         let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1741,7 +1742,7 @@ type = Null
         let loaded = LoadedCharacter::load(&def).expect("trainingdummy loads");
         let report = ImportReport::from_character("trainingdummy.def", &loaded);
         assert!(
-            report.is_flag_free(),
+            report.is_clean(),
             "trainingdummy must import with zero Flagged; report:\n{}",
             report.render()
         );

@@ -578,7 +578,7 @@ fn run_import_char(src: &Path, parsed: &ImportArgs) -> i32 {
         // No --report: surface a one-line summary so the run is not silent.
         let missing = report.count_kind(import::RepairKind::MissingSpriteRef);
         let truncated = report.count_kind(import::RepairKind::TruncatedExpr);
-        if report.is_flag_free() {
+        if report.is_clean() {
             tracing::info!(
                 "import: {} imported with no flags ({} entr(y/ies) total)",
                 src.display(),
