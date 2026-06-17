@@ -4457,6 +4457,8 @@ pub(crate) mod tests_support {
     fn simple_loaded() -> LoadedCharacter {
         LoadedCharacter {
             name: "test".to_string(),
+            displayname: "test".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: CharacterConstants::default(),
             states: HashMap::new(),
@@ -4619,6 +4621,8 @@ time = 1
     fn loaded_with(air: AirFile) -> LoadedCharacter {
         LoadedCharacter {
             name: "test".to_string(),
+            displayname: "test".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: CharacterConstants::default(),
             states: HashMap::new(),

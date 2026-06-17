@@ -75,6 +75,7 @@ pub mod identity;
 pub mod invuln;
 pub mod ir_cache;
 pub mod loader;
+pub mod movelist;
 pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
@@ -94,6 +95,7 @@ pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
     LoadedCharacter, LoadedPalette,
 };
+pub use movelist::{format_motion, movelist_from_cmd, MoveEntry};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

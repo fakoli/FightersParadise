@@ -135,6 +135,8 @@ fn rng_probe_loaded() -> LoadedCharacter {
     );
     LoadedCharacter {
         name: "rng-probe".to_string(),
+        displayname: "rng-probe".to_string(),
+        author: String::new(),
         localcoord: (320, 240),
         constants: CharacterConstants::default(),
         states,

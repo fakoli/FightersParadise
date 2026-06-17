@@ -4807,6 +4807,15 @@ enum RunScreen {
     Title(screens::TitleMenu),
     /// The character-select grid.
     Select(screens::SelectScreen),
+    /// The movelist / character-info screen (T071), shown when the player presses
+    /// Info on a character cell. Carries the info to display plus the
+    /// character-select screen to resume when dismissed.
+    CharacterInfo {
+        /// The character-info / movelist data to draw.
+        info: screens::InfoScreen,
+        /// The character-select screen to return to on dismiss (unchanged).
+        select: screens::SelectScreen,
+    },
     /// The stage-select list (T041), shown after character-select and before the
     /// fight. Carries the already-chosen [`screens::MatchPick`] so the match can
     /// be built once a stage is confirmed; cancelling returns to character-select.
@@ -4913,6 +4922,26 @@ impl MenuApp {
     /// Enters the setup / options screen (T042), reachable from the title menu.
     fn enter_setup(&mut self) {
         self.screen = RunScreen::Setup(screens::SetupScreen::new());
+    }
+
+    /// Enters the movelist / character-info screen (T071) for the character at
+    /// `def_path`, carrying the character-select screen forward to resume on
+    /// dismiss. The character is loaded here (off the hot path); a load failure
+    /// degrades to a [`screens::InfoScreen::load_failed`] fallback that still
+    /// shows the roster label, so Info never crashes or traps the player.
+    fn enter_character_info(&mut self, def_path: &Path, select: screens::SelectScreen) {
+        let info = match fp_character::LoadedCharacter::load(def_path) {
+            Ok(loaded) => screens::InfoScreen::from_loaded(&loaded),
+            Err(e) => {
+                tracing::warn!("character info: failed to load {}: {e}", def_path.display());
+                let label = def_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("???");
+                screens::InfoScreen::load_failed(label)
+            }
+        };
+        self.screen = RunScreen::CharacterInfo { info, select };
     }
 
     /// Enters the stage-select screen (T041) for a completed character pick,
@@ -5167,6 +5196,107 @@ fn draw_select_screen(
         screens::SelectMode::Training => "PICK FIGHTER",
     };
     draw_centered_text(frame, font, hint, win_w, y + 20.0, 2.0, 0.8);
+    // Tab opens the character-info / movelist screen (T071) for the highlighted
+    // character.
+    draw_centered_text(frame, font, "TAB  INFO", win_w, y + 44.0, 1.5, 0.6);
+}
+
+/// Draws the movelist / character-info screen (T071): the character's display
+/// name and author as a header, then the movelist as a left-aligned list of
+/// `NAME   MOTION` lines, with a dismiss hint. A no-op when no font is loaded
+/// (the screen still functions and dismisses; nothing is drawn).
+///
+/// Renders cleanly for a sparse/malformed character: an empty movelist shows a
+/// "NO MOVES LISTED" note rather than a blank panel, and every string is folded
+/// into the font's glyph set ([`to_info_text`]) so unrenderable symbols
+/// degrade rather than vanish.
+fn draw_character_info_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    info: &screens::InfoScreen,
+    win_w: f32,
+) {
+    // Header: display name (large) + author credit (small), both centered.
+    let title = if info.display_name.is_empty() {
+        "CHARACTER".to_string()
+    } else {
+        to_menu_text(&info.display_name)
+    };
+    draw_centered_text(frame, font, &title, win_w, 36.0, 3.0, 1.0);
+    if !info.author.is_empty() {
+        let author = format!("BY {}", to_menu_text(&info.author));
+        draw_centered_text(frame, font, &author, win_w, 80.0, 1.5, 0.8);
+    }
+    draw_centered_text(frame, font, "MOVELIST", win_w, 112.0, 2.0, 0.9);
+
+    // The movelist, left-aligned. Each line is "NAME   MOTION"; an empty motion
+    // (button-only / unparseable) just shows the name.
+    const SCALE: f32 = 2.0;
+    let line_h = font.line_height() as f32 * SCALE;
+    let x = (win_w * 0.12).max(16.0);
+    let mut y = 152.0;
+    if info.moves.is_empty() {
+        draw_centered_text(frame, font, "NO MOVES LISTED", win_w, y, 1.5, 0.7);
+    } else {
+        for mv in &info.moves {
+            let name = to_info_text(&mv.name);
+            let line = if mv.motion.is_empty() {
+                name
+            } else {
+                format!("{name}   {}", to_info_text(&mv.motion))
+            };
+            frame.draw_text(
+                font,
+                &line,
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: SCALE,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+            y += line_h + 4.0;
+        }
+    }
+
+    draw_centered_text(
+        frame,
+        font,
+        "TAB OR BACK TO RETURN",
+        win_w,
+        y + 28.0,
+        1.5,
+        0.6,
+    );
+}
+
+/// Folds a movelist string into the menu font's glyph set for display (T071).
+///
+/// The shipped FNT covers `0-9 A-Z`, space, and colon. The movelist uses a few
+/// symbols the font can't draw — `+` (simultaneous press) and the unicode arrows
+/// used by the literal-motion fallback. Map them to renderable letters/spaces so
+/// the line stays legible (e.g. `QCF+a` -> `QCF A`, `\u{2192}\u{2193}+x` ->
+/// `FD X`) instead of dropping glyphs. The underlying movelist data keeps the
+/// proper symbols; only the on-screen text is folded.
+fn to_info_text(s: &str) -> String {
+    let mapped: String = s
+        .chars()
+        .map(|c| match c {
+            '+' => ' ',
+            '\u{2191}' => 'U', // ↑
+            '\u{2193}' => 'D', // ↓
+            '\u{2192}' => 'F', // →
+            '\u{2190}' => 'B', // ←
+            '\u{2197}' => 'U', // ↗ (approx; diagonals collapse to nearest cardinal)
+            '\u{2196}' => 'U', // ↖
+            '\u{2198}' => 'D', // ↘
+            '\u{2199}' => 'D', // ↙
+            '[' | ']' => ' ',  // charge brackets -> spaces
+            other => other,
+        })
+        .collect();
+    to_menu_text(&mapped)
 }
 
 /// Draws the stage-select screen (T041): a header, the available stages as a
@@ -5813,6 +5943,10 @@ fn run() -> fp_core::FpResult<()> {
         // physical press), complementing the held-state directions sampled below.
         let mut esc_pressed = false;
         let mut confirm_key_pressed = false;
+        // Menu "info" edge (T071): opens the character-info / movelist screen on
+        // the character-select screen, and dismisses it. Bound to Tab so it never
+        // collides with the confirm (Enter/Space) or back (Esc) keys.
+        let mut info_key_pressed = false;
         // The first physical key pressed this frame (its scancode), excluding
         // Escape. Used by the setup screen's key-capture mode (T042) to bind the
         // pressed key to the action being remapped; ignored in every other mode.
@@ -5843,6 +5977,14 @@ fn run() -> fp_core::FpResult<()> {
                     ..
                 } => {
                     confirm_key_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Tab),
+                    repeat: false,
+                    ..
+                } => {
+                    // Menu "info" action (T071). Outside the menu it is inert.
+                    info_key_pressed = true;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::F1),
@@ -5989,14 +6131,17 @@ fn run() -> fp_core::FpResult<()> {
                 left: p1_input.left,
                 right: p1_input.right,
                 // A held confirm/back is also fine — edge detection makes it
-                // one-shot. Map controller A (a) to confirm, B (b) to back.
+                // one-shot. Map controller A (a) to confirm, B (b) to back, C (c)
+                // to info (the character-info / movelist action, T071).
                 confirm: p1_input.a,
                 back: p1_input.b,
+                info: p1_input.c,
             };
             let mut menu_in = screens::MenuInput::from_edges(held, prev_menu_held);
             // Fold in the discrete key-event edges (these are already one-shot).
             menu_in.confirm = menu_in.confirm || confirm_key_pressed;
             menu_in.back = menu_in.back || esc_pressed;
+            menu_in.info = menu_in.info || info_key_pressed;
             prev_menu_held = held;
 
             // Drive the active menu screen. The Fight screen is driven by the
@@ -6053,12 +6198,34 @@ fn run() -> fp_core::FpResult<()> {
                 }
                 RunScreen::Select(ref mut select) => {
                     let mode = select.mode;
-                    match select.update(menu_in, frame_counter) {
+                    let outcome = select.update(menu_in, frame_counter);
+                    // Snapshot the select screen for outcomes that need to leave it
+                    // and come back (Info), so the `&mut app.screen` borrow ends
+                    // before reassigning the screen.
+                    let select_snapshot = select.clone();
+                    match outcome {
                         screens::SelectOutcome::Pending => {}
                         screens::SelectOutcome::Cancelled => app.return_to_title(),
                         // Characters chosen: advance to stage-select (T041), not
                         // straight to the fight.
                         screens::SelectOutcome::Done(pick) => app.enter_stage_select(pick, mode),
+                        // Info pressed: open the movelist / character-info screen
+                        // (T071), keeping the select screen to resume on dismiss.
+                        screens::SelectOutcome::ShowInfo(def_path) => {
+                            app.enter_character_info(&def_path, select_snapshot)
+                        }
+                    }
+                }
+                RunScreen::CharacterInfo { ref info, .. } => {
+                    // Any dismiss returns to the snapshotted character-select.
+                    if info.update(menu_in) == screens::InfoOutcome::Dismissed {
+                        // Move the saved select screen back out (take ownership by
+                        // replacing the whole screen).
+                        if let RunScreen::CharacterInfo { select, .. } =
+                            std::mem::replace(&mut app.screen, RunScreen::Quit)
+                        {
+                            app.screen = RunScreen::Select(select);
+                        }
                     }
                 }
                 RunScreen::StageSelect {
@@ -6230,6 +6397,11 @@ fn run() -> fp_core::FpResult<()> {
                 RunScreen::Select(select) => {
                     if let Some(font) = app.font.as_ref() {
                         draw_select_screen(&mut frame, font, select, win_wf);
+                    }
+                }
+                RunScreen::CharacterInfo { info, .. } => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_character_info_screen(&mut frame, font, info, win_wf);
                     }
                 }
                 RunScreen::StageSelect { stages, .. } => {
@@ -6608,6 +6780,7 @@ mod tests {
             right: p1.right,
             confirm: p1.a,
             back: p1.b,
+            info: p1.c,
         };
         screens::MenuInput::from_edges(held, screens::HeldMenuInput::default())
     }
@@ -9084,6 +9257,8 @@ mod tests {
         actions.insert(0, action);
         let loaded = LoadedCharacter {
             name: "synth".to_string(),
+            displayname: "synth".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: fp_character::CharacterConstants::default(),
             states: HashMap::new(),
@@ -9162,6 +9337,8 @@ mod tests {
         actions.insert(200, attack);
         let loaded = LoadedCharacter {
             name: "synth".to_string(),
+            displayname: "synth".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: fp_character::CharacterConstants::default(),
             states: HashMap::new(),

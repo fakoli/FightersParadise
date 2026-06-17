@@ -487,6 +487,13 @@ impl CompiledState {
 pub struct LoadedCharacter {
     /// Display name from `[Info] name` (empty if absent).
     pub name: String,
+    /// Human-facing display name from `[Info] displayname` (falls back to
+    /// [`name`](Self::name) when the `.def` omits it, matching MUGEN's screenpack
+    /// behaviour). Used by the in-app character-info / movelist screen (T071).
+    pub displayname: String,
+    /// Author credit from `[Info] author` (empty if absent). Surfaced verbatim by
+    /// the character-info screen (T071) — never invented.
+    pub author: String,
     /// Local coordinate space `(width, height)` from `[Info] localcoord`,
     /// defaulting to MUGEN's `(320, 240)` when absent or malformed.
     pub localcoord: (i32, i32),
@@ -588,6 +595,14 @@ impl LoadedCharacter {
 
         // ---- [Info] ----
         let name = def.get("Info", "name").unwrap_or("").to_string();
+        // `displayname` is the screenpack-facing label; MUGEN falls back to `name`
+        // when it is absent, so mirror that rather than showing an empty string.
+        let displayname = def
+            .get("Info", "displayname")
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.clone());
+        let author = def.get("Info", "author").unwrap_or("").to_string();
         let localcoord = parse_localcoord(def.get("Info", "localcoord"));
 
         // ---- [Files]: required assets ----
@@ -742,6 +757,8 @@ impl LoadedCharacter {
 
         Ok(Self {
             name,
+            displayname,
+            author,
             localcoord,
             constants,
             states,
