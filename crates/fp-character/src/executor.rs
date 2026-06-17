@@ -892,6 +892,17 @@ pub struct TickReport {
     /// is at disadvantage). It defaults to [`None`] and, like every other field,
     /// never carries across ticks (a fresh [`TickReport`] is built per tick).
     pub frame_advantage: Option<i32>,
+    /// `true` if a `LifebarAction` controller fired this tick (T081).
+    ///
+    /// MUGEN's `LifebarAction` cues the lifebar/announcer to play its scripted
+    /// round-flow action (the win-pose / "round over" announcer beat). A
+    /// `Character` tick cannot reach into the round-flow/HUD owner, so — exactly
+    /// like the other request fields — the controller only *records* that the cue
+    /// fired here. The match coordinator (`fp-engine`) reads this
+    /// after the tick and surfaces it as its announcer signal. It defaults to
+    /// `false` and, like every other request field, never carries across ticks (a
+    /// fresh [`TickReport`] is built per tick).
+    pub lifebar_action: bool,
 }
 
 impl Character {
@@ -1734,6 +1745,8 @@ impl Character {
             self.ctrl_remove_explod(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("DestroySelf") {
             self.ctrl_destroy_self(ctrl, report);
+        } else if kind.eq_ignore_ascii_case("LifebarAction") {
+            self.ctrl_lifebar_action(report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
             // run because it depends on an unbuilt subsystem (the bind / hit-count
@@ -3670,6 +3683,20 @@ impl Character {
         {
             self.victory_quote = Some(v.to_int());
         }
+    }
+
+    /// `LifebarAction`: cue the lifebar / announcer round-flow action (T081).
+    ///
+    /// MUGEN's `LifebarAction` is a parameterless controller a character fires
+    /// (typically from its win state) to tell the lifebar/HUD to play its scripted
+    /// round-flow beat — the win-pose / "round over" announcer cue. A `Character`
+    /// tick cannot reach the round-flow/HUD owner, so (deferred-effects pattern,
+    /// like `PlaySnd` / `Pause`) this only *records* the cue: it sets the per-tick
+    /// [`TickReport::lifebar_action`] flag for the match coordinator (`fp-engine`)
+    /// to consume after the tick. Cosmetic — it never affects the simulation.
+    /// Never panics.
+    fn ctrl_lifebar_action(&self, report: &mut TickReport) {
+        report.lifebar_action = true;
     }
 
     /// `PosFreeze`: hold the character's position for this tick (T015).
@@ -16648,6 +16675,38 @@ mod tests {
         assert_eq!(ch.life, before, "deferred BGPalFX did not mutate state");
         assert!(report.freeze_request.is_none());
         assert!(report.target_ops.is_empty());
+    }
+
+    /// `LifebarAction` is recognized and routed to its real arm (T081): it is NOT
+    /// a tracked-deferred controller (so it never hits the WARN no-op), a firing
+    /// `LifebarAction` sets [`TickReport::lifebar_action`], and a tick with no
+    /// `LifebarAction` leaves the flag clear (the negative control).
+    #[test]
+    fn lifebaraction_recognized() {
+        // Not in the deferred set — it has a real arm now, not a tracked no-op.
+        assert!(
+            !is_tracked_deferred_controller("LifebarAction"),
+            "LifebarAction is handled, not deferred"
+        );
+
+        // A firing `LifebarAction` sets the per-tick report flag.
+        let lc = one_ctrl_synth("LifebarAction", &[]);
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert!(
+            report.lifebar_action,
+            "a firing LifebarAction sets TickReport::lifebar_action"
+        );
+
+        // Negative control: a tick whose only controller is NOT LifebarAction
+        // leaves the report flag clear (the per-tick edge does not fire on its own).
+        let other = one_ctrl_synth("Null", &[]);
+        let mut ch2 = Character::new();
+        let report2 = other.tick(&mut ch2);
+        assert!(
+            !report2.lifebar_action,
+            "no LifebarAction → TickReport::lifebar_action stays false"
+        );
     }
 
     /// `Explod` emits an [`ExplodSpawn`] onto the report with the parsed
