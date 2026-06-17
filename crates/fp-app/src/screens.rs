@@ -559,18 +559,7 @@ pub struct InfoScreen {
     /// when the `.def` declares none.
     pub author: String,
     /// The formatted movelist: each entry is a `(command-name, motion)` pair.
-    pub moves: Vec<MoveLine>,
-}
-
-/// One displayed movelist line: the raw command name (verbatim) and its
-/// human-readable motion (e.g. `"QCF+a"`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoveLine {
-    /// The command name as authored in the character's `.cmd`.
-    pub name: String,
-    /// The human-readable motion string (may be empty for a button-only or
-    /// unparseable command).
-    pub motion: String,
+    pub moves: Vec<fp_character::MoveEntry>,
 }
 
 /// What one frame of info-screen input produced.
@@ -589,13 +578,7 @@ impl InfoScreen {
     /// shows as a "no moves listed" note — never an error.
     #[must_use]
     pub fn from_loaded(loaded: &fp_character::LoadedCharacter) -> Self {
-        let moves = fp_character::movelist_from_cmd(loaded.cmd.as_ref())
-            .into_iter()
-            .map(|m| MoveLine {
-                name: m.name,
-                motion: m.motion,
-            })
-            .collect();
+        let moves = fp_character::movelist_from_cmd(loaded.cmd.as_ref());
         Self {
             display_name: loaded.displayname.clone(),
             author: loaded.author.clone(),
@@ -1825,13 +1808,7 @@ mod tests {
         let screen = InfoScreen {
             display_name: "Test Fighter".to_string(),
             author: "Me".to_string(),
-            moves: moves
-                .into_iter()
-                .map(|m| MoveLine {
-                    name: m.name,
-                    motion: m.motion,
-                })
-                .collect(),
+            moves,
         };
         // `holdfwd` is filtered as locomotion; `fireball` survives with QCF+a.
         assert_eq!(screen.moves.len(), 1);
