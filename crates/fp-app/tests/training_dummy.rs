@@ -290,6 +290,41 @@ fn training_dummy_has_special_move_statedefs() {
     );
 }
 
+/// T071: the character-info / movelist screen derives a readable movelist from
+/// the shipped Training Dummy's own `.cmd`. This proves the data path the in-app
+/// Info screen renders — display name + author from `[Info]`, and the special
+/// motions formatted as human strings — against real shipped content (not a
+/// synthetic fixture), and that pure directional "hold" locomotion commands are
+/// filtered out so the list reads as *moves*.
+#[test]
+fn training_dummy_movelist_lists_fireball_and_dp_with_motions() {
+    let def = dummy_asset("trainingdummy.def");
+    let loaded = LoadedCharacter::load(&def)
+        .unwrap_or_else(|e| panic!("Training Dummy failed to load: {e}"));
+
+    // Display name + author come straight from `[Info]` (verbatim, not invented).
+    assert_eq!(loaded.displayname, "Training Dummy");
+    assert_eq!(loaded.author, "Fighters Paradise");
+
+    let moves = fp_character::movelist_from_cmd(loaded.cmd.as_ref());
+    let by_name = |name: &str| moves.iter().find(|m| m.name == name);
+
+    // The QCF fireball and the DP both appear with their recognised motions.
+    let fireball = by_name("fireball").expect("movelist must contain the fireball command");
+    assert_eq!(fireball.motion, "QCF+a");
+    let dp = by_name("dp").expect("movelist must contain the dragon-punch command");
+    assert_eq!(dp.motion, "DP+a");
+
+    // The four directional "hold" commands (holdfwd/back/up/down) are filtered as
+    // engine locomotion, not player-facing moves.
+    for hold in ["holdfwd", "holdback", "holdup", "holddown"] {
+        assert!(
+            by_name(hold).is_none(),
+            "locomotion command {hold:?} must be filtered from the movelist"
+        );
+    }
+}
+
 // NOTE: the validator itself lives in the `fp-app` *binary* crate's `validate`
 // module, which integration tests cannot import (a `bin` crate exposes no lib
 // target). The "the shipped fixture validates clean" assertion therefore lives

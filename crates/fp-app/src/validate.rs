@@ -1402,6 +1402,8 @@ mod tests {
         }
         LoadedCharacter {
             name: "Test Dummy".to_string(),
+            displayname: "Test Dummy".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: CharacterConstants::default(),
             states: map,

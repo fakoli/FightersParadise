@@ -192,6 +192,8 @@ mod tests {
         }
         LoadedCharacter {
             name: name.to_string(),
+            displayname: name.to_string(),
+            author: String::new(),
             localcoord: constants.localcoord,
             constants,
             states,

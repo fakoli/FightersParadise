@@ -79,6 +79,10 @@ pub struct MenuInput {
     pub confirm: bool,
     /// Back / cancel (rising edge this frame).
     pub back: bool,
+    /// Info / character-details action (rising edge this frame). On the
+    /// character-select screen this opens the movelist / character-info screen
+    /// (T071) for the highlighted character.
+    pub info: bool,
 }
 
 impl MenuInput {
@@ -96,6 +100,7 @@ impl MenuInput {
             right: now.right && !prev.right,
             confirm: now.confirm && !prev.confirm,
             back: now.back && !prev.back,
+            info: now.info && !prev.info,
         }
     }
 }
@@ -118,6 +123,8 @@ pub struct HeldMenuInput {
     pub confirm: bool,
     /// A back/cancel button held this frame.
     pub back: bool,
+    /// An info / character-details button held this frame (T071).
+    pub info: bool,
 }
 
 /// Which players pick a character on the select screen, decided by the title
@@ -331,6 +338,11 @@ pub enum SelectOutcome {
     Done(MatchPick),
     /// The player cancelled back to the title menu.
     Cancelled,
+    /// The player pressed Info on a concrete character cell: open the
+    /// movelist / character-info screen (T071) for the character at this resolved
+    /// `.def` path. The select screen is left untouched so it resumes when the
+    /// info screen is dismissed.
+    ShowInfo(PathBuf),
 }
 
 impl SelectScreen {
@@ -419,6 +431,22 @@ impl SelectScreen {
             return SelectOutcome::Cancelled;
         }
 
+        // Info opens the character-info / movelist screen (T071) for the cell
+        // under the *active* (not-yet-locked) cursor, but only for a concrete
+        // character — Random has no single `.def` to describe. It does not move
+        // the cursor or lock anything, so the select screen resumes unchanged when
+        // the info screen is dismissed.
+        if input.info {
+            let cursor = if self.p1_locked.is_none() {
+                self.p1_cursor
+            } else {
+                self.p2_cursor
+            };
+            if let Some(path) = self.info_def_path(cursor) {
+                return SelectOutcome::ShowInfo(path);
+            }
+        }
+
         let len = self.cells.len();
 
         // Move P1's cursor while it isn't locked.
@@ -463,6 +491,17 @@ impl SelectScreen {
         }
     }
 
+    /// Resolves a cell index to the concrete character `.def` path the info
+    /// screen should describe (T071), or `None` for a `Random` cell / out-of-range
+    /// index. Resolves the entry's relative `.def` against the `select.def`
+    /// directory, the same way [`build_pick`](Self::build_pick) does.
+    fn info_def_path(&self, index: usize) -> Option<PathBuf> {
+        match self.cells.get(index) {
+            Some(RosterCell::Character(e)) => Some(self.base_dir.join(&e.def_path)),
+            _ => None,
+        }
+    }
+
     /// Resolves one cell index to a concrete roster entry + its display name.
     ///
     /// A `Character` cell resolves to itself; a `Random` cell picks a concrete
@@ -496,6 +535,95 @@ impl SelectScreen {
         }
         let idx = (seed % concrete.len() as u64) as usize;
         concrete.get(idx).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Character-Info / Movelist screen (T071)
+// ---------------------------------------------------------------------------
+
+/// The movelist / character-info screen (T071): a character's display name,
+/// author, and a list of moves derived from its `.cmd` command definitions.
+///
+/// Built from a loaded character ([`InfoScreen::from_loaded`]) or, when the
+/// character failed to load, from a fallback that still shows *something* rather
+/// than trapping the player ([`InfoScreen::load_failed`]). Pure data: the app
+/// draws it and dismisses it on Back/Confirm — it never holds the whole loaded
+/// character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfoScreen {
+    /// The character's display name (`[Info] displayname`, falling back to
+    /// `[Info] name`). May be empty if the `.def` had neither.
+    pub display_name: String,
+    /// The character's author credit (`[Info] author`), shown verbatim. Empty
+    /// when the `.def` declares none.
+    pub author: String,
+    /// The formatted movelist: each entry is a `(command-name, motion)` pair.
+    pub moves: Vec<MoveLine>,
+}
+
+/// One displayed movelist line: the raw command name (verbatim) and its
+/// human-readable motion (e.g. `"QCF+a"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveLine {
+    /// The command name as authored in the character's `.cmd`.
+    pub name: String,
+    /// The human-readable motion string (may be empty for a button-only or
+    /// unparseable command).
+    pub motion: String,
+}
+
+/// What one frame of info-screen input produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoOutcome {
+    /// Stay on the info screen.
+    Pending,
+    /// Dismiss the info screen and return to character-select.
+    Dismissed,
+}
+
+impl InfoScreen {
+    /// Builds the info screen from a loaded character, deriving the movelist from
+    /// its parsed `.cmd` ([`fp_character::movelist_from_cmd`]). A character with
+    /// no `.cmd` (or an empty one) yields an empty movelist, which the renderer
+    /// shows as a "no moves listed" note — never an error.
+    #[must_use]
+    pub fn from_loaded(loaded: &fp_character::LoadedCharacter) -> Self {
+        let moves = fp_character::movelist_from_cmd(loaded.cmd.as_ref())
+            .into_iter()
+            .map(|m| MoveLine {
+                name: m.name,
+                motion: m.motion,
+            })
+            .collect();
+        Self {
+            display_name: loaded.displayname.clone(),
+            author: loaded.author.clone(),
+            moves,
+        }
+    }
+
+    /// Builds a fallback info screen for a character that failed to load, so the
+    /// Info action never traps the player on a blank screen. `label` is the
+    /// roster display name (already known before the load attempt).
+    #[must_use]
+    pub fn load_failed(label: &str) -> Self {
+        Self {
+            display_name: label.to_string(),
+            author: String::new(),
+            moves: Vec::new(),
+        }
+    }
+
+    /// Applies one frame of input: any of Back/Confirm/Info dismisses the screen
+    /// back to character-select.
+    #[must_use]
+    pub fn update(&self, input: MenuInput) -> InfoOutcome {
+        if input.back || input.confirm || input.info {
+            InfoOutcome::Dismissed
+        } else {
+            InfoOutcome::Pending
+        }
     }
 }
 
@@ -1406,6 +1534,12 @@ mod tests {
             ..MenuInput::default()
         }
     }
+    fn info() -> MenuInput {
+        MenuInput {
+            info: true,
+            ..MenuInput::default()
+        }
+    }
 
     // ---- edge detection -------------------------------------------------
 
@@ -1612,6 +1746,113 @@ mod tests {
             "random resolves to the only concrete character"
         );
         assert_eq!(pick.p1_name, "The Only");
+    }
+
+    #[test]
+    fn info_on_character_cell_opens_info_with_resolved_def_path() {
+        // T071: pressing Info on a concrete character yields ShowInfo with the
+        // `.def` resolved against the select.def directory — without moving the
+        // cursor or locking anything.
+        let select = roster_2plus_random();
+        let mut screen = SelectScreen::new(
+            SelectMode::Versus,
+            &select,
+            &info_grid(3),
+            Path::new("data/select.def"),
+        );
+        // Move to Beta (cell 1) so we exercise the active-cursor resolution.
+        screen.update(
+            MenuInput {
+                right: true,
+                ..MenuInput::default()
+            },
+            0,
+        );
+        assert_eq!(screen.p1_cursor, 1);
+        let outcome = screen.update(info(), 0);
+        assert_eq!(
+            outcome,
+            SelectOutcome::ShowInfo(PathBuf::from("data").join("b/b.def")),
+        );
+        // The select screen is untouched: still nobody locked, cursor unmoved.
+        assert!(screen.p1_locked.is_none());
+        assert_eq!(screen.p1_cursor, 1);
+    }
+
+    #[test]
+    fn info_on_random_cell_is_inert() {
+        // Random has no single `.def` to describe, so Info stays Pending.
+        let select = roster_2plus_random();
+        let mut screen = SelectScreen::new(
+            SelectMode::Training,
+            &select,
+            &info_grid(3),
+            Path::new("data/select.def"),
+        );
+        // Cell 2 is the random icon.
+        screen.update(
+            MenuInput {
+                right: true,
+                ..MenuInput::default()
+            },
+            0,
+        );
+        screen.update(
+            MenuInput {
+                right: true,
+                ..MenuInput::default()
+            },
+            0,
+        );
+        assert_eq!(screen.p1_cursor, 2);
+        assert_eq!(screen.update(info(), 0), SelectOutcome::Pending);
+    }
+
+    #[test]
+    fn info_screen_from_loaded_lists_specials_and_dismisses() {
+        // Build an InfoScreen straight from a synthetic loaded character carrying
+        // a known `.cmd`, and confirm the movelist + dismiss behaviour without any
+        // window or filesystem.
+        use fp_formats::cmd::CmdFile;
+        let cmd = CmdFile::from_str(
+            "[Command]\nname = \"fireball\"\ncommand = ~D, DF, F, a\n\n\
+             [Command]\nname = \"holdfwd\"\ncommand = /$F\n",
+        )
+        .unwrap();
+        // A minimal loaded character is awkward to construct here; instead test the
+        // pure mapping the screen relies on, then the input handling.
+        let moves = fp_character::movelist_from_cmd(Some(&cmd));
+        let screen = InfoScreen {
+            display_name: "Test Fighter".to_string(),
+            author: "Me".to_string(),
+            moves: moves
+                .into_iter()
+                .map(|m| MoveLine {
+                    name: m.name,
+                    motion: m.motion,
+                })
+                .collect(),
+        };
+        // `holdfwd` is filtered as locomotion; `fireball` survives with QCF+a.
+        assert_eq!(screen.moves.len(), 1);
+        assert_eq!(screen.moves[0].name, "fireball");
+        assert_eq!(screen.moves[0].motion, "QCF+a");
+        // Any of back / confirm / info dismisses.
+        assert_eq!(screen.update(back()), InfoOutcome::Dismissed);
+        assert_eq!(screen.update(confirm()), InfoOutcome::Dismissed);
+        assert_eq!(screen.update(info()), InfoOutcome::Dismissed);
+        assert_eq!(screen.update(MenuInput::default()), InfoOutcome::Pending);
+    }
+
+    #[test]
+    fn info_screen_load_failed_still_shows_label() {
+        // A character that fails to load must not trap the player: the fallback
+        // shows the roster label and an empty movelist, never panics.
+        let screen = InfoScreen::load_failed("Broken Char");
+        assert_eq!(screen.display_name, "Broken Char");
+        assert!(screen.author.is_empty());
+        assert!(screen.moves.is_empty());
+        assert_eq!(screen.update(back()), InfoOutcome::Dismissed);
     }
 
     #[test]
