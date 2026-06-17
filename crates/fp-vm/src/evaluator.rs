@@ -990,8 +990,31 @@ fn bitwise(l: Eval, r: Eval, op: fn(i32, i32) -> i32) -> Eval {
 /// any other name is treated as a parameterized trigger resolved via
 /// [`EvalContext::trigger`] with the evaluated arguments.
 fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
-    let lname = name.to_ascii_lowercase();
-    match lname.as_str() {
+    // Hot path: `eval_call` runs for every function-form trigger/intrinsic
+    // (`var(n)`, `cond`, `abs`, `Pos x`, `AnimElem`, every parenthesized trigger),
+    // i.e. constantly during a busy match. The case-insensitive dispatch needs a
+    // lowercased name, but a `String::to_ascii_lowercase` here allocated on *every*
+    // call and showed up as per-eval malloc traffic (R1). Every name this match
+    // recognises is short, so fold to lowercase in a fixed stack buffer and only
+    // fall back to a heap `String` for an over-long name — which cannot match any
+    // known intrinsic anyway, so it routes straight to the numeric trigger path
+    // with its original (unchanged) name. The dispatched value is identical.
+    let mut lbuf = [0u8; 32];
+    let lname: &str = if name.len() <= lbuf.len() && name.is_ascii() {
+        let buf = &mut lbuf[..name.len()];
+        buf.copy_from_slice(name.as_bytes());
+        buf.make_ascii_lowercase();
+        // SAFETY-free: ASCII-lowercasing ASCII bytes stays valid UTF-8.
+        std::str::from_utf8(buf).unwrap_or(name)
+    } else {
+        // A name longer than the buffer (or non-ASCII) cannot match any intrinsic
+        // or member-keyed literal below — all of those are short ASCII — so it is by
+        // definition an ordinary parameterized trigger. Route it straight to the
+        // numeric path with its original name; no lowercasing (hence no allocation)
+        // is needed. Semantics are unchanged (it would have hit the `_` arm anyway).
+        return eval_numeric_trigger(name, args, ctx);
+    };
+    match lname {
         // ---- Lazy control flow: only the taken branch is evaluated ----
         "cond" | "ifelse" if args.len() == 3 => {
             let c = eval_inner(&args[0], ctx);
@@ -1066,7 +1089,7 @@ fn eval_call(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
         // `trigger_str` seam (task 4.11 for GetHitVar; task 5.6d for const). Any
         // non-ident argument (a rare numeric/computed form) falls through to the
         // ordinary numeric path below.
-        _ if is_member_keyed_trigger(&lname) => {
+        _ if is_member_keyed_trigger(lname) => {
             if let [Expr::Ident(member)] = args {
                 Eval::from_value(ctx.trigger_str(name, member))
             } else {
@@ -1118,15 +1141,40 @@ fn is_member_keyed_trigger(lname: &str) -> bool {
 /// `X=0` / `Y=1` / `Z=2` (see [`axis_arg_code`]). Any other string maps to the
 /// safe default `0`.
 fn eval_numeric_trigger(name: &str, args: &[Expr], ctx: &dyn EvalContext) -> Eval {
-    let mut evaluated = Vec::with_capacity(args.len());
-    for a in args {
-        let v = match a {
+    // Hot path: this runs once per numeric-trigger evaluation, and a busy match
+    // (many helpers, each ticking a CNS state machine full of triggers) evaluates
+    // these by the hundreds of thousands per second. A heap `Vec` here cost a
+    // malloc+free on *every* eval and dominated allocator-bound CPU profiles (R1).
+    // MUGEN triggers take a tiny, fixed arg count, with **zero** args by far the
+    // common case (`StateNo`, `Time`, `MoveType`, `Ctrl`, …); the parenthesized
+    // forms take 1 (`Pos X`, `Var(n)`, `AnimElem`, `NumHelper(id)`, …) or, rarely,
+    // 2 (`TimeMod`/`HitDefAttr`/`Proj*`). Branch on the count so the zero-arg path
+    // allocates and copies nothing, the 1/2-arg paths use a tiny stack array, and
+    // only a pathological (parser-can't-actually-produce-it) >2-arg call falls back
+    // to a heap `Vec`. `Value` is `Copy`, so each branch hands `trigger` the exact
+    // same slice contents the old `Vec` did — values and semantics are unchanged.
+    let eval_arg = |a: &Expr| -> Value {
+        match a {
             Expr::Str(s) => Value::Int(axis_arg_code(s)),
             other => eval_inner(other, ctx).into_value(),
-        };
-        evaluated.push(v);
+        }
+    };
+
+    match args {
+        [] => Eval::from_value(ctx.trigger(name, &[])),
+        [a0] => {
+            let buf = [eval_arg(a0)];
+            Eval::from_value(ctx.trigger(name, &buf))
+        }
+        [a0, a1] => {
+            let buf = [eval_arg(a0), eval_arg(a1)];
+            Eval::from_value(ctx.trigger(name, &buf))
+        }
+        _ => {
+            let evaluated: Vec<Value> = args.iter().map(eval_arg).collect();
+            Eval::from_value(ctx.trigger(name, &evaluated))
+        }
     }
-    Eval::from_value(ctx.trigger(name, &evaluated))
 }
 
 /// Implements `random` / `random(lo, hi)` via the entity-owned RNG seam (§11).
