@@ -1481,12 +1481,29 @@ impl Character {
 
         // CB6: consider groups in ascending number from 1, stopping at the first
         // gap. A controller fires if any *contiguous* group is fully true.
-        for group in contiguous_groups(&ctrl.triggers) {
+        //
+        // Hot path: `gating_passes` runs for every controller of every entity every
+        // tick (and a busy match has dozens of helpers, each with many controllers),
+        // so it must not allocate. The previous `contiguous_groups` helper built two
+        // `Vec`s per call — a real per-tick allocation hotspot (R1). Instead, walk
+        // the contiguous run `1, 2, 3, …` directly: for each expected number find the
+        // matching group by a linear scan (group counts are tiny — usually a single
+        // `trigger1`), short-circuit the OR on the first satisfied group, and stop at
+        // the first missing number. This is the exact CB6 semantics of
+        // `fp_vm::triggers::active_group_indices` (ascending number, first-gap stop,
+        // duplicate numbers collapse to the first occurrence) with no heap traffic.
+        let mut expected: u32 = 1;
+        loop {
+            // First group carrying `expected` (duplicates collapse to the first,
+            // matching `active_group_indices`). `None` => a gap: stop (CB6).
+            let Some(group) = ctrl.triggers.iter().find(|g| g.number == expected) else {
+                return false;
+            };
             if self.group_is_true(group, env) {
                 return true;
             }
+            expected += 1;
         }
-        false
     }
 
     /// Returns `true` if every condition in a numbered group is true (AND).
@@ -4706,6 +4723,11 @@ fn interpolate_anim_transform(
 /// so the executor, validators, and any other trigger consumer share one
 /// definition; this wrapper just maps the active indices back to the original
 /// [`CompiledTriggerGroup`] references in ascending-number order.
+///
+/// Retained as the oracle the `gating_passes` zero-alloc walk is tested against:
+/// the hot path no longer calls this (it would allocate per controller per tick),
+/// but the test suite asserts the inline walk reproduces this reference behaviour.
+#[cfg(test)]
 fn contiguous_groups(groups: &[CompiledTriggerGroup]) -> Vec<&CompiledTriggerGroup> {
     let numbers: Vec<u32> = groups.iter().map(|g| g.number).collect();
     fp_vm::triggers::active_group_indices(&numbers)
@@ -7896,6 +7918,73 @@ mod tests {
         ch.state_no = 0;
         assert_eq!(lc.tick(&mut ch).transitions, 1);
         assert_eq!(ch.state_no, 9);
+    }
+
+    #[test]
+    fn gating_walk_matches_contiguous_groups_oracle() {
+        // R1 zero-alloc refactor lock: `gating_passes` no longer allocates a
+        // `contiguous_groups` Vec per controller per tick — it walks the contiguous
+        // run inline. This pins the inline walk's fire/no-fire decision to the
+        // `contiguous_groups` + `group_is_true` reference for a spread of layouts
+        // (gaps, out-of-order, no-trigger1, post-gap-true). For each layout we both
+        // (a) compute the oracle decision directly and (b) observe the real engine
+        // decision through `lc.tick`, and assert they agree — so a future tweak to
+        // the walk that drifts from CB6 semantics fails here.
+        //
+        // `"1"`/`"0"` are const-true/false trigger conditions; a fired controller
+        // is observed via `report.controllers_fired` on a single-controller state.
+        let layouts: &[&[(u32, &str)]] = &[
+            &[(1, "1")],                     // trigger1 true -> fire
+            &[(1, "0")],                     // trigger1 false -> no fire
+            &[(1, "0"), (2, "1")],           // OR across contiguous -> fire
+            &[(1, "0"), (2, "0")],           // both false -> no fire
+            &[(1, "0"), (3, "1")],           // gap after 1: group 3 dead -> no fire
+            &[(2, "1"), (3, "1")],           // no trigger1 -> cannot fire
+            &[(3, "0"), (1, "0"), (2, "1")], // out-of-order, contiguous -> fire on 2
+            &[(2, "1"), (1, "0"), (4, "1")], // out-of-order with gap (no 3): 4 dead -> no fire
+            &[(1, "0"), (2, "0"), (3, "1")], // fully contiguous, last true -> fire
+        ];
+
+        // Reference decision: the pre-refactor logic, built from the retained
+        // `contiguous_groups` oracle. A group's truth is its single const condition.
+        let oracle = |groups: &[CompiledTriggerGroup]| -> bool {
+            if groups.is_empty() {
+                return false;
+            }
+            contiguous_groups(groups).iter().any(|g| {
+                !g.conditions.is_empty()
+                    && g.conditions
+                        .iter()
+                        .all(|c| eval(&c.expr, &Character::new()).as_bool())
+            })
+        };
+
+        for layout in layouts {
+            // Each group carries a single const condition; rebuild it as the
+            // `&[(u32, &[&str])]` slice `ctrl` expects.
+            let cond_bufs: Vec<[&str; 1]> = layout.iter().map(|(_, c)| [*c]).collect();
+            let groups_arg: Vec<(u32, &[&str])> = layout
+                .iter()
+                .zip(&cond_bufs)
+                .map(|((n, _), buf)| (*n, &buf[..]))
+                .collect();
+
+            let c = ctrl(0, "VelAdd", &[], &groups_arg, None, &[("x", "1")]);
+            let compiled_groups = c.triggers.clone();
+            let expected = oracle(&compiled_groups);
+
+            let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+            let mut ch = Character::new();
+            ch.state_no = 0;
+            ch.physics = Physics::None;
+            ch.vel = Vec2::<f32>::ZERO;
+            let report = lc.tick(&mut ch);
+            let fired = report.controllers_fired > 0;
+            assert_eq!(
+                fired, expected,
+                "layout {layout:?}: inline gating walk disagreed with contiguous_groups oracle"
+            );
+        }
     }
 
     #[test]
