@@ -1899,6 +1899,20 @@ pub struct Match {
     /// once the first hit lands and keep guarding the rest of the combo — unlike
     /// the per-tick [`Match::p2_was_hit`], which goes false on combo gaps.
     p2_hit_latched: bool,
+
+    /// Whether a `LifebarAction` controller fired on the most recent
+    /// [`Match::tick`] (MUGEN `LifebarAction`; T081).
+    ///
+    /// A per-tick edge signal: recomputed every tick from either player's
+    /// [`fp_character::TickReport::lifebar_action`], it is `true` ONLY on a frame a
+    /// fighter cued its lifebar/announcer round-flow action (the win-pose / "round
+    /// over" announcer beat) and goes false again the next tick. The presentation
+    /// layer (`fp-app`'s HUD / announcer) reads it via
+    /// [`Match::lifebar_action_announced`] to play that cosmetic beat. Cleared at
+    /// the start of each tick (and so reset between rounds). A *cosmetic* signal —
+    /// it never affects the simulation, and (like the other per-tick edge signals)
+    /// is not captured in a [`MatchSnapshot`](crate::snapshot::MatchSnapshot).
+    lifebar_action_announced: bool,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -2074,6 +2088,7 @@ impl Match {
             p2_infinite_meter: false,
             p2_was_hit: false,
             p2_hit_latched: false,
+            lifebar_action_announced: false,
         };
         // Drive each fighter through its round-init state (5900) for round 1, the
         // same way [`Match::reset_for_next_round`] does for every later round.
@@ -2226,6 +2241,19 @@ impl Match {
     #[must_use]
     pub fn p2_hit_latched(&self) -> bool {
         self.p2_hit_latched
+    }
+
+    /// Whether a `LifebarAction` controller fired on the most recent
+    /// [`Match::tick`] (MUGEN `LifebarAction`; T081).
+    ///
+    /// A per-tick edge signal, `true` ONLY on the frame either fighter cued its
+    /// lifebar/announcer round-flow action (the win-pose / "round over" announcer
+    /// beat), and false again the next tick. The presentation layer (`fp-app`'s
+    /// HUD / announcer) reads this to play that cosmetic beat. Cosmetic — it never
+    /// affects the simulation.
+    #[must_use]
+    pub fn lifebar_action_announced(&self) -> bool {
+        self.lifebar_action_announced
     }
 
     /// Resets both fighters to their round-start positions, facing, full life, and
@@ -2753,6 +2781,12 @@ impl Match {
             .p2
             .tick_root(Some(&self.p1.character), stage, p2_relations);
         let p2_freeze = p2_report.freeze_request;
+        // (T081) Surface a `LifebarAction` cue from EITHER fighter this tick as the
+        // announcer/round-flow signal. A per-tick edge: recomputed every tick (true
+        // ONLY on a frame the cue fired), so it resets to false the next tick and
+        // between rounds. Cosmetic — read by the HUD/announcer, never affects the
+        // simulation.
+        self.lifebar_action_announced = p1_report.lifebar_action || p2_report.lifebar_action;
         let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
         let p2_projectile_spawns = std::mem::take(&mut p2_report.projectile_spawns);
         let p2_explod_spawns = std::mem::take(&mut p2_report.explod_spawns);
@@ -7327,6 +7361,74 @@ time = 1
         assert!(
             m.p2_sound_requests().is_empty(),
             "silent P2 surfaces nothing"
+        );
+    }
+
+    /// Builds a parameterless [`CompiledController`] of type `LifebarAction` that
+    /// fires unconditionally (`trigger1 = 1`).
+    fn lifebar_action_controller() -> fp_character::CompiledController {
+        fp_character::CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("LifebarAction".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![fp_character::CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![fp_character::CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A `Match` whose P1 fires a `LifebarAction` every tick and whose P2 is idle.
+    fn lifebar_action_match() -> Match {
+        let mut p1_loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        p1_loaded
+            .states
+            .insert(0, state0_with(lifebar_action_controller()));
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, defender_loaded());
+        Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+    }
+
+    /// AC (T081): a fighter's `LifebarAction` controller surfaces the announcer cue
+    /// on [`Match::lifebar_action_announced`] after `tick` — the real arm signals
+    /// the round-flow/HUD instead of a no-op.
+    #[test]
+    fn lifebar_action_surfaces_announcer_signal() {
+        let mut m = lifebar_action_match();
+        assert!(
+            !m.lifebar_action_announced(),
+            "no announcer cue before any LifebarAction fires"
+        );
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.lifebar_action_announced(),
+            "P1's LifebarAction surfaces the announcer cue on the match"
+        );
+    }
+
+    /// AC (T081): the announcer cue is a per-tick edge — a tick with no
+    /// `LifebarAction` clears it again, so a stale cue never lingers.
+    #[test]
+    fn lifebar_action_signal_is_per_tick_edge() {
+        // A plain match (neither side fires LifebarAction) never raises the cue.
+        let mut m = play_snd_match();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            !m.lifebar_action_announced(),
+            "no LifebarAction → the announcer cue stays clear"
         );
     }
 

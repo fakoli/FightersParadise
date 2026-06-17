@@ -2088,6 +2088,16 @@ pub struct Character {
     /// reads this to pick which quote to show. `None` by default.
     pub victory_quote: Option<i32>,
 
+    /// Sticky "this fighter has cued its lifebar/announcer action" latch
+    /// (MUGEN `LifebarAction`; T081).
+    ///
+    /// Set the first time a `LifebarAction` controller fires (typically from the
+    /// win state) and left set — a cosmetic readout the win-screen / HUD presenter
+    /// can consult to know the announcer beat was triggered. `false` by default;
+    /// the per-tick edge is reported separately via [`TickReport::lifebar_action`]
+    /// (`crate::TickReport`) for the match coordinator.
+    pub lifebar_action_announced: bool,
+
     /// Per-tick draw-angle override set by the `AngleDraw` / `AngleSet` /
     /// `AngleAdd` / `AngleMul` controllers (T015).
     ///
@@ -2429,6 +2439,7 @@ impl Default for Character {
             remap_pal: RemapPal::default(),
             clipboard: String::new(),
             victory_quote: None,
+            lifebar_action_announced: false,
             draw_angle: DrawAngle::default(),
             pos_frozen: false,
             cur_trans: None,
