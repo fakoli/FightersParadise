@@ -4174,6 +4174,10 @@ fn load_match_or_fallback(
         DEFAULT_STAGE_BG,
         pal,
         team_mode,
+        // The direct-CLI path keeps the default difficulty so its deterministic
+        // play-out (default seed + Normal) is unchanged; the Setup/Options screen
+        // (menu flow) is what selects a non-default difficulty (T069).
+        AiDifficulty::Normal,
         renderer,
     )
 }
@@ -4183,6 +4187,11 @@ fn load_match_or_fallback(
 /// stage-select screen lets the player choose the backdrop). All the same
 /// best-effort guarantees apply: a missing/bad backdrop simply leaves the flat
 /// clear color.
+// The match-loading path threads a wide but flat set of independent inputs
+// (the two characters, optional stage, backdrop, palette/team/difficulty
+// selections, and the renderer); bundling them into a struct would only move the
+// same fields elsewhere without clarifying the call, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn load_match_with_backdrop(
     p1_def: &Path,
     p2_def: &Path,
@@ -4190,17 +4199,19 @@ fn load_match_with_backdrop(
     backdrop_path: &str,
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_difficulty: AiDifficulty,
     renderer: &Renderer,
 ) -> Mode {
     match build_team_match(p1_def, p2_def, pal, team_mode) {
         Ok(mut m) => {
             // Declare each side's input driver so the engine assigns the right
             // `AILevel` (T052): P1 is the human at the keyboard (level 0), P2 is
-            // the baseline CPU AI at the same difficulty the `CpuAi` below runs
-            // (`AiDifficulty::Normal` -> level 4). A second human controller still
-            // overrides the CPU's inputs per-frame in `tick_match_run`, but the
-            // identity (and thus `AILevel`) is set once here at construction.
-            m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
+            // the baseline CPU AI at the Setup/Options-selected difficulty the
+            // `CpuAi` below runs (T069; default `Normal` -> level 4). A second
+            // human controller still overrides the CPU's inputs per-frame in
+            // `tick_match_run`, but the identity (and thus `AILevel`) is set once
+            // here at construction.
+            m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(cpu_difficulty));
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the team's inner
             // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle
@@ -4258,7 +4269,7 @@ fn load_match_with_backdrop(
                 // present, overrides it per-frame in `tick_match_run`.
                 cpu_ai: Some(CpuAi::new(
                     derive_player_seed(DEFAULT_MATCH_SEED, 1),
-                    AiDifficulty::Normal,
+                    cpu_difficulty,
                 )),
                 dummy_mode: DummyMode::default(),
                 dummy_tick: 0,
@@ -4857,6 +4868,7 @@ impl MenuApp {
         pick: &screens::MatchPick,
         stage: &screens::StageChoice,
         mode: screens::SelectMode,
+        cpu_difficulty: AiDifficulty,
         renderer: &Renderer,
     ) {
         let game_mode = game_mode_for(mode);
@@ -4870,7 +4882,7 @@ impl MenuApp {
             stage.name,
             stage.path.display(),
         );
-        match build_match_run(&pick.p1_def, &pick.p2_def, stage, renderer) {
+        match build_match_run(&pick.p1_def, &pick.p2_def, stage, cpu_difficulty, renderer) {
             Some(mut run) => {
                 // (T066) Flag the match's mode so Training disables round
                 // termination (no timeout, no auto-KO end) while Versus runs the
@@ -4951,6 +4963,7 @@ fn build_match_run(
     p1_def: &Path,
     p2_def: &Path,
     stage: &screens::StageChoice,
+    cpu_difficulty: AiDifficulty,
     renderer: &Renderer,
 ) -> Option<MatchRun> {
     // A `.def` stage becomes a MUGEN `[BGdef]` stage; a backdrop stage has no
@@ -4968,6 +4981,8 @@ fn build_match_run(
         // The in-app menu fights 1v1; the team modes are reachable via the
         // `--simul`/`--turns` direct-CLI flag (T027).
         TeamMode::Single,
+        // P2's CPU difficulty as chosen on the Setup/Options screen (T069).
+        cpu_difficulty,
         renderer,
     ) {
         Mode::Match(run) => Some(*run),
@@ -5130,6 +5145,8 @@ fn draw_setup_screen(
     // customization row, or an action).
     let focus = if setup.on_device_row() {
         "DEVICE".to_string()
+    } else if setup.on_cpu_difficulty_row() {
+        "CPU".to_string()
     } else if setup.on_hud_row() {
         "HUD".to_string()
     } else {
@@ -5152,6 +5169,10 @@ fn draw_setup_screen(
             // The device-preference row.
             screens::SetupRowKind::Device => {
                 format!("{marker} DEVICE: {}", config.device.label())
+            }
+            // The CPU-difficulty selector row (T069): Left/Right step it.
+            screens::SetupRowKind::CpuDifficulty => {
+                format!("{marker} CPU: {}", config.cpu_difficulty.label())
             }
             // The HUD-customization entry row (T046).
             screens::SetupRowKind::HudCustomize => format!("{marker} HUD CUSTOMIZE..."),
@@ -5966,7 +5987,13 @@ fn run() -> fp_core::FpResult<()> {
                         // Cancel from stage-select goes back to character-select.
                         screens::StageOutcome::Cancelled => app.return_to_select(mode),
                         screens::StageOutcome::Done(stage) => {
-                            app.enter_fight(&pick, &stage, mode, &renderer);
+                            app.enter_fight(
+                                &pick,
+                                &stage,
+                                mode,
+                                input_config.cpu_difficulty,
+                                &renderer,
+                            );
                         }
                     }
                 }
@@ -6626,9 +6653,10 @@ mod tests {
 
         // Rebind `a` to `P` through the setup screen's capture path.
         let mut setup = screens::SetupScreen::new();
-        // Walk to the `A` action row (device, HUD-customize, Up, Down, Left,
-        // Right, A — the HUD-customization row (T046) sits between device and Up).
-        for _ in 0..6 {
+        // Walk to the `A` action row (device, CPU-difficulty, HUD-customize, Up,
+        // Down, Left, Right, A — the CPU-difficulty (T069) and HUD-customization
+        // (T046) rows sit between device and Up).
+        for _ in 0..7 {
             setup.update(
                 screens::MenuInput {
                     down: true,
