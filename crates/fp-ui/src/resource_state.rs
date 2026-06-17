@@ -44,15 +44,11 @@ const LOW_LIFE_COLOR: BarColor = BarColor {
     b: 0.25,
 };
 
-/// The color the power bar is tinted toward on the "bright" phase of the
-/// max-power flash: full white (a no-op multiply, so the bar reads at its
-/// brightest configured color). The flash alternates this with
-/// [`POWER_FLASH_DIM`].
-const POWER_FLASH_BRIGHT: BarColor = BarColor::WHITE;
-
 /// The color the power bar is tinted toward on the "dim" phase of the max-power
 /// flash: a partial darken so the bar visibly pulses. A multiply by these
-/// sub-`1.0` channels dims whatever color the bar already is.
+/// sub-`1.0` channels dims whatever color the bar already is. The "bright" phase
+/// is just [`BarColor::WHITE`] (a no-op multiply), so the bar alternates between
+/// its configured color and this dim.
 const POWER_FLASH_DIM: BarColor = BarColor {
     r: 0.45,
     g: 0.45,
@@ -110,7 +106,7 @@ pub fn max_power_flash_tint(fraction: f32, frame: u64) -> BarColor {
     // deterministic square-wave pulse keyed purely off the frame counter.
     let half = (POWER_FLASH_PERIOD / 2).max(1);
     if (frame / half).is_multiple_of(2) {
-        POWER_FLASH_BRIGHT
+        BarColor::WHITE
     } else {
         POWER_FLASH_DIM
     }
@@ -197,16 +193,11 @@ mod tests {
     }
 
     #[test]
-    fn low_life_combined_onto_green_pushes_toward_red() {
-        // A green configured life bar at low life: after combine, red should
-        // out-weigh green so the bar reads as endangered.
-        let combined = BarColor::GREEN.combine(low_life_tint(0.1));
-        // GREEN has r=0, so the multiply keeps r=0 here; verify against a more
-        // realistic white-ish configured bar where the shift is visible.
-        let white_low = BarColor::WHITE.combine(low_life_tint(0.1));
-        assert!(white_low.r > white_low.g);
-        assert!(white_low.r > white_low.b);
-        // The green case stays valid (no panic / in-gamut), documenting intent.
-        let _ = combined;
+    fn low_life_combined_onto_configured_bar_pushes_toward_red() {
+        // A configured (white-ish) life bar at low life: after combine, red should
+        // out-weigh green/blue so the bar reads as endangered.
+        let low = BarColor::WHITE.combine(low_life_tint(0.1));
+        assert!(low.r > low.g);
+        assert!(low.r > low.b);
     }
 }
