@@ -122,6 +122,7 @@ use std::collections::HashMap;
 use fp_core::Vec2;
 use fp_formats::air::AirFile;
 use fp_vm::{eval, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
@@ -401,7 +402,7 @@ pub enum FreezeKind {
 /// matching the single-effect nature of the controller. Sound/anim spawning that
 /// MUGEN's `SuperPause` also performs (the flash sprite + sound) is out of scope
 /// here — this models only the freeze mechanic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FreezeRequest {
     /// Whether to freeze everyone ([`Pause`](FreezeKind::Pause)) or everyone but
     /// the triggerer ([`SuperPause`](FreezeKind::SuperPause)).
@@ -410,6 +411,99 @@ pub struct FreezeRequest {
     /// non-positive `time` is clamped to `0` (no freeze) before being emitted, so
     /// a consumer never sees a negative duration.
     pub time: i32,
+    /// `SuperPause` defence/invuln window for the triggerer (T080). Carries the
+    /// controller's `unhittable` / `p2defmul` so the coordinator can install a
+    /// [`SuperPauseEffect`] on the triggerer for the pause duration. For a
+    /// [`Pause`](FreezeKind::Pause) (which has no such parameters) this is the
+    /// inert default ([`SuperPauseEffect::inactive`] values: not unhittable,
+    /// `p2defmul = 1.0`).
+    pub effect: SuperPauseEffect,
+}
+
+/// The `SuperPause` defence / invulnerability window that holds on the triggering
+/// player for the duration of a `SuperPause` freeze (T080).
+///
+/// MUGEN's `SuperPause` controller takes two combat-affecting parameters beyond
+/// the freeze itself:
+///
+/// - `unhittable` (`0`/`1`, default `1`): while the pause holds, the triggerer
+///   cannot be hit — incoming attacks pass through it, exactly like a `NotHitBy`
+///   window, dealing no damage and forcing no reaction.
+/// - `p2defmul` (float, default `1.0`): the **opponent's** effective defence is
+///   multiplied by this for the pause window, so a super that connects during its
+///   own flash can be tuned to deal more (`<1.0` raises the opponent's defence,
+///   `>1.0` lowers it — i.e. it scales damage *taken* by the opponent).
+///
+/// `fp-character` only *classifies* the request (parses these off the controller
+/// and emits them on [`FreezeRequest::effect`]); the match coordinator
+/// (`fp-engine`) installs the live effect on the triggerer with a tick countdown
+/// matching the freeze, and clears it when the freeze ends. Hit resolution
+/// ([`crate::combat::resolve_attack`]) consults the **defender's** effect for
+/// `unhittable` and the **attacker's** effect for `p2defmul` (the attacker is the
+/// triggerer whose super scales the opponent's defence). An inactive effect
+/// (`remaining == 0`) blocks nothing and scales by `1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SuperPauseEffect {
+    /// Whether the triggerer is invulnerable while the window is active
+    /// (`unhittable`; MUGEN default `1`).
+    pub unhittable: bool,
+    /// Multiplier applied to the **opponent's** effective defence while the window
+    /// is active (`p2defmul`; MUGEN default `1.0`).
+    pub p2defmul: f32,
+    /// Ticks of the window remaining; `0` (the inactive default) means no window —
+    /// the effect blocks nothing and scales damage by `1.0`. Aged down one per
+    /// frozen frame by the coordinator and cleared with the freeze.
+    pub remaining: i32,
+}
+
+impl SuperPauseEffect {
+    /// The inactive window: not unhittable, neutral (`1.0`) defence multiplier, no
+    /// ticks remaining. Blocks nothing and scales damage by `1.0`.
+    #[must_use]
+    pub const fn inactive() -> Self {
+        Self {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 0,
+        }
+    }
+
+    /// Whether the window is currently holding (one or more ticks remaining).
+    #[must_use]
+    pub const fn active(self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Whether this window makes its owner unhittable **right now** (active *and*
+    /// `unhittable = 1`). Consulted on the **defender** in hit resolution.
+    #[must_use]
+    pub const fn blocks_incoming(self) -> bool {
+        self.active() && self.unhittable
+    }
+
+    /// The opponent-defence multiplier in effect **right now**: `p2defmul` while
+    /// active, else the neutral `1.0`. Consulted on the **attacker** (the
+    /// triggerer) in hit resolution so the opponent's effective defence is scaled
+    /// for the pause window only.
+    #[must_use]
+    pub fn active_p2defmul(self) -> f32 {
+        if self.active() {
+            self.p2defmul
+        } else {
+            1.0
+        }
+    }
+
+    /// Ages the window down by one tick, clearing it (back to
+    /// [`inactive`](Self::inactive)) when it expires. Idempotent once inactive.
+    pub fn tick_down(&mut self) {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            if self.remaining <= 0 {
+                *self = Self::inactive();
+            }
+        }
+    }
 }
 
 /// How a [`Helper`](HelperSpawn)'s spawn position is interpreted, mirroring
@@ -3879,7 +3973,35 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .map_or(30, |v| v.to_int())
             .max(0);
-        report.freeze_request = Some(FreezeRequest { kind, time });
+        // T080: a `SuperPause` also carries the triggerer's defence/invuln window
+        // (`unhittable`, MUGEN default 1; `p2defmul`, default 1.0). A plain `Pause`
+        // has neither, so it emits the inert default window. The window is only
+        // *meaningful* for `SuperPause` (a `Pause` freezes everyone, so there is no
+        // exempt triggerer to make unhittable), but reading the params for both is
+        // harmless — a `Pause` author never sets them.
+        let effect = match kind {
+            FreezeKind::SuperPause => {
+                let unhittable = ctrl
+                    .params
+                    .get("unhittable")
+                    .and_then(|p| self.eval_param(p, env))
+                    .is_none_or(|v| v.to_int() != 0);
+                let p2defmul = ctrl
+                    .params
+                    .get("p2defmul")
+                    .and_then(|p| self.eval_param(p, env))
+                    .map_or(1.0, |v| v.to_float());
+                SuperPauseEffect {
+                    unhittable,
+                    p2defmul,
+                    // The window lasts exactly the freeze duration; the coordinator
+                    // installs `remaining = time` when it arms the freeze.
+                    remaining: time,
+                }
+            }
+            FreezeKind::Pause => SuperPauseEffect::inactive(),
+        };
+        report.freeze_request = Some(FreezeRequest { kind, time, effect });
     }
 
     /// `HitVelSet`: (re)set the character's velocity from its `GetHitVar` x/y
@@ -10488,11 +10610,18 @@ mod tests {
     #[test]
     fn superpause_emits_freeze_request_with_time() {
         let report = pause_tick("SuperPause", &[("time", "30")]);
+        // T080: a `SuperPause` with no `unhittable`/`p2defmul` carries the MUGEN
+        // defaults (unhittable, neutral 1.0 multiplier) and a window matching `time`.
         assert_eq!(
             report.freeze_request,
             Some(FreezeRequest {
                 kind: FreezeKind::SuperPause,
                 time: 30,
+                effect: SuperPauseEffect {
+                    unhittable: true,
+                    p2defmul: 1.0,
+                    remaining: 30,
+                },
             })
         );
     }
@@ -10500,11 +10629,13 @@ mod tests {
     #[test]
     fn pause_emits_freeze_request_with_time() {
         let report = pause_tick("Pause", &[("time", "20")]);
+        // A plain `Pause` carries the inert window (no triggerer to make unhittable).
         assert_eq!(
             report.freeze_request,
             Some(FreezeRequest {
                 kind: FreezeKind::Pause,
                 time: 20,
+                effect: SuperPauseEffect::inactive(),
             })
         );
     }
@@ -10518,6 +10649,11 @@ mod tests {
             Some(FreezeRequest {
                 kind: FreezeKind::SuperPause,
                 time: 30,
+                effect: SuperPauseEffect {
+                    unhittable: true,
+                    p2defmul: 1.0,
+                    remaining: 30,
+                },
             })
         );
     }
@@ -10530,8 +10666,56 @@ mod tests {
             Some(FreezeRequest {
                 kind: FreezeKind::Pause,
                 time: 0,
+                effect: SuperPauseEffect::inactive(),
             })
         );
+    }
+
+    #[test]
+    fn superpause_effect_tick_down_clears_at_zero() {
+        let mut e = SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 2,
+        };
+        assert!(e.active());
+        assert!(e.blocks_incoming());
+        assert!((e.active_p2defmul() - 2.0).abs() < 1e-6);
+        e.tick_down();
+        assert_eq!(e.remaining, 1);
+        e.tick_down();
+        // Reaching zero resets to the inert default.
+        assert!(!e.active());
+        assert!(!e.blocks_incoming());
+        assert!((e.active_p2defmul() - 1.0).abs() < 1e-6);
+        // Idempotent once inactive.
+        e.tick_down();
+        assert_eq!(e, SuperPauseEffect::inactive());
+    }
+
+    #[test]
+    fn superpause_effect_unhittable_zero_does_not_block_even_when_active() {
+        let e = SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 5,
+        };
+        assert!(e.active());
+        assert!(!e.blocks_incoming(), "unhittable=0 never blocks");
+    }
+
+    #[test]
+    fn superpause_parses_unhittable_and_p2defmul() {
+        // T080: `unhittable = 0` opts the triggerer out of invuln; `p2defmul`
+        // scales the opponent's defence for the window.
+        let report = pause_tick(
+            "SuperPause",
+            &[("time", "10"), ("unhittable", "0"), ("p2defmul", "2.0")],
+        );
+        let req = report.freeze_request.expect("SuperPause emits a request");
+        assert!(!req.effect.unhittable);
+        assert!((req.effect.p2defmul - 2.0).abs() < 1e-6);
+        assert_eq!(req.effect.remaining, 10);
     }
 
     #[test]

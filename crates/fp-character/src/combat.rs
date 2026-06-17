@@ -187,6 +187,16 @@ pub fn resolve_attack(
         return None;
     }
 
+    // (2b·T080) SuperPause `unhittable` invulnerability. The `SuperPause` triggerer
+    // carries a [`SuperPauseEffect`](crate::SuperPauseEffect) for the pause window;
+    // while it is active and `unhittable = 1`, the triggerer cannot be hit. Drop the
+    // hit exactly like a `NotHitBy` block (it passes through — no damage, no state
+    // change, no hit-pause, NOT marked connected), matching MUGEN's behavior of a
+    // super's startup flash protecting the attacker.
+    if defender.superpause_effect.blocks_incoming() {
+        return None;
+    }
+
     // (2c) HitOverride (audit #9b). BEFORE the normal get-hit, consult the
     // DEFENDER's armed override slots against the ATTACKER's HitDef `attr`. On the
     // first matching active slot MUGEN redirects the defender to the slot's
@@ -281,10 +291,18 @@ pub fn resolve_attack(
 
     // Scale damage by the attacker's attack multiplier and the defender's defence
     // multiplier (MUGEN AttackMulSet / DefenceMulSet; both default 1.0, so the base
-    // damage is unchanged when neither is set). final = round(base * atk * def).
-    let applied_damage = (outcome.damage as f32 * attacker.attack_mul * defender.defence_mul)
-        .round()
-        .clamp(0.0, i32::MAX as f32) as i32;
+    // damage is unchanged when neither is set). The attacker's active SuperPause
+    // `p2defmul` (T080) folds in here too: it scales the OPPONENT's (the defender's)
+    // effective defence for the pause window, so it multiplies the damage the
+    // defender takes. It lives on the attacker (the triggerer) and is the neutral
+    // `1.0` outside an active SuperPause window, so the base damage is unchanged for
+    // ordinary hits. final = round(base * atk * def * p2defmul).
+    let applied_damage = (outcome.damage as f32
+        * attacker.attack_mul
+        * defender.defence_mul
+        * attacker.superpause_effect.active_p2defmul())
+    .round()
+    .clamp(0.0, i32::MAX as f32) as i32;
 
     defender.life = (defender.life - applied_damage).max(0);
     defender.vel = knockback;
@@ -659,6 +677,81 @@ mod tests {
         d.defence_mul = 0.5;
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
         assert_eq!(res.damage, 30, "2.0 * 0.5 leaves base damage");
+    }
+
+    #[test]
+    fn superpause_unhittable_defender_blocks_hit() {
+        // T080: an active `unhittable` SuperPause window on the defender drops the
+        // hit entirely (pass-through, like NotHitBy): no damage, no connection.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_none(), "unhittable window blocks the hit");
+        assert_eq!(d.life, 1000, "no damage applied");
+        assert!(!a.move_connect.contact(), "the move did not connect");
+    }
+
+    #[test]
+    fn superpause_unhittable_zero_does_not_block() {
+        // Negative control: an active window with `unhittable = 0` lets the hit land.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 30, "hit lands at base damage");
+    }
+
+    #[test]
+    fn superpause_p2defmul_on_attacker_scales_defender_damage() {
+        // T080: the attacker's (triggerer's) active `p2defmul` multiplies the
+        // damage the defender takes; an inactive window leaves the base damage.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        a.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 60, "p2defmul 2.0 doubles defender damage");
+        assert_eq!(d.life, 1000 - 60);
+    }
+
+    #[test]
+    fn superpause_inactive_window_is_inert() {
+        // A window with `remaining = 0` neither blocks nor scales (the default state
+        // every character carries outside a SuperPause).
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        a.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 5.0,
+            remaining: 0,
+        };
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 0,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 30, "inactive windows leave base damage");
     }
 
     #[test]
