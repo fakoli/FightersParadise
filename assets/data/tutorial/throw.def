@@ -1,0 +1,8 @@
+; Trials lesson 2 — Attack, Block, Throw / RPS (original clean-room content, MIT).
+[Lesson]
+title       = "Attack, Block, Throw"
+instruction = "The dummy blocks everything. A throw beats block — land a throw."
+dummy       = guardall
+overlays    =
+success     = throwconnected
+timeout     = 600
