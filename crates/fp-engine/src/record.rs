@@ -306,10 +306,4 @@ impl<'m> TrainingPlayback<'m> {
     pub fn match_ref(&self) -> &Match {
         self.game
     }
-
-    /// Consumes the playback, returning the recording so it can be re-used.
-    #[must_use]
-    pub fn into_recording(self) -> TrainingRecording {
-        self.recording
-    }
 }
