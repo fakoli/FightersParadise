@@ -91,11 +91,6 @@ pub enum AiDifficulty {
 }
 
 impl AiDifficulty {
-    /// Every difficulty level, in ascending order (Easy → Normal → Hard), as the
-    /// Setup/Options CPU-difficulty selector cycles through them (T069).
-    pub const ALL: [AiDifficulty; 3] =
-        [AiDifficulty::Easy, AiDifficulty::Normal, AiDifficulty::Hard];
-
     /// A short uppercase label for the level, for a menu/HUD renderer (matches
     /// the menu font's glyph set). Used by the Setup/Options CPU-difficulty row
     /// (T069).
@@ -561,10 +556,6 @@ mod tests {
     /// each end (no wrap), and its labels match the menu glyph set (T069).
     #[test]
     fn difficulty_selector_cycles_and_saturates() {
-        assert_eq!(
-            AiDifficulty::ALL,
-            [AiDifficulty::Easy, AiDifficulty::Normal, AiDifficulty::Hard]
-        );
         // harder() steps up and clamps at Hard.
         assert_eq!(AiDifficulty::Easy.harder(), AiDifficulty::Normal);
         assert_eq!(AiDifficulty::Normal.harder(), AiDifficulty::Hard);
