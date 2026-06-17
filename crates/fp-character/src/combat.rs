@@ -58,6 +58,14 @@ pub struct AttackResolution {
     pub attacker_hitpause: i32,
     /// Hit-pause ticks set on the defender (`pausetime.p2`).
     pub defender_hitpause: i32,
+    /// The defender's induced stun in ticks — the hit-stun on a clean
+    /// [`HitResult::Hit`] or the guard-stun on a [`HitResult::Guard`] (the
+    /// `outcome.hittime` written onto the defender's
+    /// [`GetHitVars::hittime`](crate::GetHitVars::hittime)). This is the
+    /// "defender held for N frames" number the frame-advantage readout subtracts
+    /// the attacker's remaining recovery from; see
+    /// [`crate::framedata::frame_advantage`].
+    pub stun: i32,
     /// The attacker's `HitDef` sound to play for this connection: the `hitsound`
     /// on a clean [`HitResult::Hit`], the `guardsound` on a [`HitResult::Guard`].
     /// [`None`] when the relevant sound is unset on the `HitDef`. (A miss never
@@ -216,6 +224,9 @@ pub fn resolve_attack(
             defender_state: override_state,
             attacker_hitpause: 0,
             defender_hitpause: 0,
+            // The override state takes over the defender's reaction entirely, so
+            // there is no engine-imposed hit/guard stun to count here.
+            stun: 0,
             hit_sound: None,
             attacker_state: hitdef.p1stateno,
         });
@@ -396,6 +407,7 @@ pub fn resolve_attack(
         defender_state: outcome.gethit_state,
         attacker_hitpause: outcome.pausetime,
         defender_hitpause: outcome.shaketime,
+        stun: outcome.hittime,
         hit_sound,
         // `p1stateno` is parsed onto the HitDef but applied to the attacker
         // downstream (P8b), since the attacker's state graph is not in hand here.

@@ -782,6 +782,22 @@ pub struct TickReport {
     /// documented no-op (the root cannot remove itself mid-match); the coordinator
     /// only honors it for helper entities.
     pub destroy_self: bool,
+    /// On-block / on-hit frame advantage (in 60Hz ticks) for an attack this
+    /// character landed on the opponent this tick, or [`None`] when it did not
+    /// connect this tick (T065, feature F026).
+    ///
+    /// This is the **dynamic** half of the frame-data readout: it can only be known
+    /// at the moment a move connects, from the defender's induced stun and the
+    /// attacker's remaining recovery, neither of which is static AIR data. Unlike
+    /// the other request fields, `Character::tick` never populates this — the match
+    /// coordinator (`fp-engine`) computes it at the connecting-hit moment (after the
+    /// per-tick attack passes resolve) via
+    /// [`crate::framedata::frame_advantage`] and writes it onto the **attacker's**
+    /// report. A positive value means the attacker recovers first (advantage on the
+    /// opponent), a negative value means the defender recovers first (the attacker
+    /// is at disadvantage). It defaults to [`None`] and, like every other field,
+    /// never carries across ticks (a fresh [`TickReport`] is built per tick).
+    pub frame_advantage: Option<i32>,
 }
 
 impl Character {

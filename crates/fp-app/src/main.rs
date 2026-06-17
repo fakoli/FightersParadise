@@ -2723,10 +2723,17 @@ impl TrainingOverlay {
 /// R<recovery>` for the action it is currently executing, or `S/A/R —` when that
 /// action is not a countable attack (idle / movement / looping / `time = -1`).
 ///
+/// When the player's move **connected on the most recent tick**, the on-block /
+/// on-hit **frame advantage** is appended in the `ADV +3` / `ADV −5` form (a
+/// signed number of ticks; positive = the attacker recovers first). On a tick with
+/// no connection the advantage segment reads `ADV —`, so the readout never shows a
+/// stale advantage number.
+///
 /// Looks up the current action ([`Player::anim`]) in the player's loaded `.air`
 /// table and runs [`fp_character::MoveFrameData::compute`]; a missing action or
 /// an uncountable one both fall to the `—` form (never a wrong number, never a
-/// panic) per the project's error philosophy.
+/// panic) per the project's error philosophy. The advantage is read from
+/// [`fp_engine::Player::frame_advantage`], which the engine recomputes each tick.
 fn format_frame_data(player: &fp_engine::Player) -> String {
     let fd = player
         .loaded
@@ -2734,9 +2741,31 @@ fn format_frame_data(player: &fp_engine::Player) -> String {
         .actions
         .get(&player.anim())
         .and_then(fp_character::MoveFrameData::compute);
-    match fd {
+    let sar = match fd {
         Some(fd) => format!("S{} A{} R{}", fd.startup, fd.active, fd.recovery),
         None => "S/A/R —".to_string(),
+    };
+    format!(
+        "{sar}  {}",
+        format_frame_advantage(player.frame_advantage())
+    )
+}
+
+/// Formats the on-block / on-hit frame-advantage segment of the frame-data readout
+/// (T065): `ADV +3` / `ADV −5` (signed ticks, positive = the attacker recovers
+/// first) when the move connected this tick, or `ADV —` when it did not (`None`),
+/// so a stale advantage number is never shown.
+///
+/// Split out so the rendering form is unit-testable without scripting a whole
+/// match: the engine computes the [`Option<i32>`] advantage at contact and stashes
+/// it on the attacker [`fp_engine::Player`]; this turns it into the on-screen text.
+fn format_frame_advantage(advantage: Option<i32>) -> String {
+    match advantage {
+        // U+2212 MINUS SIGN for negatives (matches the rest of the HUD), explicit
+        // `+` for non-negative so advantage reads at a glance.
+        Some(n) if n < 0 => format!("ADV \u{2212}{}", -n),
+        Some(n) => format!("ADV +{n}"),
+        None => "ADV —".to_string(),
     }
 }
 
@@ -8877,21 +8906,50 @@ mod tests {
     #[test]
     fn format_frame_data_shows_startup_active_recovery_for_attack() {
         let player = synth_frame_data_player(200);
-        assert_eq!(format_frame_data(&player), "S3 A4 R5");
+        // A freshly-built (non-connecting) player carries no advantage => `ADV —`.
+        assert_eq!(format_frame_data(&player), "S3 A4 R5  ADV —");
     }
 
     #[test]
     fn format_frame_data_shows_dash_for_non_attack_action() {
         // Idle action (no Clsn1) is not countable -> the "—" form, never numbers.
         let player = synth_frame_data_player(0);
-        assert_eq!(format_frame_data(&player), "S/A/R —");
+        assert_eq!(format_frame_data(&player), "S/A/R —  ADV —");
     }
 
     #[test]
     fn format_frame_data_shows_dash_for_missing_action() {
         // An action absent from the .air table also degrades to "—", never panics.
         let player = synth_frame_data_player(999);
-        assert_eq!(format_frame_data(&player), "S/A/R —");
+        assert_eq!(format_frame_data(&player), "S/A/R —  ADV —");
+    }
+
+    #[test]
+    fn format_frame_advantage_shows_signed_value_when_connected() {
+        // On a connecting hit the readout shows the signed advantage: `+` when the
+        // attacker recovers first, U+2212 MINUS when the defender does (the
+        // `+3 / −5` form of T065 acceptance criterion #2).
+        assert_eq!(format_frame_advantage(Some(3)), "ADV +3");
+        assert_eq!(format_frame_advantage(Some(0)), "ADV +0");
+        assert_eq!(format_frame_advantage(Some(-5)), "ADV \u{2212}5");
+    }
+
+    #[test]
+    fn format_frame_advantage_shows_dash_without_a_connection() {
+        // No connection this tick => no advantage number (never a stale one).
+        assert_eq!(format_frame_advantage(None), "ADV —");
+    }
+
+    #[test]
+    fn format_frame_data_appends_advantage_when_present() {
+        // The full readout splices the S/A/R count and the advantage segment, so a
+        // connecting attack reads e.g. `S3 A4 R5  ADV +6`. Asserted via the segment
+        // composer to avoid scripting a whole match (the engine's
+        // `frame_advantage_surfaced_on_scripted_connecting_hit` proves the live
+        // value reaches the player; this proves the readout shows it).
+        let sar = "S3 A4 R5";
+        let composed = format!("{sar}  {}", format_frame_advantage(Some(6)));
+        assert_eq!(composed, "S3 A4 R5  ADV +6");
     }
 
     #[test]

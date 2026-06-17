@@ -56,9 +56,10 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, ExplodOp,
-    ExplodPosType, ExplodSpawn, Facing, HelperPosType, HelperSpawn, LoadedCharacter, MoveType,
-    ProjectileSpawn, RoundView, StageView, StateType, TickReport,
+    combat::resolve_attack, framedata::frame_advantage, ActiveCommands, Character,
+    CharacterFingerprint, EntityGraph, ExplodOp, ExplodPosType, ExplodSpawn, Facing, HelperPosType,
+    HelperSpawn, LoadedCharacter, MoveFrameData, MoveType, ProjectileSpawn, RoundView, StageView,
+    StateType, TickReport,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -844,6 +845,14 @@ pub struct Player {
     /// The compiled command definitions, kept to enumerate which command names to
     /// snapshot into the character's command source each tick.
     command_defs: Vec<CommandDef>,
+    /// On-block / on-hit frame advantage (in ticks) for the attack this player
+    /// landed on the opponent on the most recent tick, or [`None`] when it did
+    /// not connect that tick (T065). Mirrors the value the engine writes onto the
+    /// attacker's [`TickReport::frame_advantage`] at the connecting-hit moment, and
+    /// is the surface the frame-data readout reads (a fresh value is computed each
+    /// tick; it is cleared to [`None`] on a tick with no connection). Read it via
+    /// [`Player::frame_advantage`].
+    frame_advantage: Option<i32>,
 }
 
 impl Player {
@@ -884,7 +893,22 @@ impl Player {
             input_buffer: InputBuffer::new(),
             matcher,
             command_defs,
+            frame_advantage: None,
         }
+    }
+
+    /// The on-block / on-hit frame advantage (in 60Hz ticks) for the attack this
+    /// player landed on the opponent on the most recent tick, or [`None`] when it
+    /// did not connect that tick (T065).
+    ///
+    /// A positive value means this player recovers first (advantage); a negative
+    /// value means the opponent recovers first (this player is at disadvantage).
+    /// The value is recomputed every tick by the [`Match`] at the connecting-hit
+    /// moment and cleared to [`None`] on a tick with no connection, so a stale
+    /// number never lingers on screen.
+    #[must_use]
+    pub fn frame_advantage(&self) -> Option<i32> {
+        self.frame_advantage
     }
 
     /// The live helper entities this player currently owns (T012), in spawn
@@ -2502,6 +2526,14 @@ impl Match {
         //     hit channel) at full volume (volume_scale 100); `common` is carried
         //     from the `SoundId` so a common-file hitsound (one authored with no
         //     `S` prefix) resolves against the fight.snd downstream.
+        //
+        //     Frame-advantage readout (T065): clear last tick's value on both
+        //     players up front (unconditionally, even outside the fight phase) so a
+        //     tick with no connection shows `—` rather than a stale number. Each
+        //     connecting resolve below recomputes and sets the ATTACKER's value
+        //     (mirrored onto the attacker's `TickReport::frame_advantage`).
+        self.p1.frame_advantage = None;
+        self.p2.frame_advantage = None;
         if fighting {
             // (3a) Priority / trade clash arbitration (audit #20). BEFORE the two
             //      independent resolve_attack passes, detect the SIMULTANEOUS-hit
@@ -2541,6 +2573,13 @@ impl Match {
                 p2_states,
             );
             if let Some(res) = p1_attack {
+                // (3a') Frame advantage (T065): compute from the defender's induced
+                //       stun and P1's remaining recovery BEFORE `p1stateno` may move
+                //       P1 out of its attack action below. Stash on P1 (the readout
+                //       surface) and mirror onto P1's TickReport.
+                let adv = compute_frame_advantage(&self.p1, res.stun);
+                self.p1.frame_advantage = adv;
+                p1_report.frame_advantage = adv;
                 if let Some(s) = res.hit_sound {
                     self.p1_sound_requests.push(hit_sound_request(s));
                 }
@@ -2579,6 +2618,12 @@ impl Match {
                 p1_states,
             );
             if let Some(res) = p2_attack {
+                // (3a') Frame advantage (T065) for P2's connecting attack, mirroring
+                //       the P1 branch: defender stun minus P2's remaining recovery,
+                //       computed before `p1stateno` may move P2 out of its action.
+                let adv = compute_frame_advantage(&self.p2, res.stun);
+                self.p2.frame_advantage = adv;
+                p2_report.frame_advantage = adv;
                 if let Some(s) = res.hit_sound {
                     self.p2_sound_requests.push(hit_sound_request(s));
                 }
@@ -3813,6 +3858,59 @@ fn current_frame_clsn(air: &AirFile, anim: i32, elem: i32, attack: bool) -> Vec<
     rects.iter().map(rect_to_clsn).collect()
 }
 
+/// Computes the on-block / on-hit frame advantage for an attack the `attacker`
+/// just landed on the opponent, in 60Hz ticks (T065, feature F026).
+///
+/// Advantage is the **defender's induced stun** (`stun` — the hit-stun on a clean
+/// hit, the guard-stun on a block, straight from the resolved
+/// [`AttackResolution::stun`](fp_character::AttackResolution::stun)) minus the
+/// **attacker's frames-until-actionable** (the frames the attacker still owes
+/// before it can act again — its current move's recovery measured from where the
+/// move's frame cursor currently sits). A positive result means the attacker
+/// recovers first (advantage); a negative one means the defender recovers first.
+///
+/// "Frames-until-actionable" is the attacker's remaining move time: its current
+/// action's static [`total`](fp_character::MoveFrameData::total) frame count minus
+/// the frames already elapsed in that action (`startup + active` already spent on
+/// reaching/holding the active window, so what is left is the recovery the
+/// attacker must still sit through). It is read from the attacker's own AIR action
+/// so it reflects the move actually being thrown, not a fixed guess.
+///
+/// Returns [`None`] (the readout shows `—`) when the attacker's current action is
+/// not a countable attack ([`MoveFrameData::compute`] returned [`None`]) — there
+/// is no honest recovery to subtract — so a wrong number is never shown. Never
+/// panics: a missing action or an uncountable one both fall to [`None`], and the
+/// arithmetic is saturating via [`frame_advantage`].
+fn compute_frame_advantage(attacker: &Player, stun: i32) -> Option<i32> {
+    let action = attacker.loaded.air.action(attacker.character.anim)?;
+    let fd = MoveFrameData::compute(action)?;
+    let elapsed = elapsed_in_action(action, attacker.character.anim_elem).min(fd.total);
+    // Frames the attacker still owes before it can act: the remainder of the move.
+    let frames_until_actionable = (fd.total - elapsed).max(0);
+    Some(frame_advantage(stun, frames_until_actionable))
+}
+
+/// Sums the AIR frame durations of the elements strictly before the (zero-based)
+/// `elem` cursor, giving the ticks elapsed in the action up to the start of the
+/// current element — the static "where the move cursor sits" used by
+/// [`compute_frame_advantage`].
+///
+/// A `-1` (infinite-hold) duration in the elapsed span is treated as `0` (it
+/// contributes no measured time toward recovery rather than poisoning the count);
+/// a negative `elem` clamps to `0`; an over-large `elem` clamps to the frame count
+/// (the whole action elapsed). Never panics.
+fn elapsed_in_action(action: &AnimAction, elem: i32) -> i32 {
+    let upto = if elem < 0 {
+        0
+    } else {
+        (elem as usize).min(action.frames.len())
+    };
+    action.frames[..upto]
+        .iter()
+        .map(|f| f.ticks.max(0))
+        .fold(0i32, i32::saturating_add)
+}
+
 /// Builds the [`fp_character::SoundRequest`] for a `HitDef` impact sound (the
 /// hit or guard sound chosen by [`fp_character::AttackResolution::hit_sound`]).
 ///
@@ -4344,6 +4442,135 @@ time = 1
             m.round_state()
         );
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    // ---- Frame-advantage readout (T065, feature F026) --------------------
+
+    /// An attacker whose action 200 has a real startup / active / recovery shape so
+    /// the frame-advantage readout has a non-trivial "frames-until-actionable" to
+    /// subtract. Layout: 3 startup frames (no Clsn1), 2 active frames (Clsn1 attack
+    /// box), 4 recovery frames (no Clsn1) — `MoveFrameData::compute` =>
+    /// startup=3, active=2, recovery=4, total=9. Action 0 keeps a hurt box so the
+    /// character is hittable.
+    fn fa_attacker_loaded() -> LoadedCharacter {
+        let attack = Rect::new(10.0, -60.0, 60.0, 20.0);
+        let hurt = Rect::new(-18.0, -70.0, 36.0, 70.0);
+        let mk = |clsn1: Vec<Rect>, clsn2: Vec<Rect>, ticks: i32| AnimFrame {
+            sprite: SpriteId::new(0, 0),
+            offset: Vec2::new(0, 0),
+            ticks,
+            flip_h: false,
+            flip_v: false,
+            blend: BlendMode::Normal,
+            clsn1,
+            clsn2,
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        actions.insert(
+            200,
+            AnimAction {
+                action_number: 200,
+                // Each element holds 10 ticks so a single `Match::tick` advance
+                // (1 tick) stays WITHIN the element it started on — the anim-elem
+                // cursor the readout reads is therefore deterministic across the
+                // tick. startup = 30, active = 20, recovery = 40, total = 90.
+                frames: vec![
+                    mk(Vec::new(), Vec::new(), 10),   // startup 0
+                    mk(Vec::new(), Vec::new(), 10),   // startup 1
+                    mk(Vec::new(), Vec::new(), 10),   // startup 2
+                    mk(vec![attack], Vec::new(), 10), // active 0 (elem 3)
+                    mk(vec![attack], Vec::new(), 10), // active 1 (elem 4)
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 0
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 1
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 2
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 3
+                ],
+                loopstart: 0,
+            },
+        );
+        actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![mk(Vec::new(), vec![hurt], 1)],
+                loopstart: 0,
+            },
+        );
+        loaded_with(AirFile { actions })
+    }
+
+    /// Poses two fighters with P1's punch (action 200) overlapping P2's hurt box on
+    /// action 0, returns a fight-phase match. P1 is the attacker with the
+    /// startup/active/recovery action above; P2 is a plain hittable defender.
+    fn fa_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(-20.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(20.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, fa_attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// On a scripted CONNECTING hit, the attacker's frame advantage is surfaced
+    /// (the whole point of T065 acceptance criterion #2): it equals the defender's
+    /// induced ground hit-stun minus the attacker's frames-until-actionable, and is
+    /// exposed both on the attacker `Player` and rendered by `format_frame_data`.
+    #[test]
+    fn frame_advantage_surfaced_on_scripted_connecting_hit() {
+        let mut m = fa_match();
+        // Pin P1 on the FIRST active frame of action 200 (zero-based elem 3) with a
+        // fresh HitDef, and keep P2 on its standing hurt frame so the punch lands.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 3;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.state_type = StateType::Standing;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.holding_back = false;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // The hit connected (P2 took damage).
+        assert!(m.p2().life() < 1000, "scripted attack must connect");
+
+        // Expected: defender ground hit-stun (sample_hitdef ground hittime = 12)
+        // minus the attacker's frames-until-actionable. P1 sat on elem 3 (the first
+        // active frame); a single tick advances only WITHIN that 10-tick element, so
+        // the anim-elem cursor is still 3 when combat reads it. elapsed before
+        // elem 3 = 30 (3 startup frames @10), total = 90 =>
+        // frames-until-actionable = 90 - 30 = 60 => advantage = 12 - 60 = -48.
+        let adv = m
+            .p1()
+            .frame_advantage()
+            .expect("a connecting attack surfaces a frame advantage");
+        assert_eq!(adv, -48, "12 hit-stun minus 60 remaining recovery = -48");
+    }
+
+    /// On a tick with NO connection, the advantage is cleared to `None` (the
+    /// readout shows `—`), so a stale number never lingers on screen.
+    #[test]
+    fn frame_advantage_is_none_without_a_connection() {
+        let mut m = fa_match();
+        // P1 idle on action 0, no active HitDef -> nothing connects.
+        m.p1.character.anim = 0;
+        m.p1.character.active_hitdef = None;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().frame_advantage(),
+            None,
+            "no connection => no advantage shown"
+        );
     }
 
     // ---- Priority / trade clash resolution (audit #20) -------------------
