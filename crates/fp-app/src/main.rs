@@ -72,8 +72,8 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, GameMode, Match, MatchInput, Player, PlayerDriver, RoundState,
-    StageBounds, TeamMatch, TeamMode, Winner, DEFAULT_MATCH_SEED,
+    derive_player_seed, dummy_input, DummyMode, EffectSide, GameMode, Match, MatchInput, Player,
+    PlayerDriver, RoundState, Side, StageBounds, TeamMatch, TeamMode, Winner, DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
@@ -3872,6 +3872,14 @@ struct MatchRun {
     /// opponent position each tick and emits an approach/attack/block/jump input.
     /// Seeded deterministically from the match seed so the demo replays.
     cpu_ai: Option<CpuAi>,
+    /// The training-mode P2 dummy stance (F027 / T067). Only consulted when the
+    /// match is in [`GameMode::Training`]; cycled by the training quick-key. In
+    /// [`DummyMode::Cpu`] (and in Versus) P2 falls back to the baseline CPU AI /
+    /// human input. The default [`DummyMode::Stand`] makes the dummy stand idle.
+    dummy_mode: DummyMode,
+    /// A monotonic frame counter used only to phase [`DummyMode::JumpLoop`]'s
+    /// jump cadence (F027 / T067). Incremented once per match tick.
+    dummy_tick: u64,
 }
 
 /// Which storyboard overlay (if any) is *active* for the current frame, given the
@@ -4252,6 +4260,8 @@ fn load_match_with_backdrop(
                     derive_player_seed(DEFAULT_MATCH_SEED, 1),
                     AiDifficulty::Normal,
                 )),
+                dummy_mode: DummyMode::default(),
+                dummy_tick: 0,
             }))
         }
         Err(e) => {
@@ -5290,6 +5300,21 @@ fn pick_p2_input(
 fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
     // Observe BEFORE borrowing the AI mutably (both live on `run`).
     let obs = run.team.active().ai_observation_for_p2();
+    // Training-mode dummy control (F027 / T067): in the Lab, a non-CPU dummy
+    // stance drives P2 with a fixed held-state (stand/crouch/jump/block) computed
+    // from the live opponent side and the dummy's "was hit" signal — unless a
+    // human second controller asserts something this frame, which always wins.
+    // `DummyMode::Cpu` (and any non-Training match) falls through to the baseline
+    // CPU AI exactly as before.
+    if run.team.game_mode() == GameMode::Training
+        && !run.dummy_mode.is_cpu()
+        && match_input_is_idle(p2_human)
+    {
+        let active = run.team.active();
+        let opponent_on_right = obs.opponent_on_right();
+        let was_hit = active.p2_was_hit();
+        return dummy_input(run.dummy_mode, opponent_on_right, was_hit, run.dummy_tick);
+    }
     pick_p2_input(p2_human, run.cpu_ai.as_mut(), obs)
 }
 
@@ -5302,8 +5327,53 @@ fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
 /// tick is taken from the AI instead — so the otherwise-idle P2 approaches,
 /// attacks, blocks, and jumps. A human second controller therefore transparently
 /// overrides the AI on any frame it presses something.
+/// Applies this frame's training quick-keys (F027 / T067) to a live [`MatchRun`].
+///
+/// All four are no-ops unless the match is in [`GameMode::Training`] (the Lab),
+/// so the keys are inert in a Versus match:
+/// - `cycle_dummy` (F4): rotate the P2 dummy stance
+///   (`Stand → Crouch → JumpLoop → BlockAll → BlockAfterFirst → Cpu → …`).
+/// - `toggle_inf_life` (F5): flip "infinite life" for **both** fighters together.
+/// - `toggle_inf_meter` (F6): flip "infinite meter" for both fighters.
+/// - `reset_positions` (F7): return both fighters to their round-start positions,
+///   facing, and full life without advancing the round.
+fn apply_training_keys(
+    run: &mut MatchRun,
+    cycle_dummy: bool,
+    toggle_inf_life: bool,
+    toggle_inf_meter: bool,
+    reset_positions: bool,
+) {
+    if run.team.game_mode() != GameMode::Training {
+        return;
+    }
+    if cycle_dummy {
+        run.dummy_mode = run.dummy_mode.cycle_next();
+        tracing::info!(mode = run.dummy_mode.label(), "training: dummy stance");
+    }
+    if toggle_inf_life {
+        let on = !run.team.infinite_life(Side::P1);
+        run.team.set_infinite_life(Side::P1, on);
+        run.team.set_infinite_life(Side::P2, on);
+        tracing::info!(on, "training: infinite life (both fighters)");
+    }
+    if toggle_inf_meter {
+        let on = !run.team.infinite_meter(Side::P1);
+        run.team.set_infinite_meter(Side::P1, on);
+        run.team.set_infinite_meter(Side::P2, on);
+        tracing::info!(on, "training: infinite meter (both fighters)");
+    }
+    if reset_positions {
+        run.team.reset_positions();
+        run.dummy_tick = 0;
+        tracing::info!("training: reset positions");
+    }
+}
+
 fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput) {
     let p2_input = resolve_p2_input(run, p2_input);
+    // Advance the dummy's jump-cadence clock once per tick (F027 / T067).
+    run.dummy_tick = run.dummy_tick.wrapping_add(1);
     // Drive the whole team (in 1v1 / Single this is exactly one pair). The renderer
     // and audio below read the active pair through `run.m()`.
     run.team.tick(p1_input, p2_input);
@@ -5634,6 +5704,12 @@ fn run() -> fp_core::FpResult<()> {
         // Escape. Used by the setup screen's key-capture mode (T042) to bind the
         // pressed key to the action being remapped; ignored in every other mode.
         let mut captured_scancode: Option<Scancode> = None;
+        // Training-mode quick-key edges (F027 / T067), applied to the active
+        // match after the event loop. Each is a one-shot press this frame.
+        let mut cycle_dummy_pressed = false;
+        let mut toggle_inf_life_pressed = false;
+        let mut toggle_inf_meter_pressed = false;
+        let mut reset_positions_pressed = false;
         // Poll events
         for event in event_pump.poll_iter() {
             match event {
@@ -5685,6 +5761,36 @@ fn run() -> fp_core::FpResult<()> {
                     // Both → Off. Independent of the F1/F2 overlays.
                     overlays.input_display.cycle();
                     tracing::info!("Input display: {}", overlays.input_display.scope.label());
+                }
+                // Training quick-keys (F027 / T067). These set edge flags applied
+                // to the active match below; they are no-ops outside Training.
+                Event::KeyDown {
+                    keycode: Some(Keycode::F4),
+                    repeat: false,
+                    ..
+                } => {
+                    cycle_dummy_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F5),
+                    repeat: false,
+                    ..
+                } => {
+                    toggle_inf_life_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F6),
+                    repeat: false,
+                    ..
+                } => {
+                    toggle_inf_meter_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F7),
+                    repeat: false,
+                    ..
+                } => {
+                    reset_positions_pressed = true;
                 }
                 // Any other physical key press: record the first one this frame so
                 // the setup screen's remap-capture can bind it. (Esc/Return/Space/
@@ -5870,6 +5976,33 @@ fn run() -> fp_core::FpResult<()> {
         } else if esc_pressed {
             // Direct CLI modes keep the original Esc-quits behaviour.
             running = false;
+        }
+
+        // Apply this frame's training quick-keys (F027 / T067) to whichever match
+        // is live (direct-CLI or the menu Fight screen). No-ops outside Training.
+        if cycle_dummy_pressed
+            || toggle_inf_life_pressed
+            || toggle_inf_meter_pressed
+            || reset_positions_pressed
+        {
+            if let Some(Mode::Match(run)) = mode.as_mut() {
+                apply_training_keys(
+                    run,
+                    cycle_dummy_pressed,
+                    toggle_inf_life_pressed,
+                    toggle_inf_meter_pressed,
+                    reset_positions_pressed,
+                );
+            }
+            if let Some(RunScreen::Fight(run)) = menu_app.as_mut().map(|a| &mut a.screen) {
+                apply_training_keys(
+                    run,
+                    cycle_dummy_pressed,
+                    toggle_inf_life_pressed,
+                    toggle_inf_meter_pressed,
+                    reset_positions_pressed,
+                );
+            }
         }
 
         // --- Fixed-timestep tick (catch-up loop) ---

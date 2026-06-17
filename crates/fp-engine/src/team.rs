@@ -283,6 +283,44 @@ impl TeamMatch {
         self.game_mode = mode;
     }
 
+    /// The match-time [`GameMode`] this team is being fought under (F027 / T066).
+    /// See [`TeamMatch::set_game_mode`].
+    #[must_use]
+    pub fn game_mode(&self) -> GameMode {
+        self.game_mode
+    }
+
+    /// Enables/disables the per-side "infinite life" training toggle (F027 /
+    /// T067) on the active inner [`Match`]. See [`Match::set_infinite_life`].
+    pub fn set_infinite_life(&mut self, side: Side, enabled: bool) {
+        self.inner_mut().set_infinite_life(side, enabled);
+    }
+
+    /// Whether "infinite life" is on for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_life(&self, side: Side) -> bool {
+        self.inner_ref().infinite_life(side)
+    }
+
+    /// Enables/disables the per-side "infinite meter" training toggle (F027 /
+    /// T067) on the active inner [`Match`]. See [`Match::set_infinite_meter`].
+    pub fn set_infinite_meter(&mut self, side: Side, enabled: bool) {
+        self.inner_mut().set_infinite_meter(side, enabled);
+    }
+
+    /// Whether "infinite meter" is on for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_meter(&self, side: Side) -> bool {
+        self.inner_ref().infinite_meter(side)
+    }
+
+    /// Resets both fighters of the active pair to their round-start positions,
+    /// facing, and full life without advancing the round (the training
+    /// "reset position" key, F027 / T067). See [`Match::reset_positions`].
+    pub fn reset_positions(&mut self) {
+        self.inner_mut().reset_positions();
+    }
+
     /// The inner 1v1 [`Match`] (always present between ticks). Panics only if the
     /// match was left taken out across a tick boundary, which the hand-off path
     /// never does — it takes and re-installs within a single `tick`.

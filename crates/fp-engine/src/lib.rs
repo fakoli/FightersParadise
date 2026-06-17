@@ -73,10 +73,12 @@ use fp_input::{
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
 
+mod dummy;
 mod replay;
 mod snapshot;
 mod team;
 
+pub use dummy::{dummy_input, DummyMode};
 pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
 pub use team::{Side, TeamMatch, TeamMatchState, TeamMode, TeamOutcome};
@@ -1764,6 +1766,29 @@ pub struct Match {
     /// byte-equal. Set with [`Match::set_game_mode`]; read via
     /// [`Match::game_mode`].
     game_mode: GameMode,
+
+    // ---- Training-mode aids (F027 / T067) ---------------------------------
+    /// When `true`, P1's `life` is restored to `life_max` after each tick's combat
+    /// resolution (the Lab's "infinite life"). A *config* flag like
+    /// [`game_mode`](Match::game_mode), not snapshotted, so the Versus path stays
+    /// byte-equal. Default `false`; toggle with [`Match::set_infinite_life`].
+    p1_infinite_life: bool,
+    /// When `true`, P2's `life` is restored to `life_max` after each tick. See
+    /// [`p1_infinite_life`](Match::p1_infinite_life).
+    p2_infinite_life: bool,
+    /// When `true`, P1's `power` (super meter) is restored to `power_max` after
+    /// each tick (the Lab's "infinite meter"). Toggle with
+    /// [`Match::set_infinite_meter`].
+    p1_infinite_meter: bool,
+    /// When `true`, P2's `power` is restored to `power_max` after each tick.
+    p2_infinite_meter: bool,
+    /// Whether P1 took a connecting hit on the most recent [`Match::tick`]
+    /// (recomputed every tick). Read via [`Match::p1_was_hit`]; the training
+    /// dummy ([`DummyMode::BlockAfterFirst`]) latches on the *opponent*'s signal.
+    p1_was_hit: bool,
+    /// Whether P2 took a connecting hit on the most recent tick. See
+    /// [`Match::p2_was_hit`].
+    p2_was_hit: bool,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -1927,6 +1952,12 @@ impl Match {
             common_fx: None,
             single_round: false,
             game_mode: GameMode::Versus,
+            p1_infinite_life: false,
+            p2_infinite_life: false,
+            p1_infinite_meter: false,
+            p2_infinite_meter: false,
+            p1_was_hit: false,
+            p2_was_hit: false,
         };
         // Drive each fighter through its round-init state (5900) for round 1, the
         // same way [`Match::reset_for_next_round`] does for every later round.
@@ -2011,6 +2042,116 @@ impl Match {
     #[must_use]
     pub fn game_mode(&self) -> GameMode {
         self.game_mode
+    }
+
+    /// Sets the per-side "infinite life" training toggle (F027 / T067).
+    ///
+    /// When enabled for a side, that fighter's `life` is restored to its `life_max`
+    /// after each [`Match::tick`]'s combat resolution, so a player rehearsing a
+    /// combo never KOs the dummy (or themselves). A configuration flag, not
+    /// simulation state — not snapshotted, so leaving both `false` (the default)
+    /// keeps the Versus path byte-equal.
+    pub fn set_infinite_life(&mut self, side: Side, enabled: bool) {
+        match side {
+            Side::P1 => self.p1_infinite_life = enabled,
+            Side::P2 => self.p2_infinite_life = enabled,
+        }
+    }
+
+    /// Whether "infinite life" is enabled for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_life(&self, side: Side) -> bool {
+        match side {
+            Side::P1 => self.p1_infinite_life,
+            Side::P2 => self.p2_infinite_life,
+        }
+    }
+
+    /// Sets the per-side "infinite meter" training toggle (F027 / T067).
+    ///
+    /// When enabled, that fighter's `power` (super meter) is restored to
+    /// `power_max` after each [`Match::tick`], so supers can be rehearsed without
+    /// rebuilding meter. See [`Match::set_infinite_life`] for the config-flag
+    /// semantics.
+    pub fn set_infinite_meter(&mut self, side: Side, enabled: bool) {
+        match side {
+            Side::P1 => self.p1_infinite_meter = enabled,
+            Side::P2 => self.p2_infinite_meter = enabled,
+        }
+    }
+
+    /// Whether "infinite meter" is enabled for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_meter(&self, side: Side) -> bool {
+        match side {
+            Side::P1 => self.p1_infinite_meter,
+            Side::P2 => self.p2_infinite_meter,
+        }
+    }
+
+    /// Whether player 1 took a connecting hit on the most recent [`Match::tick`]
+    /// (F027 / T067). Recomputed every tick; the training dummy's
+    /// [`DummyMode::BlockAfterFirst`] latches off the *opponent*'s signal to start
+    /// guarding once the first hit lands.
+    #[must_use]
+    pub fn p1_was_hit(&self) -> bool {
+        self.p1_was_hit
+    }
+
+    /// Whether player 2 took a connecting hit on the most recent tick (F027 /
+    /// T067). See [`Match::p1_was_hit`].
+    #[must_use]
+    pub fn p2_was_hit(&self) -> bool {
+        self.p2_was_hit
+    }
+
+    /// Resets both fighters to their round-start positions, facing, full life, and
+    /// neutral stand **without** advancing the round counter or wins — the training
+    /// "reset position" key (F027 / T067).
+    ///
+    /// Restores the captured opener ([`RoundResetState`]) for each side, re-seeds
+    /// the face-each-other facing, clears transient combat state (active hitdefs,
+    /// hit-sparks, live projectiles/explods), and clears the per-side
+    /// "was hit this combo" latches — but leaves the round phase, round number,
+    /// timer, and accumulated round wins untouched, so the player can re-stage a
+    /// setup mid-round as many times as they like. Idempotent and panic-free.
+    pub fn reset_positions(&mut self) {
+        reset_fighter_for_round(&mut self.p1.character, self.p1_reset);
+        reset_fighter_for_round(&mut self.p2.character, self.p2_reset);
+        face_each_other(&mut self.p1.character, &mut self.p2.character);
+
+        // Clear transient cross-tick combat state so the re-staged setup starts
+        // clean (mirrors the round-reset sweep, minus the round bookkeeping).
+        self.effects.clear();
+        self.p1.projectiles.clear();
+        self.p2.projectiles.clear();
+        self.p1.explods.clear();
+        self.p2.explods.clear();
+        self.freeze = Freeze::inactive();
+        self.p1_sound_requests.clear();
+        self.p2_sound_requests.clear();
+        self.p1_was_hit = false;
+        self.p2_was_hit = false;
+
+        tracing::info!("training: reset fighters to start positions");
+    }
+
+    /// Applies the per-side training infinite-life / infinite-meter clamps
+    /// (F027 / T067). A no-op unless a toggle is enabled, so the Versus path is
+    /// unaffected. `life` is restored to `life_max`, `power` to `power_max`.
+    fn apply_training_clamps(&mut self) {
+        if self.p1_infinite_life {
+            self.p1.character.life = self.p1.character.life_max;
+        }
+        if self.p2_infinite_life {
+            self.p2.character.life = self.p2.character.life_max;
+        }
+        if self.p1_infinite_meter {
+            self.p1.character.power = self.p1.character.power_max;
+        }
+        if self.p2_infinite_meter {
+            self.p2.character.power = self.p2.character.power_max;
+        }
     }
 
     /// Seeds the two fighters' `random` streams **distinctly** from a single match
@@ -2592,6 +2733,13 @@ impl Match {
         //     (mirrored onto the attacker's `TickReport::frame_advantage`).
         self.p1.frame_advantage = None;
         self.p2.frame_advantage = None;
+        // (3·T067) Snapshot each fighter's life BEFORE combat so the per-tick
+        // "was hit" signal can be recomputed by comparing afterwards. This covers
+        // every damage path (melee, projectile, chip) without threading a flag
+        // through each resolve branch; the training dummy's `BlockAfterFirst`
+        // latches off it.
+        let p1_life_before = self.p1.character.life;
+        let p2_life_before = self.p2.character.life;
         if fighting {
             // (3a) Priority / trade clash arbitration (audit #20). BEFORE the two
             //      independent resolve_attack passes, detect the SIMULTANEOUS-hit
@@ -2706,6 +2854,15 @@ impl Match {
             resolve_projectile_hits(&mut self.p1, &mut self.p2);
             resolve_projectile_hits(&mut self.p2, &mut self.p1);
         }
+
+        // (3·T067) Recompute the per-tick "was hit" signals from the life delta
+        // (a fighter that lost life this tick took a hit), THEN apply the
+        // training infinite-life / infinite-meter clamps. Order matters: the
+        // signal is read before the heal so `BlockAfterFirst` still latches even
+        // with infinite life on, and the heal then masks the damage as intended.
+        self.p1_was_hit = self.p1.character.life < p1_life_before;
+        self.p2_was_hit = self.p2.character.life < p2_life_before;
+        self.apply_training_clamps();
 
         // (3c) Advance the live hit-spark effects (audit #17): step each spark's
         //      animation cursor against its owning side's AIR action and drop any
@@ -12587,5 +12744,229 @@ time = 1
         // On hit: 12 frames of hitstun vs the same 8 recovery → +4 (advantage).
         let on_hit = frame_advantage(12, fd.recovery);
         assert_eq!(on_hit, 4, "on-hit advantage = hitstun − recovery");
+    }
+
+    // ---- Training dummy control (F027 / T067) -----------------------------
+
+    /// Builds a fight-ready attacker (P1) vs defender (P2) match, advanced into
+    /// the Fight phase, with the defender at full life. P1 sits left, P2 right.
+    fn dummy_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Poses P1 on its punch frame with a fresh blockable HitDef for this tick.
+    fn arm_p1_punch(m: &mut Match) {
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+    }
+
+    #[test]
+    fn blockall_dummy_guards_attack_chip_only() {
+        let mut m = dummy_match();
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        // The dummy in BlockAll holds away from the opponent every tick, computed
+        // from the live opponent side — so it guards a clean hit (chip only).
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let p2_in = dummy_input(DummyMode::BlockAll, on_right, m.p2_was_hit(), 0);
+        m.tick(MatchInput::none(), p2_in);
+        // sample_hitdef: hit = 30, guard = 5. A block deals only the guard chip.
+        assert_eq!(
+            m.p2().life(),
+            before - 5,
+            "BlockAll guards the attack: guard chip only, not full hit damage"
+        );
+        assert!(
+            m.p2_was_hit(),
+            "even a blocked hit registers the chip as a hit"
+        );
+    }
+
+    #[test]
+    fn stand_dummy_takes_full_hit() {
+        // Negative control: a standing (non-blocking) dummy eats the full hit.
+        let mut m = dummy_match();
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        let p2_in = dummy_input(DummyMode::Stand, true, false, 0);
+        assert_eq!(p2_in, MatchInput::none(), "Stand holds nothing");
+        m.tick(MatchInput::none(), p2_in);
+        assert_eq!(
+            m.p2().life(),
+            before - 30,
+            "a standing dummy takes the full hit damage (30), not the guard chip"
+        );
+    }
+
+    #[test]
+    fn blockall_is_crossup_correct_after_a_side_swap() {
+        // Put the opponent on the dummy's LEFT (P1 to the right of P2). The dummy's
+        // block direction must follow the live side: guard right, not the stale left.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(60.0, 0.0);
+        p1c.facing = Facing::Left;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(0.0, 0.0);
+        p2c.facing = Facing::Right;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        let before = m.p2().life();
+        // P1 (on the right) attacks toward the left.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.facing = Facing::Left;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        // This layout mirrors `dummy_match`: here P1 is on the dummy's RIGHT, so
+        // the crossup-correct guard direction is the opposite — hold LEFT.
+        assert!(
+            on_right,
+            "opponent is on the dummy's right in this (mirrored) layout"
+        );
+        let p2_in = dummy_input(DummyMode::BlockAll, on_right, m.p2_was_hit(), 0);
+        assert!(
+            p2_in.left && !p2_in.right,
+            "guard direction follows the opponent: hold LEFT when opponent is right"
+        );
+        m.tick(MatchInput::none(), p2_in);
+        assert_eq!(
+            m.p2().life(),
+            before - 5,
+            "crossup-correct block guards the hit from the other side (chip only)"
+        );
+    }
+
+    #[test]
+    fn block_after_first_lets_first_hit_land_then_guards() {
+        let mut m = dummy_match();
+        let start = m.p2().life();
+        // Tick 1: not yet hit, so BlockAfterFirst stands and eats the first hit.
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_was_hit(), 0);
+        assert_eq!(in1, MatchInput::none(), "stands before the first hit lands");
+        m.tick(MatchInput::none(), in1);
+        assert_eq!(
+            m.p2().life(),
+            start - 30,
+            "the first hit lands cleanly (full 30 damage)"
+        );
+        assert!(m.p2_was_hit(), "the first hit latches the was-hit signal");
+
+        // Tick 2: now hit — BlockAfterFirst guards, so the second hit is chip only.
+        let after_first = m.p2().life();
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_was_hit(), 1);
+        assert!(in2.left || in2.right, "guards after the first hit");
+        m.tick(MatchInput::none(), in2);
+        assert_eq!(
+            m.p2().life(),
+            after_first - 5,
+            "the second hit is blocked: guard chip only"
+        );
+    }
+
+    #[test]
+    fn infinite_life_keeps_life_at_max_after_a_hit() {
+        let mut m = dummy_match();
+        m.set_infinite_life(Side::P2, true);
+        let max = m.p2().character.life_max;
+        assert_eq!(m.p2().life(), max, "starts at max");
+        arm_p1_punch(&mut m);
+        // A standing dummy takes the hit, but infinite life restores it to max.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(m.p2_was_hit(), "the hit still registers");
+        assert_eq!(
+            m.p2().life(),
+            max,
+            "infinite life clamps the defender back to life_max after the hit"
+        );
+        assert!(m.infinite_life(Side::P2));
+        assert!(!m.infinite_life(Side::P1));
+    }
+
+    #[test]
+    fn infinite_meter_keeps_power_at_max() {
+        let mut m = dummy_match();
+        m.set_infinite_meter(Side::P1, true);
+        m.p1.character.power = 0;
+        let pmax = m.p1.character.power_max;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.power,
+            pmax,
+            "infinite meter clamps power up to power_max each tick"
+        );
+        assert!(m.infinite_meter(Side::P1));
+    }
+
+    #[test]
+    fn no_infinite_toggle_leaves_combat_unchanged() {
+        // Regression guard: with both toggles off, a hit drops life as normal.
+        let mut m = dummy_match();
+        assert!(!m.infinite_life(Side::P1) && !m.infinite_life(Side::P2));
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p2().life() < before,
+            "without the toggle, life drops normally"
+        );
+    }
+
+    #[test]
+    fn reset_positions_restores_start_pos_and_life_without_advancing_round() {
+        let mut m = dummy_match();
+        let p1_start = m.p1().pos();
+        let p2_start = m.p2().pos();
+        let round_before = m.round_number();
+        // Damage and shove the fighters around.
+        m.p2.character.life = 100;
+        m.p1.character.pos = Vec2::new(-150.0, 0.0);
+        m.p2.character.pos = Vec2::new(150.0, 0.0);
+        m.p2_was_hit = true;
+
+        m.reset_positions();
+
+        assert_eq!(m.p1().pos(), p1_start, "P1 back to its start position");
+        assert_eq!(m.p2().pos(), p2_start, "P2 back to its start position");
+        assert_eq!(
+            m.p2().life(),
+            m.p2().character.life_max,
+            "reset restores full life"
+        );
+        assert!(!m.p2_was_hit(), "reset clears the was-hit latch");
+        assert_eq!(
+            m.round_number(),
+            round_before,
+            "reset_positions does NOT advance the round counter"
+        );
     }
 }
