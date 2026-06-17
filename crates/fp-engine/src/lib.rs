@@ -7239,6 +7239,31 @@ time = 1
         ))
     }
 
+    /// Drives `m` (no input) until BOTH fighters are controllable in the neutral
+    /// stand (state 0 with `ctrl`) — i.e. they have finished the round-init intro
+    /// (common1 5900 -> the character's `[Statedef 191]` intro animation, T056) and
+    /// handed control back. Returns whether both became controllable within budget.
+    ///
+    /// `RoundState::Fight` alone is not enough to drive locomotion: KFM's authored
+    /// intro keeps a fighter in state 191 (no control) while its intro animation
+    /// plays out before `ChangeState`-ing to the stand. A test that wants to prove
+    /// walking must wait for this, not merely for the fight to go live.
+    fn run_until_both_can_walk(m: &mut Match) -> bool {
+        let ready = |m: &Match| {
+            m.p1().character.state_no == 0
+                && m.p1().character.ctrl
+                && m.p2().character.state_no == 0
+                && m.p2().character.ctrl
+        };
+        for _ in 0..240 {
+            if ready(m) {
+                return true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        ready(m)
+    }
+
     /// Drives `m` through the intro into the live fight, returning whether it
     /// became live within the budget.
     fn run_until_fight(m: &mut Match) -> bool {
@@ -7259,9 +7284,14 @@ time = 1
     #[test]
     fn p1_walks_toward_opponent_via_real_commands() {
         let Some(mut m) = two_kfm_match() else { return };
+        // Drive past the round-init intro (T056): the fight going live is not enough,
+        // KFM plays a finite intro (state 191) before handing control to the stand.
         assert!(
-            run_until_fight(&mut m),
-            "fight must go live before driving input"
+            run_until_both_can_walk(&mut m),
+            "fighters must hand control back from the round-init intro before walking; \
+             p1 state {} ctrl {}",
+            m.p1().character.state_no,
+            m.p1().character.ctrl
         );
         assert_eq!(m.p1().facing(), Facing::Right, "P1 faces P2 (to its right)");
 
@@ -7303,9 +7333,13 @@ time = 1
     #[test]
     fn p2_walks_toward_opponent_facing_left() {
         let Some(mut m) = two_kfm_match() else { return };
+        // Drive past the round-init intro (T056) before asserting locomotion.
         assert!(
-            run_until_fight(&mut m),
-            "fight must go live before driving input"
+            run_until_both_can_walk(&mut m),
+            "fighters must hand control back from the round-init intro before walking; \
+             p2 state {} ctrl {}",
+            m.p2().character.state_no,
+            m.p2().character.ctrl
         );
         assert_eq!(m.p2().facing(), Facing::Left, "P2 faces P1 (to its left)");
 
@@ -7583,6 +7617,38 @@ time = 1
         }
     }
 
+    /// A converging round-init state ([`ROUND_INIT_STATE`], 5900) that hands
+    /// straight back to the neutral stand (state 0) on `Time = 0` — the same shape
+    /// the shipped clean-room `common1.cns` 5900 has. Inserted into a loaded graph
+    /// so the engine's round-init ([`Match::run_round_init`], T056) converges in a
+    /// single tick to state 0 rather than into a character's multi-tick intro
+    /// animation. This keeps the round-init mechanism exercised while leaving a
+    /// single-tick cross-entity probe (which lives at state 0) free to run.
+    fn converging_round_init_state() -> CompiledState {
+        CompiledState {
+            number: ROUND_INIT_STATE,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            controllers: vec![CompiledController {
+                state_number: ROUND_INIT_STATE,
+                label: String::new(),
+                controller_type: Some("ChangeState".to_string()),
+                triggerall: Vec::new(),
+                triggers: vec![CompiledTriggerGroup {
+                    number: 1,
+                    conditions: vec![CompiledExpr::compile("Time = 0")],
+                }],
+                persistent: None,
+                ignorehitpause: None,
+                params: [("value".to_string(), CompiledParam::compile("0"))]
+                    .into_iter()
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// A state 0 that, every tick, records what this character's cross-entity
     /// triggers see about its opponent into its integer var bank:
     /// - `var(0)` = `p2dist X` (facing-relative gap to the opponent),
@@ -7622,8 +7688,13 @@ time = 1
         let Some((mut lc1, lc2)) = two_kfm_loaded() else {
             return;
         };
-        // Replace P1's state 0 with the cross-entity probe.
+        // Replace P1's state 0 with the cross-entity probe, and override its
+        // round-init 5900 with a converging stub so the engine's round-init (T056)
+        // lands directly on the probe at state 0 in the single tick below, rather
+        // than into KFM's multi-tick intro animation (states 190/191).
         lc1.states.insert(0, cross_entity_probe_state());
+        lc1.states
+            .insert(ROUND_INIT_STATE, converging_round_init_state());
 
         // P1 at x=-60 facing right, P2 at x=60 facing left, with a known life.
         let mut p1c = Character::with_constants(lc1.constants);
@@ -7694,6 +7765,10 @@ time = 1
         let mut probe = cross_entity_probe_state();
         probe.controllers.push(gated);
         lc1.states.insert(0, probe);
+        // Converge round-init (T056) straight to state 0 so the gated probe runs in
+        // the single tick below, instead of KFM's multi-tick intro (190/191).
+        lc1.states
+            .insert(ROUND_INIT_STATE, converging_round_init_state());
 
         let mut p1c = Character::with_constants(lc1.constants);
         p1c.pos = Vec2::new(-60.0, 0.0);
