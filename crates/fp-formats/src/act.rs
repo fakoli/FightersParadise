@@ -58,10 +58,49 @@ pub const ACT_RGBA_SIZE: usize = 1024;
 /// by [`crate::sff::SffFile::palette`]), already de-reversed into natural index
 /// order (`rgba[0..4]` is palette index 0) with the index-0-transparent
 /// convention applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActPalette {
     /// 256 colours × 4 bytes (RGBA), index 0 first. Index 0 has alpha = 0.
+    ///
+    /// Serialized through [`rgba_bytes`] because serde's stock array support
+    /// stops at 32 elements; the helper round-trips the fixed
+    /// [`ACT_RGBA_SIZE`]-byte buffer losslessly via a byte sequence.
+    #[serde(with = "rgba_bytes")]
     pub rgba: [u8; ACT_RGBA_SIZE],
+}
+
+/// (De)serializes the fixed [`ACT_RGBA_SIZE`]-byte palette buffer.
+///
+/// serde derives `Serialize`/`Deserialize` for `[T; N]` only up to `N == 32`,
+/// so the 1024-byte palette needs a manual seam. It is encoded as a byte
+/// sequence and decoded back into the fixed-size array, returning a recoverable
+/// error (never a panic) if the byte count does not match.
+mod rgba_bytes {
+    use super::ACT_RGBA_SIZE;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serializes the array as a borrowed byte slice.
+    pub(super) fn serialize<S>(rgba: &[u8; ACT_RGBA_SIZE], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(rgba)
+    }
+
+    /// Deserializes a byte buffer back into the fixed-size array.
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; ACT_RGBA_SIZE], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            D::Error::custom(format!(
+                "ActPalette.rgba expected {ACT_RGBA_SIZE} bytes, got {}",
+                v.len()
+            ))
+        })
+    }
 }
 
 impl ActPalette {

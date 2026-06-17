@@ -289,7 +289,7 @@ impl fmt::Display for Value {
 ///
 /// [kb]: ../../../docs/knowledge-base/07-evaluator-semantics.md
 /// [trigger.html]: https://www.elecbyte.com/mugendocs/trigger.html
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Redirect {
     /// `parent` — the helper's immediate creator. Errors (→ `None`) if the
     /// current entity is a root player rather than a helper.
@@ -343,7 +343,7 @@ impl fmt::Display for Redirect {
 /// [`Expr::Assign`](crate::parser::Expr::Assign)). The bank fixes the element
 /// type the assigned value is coerced to: the integer banks store an `i32`, the
 /// float banks an `f32`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AssignBank {
     /// `var(n)` — the integer variable bank.
     Var,

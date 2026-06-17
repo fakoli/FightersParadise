@@ -20,7 +20,7 @@ const PALETTE_RGB_SIZE: usize = 768;
 const PALETTE_RGBA_BYTES_PER_COLOR: usize = 4;
 
 /// A parsed palette sub-header from an SFF v2 file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SffPalette {
     /// Palette group number.
     pub group: u16,

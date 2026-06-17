@@ -607,10 +607,12 @@ dependencies = [
 name = "fp-formats"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "encoding_rs",
  "fp-core",
  "nom",
  "png",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -676,9 +678,11 @@ dependencies = [
 name = "fp-vm"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "fp-core",
  "fp-formats",
  "proptest",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]

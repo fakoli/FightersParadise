@@ -78,7 +78,7 @@ use crate::lexer::{tokenize, Token, TokenKind};
 /// Each variant maps to exactly one source operator. Equality is represented by
 /// a single [`BinaryOp::Eq`] regardless of whether the source used `=` or its
 /// `==` alias, so the evaluator does not have to distinguish them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     /// `||` — logical OR.
     Or,
@@ -142,7 +142,7 @@ impl fmt::Display for BinaryOp {
 }
 
 /// A unary prefix operator in the MUGEN expression grammar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// `!` — logical NOT.
     Not,
@@ -167,7 +167,7 @@ impl fmt::Display for UnaryOp {
 ///
 /// MUGEN ranges can mix bound kinds, e.g. `(0,10]` is "greater than 0 and at
 /// most 10".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Bound {
     /// Inclusive bound, written with a square bracket (`[` or `]`).
     Inclusive,
@@ -180,7 +180,7 @@ pub enum Bound {
 /// This is the output of [`parse`] / [`parse_str`] and the input to the
 /// evaluator (task 4.4). Sub-expressions are boxed so the enum stays a fixed
 /// size.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     /// An integer literal, e.g. `42`.
     Int(i64),

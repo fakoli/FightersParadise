@@ -30,3 +30,30 @@ pub mod fnt;
 pub mod sff;
 pub mod snd;
 pub mod text;
+
+/// Deterministic serialization helper for `HashMap` fields (F034 T086).
+///
+/// `HashMap` iteration order is unspecified, so two serializations of the same
+/// map can differ byte-for-byte — which would defeat the content-addressed IR
+/// cache the parsed formats feed into. This module serializes a map through a
+/// sorted intermediate (`BTreeMap`) so the encoding is **deterministic**:
+/// identical maps always produce identical bytes, with keys emitted in sorted
+/// order. Deserialization uses serde's stock `HashMap` path (input order does
+/// not matter), so only [`serialize`](sorted_map::serialize) is provided.
+pub(crate) mod sorted_map {
+    use std::collections::{BTreeMap, HashMap};
+
+    use serde::{Serialize, Serializer};
+
+    /// Serializes a `HashMap` as a sorted (`BTreeMap`) sequence so the byte
+    /// output is deterministic across runs.
+    pub(crate) fn serialize<S, K, V>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        K: Serialize + Ord,
+        V: Serialize,
+    {
+        let sorted: BTreeMap<&K, &V> = map.iter().collect();
+        sorted.serialize(serializer)
+    }
+}

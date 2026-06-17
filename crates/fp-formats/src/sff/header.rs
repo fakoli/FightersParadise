@@ -15,7 +15,7 @@ const SFF_SIGNATURE: &[u8; 12] = b"ElecbyteSpr\0";
 const HEADER_SIZE: usize = 512;
 
 /// Parsed SFF v2 file header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SffHeader {
     /// Major version number (should be 2 for SFF v2).
     pub version_major: u8,

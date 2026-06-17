@@ -25,14 +25,18 @@ use std::path::Path;
 use fp_core::{FpError, FpResult, Rect, SpriteId, Vec2};
 
 /// A complete parsed AIR file containing all animation actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AirFile {
     /// Map from action number to animation action.
+    ///
+    /// Serialized through [`crate::sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "crate::sorted_map::serialize")]
     pub actions: HashMap<i32, AnimAction>,
 }
 
 /// A single animation action (sequence of frames).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimAction {
     /// The action number identifying this animation.
     pub action_number: i32,
@@ -47,7 +51,7 @@ pub struct AnimAction {
 /// Implements [`Default`] (an empty sprite-0 frame with no transforms) so
 /// callers can build a frame and override only the fields they care about via
 /// `AnimFrame { ..Default::default() }`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimFrame {
     /// Which sprite to display (group, image).
     pub sprite: SpriteId,
@@ -97,7 +101,7 @@ impl AnimFrame {
 /// frame's duration into the frame that follows the line. All fields default to
 /// `false`, so a plain AIR with no `Interpolate` lines is byte-for-byte
 /// unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Interpolate {
     /// Interpolate the position offset (`Interpolate Offset`).
     pub offset: bool,
@@ -117,7 +121,7 @@ impl Interpolate {
 }
 
 /// Sprite blending mode for rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     /// Standard rendering (no blending).
     #[default]
