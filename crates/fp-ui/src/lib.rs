@@ -34,6 +34,7 @@
 pub mod discovery;
 pub mod hud_config;
 pub mod renderer;
+pub mod resource_state;
 pub mod screenpack;
 pub mod select_def;
 pub mod system_def;
@@ -43,6 +44,10 @@ pub use hud_config::{BarColor, HudConfig, HudElement};
 pub use renderer::{
     bar_fill_uv, bar_tint_palfx, clamp_fraction, combo_text, face_draw_pos, MatchHudState,
     ScreenpackHud,
+};
+pub use resource_state::{
+    low_life_tint, max_power_flash_tint, LOW_LIFE_THRESHOLD, MAX_POWER_THRESHOLD,
+    POWER_FLASH_PERIOD,
 };
 pub use screenpack::{
     ComboLayout, FaceSide, LifebarSide, NameSide, Pos, PowerbarSide, RoundLayout, ScreenpackLayout,

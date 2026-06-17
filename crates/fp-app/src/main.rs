@@ -1665,7 +1665,7 @@ impl Hud {
     /// Draws the full match HUD: a life bar for each fighter (P1 top-left, P2
     /// top-right), a smaller power (super-meter) bar directly beneath each, and a
     /// round/KO indicator. Crude by design.
-    fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match) {
+    fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match, tick: u64) {
         const MARGIN: f32 = 12.0;
         const BAR_W: f32 = 200.0;
         const BAR_H: f32 = 16.0;
@@ -1691,7 +1691,7 @@ impl Hud {
             w: POWER_BAR_W,
             h: POWER_BAR_H,
         };
-        self.draw_power_bar(frame, p1_power, m.p1(), false);
+        self.draw_power_bar(frame, p1_power, m.p1(), false, tick);
         // P2 life bar, top-right, draining toward the center (mirrored).
         let p2_bar = HudRect {
             x: win_w - MARGIN - BAR_W,
@@ -1707,7 +1707,7 @@ impl Hud {
             w: POWER_BAR_W,
             h: POWER_BAR_H,
         };
-        self.draw_power_bar(frame, p2_power, m.p2(), true);
+        self.draw_power_bar(frame, p2_power, m.p2(), true, tick);
 
         // The round timer (remaining whole seconds), centered near the top, drawn
         // as bitmap text when the font is available. Always rendered during a live
@@ -1777,8 +1777,13 @@ impl Hud {
 
         let frac = life_fraction(player.life(), player.life_max());
         let fill_w = bar.w * frac;
-        // Color shifts from green (healthy) to red (near death).
-        let color = if frac > 0.33 { &self.green } else { &self.red };
+        // Color shifts from green (healthy) to red at low life (<25%, T074),
+        // using the same threshold the screenpack HUD uses so both readouts agree.
+        let color = if !fp_ui::low_life_tint(frac).is_neutral() {
+            &self.red
+        } else {
+            &self.green
+        };
         if fill_w > 0.0 {
             let fill_x = if mirror {
                 bar.x + (bar.w - fill_w)
@@ -1801,18 +1806,33 @@ impl Hud {
     /// then a blue fill proportional to `power / power_max`. When `mirror` is set
     /// the fill is anchored to the right edge (so P2's bar fills toward the
     /// center, matching its life bar above).
+    ///
+    /// At max meter (a super is available) the fill **flashes** (T074): it
+    /// alternates between blue and a bright yellow on a deterministic, frame-keyed
+    /// pulse (the quad HUD cannot multiply a per-draw tint, so it swaps between
+    /// pre-built color quads instead). `tick` drives the pulse — no RNG, so the
+    /// flash is replay-safe.
     fn draw_power_bar(
         &self,
         frame: &mut fp_render::RenderFrame<'_>,
         bar: HudRect,
         player: &Player,
         mirror: bool,
+        tick: u64,
     ) {
         // Backing.
         self.fill(frame, &self.dark, bar);
 
         let frac = power_fraction(player.power(), player.power_max());
         let fill_w = bar.w * frac;
+        // At max meter, flash: the shared helper returns a non-neutral tint only
+        // during the flash's "dim" phase, which we render as the bright yellow
+        // accent so the full bar pulses; otherwise the normal blue fill.
+        let color = if fp_ui::max_power_flash_tint(frac, tick).is_neutral() {
+            &self.blue
+        } else {
+            &self.yellow
+        };
         if fill_w > 0.0 {
             let fill_x = if mirror {
                 bar.x + (bar.w - fill_w)
@@ -1821,7 +1841,7 @@ impl Hud {
             };
             self.fill(
                 frame,
-                &self.blue,
+                color,
                 HudRect {
                     x: fill_x,
                     w: fill_w,
@@ -4565,6 +4585,8 @@ fn match_hud_state(m: &Match) -> MatchHudState {
         timer_seconds: Some(timer_frames_to_seconds(m.timer())),
         round_text: round_readout(m),
         combo_count: active_combo_count(m),
+        // The caller sets `frame` (drives the T074 max-power flash) after building.
+        frame: 0,
     }
 }
 
@@ -5786,6 +5808,7 @@ fn draw_match_run(
     overlays: MatchOverlays,
     win_wf: f32,
     win_hf: f32,
+    tick: u64,
 ) {
     // Camera follows the fighters' midpoint, clamped to the stage's bounds — X
     // horizontally and Y vertically (scaled by `[Camera] verticalfollow`). With no
@@ -5908,12 +5931,14 @@ fn draw_match_run(
         .draw(frame, run.m(), hud.font(), win_wf);
 
     // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
+    // `tick` drives the deterministic max-power flash (T074) for both paths.
     match run.screenpack.as_ref() {
         Some(screenpack) => {
-            let state = match_hud_state(run.m());
+            let mut state = match_hud_state(run.m());
+            state.frame = tick;
             screenpack.draw(frame, &state);
         }
-        None => hud.draw(frame, win_wf, run.m()),
+        None => hud.draw(frame, win_wf, run.m(), tick),
     }
 
     // Intro/ending storyboard overlay (audit #32), drawn LAST and only while one
@@ -6461,7 +6486,15 @@ fn run() -> fp_core::FpResult<()> {
         // Direct-CLI content modes render exactly as before.
         match mode.as_ref() {
             Some(Mode::Match(run)) => {
-                draw_match_run(&mut frame, run, &hud, overlays, win_wf, win_hf);
+                draw_match_run(
+                    &mut frame,
+                    run,
+                    &hud,
+                    overlays,
+                    win_wf,
+                    win_hf,
+                    frame_counter,
+                );
             }
             Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -6532,7 +6565,15 @@ fn run() -> fp_core::FpResult<()> {
                     }
                 }
                 RunScreen::Fight(run) => {
-                    draw_match_run(&mut frame, run, &hud, overlays, win_wf, win_hf);
+                    draw_match_run(
+                        &mut frame,
+                        run,
+                        &hud,
+                        overlays,
+                        win_wf,
+                        win_hf,
+                        frame_counter,
+                    );
                 }
                 RunScreen::Quit => {}
             }
@@ -7414,6 +7455,56 @@ mod tests {
             "zero power_max yields 0, no div-by-zero"
         );
         assert_eq!(power_fraction(100, -10), 0.0, "negative power_max yields 0");
+    }
+
+    /// T074: the quad HUD picks its life-bar color from the SAME shared
+    /// `fp_ui::low_life_tint` threshold the screenpack HUD uses, so a fighter
+    /// below 25% life reads red and a healthy fighter reads green. This mirrors
+    /// the exact decision in `Hud::draw_life_bar`.
+    #[test]
+    fn quad_life_bar_red_shifts_below_25_percent() {
+        // Pick "red" exactly when the shared threshold tint is non-neutral.
+        let picks_red = |frac: f32| !fp_ui::low_life_tint(frac).is_neutral();
+        assert!(!picks_red(life_fraction(1000, 1000)), "full life is green");
+        assert!(!picks_red(life_fraction(500, 1000)), "half life is green");
+        assert!(
+            !picks_red(life_fraction(260, 1000)),
+            "just above 25% stays green"
+        );
+        assert!(
+            picks_red(life_fraction(250, 1000)),
+            "at 25% red-shifts (matches the screenpack threshold)"
+        );
+        assert!(picks_red(life_fraction(100, 1000)), "10% life is red");
+        assert!(picks_red(life_fraction(0, 1000)), "dead reads red");
+    }
+
+    /// T074: the quad HUD power bar flashes (swaps blue↔yellow) ONLY at max meter,
+    /// driven by the deterministic frame-keyed `fp_ui::max_power_flash_tint`. The
+    /// decision mirrors `Hud::draw_power_bar`.
+    #[test]
+    fn quad_power_bar_flashes_only_at_max() {
+        // "yellow" (flash accent) exactly when the shared flash tint is non-neutral.
+        let picks_yellow =
+            |frac: f32, tick: u64| !fp_ui::max_power_flash_tint(frac, tick).is_neutral();
+        // Below max: never flashes, at every frame across a full period.
+        for tick in 0..(fp_ui::POWER_FLASH_PERIOD * 2) {
+            assert!(
+                !picks_yellow(power_fraction(1500, 3000), tick),
+                "half meter never flashes"
+            );
+            assert!(
+                !picks_yellow(power_fraction(2900, 3000), tick),
+                "nearly-but-not-full never flashes"
+            );
+        }
+        // At max meter: the bar flashes on at least one phase within a period and
+        // is back to blue on another — a visible, deterministic pulse.
+        let full = power_fraction(3000, 3000);
+        let flashed = (0..fp_ui::POWER_FLASH_PERIOD).any(|t| picks_yellow(full, t));
+        let blued = (0..fp_ui::POWER_FLASH_PERIOD).any(|t| !picks_yellow(full, t));
+        assert!(flashed, "max meter must flash (yellow) on some frame");
+        assert!(blued, "max meter must show blue on some frame (it pulses)");
     }
 
     /// AC2: world X maps into the window centered on the midpoint, with the origin
