@@ -536,14 +536,16 @@ fn eval_proj_tail(
 }
 
 /// Maps a written projectile-info trigger name to the corresponding `*Time`
-/// trigger name the evaluator reads for the time-since-event value (T026), e.g.
-/// `ProjContact2000` → `ProjContactTime2000`, `ProjHit5` → `ProjHitTime5`. Returns
-/// `None` if `name` is not a `ProjContact` / `ProjHit` / `ProjGuarded` trigger
-/// (with or without the `Time` infix already present) followed by an id suffix.
+/// trigger name the evaluator reads for the time-since-event value (T026, T078),
+/// e.g. `ProjContact2000` → `ProjContactTime2000`, `ProjHit5` → `ProjHitTime5`,
+/// `ProjCancel7` → `ProjCancelTime7`, and the no-id `ProjHit` → `ProjHitTime`.
+/// Returns `None` if `name` is not a `ProjContact` / `ProjHit` / `ProjGuarded` /
+/// `ProjCancel` trigger (with or without the `Time` infix already present).
 ///
-/// Case-insensitive on the base; the original id suffix (and its case) is kept.
-/// A name that already carries the `Time` infix (the bare `ProjContactTime<id>`
-/// form should never reach the tail path, but be defensive) is returned as-is.
+/// Case-insensitive on the base; the original id suffix (and its case) is kept —
+/// an empty suffix (the no-id aggregate form, T078) is preserved as empty. A name
+/// that already carries the `Time` infix (the bare `ProjContactTime<id>` form
+/// should never reach the tail path, but be defensive) is returned as-is.
 fn proj_time_trigger_name(name: &str) -> Option<String> {
     // Allocation-free guard: reject anything not beginning with a case-insensitive
     // `proj` before touching the prefix tables, and match each base against the
@@ -559,15 +561,21 @@ fn proj_time_trigger_name(name: &str) -> Option<String> {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
     };
     // Already a `*Time` form → use verbatim.
-    const TIME_BASES: [&str; 3] = ["projcontacttime", "projguardedtime", "projhittime"];
+    const TIME_BASES: [&str; 4] = [
+        "projcontacttime",
+        "projguardedtime",
+        "projcanceltime",
+        "projhittime",
+    ];
     if TIME_BASES.iter().any(|b| starts_with_ci(b)) {
         return Some(name.to_string());
     }
     // (base, time-infixed base) — insert `Time` after the family base, keeping
     // the trailing id suffix from the original (case-preserved) name.
-    const BASES: [(&str, &str); 3] = [
+    const BASES: [(&str, &str); 4] = [
         ("projcontact", "ProjContactTime"),
         ("projguarded", "ProjGuardedTime"),
+        ("projcancel", "ProjCancelTime"),
         ("projhit", "ProjHitTime"),
     ];
     for (base, time_base) in BASES {
