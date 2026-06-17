@@ -369,6 +369,14 @@ pub fn resolve_attack(
     // longer of the two). A miss never reaches this point (it returns `None`
     // above), so a miss pauses NEITHER participant — exactly the required rule.
     //
+    // HITSTOP STRENGTH-SCALING (T073): the attacker's hit-stop is surfaced
+    // verbatim from the connecting `HitDef`'s `pausetime.p1`, so a heavy move
+    // (large authored `pausetime`) freezes the attacker longer than a light one
+    // and "reads heavier" — no separate strength system is invented; the freeze
+    // is data-driven straight from the HitDef. The executor counts this freeze
+    // down one tick at a time (see `Character::hitpause`), so a hit with
+    // `pausetime.p1 = 0` imparts no attacker hit-stop at all.
+    //
     // GUARD PAUSETIME FALLBACK: MUGEN's `HitDef` can carry a distinct
     // `guard.pausetime`; [`fp_combat::HitDef`] does not model that field yet, so
     // [`fp_combat::resolve_hit`] reports `pausetime.p1`/`pausetime.p2` for *both*
