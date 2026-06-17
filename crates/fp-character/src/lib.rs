@@ -375,7 +375,7 @@ fn clamp_usize(index: i32, len: usize) -> usize {
 /// (player widths, walk/jump velocities, gravity and friction). Every field has
 /// a safe MUGEN-style default; unknown/unmodeled constants resolve to the safe
 /// default rather than failing the load.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CharacterConstants {
     /// Maximum life (`[Data] life`). Defaults to MUGEN's `1000`.
     pub life_max: i32,
@@ -444,7 +444,7 @@ impl Default for CharacterConstants {
 /// Only the fields the executor and physics need are modeled here (player
 /// widths and height); the remaining `[Size]` keys (`xscale`, `head.pos`, …)
 /// are not read yet. Each defaults to KFM's value, MUGEN's de-facto baseline.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SizeConstants {
     /// `ground.front` — player half-width forward, on the ground (pixels).
     pub ground_front: i32,
@@ -480,7 +480,7 @@ impl Default for SizeConstants {
 /// whose stored `y` is `0`; the y component of a jump comes from `jump.neu.y`
 /// (mirrored into [`jump_up`](Self::jump_up)) or, for air jumps, from
 /// `airjump.neu.y` (mirrored into [`airjump_y`](Self::airjump_y)).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VelocityConstants {
     /// `walk.fwd` — forward walking velocity `(x, y)`. MUGEN authors this as a
     /// bare x value; `y` is `0`.
@@ -550,7 +550,7 @@ impl Default for VelocityConstants {
 /// `yaccel` is the per-tick downward acceleration applied by air physics
 /// (`Physics::Air`). `stand.friction`/`crouch.friction` are the multiplicative
 /// coefficients applied to x-velocity each tick by stand/crouch physics.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MovementConstants {
     /// `yaccel` — downward acceleration in pixels/tick² (gravity).
     pub yaccel: f32,

@@ -113,7 +113,7 @@ const ADX_MARKER_SCAN_LEN: usize = 32;
 ///
 /// The payload is the raw, undecoded blob stored in the file — in practice a
 /// RIFF/WAVE chunk. Decoding to PCM samples is the responsibility of `fp-audio`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SndEntry {
     /// Group number this sound belongs to (the first half of the `PlaySnd` key).
     pub group: u32,
@@ -170,7 +170,7 @@ pub fn sniff_sound_format(data: &[u8]) -> SoundFormat {
 /// Holds the parsed file version and every successfully recovered sound entry.
 /// Truncated or garbled entries are warn-logged and skipped, so a partially
 /// damaged file still yields a usable [`SndFile`] with whatever sounds parsed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SndFile {
     /// The container format version (`4` for the v4.0.0.0 files MUGEN 1.0 ships).
     pub version: u32,

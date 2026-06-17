@@ -38,7 +38,7 @@ use fp_core::{FpError, FpResult};
 use std::path::Path;
 
 /// Which SFF container format a loaded file uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SffVersion {
     /// SFF v1 — inline PCX images (MUGEN 2002 / WinMUGEN era).
     V1,
@@ -52,7 +52,7 @@ pub enum SffVersion {
 /// data blocks needed to decompress sprite pixels and resolve palette colors.
 /// For SFF v1 the sprites are inline PCX images stored in the single backing
 /// buffer; for SFF v2 they live in the LData/TData blocks.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SffFile {
     /// Which container format this file uses.
     pub version: SffVersion,

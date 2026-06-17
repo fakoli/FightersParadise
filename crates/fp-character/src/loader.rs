@@ -65,13 +65,40 @@ use fp_core::Vec2;
 
 use crate::{CharacterConstants, MovementConstants, SizeConstants, VelocityConstants};
 
+/// Deterministic serialization helper for `HashMap` fields.
+///
+/// `HashMap` iteration order is unspecified, so two serializations of the same
+/// map can differ byte-for-byte — which would defeat the content-addressed IR
+/// cache (F034). This module serializes a map through a sorted intermediate
+/// (`BTreeMap`) so the encoding is **deterministic**: identical maps always
+/// produce identical bytes, with keys emitted in sorted order. Deserialization
+/// uses serde's stock `HashMap` path (order does not matter on the way back in),
+/// so only [`serialize`](sorted_map::serialize) is provided.
+pub(crate) mod sorted_map {
+    use std::collections::{BTreeMap, HashMap};
+
+    use serde::{Serialize, Serializer};
+
+    /// Serializes a `HashMap` as a sorted (`BTreeMap`) sequence so the byte
+    /// output is deterministic across runs.
+    pub(crate) fn serialize<S, K, V>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        K: Serialize + Ord,
+        V: Serialize,
+    {
+        let sorted: BTreeMap<&K, &V> = map.iter().collect();
+        sorted.serialize(serializer)
+    }
+}
+
 /// A trigger expression compiled at load time.
 ///
 /// Wraps the parsed [`Expr`] together with the original source text
 /// for diagnostics. When an expression fails to parse, the engine substitutes a
 /// constant-`0` expression (so the trigger can never fire) and records that fact
 /// via [`is_fallback`](CompiledExpr::is_fallback).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledExpr {
     /// The compiled abstract syntax tree (a constant `0` if compilation failed).
     pub expr: Expr,
@@ -143,7 +170,7 @@ impl CompiledExpr {
 /// parameter therefore yields a one-element [`components`](CompiledParam::components)
 /// list, and a genuine parse failure of an individual component still warns
 /// (real malformed content stays visible).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledParam {
     /// The compiled components, in source order. Always at least one element
     /// (an empty or whitespace-only raw value yields one const-`0` component).
@@ -252,7 +279,7 @@ fn split_top_level_commas(source: &str) -> Vec<&str> {
 /// Mirrors [`fp_formats::cns::TriggerGroup`]: the controller fires if any group
 /// is fully satisfied (OR across groups), and within a group every condition is
 /// AND'd. Each condition here is a [`CompiledExpr`] rather than a raw string.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledTriggerGroup {
     /// The group number `N` from `triggerN`.
     pub number: u32,
@@ -267,7 +294,7 @@ pub struct CompiledTriggerGroup {
 /// [`triggerall`](CompiledController::triggerall) conditions, the compiled
 /// numbered [`triggers`](CompiledController::triggers) groups, and the compiled
 /// [`params`](CompiledController::params).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledController {
     /// The owning state number (the `N` in `[State N, label]`).
     pub state_number: i32,
@@ -296,6 +323,10 @@ pub struct CompiledController {
     /// its own expression (const-`0` on a genuine single-component failure).
     /// A scalar parameter has exactly one component (index `0`); read it with
     /// [`CompiledParam::component`].
+    ///
+    /// Serialized through [`sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "sorted_map::serialize")]
     pub params: HashMap<String, CompiledParam>,
 }
 
@@ -354,7 +385,7 @@ impl CompiledController {
 /// fill the fields explicitly. The `Default` impl lets downstream code build a
 /// minimal `CompiledState` with struct-update syntax (`..Default::default()`)
 /// so adding a new optional header field does not force every literal to change.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledState {
     /// The state number.
     pub number: i32,
@@ -452,7 +483,7 @@ impl CompiledState {
 /// The executor (task 5.3) instantiates a live [`Character`](crate::Character)
 /// from a `LoadedCharacter` and steps its state machine using
 /// [`states`](LoadedCharacter::states).
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedCharacter {
     /// Display name from `[Info] name` (empty if absent).
     pub name: String,
@@ -465,6 +496,10 @@ pub struct LoadedCharacter {
     /// The merged, compiled state graph keyed by state number. On a number
     /// collision the **first** definition wins (earlier CNS files and the
     /// character's own states beat `stcommon`).
+    ///
+    /// Serialized through [`sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "sorted_map::serialize")]
     pub states: HashMap<i32, CompiledState>,
     /// Loaded sprite container (required).
     pub sff: SffFile,
@@ -495,7 +530,7 @@ pub struct LoadedCharacter {
 /// runtime selection ([`Character::active_palette`](crate::Character::active_palette))
 /// can be resolved back to the bytes the GPU palette-lookup uploads. See
 /// [`LoadedCharacter::palettes`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedPalette {
     /// The 1-based MUGEN palette slot (`palN` → `N`, so `1..=12`).
     pub slot: u32,

@@ -9,6 +9,10 @@ license.workspace = true
 fp-core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# Content-import IR cache seam (F034 T086): the static load graph (`Expr` and
+# the `Redirect`/`AssignBank`/`BinaryOp`/`UnaryOp`/`Bound` leaves it embeds)
+# derives Serialize/Deserialize so a character's compiled IR can be cached.
+serde.workspace = true
 
 # Dev-only: the keystone integration test (tests/cns_integration.rs) drives the
 # expression VM end-to-end over real MUGEN CNS content parsed by fp-formats.
@@ -20,3 +24,6 @@ fp-formats = { path = "../fp-formats" }
 # never-panic contract against randomized/adversarial input (audit #37). Not
 # asset-gated, so these run on CI (unlike the real-KFM no-panic tests).
 proptest.workspace = true
+# Serde round-trip tests (T086) encode `Expr` through bincode and assert a
+# structural + byte-identical round-trip.
+bincode.workspace = true
