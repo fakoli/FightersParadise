@@ -2098,6 +2098,21 @@ pub struct Character {
     /// renderer reads [`Character::cur_trans`] to pick the sprite blend. See
     /// [`TransMode`].
     pub cur_trans: Option<TransMode>,
+
+    /// Which roster side this entity belongs to — MUGEN's `TeamSide` trigger
+    /// (1 = left/P1 team, 2 = right/P2 team); T062.
+    ///
+    /// This is a fixed per-entity attribute decided at side assignment, the same
+    /// way `ai_level` is plumbed in: the match coordinator (`fp-engine`'s `Match`)
+    /// stamps it once via [`Character::set_team_side`] when a player joins a side,
+    /// and a helper inherits its owner's side. It is **not** `Facing` — a
+    /// left-team fighter can turn to face either direction without changing teams,
+    /// so this stays tied to the roster slot, never the facing flag.
+    ///
+    /// A bare / freshly-constructed `Character` defaults to `1` (the P1/left team),
+    /// the documented safe default for a single-character context. See
+    /// [`Character::trigger`]'s `TeamSide` arm.
+    pub team_side: i32,
 }
 
 /// A sprite-draw rotation set by the `AngleDraw` family of controllers (T015).
@@ -2400,6 +2415,9 @@ impl Default for Character {
             draw_angle: DrawAngle::default(),
             pos_frozen: false,
             cur_trans: None,
+            // Safe default roster side: the P1/left team (T062). The match
+            // coordinator overrides this via `set_team_side` at side assignment.
+            team_side: 1,
         }
     }
 }
@@ -2578,6 +2596,25 @@ impl Character {
     /// safe defaults). See [`RoundView`].
     pub fn set_round_view(&mut self, view: RoundView) {
         self.round_view = view;
+    }
+
+    /// Sets this entity's roster side for the `TeamSide` trigger (1 = left/P1
+    /// team, 2 = right/P2 team); T062.
+    ///
+    /// Called once at side assignment by the match coordinator (`fp-engine`'s
+    /// `Match`), the same way `ai_level` is plumbed in. A value other than `1` or
+    /// `2` is clamped to the nearest valid side (`<= 1` → `1`, `>= 2` → `2`) so
+    /// the trigger never reports a bogus team. A character that is never assigned a
+    /// side keeps the default `1` (the P1/left team).
+    pub fn set_team_side(&mut self, side: i32) {
+        self.team_side = side.clamp(1, 2);
+    }
+
+    /// This entity's roster side — MUGEN's `TeamSide` (1 = left/P1 team,
+    /// 2 = right/P2 team); T062. Defaults to `1` for a single-character context.
+    #[must_use]
+    pub fn team_side(&self) -> i32 {
+        self.team_side
     }
 
     /// Advances every tracked projectile-id contact/hit/guard counter by one tick
@@ -3536,6 +3573,19 @@ impl EvalContext for Character {
         }
         if name.eq_ignore_ascii_case("RoundsExisted") {
             return Value::Int(self.round_view.rounds_existed);
+        }
+
+        // ---- Team / identity (T062) -----------------------------------------
+        // `TeamSide` is the fixed roster side this entity belongs to (1 = left/P1
+        // team, 2 = right/P2 team), stamped at side assignment by the coordinator
+        // (`fp-engine`'s `Match`) via `set_team_side` — NOT the `Facing` flag (a
+        // left-team fighter can face either way). A bare `Character` reads the
+        // safe default `1` (P1/left team) for a single-character context.
+        // (`PlayerIDExist(n)` needs the playerid id-space, so it is answered on the
+        // cross-entity wrapper `EvalCtx`, not here; a self-only `Character` has no
+        // id table and reports `0`.)
+        if name.eq_ignore_ascii_case("TeamSide") {
+            return Value::Int(self.team_side);
         }
 
         // ---- Deferred triggers (documented, not silently wrong) -------------
@@ -4566,6 +4616,23 @@ impl<'a> EvalCtx<'a> {
                 None => i32::from(self.me.has_target),
                 Some(_) => 0,
             }));
+        }
+
+        // `PlayerIDExist(n)` — `1` iff a player/helper carrying global id `n` is
+        // currently alive, else `0` (T062). It reuses the same `playerid(n)`
+        // id-space the `playerid` redirect resolves against (T014): the owner
+        // (`fp-engine`'s `Match`) installs the live `(id, entity)` table on the
+        // graph each tick (see [`EntityGraph::with_players`]), so this answers
+        // from the real roster. The VM parses the parenthesized form as a
+        // function-call trigger, so `n` arrives as the first argument; a missing
+        // or non-integer argument resolves to `0` (no id requested → nothing
+        // matches). A context with no id table wired (bare `Character` /
+        // single-character / test seam) reports `0` for every id. Never panics.
+        if name.eq_ignore_ascii_case("PlayerIDExist") {
+            let exists = args
+                .first()
+                .is_some_and(|v| self.graph.player(v.to_int()).is_some());
+            return Some(Value::from(exists));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -7853,6 +7920,81 @@ mod tests {
         // NUMHELPER: no own-helper list wired → every count is 0, never panics.
         assert_eq!(empty.num_helpers(None), 0);
         assert_eq!(empty.num_helpers(Some(3)), 0);
+    }
+
+    /// T062 (AC: `TeamSide` defaults to 1 on a single-character context). A bare
+    /// `Character` reports the P1/left team, both through the direct `trigger`
+    /// accessor and through the VM eval path — never a panic, never 0.
+    #[test]
+    fn team_triggers_team_side_defaults_to_one() {
+        let me = Character::new();
+        assert_eq!(me.team_side(), 1, "default roster side is the P1/left team");
+        assert_eq!(me.trigger("TeamSide", &[]), Value::Int(1));
+        // Same answer through the real VM eval path (case-insensitive).
+        assert_eq!(ev("TeamSide", &me), Value::Int(1));
+        assert_eq!(ev("teamside = 1", &me), Value::Int(1));
+    }
+
+    /// T062 (AC: `TeamSide` returns 1 (left/P1) or 2 (right/P2)). The side is
+    /// stamped by `set_team_side` (as `fp-engine` does at side assignment) and is
+    /// independent of `Facing` — turning the fighter around does not change teams.
+    #[test]
+    fn team_triggers_team_side_reflects_assigned_side() {
+        let mut p2 = Character::new();
+        p2.set_team_side(2);
+        // Even facing left (toward a P1 on the right), the team is still P2/right.
+        p2.facing = Facing::Left;
+        assert_eq!(p2.team_side(), 2);
+        assert_eq!(ev("TeamSide", &p2), Value::Int(2));
+        // Flipping facing does not change the team.
+        p2.facing = Facing::Right;
+        assert_eq!(ev("TeamSide = 2", &p2), Value::Int(1));
+
+        // An out-of-range side is clamped to the nearest valid team (never bogus).
+        let mut clamped = Character::new();
+        clamped.set_team_side(5);
+        assert_eq!(clamped.team_side(), 2, "side > 2 clamps to the right team");
+        clamped.set_team_side(-3);
+        assert_eq!(clamped.team_side(), 1, "side < 1 clamps to the left team");
+    }
+
+    /// T062 (AC: safe default for a single-character context). With no playerid
+    /// id-table wired (a bare `Character` / single-character match), every
+    /// `PlayerIDExist(n)` reports `0` — the documented absence default.
+    #[test]
+    fn team_triggers_playerid_exist_defaults_to_zero() {
+        let me = Character::new();
+        // No id table → nothing exists, for any id, including a missing argument.
+        assert_eq!(ev("PlayerIDExist(1)", &me), Value::Int(0));
+        assert_eq!(ev("PlayerIDExist(42)", &me), Value::Int(0));
+        // Through the graph-less EvalCtx wrapper too.
+        let graph = EntityGraph::default();
+        assert_eq!(ev_graph("PlayerIDExist(1)", &me, graph), Value::Int(0));
+    }
+
+    /// T062 (AC: `PlayerIDExist(n)` returns 1 iff a player/helper with that id
+    /// currently exists). With the live `(id, entity)` table installed (the same
+    /// `playerid(n)` id-space `fp-engine` wires each tick), the trigger answers
+    /// from the real roster: 1 for a present id, 0 for an absent one — end-to-end
+    /// through the VM eval path the executor uses.
+    #[test]
+    fn team_triggers_playerid_exist_reflects_live_roster() {
+        let me = Character::new();
+        // Two live entities addressable by global id (a player and a helper).
+        let p2 = Character::new();
+        let helper = Character::new();
+        let players: [(i32, &Character); 2] = [(2, &p2), (1001, &helper)];
+        let graph = EntityGraph::default().with_players(&players);
+
+        // Present ids → 1; absent id → 0.
+        assert_eq!(ev_graph("PlayerIDExist(2)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("PlayerIDExist(1001)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("PlayerIDExist(3)", &me, graph), Value::Int(0));
+
+        // It shares the playerid redirect's id-space: a redirect to a present id
+        // resolves, and PlayerIDExist agrees on which ids are live.
+        assert!(graph.player(2).is_some());
+        assert!(graph.player(3).is_none());
     }
 
     /// NUMHELPER (AC: `fp-character` unit test): with the owning player's

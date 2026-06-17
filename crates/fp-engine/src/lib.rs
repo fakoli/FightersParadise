@@ -1932,6 +1932,12 @@ impl Match {
     ) -> Self {
         // Seed facing so the two start looking at each other (baseline facep2).
         face_each_other(&mut p1.character, &mut p2.character);
+        // Stamp each fighter's roster side for the `TeamSide` trigger (T062): P1
+        // is the left team (1), P2 the right team (2). This is fixed at side
+        // assignment and independent of facing (a fighter may turn around without
+        // changing teams).
+        p1.character.set_team_side(1);
+        p2.character.set_team_side(2);
         // Capture each fighter's seeded opener so every round can reset to it.
         let p1_reset = RoundResetState::capture(&p1.character);
         let p2_reset = RoundResetState::capture(&p2.character);
