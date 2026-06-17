@@ -3929,6 +3929,14 @@ fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
     c.anim_elem_time = 0;
     c.anim_time = 0;
 
+    // Variable banks zero-init at round start (T054 cheap-AI var-init safety).
+    // MUGEN clears `var`/`fvar`/`sysvar`/`sysfvar` to 0 at the top of every round
+    // (we do not yet model the per-var `IntPersist`/`FloatPersist` opt-out, so
+    // every var is treated as non-persistent — the safe, conservative default).
+    // This guarantees no magic value seeded in a prior round (e.g. the evilken
+    // cheap-AI `Var(30)=59` trap) survives into the next round for any player.
+    c.clear_vars();
+
     // Transient combat state must not leak across the round boundary.
     c.active_hitdef = None;
     c.hitpause = 0;
@@ -7894,6 +7902,50 @@ time = 1
             "the reset clears stale sound requests"
         );
         assert!(m.p2_sound_requests().is_empty());
+    }
+
+    /// T054 (cheap-AI var-init safety): the per-round reset zeroes EVERY variable
+    /// bank for both fighters, so no value seeded in a prior round (the evilken
+    /// cheap-AI `Var(30)=59` trap among them) leaks into the next round — for the
+    /// CPU OR the human. `ai_level` itself is identity, not a per-round var, so it
+    /// is intentionally untouched by the reset.
+    #[test]
+    fn round_reset_clears_seeded_vars_for_both_fighters() {
+        let mut m = basic_match();
+        m.p1.character.set_ai_level(5); // P1 is the CPU; P2 stays human (0)
+
+        // Seed the cheap-AI buff var (and a few others) on both sides as if a
+        // prior round wrote them.
+        m.p1.character.vars[30] = 59;
+        m.p1.character.fvars[1] = 3.5;
+        m.p1.character.sysvars[2] = -7;
+        m.p2.character.vars[30] = 59;
+        m.p2.character.sysfvars[0] = 1.25;
+
+        m.reset_for_next_round();
+
+        for (label, c) in [("P1(cpu)", &m.p1.character), ("P2(human)", &m.p2.character)] {
+            assert!(c.vars.iter().all(|&v| v == 0), "{label}: var(0..) cleared");
+            assert!(
+                c.fvars.iter().all(|&v| v == 0.0),
+                "{label}: fvar(0..) cleared"
+            );
+            assert!(
+                c.sysvars.iter().all(|&v| v == 0),
+                "{label}: sysvar(0..) cleared"
+            );
+            assert!(
+                c.sysfvars.iter().all(|&v| v == 0.0),
+                "{label}: sysfvar(0..) cleared"
+            );
+        }
+        // The CPU identity bit survives the reset (it is not a per-round var).
+        assert_eq!(
+            m.p1.character.ai_level(),
+            5,
+            "ai_level survives round reset"
+        );
+        assert_eq!(m.p2.character.ai_level(), 0, "human stays a human");
     }
 
     /// AC2: a time-over decided round in a best-of-N match still resets and the

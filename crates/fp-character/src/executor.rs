@@ -17005,4 +17005,118 @@ mod tests {
         ch.anim_elem_time = 0;
         assert_eq!(ch.anim_transform(&air), AnimTransform::IDENTITY);
     }
+
+    // ---- T054: cheap-AI var-init safety ------------------------------------
+    //
+    // The "cheap AI" idiom (the evilken `Var(30)=59` trap, mechanics-ref §4.2):
+    // a character seeds a variable behind a `triggerall = AILevel` gate during
+    // round-init so that ONLY a CPU-controlled copy (whose `AILevel > 0`) gets
+    // the buff, while a human (`AILevel = 0`) leaves the var at its zero default.
+    // These tests lock in that (a) the var banks zero-initialize and (b) the
+    // `AILevel` gate behaves as MUGEN's: false for a human, true for a CPU.
+    //
+    // BOUNDARY (documented, not a bug): the *legacy* WinMUGEN cheap-AI idiom set
+    // its flag down an input path (e.g. detecting `command = "holdfwd"` plus an
+    // impossible button mash on the very first tick) that a human literally
+    // cannot reproduce, WITHOUT using `AILevel`. We do not — and cannot fully —
+    // emulate that input-timing trick. With the modern `AILevel` trigger wired
+    // (T052), the *modern* idiom is fully safe, which is what matters for the
+    // evilken class of characters.
+
+    /// Builds the cheap-AI round-init fixture: a [Statedef 5900] whose sole
+    /// controller is `VarSet var(30) = 59` gated `triggerall = AILevel`. Returns
+    /// the synthetic state graph. Mirrors the evilken trap structure.
+    fn cheap_ai_round_init_fixture() -> Synth {
+        let trap = ctrl(
+            5900,
+            "VarSet",
+            &["AILevel"], // triggerall = AILevel — only true for a CPU (ai_level > 0)
+            &[(1, &["Time = 0"])],
+            None,
+            &[("var(30)", "59")],
+        );
+        let st5900 = stand_n(5900, vec![trap]);
+        loaded(vec![st5900], tiny_air(0, &[5, 5]))
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_all_banks_zero_at_construction() {
+        // A freshly-constructed (human) Character zero-inits every var bank; no
+        // engine path seeds a magic value.
+        let ch = Character::new();
+        assert_eq!(ch.ai_level(), 0, "a bare Character is a human (AILevel 0)");
+        assert!(ch.vars.iter().all(|&v| v == 0), "var(0..) all zero");
+        assert!(ch.fvars.iter().all(|&v| v == 0.0), "fvar(0..) all zero");
+        assert!(ch.sysvars.iter().all(|&v| v == 0), "sysvar(0..) all zero");
+        assert!(
+            ch.sysfvars.iter().all(|&v| v == 0.0),
+            "sysfvar(0..) all zero"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_human_never_satisfies_gate() {
+        // AC2 (human side): a human (ai_level = 0) runs the round-init state and
+        // ends with Var(30) == 0 — the `triggerall = AILevel` gate is false, so
+        // the VarSet never fires.
+        let synth = cheap_ai_round_init_fixture();
+        let mut ch = Character::new(); // ai_level defaults to 0 (human)
+        ch.change_state(&synth.states, 5900);
+        let _ = synth.tick(&mut ch); // Time = 0: the gated VarSet would fire IFF AILevel
+        ch.flush_var_assignments();
+        assert_eq!(
+            ch.vars[30], 0,
+            "human (AILevel 0) must NOT satisfy the cheap-AI var gate"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_cpu_satisfies_gate() {
+        // AC2 (CPU side): a CPU at ai_level = 5 runs the same round-init state and
+        // ends with Var(30) == 59 — the `triggerall = AILevel` gate is true.
+        let synth = cheap_ai_round_init_fixture();
+        let mut ch = Character::new();
+        ch.set_ai_level(5);
+        ch.change_state(&synth.states, 5900);
+        let _ = synth.tick(&mut ch);
+        ch.flush_var_assignments();
+        assert_eq!(
+            ch.vars[30], 59,
+            "CPU (AILevel 5) DOES satisfy the gate and gets the buffed var"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_ailevel_trigger_reads_field() {
+        // The `AILevel` trigger reflects the entity field exactly: 0 for a human,
+        // the assigned level for a CPU. (The gate above depends on this.)
+        let mut ch = Character::new();
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(0));
+        ch.set_ai_level(8);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(8));
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_clear_vars_zeroes_every_bank() {
+        // Round reset (`fp-engine`) calls `clear_vars`; it must wipe ALL banks so
+        // no value seeded in a prior round (the cheap-AI trap among them) leaks
+        // into the next round for any player.
+        let mut ch = Character::new();
+        ch.vars[30] = 59;
+        ch.vars[0] = 7;
+        ch.fvars[3] = 2.5;
+        ch.sysvars[1] = -4;
+        ch.sysfvars[2] = 1.25;
+        ch.clear_vars();
+        assert!(ch.vars.iter().all(|&v| v == 0), "all var(0..) cleared");
+        assert!(ch.fvars.iter().all(|&v| v == 0.0), "all fvar(0..) cleared");
+        assert!(
+            ch.sysvars.iter().all(|&v| v == 0),
+            "all sysvar(0..) cleared"
+        );
+        assert!(
+            ch.sysfvars.iter().all(|&v| v == 0.0),
+            "all sysfvar(0..) cleared"
+        );
+    }
 }

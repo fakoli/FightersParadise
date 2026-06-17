@@ -2468,6 +2468,25 @@ impl Character {
         self.ai_level = level;
     }
 
+    /// Zeroes every variable bank — `var(0..)`, `fvar(0..)`, `sysvar(0..)`, and
+    /// `sysfvar(0..)` — back to their construction-time defaults (T054).
+    ///
+    /// MUGEN clears a fighter's variables at the top of every round, so no value
+    /// seeded in a prior round (notably the evilken cheap-AI `Var(30)=59` trap)
+    /// can survive into the next one. The round coordinator (`fp-engine`) calls
+    /// this from its per-round reset. The per-var `IntPersist`/`FloatPersist`
+    /// opt-out is not yet modelled, so every bank is treated as non-persistent —
+    /// the conservative, safety-preserving default. Any pending in-expression
+    /// `:=` assignments ([`var_assignments`](Character::flush_var_assignments))
+    /// are also dropped so a half-evaluated write cannot leak across the reset.
+    pub fn clear_vars(&mut self) {
+        self.vars = [0; NUM_VARS];
+        self.fvars = [0.0; NUM_FVARS];
+        self.sysvars = [0; NUM_SYSVARS];
+        self.sysfvars = [0.0; NUM_SYSFVARS];
+        self.var_assignments.borrow_mut().clear();
+    }
+
     /// Returns the selected external `.act` palette override as a 0-based index
     /// into the owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes),
     /// or `None` to render with the SFF-embedded palette.
@@ -3372,6 +3391,15 @@ impl EvalContext for Character {
         }
         if name.eq_ignore_ascii_case("PowerMax") {
             return Value::Int(self.power_max);
+        }
+        // `AILevel` is the CPU difficulty this fighter is running at: `0` for a
+        // human (the field's default — `ai_level` is only raised via
+        // [`Character::set_ai_level`] when the coordinator installs the CPU
+        // opponent, T052). A human therefore can never satisfy an
+        // `AILevel`-gated trigger, which is exactly what keeps the evilken
+        // cheap-AI `Var(30)=59` trap from firing for a human player (T054).
+        if name.eq_ignore_ascii_case("AILevel") {
+            return Value::Int(i32::from(self.ai_level));
         }
         if name.eq_ignore_ascii_case("Facing") {
             return Value::Int(self.facing.sign());
