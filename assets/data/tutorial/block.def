@@ -1,0 +1,8 @@
+; Trials lesson 1 — Block High and Low (original clean-room content, MIT).
+[Lesson]
+title       = "Block High and Low"
+instruction = "Hold back to block high attacks, down-back for lows. Block 3 hits."
+dummy       = attack
+overlays    = input
+success     = blocknhits 3
+timeout     = 600

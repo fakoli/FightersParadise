@@ -62,6 +62,7 @@
 
 mod import;
 mod screens;
+mod training;
 mod validate;
 
 use std::collections::HashMap;
@@ -189,6 +190,16 @@ fn main() {
         std::process::exit(run_import(&args));
     }
 
+    // The `tutorial` subcommand lists the Trials lesson flow (and, with `--demo`,
+    // drives the runner to completion with synthesized success signals). It is a
+    // headless CLI path — no window — so it is intercepted here, before `run()`.
+    if args
+        .get(1)
+        .is_some_and(|a| a.eq_ignore_ascii_case("tutorial"))
+    {
+        std::process::exit(run_tutorial(&args));
+    }
+
     if let Err(e) = run() {
         tracing::error!("Fatal error: {e}");
         std::process::exit(1);
@@ -229,6 +240,107 @@ fn run_validate(args: &[String]) -> i32 {
             eprintln!("validate: failed to load {}: {e}", def_path.display());
             1
         }
+    }
+}
+
+/// Default directory the Trials lesson scripts ship in (relative to a game root).
+const TUTORIAL_DIR: &str = "assets/data/tutorial";
+
+/// Runs the `tutorial [dir] [--demo]` subcommand: a headless view of the Trials
+/// flow.
+///
+/// Without `--demo` it loads the ordered lesson list (from `[dir]/tutorial.def`,
+/// or the optional path, falling back to the built-in clean-room set when the
+/// scripts are absent) and prints each lesson's goal + dummy/overlay config — so
+/// the flow is inspectable without a window.
+///
+/// With `--demo` it additionally drives a [`training::tutorial::TutorialRunner`]
+/// through the whole trial, feeding the synthesized success signal for each
+/// lesson, and prints the advance trace — proving the runner advances through the
+/// list and detects each success exactly once, with the always-works Skip never
+/// soft-locking. Always exits 0 (a tutorial flow has no failure mode — bad/missing
+/// assets degrade to the built-in set).
+fn run_tutorial(args: &[String]) -> i32 {
+    use training::tutorial::{load_lessons, TickOutcome, TutorialRunner};
+
+    let demo = args.iter().any(|a| a.eq_ignore_ascii_case("--demo"));
+    // First non-flag positional after `tutorial` is an optional lesson dir.
+    let dir = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(TUTORIAL_DIR));
+
+    let lessons = load_lessons(&dir);
+    println!("Trials — {} lesson(s):", lessons.len());
+    for (i, lesson) in lessons.iter().enumerate() {
+        println!(
+            "  {}. {} [dummy={:?}] — {}",
+            i + 1,
+            lesson.title,
+            lesson.dummy,
+            lesson.instruction
+        );
+    }
+
+    if !demo {
+        return 0;
+    }
+
+    println!("\n--demo: driving the runner with synthesized success signals:");
+    let mut runner = TutorialRunner::new(lessons);
+    if runner.is_empty() {
+        println!("  (no lessons — trial is already complete)");
+    }
+    let total = runner.len();
+    while let Some(lesson) = runner.current() {
+        let step = runner.index() + 1;
+        let title = format!("[{step}/{total}] {}", lesson.title);
+        let Some(event) = synth_success_event(&lesson.success) else {
+            // No synthesizable signal (only `Unsatisfiable`, which the runner
+            // auto-skips) — use the always-works Skip so we never hang.
+            let outcome = runner.skip();
+            println!("  skipped: {title} -> {outcome:?}");
+            continue;
+        };
+        // Some conditions need repeated signals (e.g. BlockNHits feeds one guarded
+        // hit at a time). Feed until the lesson advances, capped so a lesson that
+        // never advances cannot spin (it can't — every non-`Unsatisfiable` cond is
+        // satisfiable by `synth_success_event`).
+        let mut outcome = TickOutcome::InProgress;
+        for _ in 0..64 {
+            outcome = runner.observe(std::slice::from_ref(&event));
+            if outcome != TickOutcome::InProgress {
+                break;
+            }
+        }
+        println!("  completed: {title} -> {outcome:?}");
+    }
+    println!("Trial complete: {}", runner.is_complete());
+    0
+}
+
+/// Maps a [`training::tutorial::SuccessCond`] to the [`training::tutorial::LessonEvent`]
+/// that satisfies it — used by `tutorial --demo` to drive the runner headlessly,
+/// and shared with the runner's own tests. Returns `None` for an unsatisfiable
+/// condition (the runner auto-skips those).
+fn synth_success_event(
+    cond: &training::tutorial::SuccessCond,
+) -> Option<training::tutorial::LessonEvent> {
+    use training::tutorial::{LessonEvent, SuccessCond};
+    match cond {
+        SuccessCond::LandCommand(name) => Some(LessonEvent::CommandRecognized(name.clone())),
+        SuccessCond::BlockNHits(_) => Some(LessonEvent::HitConnected {
+            defender_airborne: false,
+            guarded: true,
+        }),
+        SuccessCond::ComboCount(n) => Some(LessonEvent::ComboCount(*n)),
+        SuccessCond::AntiAir => Some(LessonEvent::HitConnected {
+            defender_airborne: true,
+            guarded: false,
+        }),
+        SuccessCond::ThrowConnected => Some(LessonEvent::ThrowConnected),
+        SuccessCond::Unsatisfiable => None,
     }
 }
 
@@ -10038,6 +10150,75 @@ mod tests {
 
     /// No file argument routes to the Title menu; an explicit `menu` token does
     /// too. Any direct content path keeps the legacy direct route (no menu), so
+    /// Resolves a path under the workspace repo root (`CARGO_MANIFEST_DIR` is
+    /// `crates/fp-app`; go up two levels).
+    fn repo_path(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    #[test]
+    fn synth_success_event_satisfies_each_condition() {
+        use training::tutorial::{LessonEvent, SuccessCond, TutorialRunner};
+        // Every non-`Unsatisfiable` condition has a synthesizable event that
+        // actually advances a runner whose sole lesson uses that condition.
+        for cond in [
+            SuccessCond::LandCommand("fireball".to_string()),
+            SuccessCond::BlockNHits(1),
+            SuccessCond::ComboCount(2),
+            SuccessCond::AntiAir,
+            SuccessCond::ThrowConnected,
+        ] {
+            let ev = synth_success_event(&cond).expect("satisfiable cond has an event");
+            let mut r = TutorialRunner::new(vec![training::tutorial::Lesson {
+                title: "x".to_string(),
+                instruction: String::new(),
+                dummy: training::tutorial::DummyMode::Stand,
+                overlays: training::tutorial::OverlayFlags::default(),
+                success: cond,
+                timeout_hint: None,
+            }]);
+            let outcome = r.observe(std::slice::from_ref(&ev));
+            assert_eq!(
+                outcome,
+                training::tutorial::TickOutcome::TrialComplete,
+                "event {ev:?} should complete its lesson"
+            );
+        }
+        // `Unsatisfiable` has no synth event (the runner auto-skips it).
+        assert!(synth_success_event(&SuccessCond::Unsatisfiable).is_none());
+        // Touch the type so the import is genuinely exercised.
+        let _: LessonEvent = LessonEvent::ThrowConnected;
+    }
+
+    #[test]
+    fn shipped_tutorial_assets_load_and_run_to_completion() {
+        use training::tutorial::{load_lessons, TickOutcome, TutorialRunner};
+        let dir = repo_path("assets/data/tutorial");
+        // The on-disk clean-room lesson scripts must parse (not fall back).
+        let lessons = load_lessons(&dir);
+        assert_eq!(lessons.len(), 5, "ships exactly the 5 required lessons");
+        assert_eq!(lessons[0].title, "Block High and Low");
+        assert_eq!(lessons[2].title, "Throw a Fireball");
+
+        // Driving the runner with each lesson's synthesized success advances
+        // through the whole list to completion — the flow never soft-locks.
+        let mut r = TutorialRunner::new(lessons);
+        while let Some(lesson) = r.current() {
+            let ev = synth_success_event(&lesson.success).expect("shipped lessons are satisfiable");
+            let mut outcome = TickOutcome::InProgress;
+            for _ in 0..64 {
+                outcome = r.observe(std::slice::from_ref(&ev));
+                if outcome != TickOutcome::InProgress {
+                    break;
+                }
+            }
+            assert_ne!(outcome, TickOutcome::InProgress, "lesson must advance");
+        }
+        assert!(r.is_complete());
+    }
+
     /// the existing CLI is preserved.
     #[test]
     fn cli_route_menu_vs_direct() {

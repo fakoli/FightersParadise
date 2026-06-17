@@ -1,0 +1,8 @@
+; Trials lesson 5 — 2-hit BnB combo (original clean-room content, MIT).
+[Lesson]
+title       = "2-Hit BnB Combo"
+instruction = "Chain two attacks into a combo. Land a 2-hit combo."
+dummy       = stand
+overlays    = hitboxes, framedata
+success     = combocount 2
+timeout     = 600
