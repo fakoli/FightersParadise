@@ -44,26 +44,77 @@ use serde::Serialize;
 
 /// The kind of repair applied to a single CNS/CMD line.
 ///
-/// Each variant corresponds to exactly one of the parser's recoverable
-/// `CNS:`-warning shapes; the overlay rewrites the line so that shape no longer
-/// warns on re-parse.
+/// Each variant corresponds to one recoverable problem the import classifies —
+/// the CNS/CMD text-overlay shapes plus the character-graph findings T082 adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RepairKind {
     /// A non-blank line with no `=` that is not a section header (e.g. a stray
     /// keyword like `Special cancelling` or a bare token `t`). Commented out.
     StrayLine,
-    /// A `key = value` line whose key (the text before the first `=`) is empty
-    /// (e.g. `= 5`). Commented out.
-    EmptyKey,
-    /// A well-formed, parseable header that uses a colon as its number/label
-    /// separator (e.g. `[State 9999: Foo]`). The colon is rewritten to a comma
-    /// **in the header only**.
-    ColonHeader,
     /// A line that opens a section (`[`) but does not parse as a recoverable
     /// `[Statedef N]` / `[State N, label]` header — either it is not closed with
     /// `]` (`[GarbageHeader`) or its state number is non-numeric. Commented out
     /// with an `[unparsed]` marker.
     MalformedHeader,
+    /// A `key = value` line whose key (the text before the first `=`) is empty
+    /// (e.g. `= 5`). Commented out.
+    EmptyKey,
+    /// A trigger / parameter expression that was **empty** at compile time and
+    /// silently became the const-`0` fallback. The repair is to drop it (an empty
+    /// expression contributes nothing); recorded under [`Tier::Repaired`].
+    EmptyExpr,
+    /// A trigger / parameter expression that failed to compile but was **not**
+    /// empty (a typo / truncated source). The loader substitutes const-`0`, so the
+    /// trigger would never fire / the parameter reads `0`; a human must look —
+    /// recorded under [`Tier::Flagged`].
+    TruncatedExpr,
+    /// A well-formed, parseable header that uses a colon as its number/label
+    /// separator (e.g. `[State 9999: Foo]`). The colon is rewritten to a comma
+    /// **in the header only**.
+    ColonHeader,
+    /// An SFF sprite with degenerate `0×0` dimensions that is **not** linked to a
+    /// real sprite (it owns no pixels and renders nothing). An advisory: the
+    /// engine already treats a missing/empty sprite as invisible, so it is recorded
+    /// under [`Tier::Advisory`] rather than flagged.
+    ZeroDimSprite,
+    /// An AIR frame references a `(group, image)` the SFF does not contain (the
+    /// frame would draw nothing). Recorded under [`Tier::Flagged`].
+    MissingSpriteRef,
+}
+
+impl RepairKind {
+    /// The stable, human-facing category label (used as the JSON `kind` and for
+    /// per-category counts). Stable across releases — downstream tooling keys off
+    /// it, so never rename a variant's label without a migration.
+    #[must_use]
+    pub fn category(self) -> &'static str {
+        match self {
+            RepairKind::StrayLine => "StrayLine",
+            RepairKind::MalformedHeader => "MalformedHeader",
+            RepairKind::EmptyKey => "EmptyKey",
+            RepairKind::EmptyExpr => "EmptyExpr",
+            RepairKind::TruncatedExpr => "TruncatedExpr",
+            RepairKind::ColonHeader => "ColonHeader",
+            RepairKind::ZeroDimSprite => "ZeroDimSprite",
+            RepairKind::MissingSpriteRef => "MissingSpriteRef",
+        }
+    }
+
+    /// The default [`Tier`] this repair kind reports under. Provably-safe
+    /// rewrites are [`Tier::Repaired`]; informational notes are [`Tier::Advisory`];
+    /// everything a human should resolve is [`Tier::Flagged`].
+    #[must_use]
+    pub fn tier(self) -> Tier {
+        match self {
+            RepairKind::StrayLine
+            | RepairKind::MalformedHeader
+            | RepairKind::EmptyKey
+            | RepairKind::EmptyExpr
+            | RepairKind::ColonHeader => Tier::Repaired,
+            RepairKind::TruncatedExpr | RepairKind::MissingSpriteRef => Tier::Flagged,
+            RepairKind::ZeroDimSprite => Tier::Advisory,
+        }
+    }
 }
 
 /// A single repair the overlay applied, recording the source line (1-based) and
@@ -603,12 +654,7 @@ impl Tier {
 /// counts and as the JSON `kind`).
 #[must_use]
 fn cns_category(kind: RepairKind) -> &'static str {
-    match kind {
-        RepairKind::StrayLine => "StrayLine",
-        RepairKind::EmptyKey => "EmptyKey",
-        RepairKind::ColonHeader => "ColonHeader",
-        RepairKind::MalformedHeader => "MalformedHeader",
-    }
+    kind.category()
 }
 
 /// The tier an AIR [`AirRepairKind`] is reported under. A salvaged junk column or
@@ -651,6 +697,11 @@ pub struct ReportEntry {
     pub kind: String,
     /// The original (pre-repair) line text, trimmed of surrounding whitespace.
     pub original: String,
+    /// The replacement text the repair substituted, when one applies. `None` for a
+    /// drop (e.g. an [`RepairKind::EmptyExpr`] removed entirely), for a flag (no
+    /// rewrite), or for an advisory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
 }
 
 impl ReportEntry {
@@ -706,6 +757,7 @@ impl ImportReport {
                 tier: Tier::Repaired,
                 kind: cns_category(r.kind).to_string(),
                 original: r.original.trim().to_string(),
+                replacement: None,
             });
         }
         self.resort();
@@ -721,6 +773,7 @@ impl ImportReport {
                 tier: air_tier(r.kind),
                 kind: air_category(r.kind).to_string(),
                 original: r.original.trim().to_string(),
+                replacement: None,
             });
         }
         self.resort();
@@ -739,9 +792,10 @@ impl ImportReport {
     }
 
     /// Returns `true` when the report carries no entries at all (nothing repaired,
-    /// nothing flagged) — the input was clean.
+    /// nothing flagged). Stricter than [`ImportReport::is_clean`]; used by `render`
+    /// to decide whether to print the `PASS — no repairs needed` line.
     #[must_use]
-    pub fn is_clean(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -751,11 +805,14 @@ impl ImportReport {
         // Use a fixed category order rather than a HashMap so output is stable.
         const CATS: &[&str] = &[
             "StrayLine",
-            "EmptyKey",
-            "ColonHeader",
             "MalformedHeader",
+            "EmptyKey",
+            "EmptyExpr",
+            "TruncatedExpr",
             "JunkColumn",
+            "ColonHeader",
             "DeadFrame",
+            "ZeroDimSprite",
             "MissingSpriteRef",
         ];
         CATS.iter()
@@ -777,7 +834,7 @@ impl ImportReport {
         let mut out = String::new();
         out.push_str("Import report\n");
 
-        if self.is_clean() {
+        if self.is_empty() {
             out.push_str("\nPASS — no repairs needed\n");
         } else {
             out.push_str(&format!(
@@ -850,6 +907,120 @@ impl ImportReport {
     pub fn write_json(&self, dest: &Path) -> FpResult<()> {
         let json = self.to_json()?;
         write_overlay_text(&json, dest)
+    }
+
+    /// `true` when the report carries **no flagged entries** — the
+    /// import-core "clean" predicate of T082 (a report may still hold
+    /// [`Tier::Repaired`] rewrites and [`Tier::Advisory`] notes and be clean).
+    ///
+    /// This is the inverse of [`ImportReport::has_flags`]; the shipped
+    /// `assets/trainingdummy` imports with zero flags, so this returns `true` for
+    /// it. (Distinct from [`ImportReport::is_empty`], which is the stricter
+    /// "no entries at all".)
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        !self.has_flags()
+    }
+
+    /// Number of entries of a given [`RepairKind`] (matched on the stable
+    /// category label). Used by the import-core tests to assert exact tallies.
+    #[must_use]
+    pub fn count_kind(&self, kind: RepairKind) -> usize {
+        let cat = kind.category();
+        self.entries.iter().filter(|e| e.kind == cat).count()
+    }
+
+    /// Builds a fresh import report for a loaded character, attributing every
+    /// repair to `file` (the user-facing `.def` path).
+    ///
+    /// Walks the compiled state graph and the asset set the live match would use:
+    ///
+    /// - Every `is_fallback` trigger / parameter / state-header expression splits
+    ///   on whether its source was empty: an empty source is an
+    ///   [`RepairKind::EmptyExpr`] ([`Tier::Repaired`], dropped); a non-empty
+    ///   source is an [`RepairKind::TruncatedExpr`] ([`Tier::Flagged`], the source
+    ///   preserved as `original`). Multi-value parameters iterate per **component**
+    ///   so `damage = 20, 5` is never double-counted.
+    /// - Every AIR frame whose `(group, image)` is absent from the SFF is an
+    ///   [`RepairKind::MissingSpriteRef`] ([`Tier::Flagged`]).
+    /// - Every SFF sprite with degenerate, non-linked `0×0` dimensions is a
+    ///   [`RepairKind::ZeroDimSprite`] advisory ([`Tier::Advisory`]).
+    #[must_use]
+    pub fn from_character(file: &str, loaded: &fp_character::LoadedCharacter) -> Self {
+        let mut report = Self::new();
+        report.add_character(file, loaded);
+        report
+    }
+
+    /// Folds a loaded character's repairs into this report. See
+    /// [`ImportReport::from_character`] for the classification rules.
+    pub fn add_character(&mut self, file: &str, loaded: &fp_character::LoadedCharacter) {
+        // --- failed-compile expressions over the compiled state graph ----
+        // Reuse the validator's static analysis: it already walks every state
+        // header, trigger, and per-component parameter for `is_fallback`.
+        let analysis = crate::validate::analyze(loaded);
+        for failed in &analysis.failed_exprs {
+            let src = failed.source.trim();
+            let kind = if src.is_empty() {
+                RepairKind::EmptyExpr
+            } else {
+                RepairKind::TruncatedExpr
+            };
+            self.entries.push(ReportEntry {
+                file: file.to_string(),
+                line_no: None,
+                tier: kind.tier(),
+                kind: kind.category().to_string(),
+                // An EmptyExpr has no meaningful source; describe its site instead
+                // so the report still localizes it.
+                original: if src.is_empty() {
+                    format!(
+                        "state {} {} (empty expression)",
+                        failed.from_state, failed.site
+                    )
+                } else {
+                    format!("state {} {}: {}", failed.from_state, failed.site, src)
+                },
+                // EmptyExpr is dropped (no replacement); TruncatedExpr is flagged
+                // for a human (no auto-rewrite either).
+                replacement: None,
+            });
+        }
+
+        // --- AIR frames referencing sprites absent from the SFF ----------
+        for missing in &analysis.missing_sprites {
+            self.entries.push(ReportEntry {
+                file: file.to_string(),
+                line_no: None,
+                tier: RepairKind::MissingSpriteRef.tier(),
+                kind: RepairKind::MissingSpriteRef.category().to_string(),
+                original: format!(
+                    "action {} frame {} -> sprite ({}, {}) not in SFF",
+                    missing.action, missing.frame, missing.group, missing.image
+                ),
+                replacement: None,
+            });
+        }
+
+        // --- degenerate (non-linked 0x0) sprites: advisory ---------------
+        for (index, sprite) in loaded.sff.sprites.iter().enumerate() {
+            let linked = sprite.linked_index as usize != index;
+            if !linked && sprite.width == 0 && sprite.height == 0 {
+                self.entries.push(ReportEntry {
+                    file: file.to_string(),
+                    line_no: None,
+                    tier: RepairKind::ZeroDimSprite.tier(),
+                    kind: RepairKind::ZeroDimSprite.category().to_string(),
+                    original: format!(
+                        "sprite ({}, {}) is 0x0 and not linked — renders nothing",
+                        sprite.group, sprite.image
+                    ),
+                    replacement: None,
+                });
+            }
+        }
+
+        self.resort();
     }
 }
 
@@ -1258,7 +1429,10 @@ type = Null
             !repaired_only.has_flags(),
             "all-repaired report has no flags"
         );
-        assert!(!repaired_only.is_clean(), "but it is not clean either");
+        // Zero-Flagged is the "clean" predicate, so a Repaired-only report is
+        // clean even though it is not empty.
+        assert!(repaired_only.is_clean(), "no flags -> clean");
+        assert!(!repaired_only.is_empty(), "but it still has entries");
 
         // A report with a flagged missing-sprite trips --strict.
         let flagged = dirty_report();
@@ -1292,5 +1466,285 @@ type = Null
         let written = std::fs::read_to_string(&dest).expect("report file exists");
         assert_eq!(written, report.to_json().unwrap());
         let _ = std::fs::remove_file(&dest);
+    }
+
+    // -------------------------------------------------------------------
+    // Import core: character `.def` graph-walk + tier model (T082)
+    // -------------------------------------------------------------------
+
+    use fp_character::loader::{
+        CompiledController, CompiledExpr, CompiledState, CompiledTriggerGroup,
+    };
+    use fp_character::{CharacterConstants, LoadedCharacter};
+    use fp_core::SpriteId;
+    use fp_formats::air::{AirFile, AnimAction, AnimFrame};
+    use fp_formats::sff::SffFile;
+    use std::collections::HashMap;
+
+    /// Builds a synthetic SFF whose sprites are described by
+    /// `(group, image, width, height)`. A `0×0` non-linked sprite is the
+    /// `ZeroDimSprite` shape; a non-zero one is renderable. All sprites link to
+    /// themselves (so a `0×0` entry owns no pixels and is degenerate).
+    fn sff_with(coords: &[(u16, u16, u16, u16)]) -> SffFile {
+        let n = coords.len();
+        let sprite_off = 512usize;
+        let palette_off = sprite_off + 28 * n;
+        let ldata_off = palette_off + 16;
+        let ldata_len = 768 + n;
+        let total = ldata_off + ldata_len;
+        let mut buf = vec![0u8; total];
+
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[15] = 2; // major = v2
+        buf[36..40].copy_from_slice(&(sprite_off as u32).to_le_bytes());
+        buf[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[44..48].copy_from_slice(&(palette_off as u32).to_le_bytes());
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes());
+        buf[52..56].copy_from_slice(&(ldata_off as u32).to_le_bytes());
+        buf[56..60].copy_from_slice(&(ldata_len as u32).to_le_bytes());
+        buf[60..64].copy_from_slice(&(total as u32).to_le_bytes());
+        buf[64..68].copy_from_slice(&0u32.to_le_bytes());
+
+        for (i, (g, im, w, h)) in coords.iter().enumerate() {
+            let o = sprite_off + i * 28;
+            buf[o..o + 2].copy_from_slice(&g.to_le_bytes());
+            buf[o + 2..o + 4].copy_from_slice(&im.to_le_bytes());
+            buf[o + 4..o + 6].copy_from_slice(&w.to_le_bytes());
+            buf[o + 6..o + 8].copy_from_slice(&h.to_le_bytes());
+            buf[o + 12..o + 14].copy_from_slice(&(i as u16).to_le_bytes()); // linked=self
+            buf[o + 14] = 0; // raw
+            buf[o + 15] = 8; // depth
+            let px_off = 768 + i;
+            buf[o + 16..o + 20].copy_from_slice(&(px_off as u32).to_le_bytes());
+            buf[o + 20..o + 24].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let p = palette_off;
+        buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes());
+        buf[p + 12..p + 16].copy_from_slice(&768u32.to_le_bytes());
+
+        SffFile::from_bytes(&buf).expect("synthetic SFF parses")
+    }
+
+    fn air_with(action_no: i32, sprites: &[(u16, u16)]) -> AirFile {
+        let frames = sprites
+            .iter()
+            .map(|(g, i)| AnimFrame {
+                sprite: SpriteId::new(*g, *i),
+                ticks: 5,
+                ..Default::default()
+            })
+            .collect();
+        let mut map = HashMap::new();
+        map.insert(
+            action_no,
+            AnimAction {
+                action_number: action_no,
+                frames,
+                loopstart: 0,
+            },
+        );
+        AirFile { actions: map }
+    }
+
+    /// A controller whose sole trigger condition is compiled from `trigger_src`
+    /// (pass `""` to force an empty-expression fallback).
+    fn ctrl_with_trigger(kind: &str, trigger_src: &str) -> CompiledController {
+        CompiledController {
+            state_number: 0,
+            label: kind.to_string(),
+            controller_type: Some(kind.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile(trigger_src)],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: HashMap::new(),
+        }
+    }
+
+    fn loaded_char(
+        sff: SffFile,
+        air: AirFile,
+        controllers: Vec<CompiledController>,
+    ) -> LoadedCharacter {
+        let mut states = HashMap::new();
+        states.insert(
+            0,
+            CompiledState {
+                number: 0,
+                controllers,
+                ..Default::default()
+            },
+        );
+        LoadedCharacter {
+            name: "Synthetic".to_string(),
+            displayname: "Synthetic".to_string(),
+            author: String::new(),
+            localcoord: (320, 240),
+            constants: CharacterConstants::default(),
+            states,
+            sff,
+            air,
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn import_core_character_walk_tallies_expr_and_sprite_repairs() {
+        // SFF: one real sprite (0,0) + one degenerate 0x0 sprite (10,0).
+        let sff = sff_with(&[(0, 0, 8, 8), (10, 0, 0, 0)]);
+        // AIR references (0,0) (present) and (99,9) (absent -> MissingSpriteRef).
+        let air = air_with(0, &[(0, 0), (99, 9)]);
+        // Two controllers: one empty trigger (EmptyExpr), one truncated (TruncatedExpr).
+        let controllers = vec![
+            ctrl_with_trigger("Null", ""),
+            ctrl_with_trigger("Null", "var("),
+        ];
+        let loaded = loaded_char(sff, air, controllers);
+
+        let report = ImportReport::from_character("synthetic.def", &loaded);
+
+        assert_eq!(
+            report.count_kind(RepairKind::EmptyExpr),
+            1,
+            "the empty trigger is an EmptyExpr (Repaired)"
+        );
+        assert_eq!(
+            report.count_kind(RepairKind::TruncatedExpr),
+            1,
+            "the `var(` trigger is a TruncatedExpr (Flagged)"
+        );
+        assert_eq!(
+            report.count_kind(RepairKind::ZeroDimSprite),
+            1,
+            "the 0x0 non-linked sprite is one ZeroDimSprite advisory"
+        );
+        assert_eq!(
+            report.count_kind(RepairKind::MissingSpriteRef),
+            1,
+            "the (99,9) frame is one MissingSpriteRef flag"
+        );
+
+        // Tier placement: EmptyExpr + ZeroDimSprite do NOT flag; TruncatedExpr +
+        // MissingSpriteRef do.
+        assert!(report.has_flags(), "Truncated/Missing trip the flag gate");
+        assert!(!report.is_clean(), "a report with flags is not clean");
+    }
+
+    #[test]
+    fn import_core_empty_expr_is_repaired_truncated_is_flagged() {
+        assert_eq!(RepairKind::EmptyExpr.tier(), Tier::Repaired);
+        assert_eq!(RepairKind::TruncatedExpr.tier(), Tier::Flagged);
+        assert_eq!(RepairKind::ZeroDimSprite.tier(), Tier::Advisory);
+        assert_eq!(RepairKind::MissingSpriteRef.tier(), Tier::Flagged);
+    }
+
+    #[test]
+    fn import_core_synthetic_fixture_has_each_required_tier_and_kind() {
+        // The acceptance fixture: a malformed CNS *text* (stray lines + empty key)
+        // overlaid, PLUS a character graph walk that yields the empty trigger
+        // (EmptyExpr, Repaired) and the zero-dim sprite advisory — exactly what
+        // `import --report <char.def>` assembles internally.
+        let mut report = ImportReport::new();
+        report.add_cns("synthetic.cns", &repair_cns_text(DIRTY_CNS));
+
+        let sff = sff_with(&[(0, 0, 8, 8), (10, 0, 0, 0)]);
+        let air = air_with(0, &[(0, 0)]);
+        let controllers = vec![ctrl_with_trigger("Null", "")];
+        report.add_character("synthetic.def", &loaded_char(sff, air, controllers));
+
+        // ≥1 StrayLine (from the CNS text overlay, DIRTY_CNS has 2).
+        assert!(
+            report.count_kind(RepairKind::StrayLine) >= 1,
+            "≥1 StrayLine expected, got {}",
+            report.count_kind(RepairKind::StrayLine)
+        );
+        // ≥1 EmptyExpr, recorded as Repaired.
+        assert!(
+            report.count_kind(RepairKind::EmptyExpr) >= 1,
+            "≥1 EmptyExpr expected"
+        );
+        // Exactly one ZeroDimSprite advisory.
+        assert_eq!(
+            report.count_kind(RepairKind::ZeroDimSprite),
+            1,
+            "the ZeroDimSprite advisory must be present exactly once"
+        );
+
+        // The rendered human report carries each tier heading it should.
+        let text = report.render();
+        assert!(text.contains("StrayLine"), "{text}");
+        assert!(text.contains("EmptyExpr"), "{text}");
+        assert!(text.contains("ZeroDimSprite"), "{text}");
+    }
+
+    #[test]
+    fn import_core_clean_character_is_clean() {
+        // A character with only good exprs and only renderable sprites flags
+        // nothing — the trainingdummy invariant in miniature (no file written).
+        let sff = sff_with(&[(0, 0, 8, 8)]);
+        let air = air_with(0, &[(0, 0)]);
+        let controllers = vec![ctrl_with_trigger("Null", "1")];
+        let report = ImportReport::from_character("clean.def", &loaded_char(sff, air, controllers));
+
+        assert!(report.is_empty(), "no entries at all: {report:?}");
+        assert!(report.is_clean(), "zero Flagged -> import-core clean");
+        assert_eq!(report.count_kind(RepairKind::EmptyExpr), 0);
+        assert_eq!(report.count_kind(RepairKind::ZeroDimSprite), 0);
+        assert_eq!(report.count_kind(RepairKind::MissingSpriteRef), 0);
+    }
+
+    #[test]
+    fn import_core_repair_kind_model_is_complete_and_stable() {
+        // Every RepairKind maps to a stable category label and a tier. Asserting
+        // the full set documents the contract and keeps the public enum exercised.
+        let all = [
+            (RepairKind::StrayLine, "StrayLine", Tier::Repaired),
+            (
+                RepairKind::MalformedHeader,
+                "MalformedHeader",
+                Tier::Repaired,
+            ),
+            (RepairKind::EmptyKey, "EmptyKey", Tier::Repaired),
+            (RepairKind::EmptyExpr, "EmptyExpr", Tier::Repaired),
+            (RepairKind::TruncatedExpr, "TruncatedExpr", Tier::Flagged),
+            (RepairKind::ColonHeader, "ColonHeader", Tier::Repaired),
+            (RepairKind::ZeroDimSprite, "ZeroDimSprite", Tier::Advisory),
+            (
+                RepairKind::MissingSpriteRef,
+                "MissingSpriteRef",
+                Tier::Flagged,
+            ),
+        ];
+        for (kind, label, tier) in all {
+            assert_eq!(kind.category(), label, "stable category label");
+            assert_eq!(kind.tier(), tier, "tier mapping for {label}");
+        }
+    }
+
+    /// Asset-gated: the shipped `assets/trainingdummy` imports with zero Flagged.
+    /// Runs only when the fixture is present (it is shipped + CI-tracked, so this
+    /// is not gated away on CI). No file is written.
+    #[test]
+    fn import_core_trainingdummy_is_clean() {
+        // Locate the workspace `assets/trainingdummy/trainingdummy.def` from the
+        // crate dir (CARGO_MANIFEST_DIR == crates/fp-app).
+        let def = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/trainingdummy/trainingdummy.def");
+        if !def.exists() {
+            eprintln!("skipping: {} not present", def.display());
+            return;
+        }
+        let loaded = LoadedCharacter::load(&def).expect("trainingdummy loads");
+        let report = ImportReport::from_character("trainingdummy.def", &loaded);
+        assert!(
+            report.is_clean(),
+            "trainingdummy must import with zero Flagged; report:\n{}",
+            report.render()
+        );
     }
 }
