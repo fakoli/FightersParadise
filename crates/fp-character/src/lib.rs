@@ -2283,6 +2283,10 @@ pub struct ProjContactTracker {
     hit_time: i32,
     /// Ticks since this id was last guarded/blocked, or [`NEVER`](Self::NEVER).
     guarded_time: i32,
+    /// Ticks since a projectile of this id was last cancelled (collided with an
+    /// opposing projectile and removed), or [`NEVER`](Self::NEVER) (T078,
+    /// `ProjCancelTime<id>`).
+    cancel_time: i32,
 }
 
 impl Default for ProjContactTracker {
@@ -2305,6 +2309,7 @@ impl ProjContactTracker {
             contact_time: Self::NEVER,
             hit_time: Self::NEVER,
             guarded_time: Self::NEVER,
+            cancel_time: Self::NEVER,
         }
     }
 
@@ -2328,6 +2333,13 @@ impl ProjContactTracker {
         self.guarded_time
     }
 
+    /// Ticks since a projectile of this id was last cancelled, `-1` if never
+    /// (`ProjCancelTime<id>`, T078).
+    #[must_use]
+    pub const fn cancel_time(self) -> i32 {
+        self.cancel_time
+    }
+
     /// Advances each *active* counter by one tick (a counter still at
     /// [`NEVER`](Self::NEVER) stays there). Saturating so a long-lived id can
     /// never overflow `i32`.
@@ -2336,6 +2348,7 @@ impl ProjContactTracker {
             &mut self.contact_time,
             &mut self.hit_time,
             &mut self.guarded_time,
+            &mut self.cancel_time,
         ] {
             if *t >= 0 {
                 *t = t.saturating_add(1);
@@ -2352,6 +2365,14 @@ impl ProjContactTracker {
         } else {
             self.hit_time = 0;
         }
+    }
+
+    /// Records that a projectile of this id was cancelled this tick (its
+    /// cancel-time counter resets to `0`, T078). Independent of the
+    /// contact/hit/guard counters — a cancel is a projectile-vs-projectile
+    /// removal, not a connection on the opponent.
+    fn record_cancel(&mut self) {
+        self.cancel_time = 0;
     }
 }
 
@@ -2672,6 +2693,24 @@ impl Character {
         let known = self.proj_events.contains_key(&projid);
         if known || self.proj_events.len() < Self::MAX_PROJ_IDS {
             self.proj_events.entry(projid).or_default().record(guarded);
+        }
+    }
+
+    /// Records that one of this owner's projectiles with the given `projid` was
+    /// cancelled this tick (collided with an opposing projectile and removed),
+    /// feeding the `ProjCancel<id>` / `ProjCancelTime<id>` triggers (T078).
+    ///
+    /// The round coordinator (`fp-engine`) is the writer, exactly as for
+    /// [`record_proj_event`](Self::record_proj_event): when a projectile is
+    /// cancelled it calls this on the **owning** character. Resets the id's
+    /// cancel time to `0`; the contact/hit/guard counters are left untouched (a
+    /// cancel is not a connection on the opponent). A not-yet-tracked id is
+    /// inserted, bounded by [`MAX_PROJ_IDS`](Self::MAX_PROJ_IDS) so a flood of
+    /// distinct ids can never grow the map without limit. Never panics.
+    pub fn record_proj_cancel(&mut self, projid: i32) {
+        let known = self.proj_events.contains_key(&projid);
+        if known || self.proj_events.len() < Self::MAX_PROJ_IDS {
+            self.proj_events.entry(projid).or_default().record_cancel();
         }
     }
 
@@ -3266,57 +3305,76 @@ impl Character {
 }
 
 /// Which member of the projectile-trigger family a `Proj*<id>` trigger names, and
-/// whether it is the "time since" (`*Time`) form (T026).
+/// whether it is the "time since" (`*Time`) form (T026, T078).
 ///
 /// `ProjContact2000` → `(Contact, time = false)`; `ProjHitTime2000` →
-/// `(Hit, time = true)`. The owner's [`EvalContext::trigger`] resolves the value
-/// from the [`ProjContactTracker`] keyed by the parsed id.
+/// `(Hit, time = true)`; `ProjCancelTime5` → `(Cancel, time = true)`. The owner's
+/// [`EvalContext::trigger`] resolves the value from the [`ProjContactTracker`]
+/// keyed by the parsed id (or aggregated across all ids for the no-id form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjTriggerKind {
     Contact,
     Hit,
     Guarded,
+    /// Ticks since a projectile was cancelled (`ProjCancel` / `ProjCancelTime`,
+    /// T078).
+    Cancel,
 }
 
 /// Parses a bare projectile-info trigger name into its family, whether it is the
 /// `*Time` form, and the trailing projectile id — `None` if `name` is not a
-/// projectile-info trigger (T026).
+/// projectile-info trigger (T026, T078).
 ///
-/// MUGEN writes these as a fixed base name with the `projid` appended, e.g.
-/// `ProjContact2000`, `ProjHitTime340`, `ProjGuarded5`. The match is
-/// case-insensitive on the base and requires a parseable integer id suffix; a
-/// negative id (`ProjContact-1`) and a missing/garbage suffix are rejected
-/// (returns `None`), so a malformed name falls through to the ordinary trigger
-/// path and the engine-wide "unknown trigger → 0" default. Longest bases are
-/// tested first so `projcontacttime` is preferred over `projcontact`.
-fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
+/// MUGEN writes these as a fixed base name with the `projid` optionally appended,
+/// e.g. `ProjContact2000`, `ProjHitTime340`, `ProjGuarded5`, `ProjCancelTime7`.
+/// The id is **optional**: the bare no-id form (`ProjHit`, `ProjContact`,
+/// `ProjGuarded`, `ProjCancel`, and their `*Time` variants) parses with
+/// `id == None` and aggregates across all of the owner's projectile ids (T078).
+/// The match is case-insensitive on the base and accepts either an empty suffix
+/// (no-id) or a parseable **non-negative** integer id suffix; a negative id
+/// (`ProjContact-1`) and a garbage suffix are rejected (returns `None`), so a
+/// malformed name falls through to the ordinary trigger path and the engine-wide
+/// "unknown trigger → 0" default. Longest bases are tested first so
+/// `projcontacttime` is preferred over `projcontact`.
+fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, Option<i32>)> {
     // Cheap allocation-free guard: this runs as the FIRST check for every
     // bare-ident trigger the executor evaluates each tick (`Time`, `StateNo`,
     // `Anim`, …), so it must NOT heap-allocate on the common non-proj path. Every
     // projectile-info trigger begins with a case-insensitive `proj`; anything that
     // does not is rejected before any prefix matching (and well before the old
-    // `to_ascii_lowercase()` String allocation that lived here).
-    if name.len() < "projhit0".len() || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
+    // `to_ascii_lowercase()` String allocation that lived here). The shortest
+    // valid name is the bare no-id `projhit` (7 chars).
+    if name.len() < "projhit".len() || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
         return None;
     }
     // (base, kind, is_time) — `*time` variants listed first so they win the prefix
     // test over their non-time counterparts. Matched case-insensitively against the
     // name slice without lowercasing the whole string.
-    const BASES: [(&str, ProjTriggerKind, bool); 6] = [
+    const BASES: [(&str, ProjTriggerKind, bool); 8] = [
         ("projcontacttime", ProjTriggerKind::Contact, true),
         ("projguardedtime", ProjTriggerKind::Guarded, true),
+        ("projcanceltime", ProjTriggerKind::Cancel, true),
         ("projhittime", ProjTriggerKind::Hit, true),
         ("projcontact", ProjTriggerKind::Contact, false),
         ("projguarded", ProjTriggerKind::Guarded, false),
+        ("projcancel", ProjTriggerKind::Cancel, false),
         ("projhit", ProjTriggerKind::Hit, false),
     ];
     for (base, kind, is_time) in BASES {
         if let Some(prefix) = name.get(..base.len()) {
             if prefix.eq_ignore_ascii_case(base) {
-                // The id suffix must be a non-negative integer; anything else
-                // (empty, signed, non-numeric) is not a projectile-info trigger.
+                // The id suffix is optional: an empty suffix is the no-id
+                // aggregate form (`id == None`); otherwise it must be a
+                // non-negative integer. Anything else (signed, non-numeric) is
+                // not a projectile-info trigger.
                 let suffix = &name[base.len()..];
-                return suffix.parse::<i32>().ok().map(|id| (kind, is_time, id));
+                if suffix.is_empty() {
+                    return Some((kind, is_time, None));
+                }
+                return suffix
+                    .parse::<i32>()
+                    .ok()
+                    .map(|id| (kind, is_time, Some(id)));
             }
         }
     }
@@ -3324,12 +3382,32 @@ fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
 }
 
 impl Character {
+    /// Reads the counter named by `kind` (the family member) from a single
+    /// projectile-id tracker (T026, T078) — the time-since-event in ticks, or
+    /// [`ProjContactTracker::NEVER`] (`-1`) if that event never happened for the
+    /// id.
+    fn proj_counter(kind: ProjTriggerKind, tracker: ProjContactTracker) -> i32 {
+        match kind {
+            ProjTriggerKind::Contact => tracker.contact_time(),
+            ProjTriggerKind::Hit => tracker.hit_time(),
+            ProjTriggerKind::Guarded => tracker.guarded_time(),
+            ProjTriggerKind::Cancel => tracker.cancel_time(),
+        }
+    }
+
     /// Resolves a bare projectile-info trigger (`ProjContact<id>` / `ProjHit<id>`
-    /// / `ProjGuarded<id>` / `Proj*Time<id>`) against this owner's
-    /// [`proj_events`](Self::proj_events) tracker (T026), or `None` when `name` is
-    /// not such a trigger.
+    /// / `ProjGuarded<id>` / `ProjCancel<id>` / `Proj*Time<id>`, and their no-id
+    /// aggregate forms) against this owner's [`proj_events`](Self::proj_events)
+    /// trackers (T026, T078), or `None` when `name` is not such a trigger.
     ///
-    /// The `*Time` form returns the ticks since the event for that id
+    /// With an **id** the value comes from that id's tracker. With **no id** the
+    /// value is aggregated across **all** of the owner's projectile ids (T078):
+    /// the `*Time` form returns the **most-recent** matching event (the minimum
+    /// non-`NEVER` time, since a smaller "ticks since" is more recent), or
+    /// [`ProjContactTracker::NEVER`] (`-1`) if no id ever had that event; the
+    /// boolean form is true iff **any** id had the event this exact tick.
+    ///
+    /// The `*Time` form returns the ticks since the event
     /// ([`ProjContactTracker::NEVER`] = `-1` if it never happened). The boolean
     /// form (`ProjContact<id>`) returns `1` iff the event happened **this tick**
     /// (the stored time is `0`), else `0` — the comma-tail
@@ -3337,11 +3415,19 @@ impl Character {
     /// `*Time` value to compare against a window. Never panics.
     fn proj_trigger(&self, name: &str) -> Option<Value> {
         let (kind, is_time, id) = parse_proj_trigger(name)?;
-        let tracker = self.proj_tracker(id);
-        let time = match kind {
-            ProjTriggerKind::Contact => tracker.contact_time(),
-            ProjTriggerKind::Hit => tracker.hit_time(),
-            ProjTriggerKind::Guarded => tracker.guarded_time(),
+        let time = match id {
+            // Per-id form: read that id's tracker directly.
+            Some(id) => Self::proj_counter(kind, self.proj_tracker(id)),
+            // No-id aggregate form (T078): the most-recent matching event across
+            // all owner projectile ids — the minimum non-`NEVER` counter — or
+            // `NEVER` when no id ever had this event.
+            None => self
+                .proj_events
+                .values()
+                .map(|t| Self::proj_counter(kind, *t))
+                .filter(|&x| x != ProjContactTracker::NEVER)
+                .min()
+                .unwrap_or(ProjContactTracker::NEVER),
         };
         Some(if is_time {
             Value::Int(time)
@@ -4125,10 +4211,9 @@ pub struct EntityGraph<'a> {
     /// Built once per tick by the owner (`fp-engine`) from its projectile
     /// slot-map and installed on the context, exactly as
     /// [`own_helper_ids`](Self::own_helper_ids) is for `NumHelper`. Bare `NumProj`
-    /// reports its length (the total live count). Empty for a player with no live
-    /// projectiles (and for a bare/test context), in which case `NumProj` is `0`.
-    /// (MUGEN's `NumProjID(id)` per-id form is not exposed by the parser today;
-    /// the slice is id-keyed so it can be added without a shape change.)
+    /// reports its length (the total live count); `NumProjID(id)` reports the
+    /// number of entries equal to `id` (T078). Empty for a player with no live
+    /// projectiles (and for a bare/test context), in which case both report `0`.
     own_proj_ids: &'a [i32],
     /// The owning player's currently-bound *target* ids — the character id of every
     /// entity this player has hit and still holds as a `Target*` victim, for the
@@ -4288,6 +4373,21 @@ impl<'a> EntityGraph<'a> {
         // The slot-map is bounded (`MAX_PROJECTILES_PER_PLAYER`), so this never
         // overflows i32; saturate defensively anyway rather than risk a panic.
         i32::try_from(self.own_proj_ids.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Counts the owning player's live projectiles carrying `projid` for the
+    /// `NumProjID(id)` trigger (T078): the number of live projectiles whose
+    /// `projid` equals the argument. Returns `0` when the owner has none (or
+    /// wired no list — e.g. a bare/test context); never panics.
+    ///
+    /// Counts matching entries in the flat `own_proj_ids` slice the owner
+    /// installs (via [`with_own_proj_ids`](Self::with_own_proj_ids)), so the
+    /// answer is the owning player's per-id live-projectile count.
+    #[must_use]
+    pub fn num_proj_id(&self, projid: i32) -> i32 {
+        let count = self.own_proj_ids.iter().filter(|&&id| id == projid).count();
+        // Bounded by `own_proj_ids.len()`; saturate defensively rather than panic.
+        i32::try_from(count).unwrap_or(i32::MAX)
     }
 
     /// Counts the owning player's live helpers for the `NumHelper` triggers
@@ -4601,6 +4701,20 @@ impl<'a> EvalCtx<'a> {
         if name.eq_ignore_ascii_case("NumHelper") {
             let id = args.first().map(|v| v.to_int());
             return Some(Value::Int(self.graph.num_helpers(id)));
+        }
+
+        // `NumProjID(id)` — the count of the owning player's live projectiles
+        // carrying a specific `projid` (T078). The VM parses the parenthesized
+        // form as a function-call trigger, so `id` arrives as the first argument;
+        // resolved here against the owner's installed live-projectile id list,
+        // exactly like `NumProj`. With no argument (a bare `NumProjID`) it falls
+        // back to the total count. A player with no matching projectile — or any
+        // context with no list wired — reports `0`. Never panics.
+        if name.eq_ignore_ascii_case("NumProjID") {
+            return Some(Value::Int(match args.first().map(|v| v.to_int()) {
+                Some(id) => self.graph.num_proj_id(id),
+                None => self.graph.num_proj(),
+            }));
         }
 
         // `NumProj` — the count of the owning player's live projectiles (T026).
@@ -8202,6 +8316,135 @@ mod tests {
         // The already-tracked id 0 still updates (a guard event after the flood).
         me.record_proj_event(0, true);
         assert_eq!(ev("ProjGuarded0", &me), Value::Int(1));
+    }
+
+    // =====================================================================
+    // T078 — id-less (aggregate) Proj* triggers + ProjCancelTime + NumProjID.
+    // =====================================================================
+
+    /// T078 (AC1): bare no-id `ProjHit` / `ProjContact` / `ProjGuarded` aggregate
+    /// across all owner projectile ids — true iff **any** id matches this tick,
+    /// and the `*Time` aggregate is the **most-recent** matching event (the
+    /// minimum non-`NEVER` time). The per-id `Proj*<id>` triggers stay unchanged.
+    #[test]
+    fn bare_proj_triggers_aggregate_across_all_ids() {
+        let mut me = Character::new();
+
+        // No events yet: the bare boolean is false; the bare `*Time` reads NEVER.
+        assert_eq!(ev("ProjHit", &me), Value::Int(0));
+        assert_eq!(ev("ProjContact", &me), Value::Int(0));
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjHitTime", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Id 2000 lands a clean HIT now; id 2001 has had nothing.
+        me.record_proj_event(2000, false);
+        // Bare `ProjHit` is true (id 2000 hit this tick); `ProjGuarded` is not.
+        assert_eq!(ev("ProjHit", &me), Value::Int(1));
+        assert_eq!(ev("ProjContact", &me), Value::Int(1));
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(0));
+        assert_eq!(ev("ProjHitTime", &me), Value::Int(0));
+        // Per-id triggers are unchanged: 2000 hit, 2001 never did.
+        assert_eq!(ev("ProjHit2000", &me), Value::Int(1));
+        assert_eq!(
+            ev("ProjHitTime2001", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Age two ticks, then id 2001 GUARDS a hit. Now two ids have events at
+        // different ages: 2000's hit is 2 ticks old, 2001's guard is fresh.
+        me.tick_proj_events();
+        me.tick_proj_events();
+        me.record_proj_event(2001, true);
+
+        // Aggregate `ProjHitTime` = most recent HIT = id 2000's, now 2 ticks old
+        // (2001 guarded, so it has no hit time to contribute).
+        assert_eq!(ev("ProjHitTime", &me), Value::Int(2));
+        // Aggregate `ProjGuardedTime` = id 2001's fresh guard = 0.
+        assert_eq!(ev("ProjGuardedTime", &me), Value::Int(0));
+        // Aggregate `ProjContactTime` = MOST recent contact across both ids = 0
+        // (2001 just contacted), not 2000's older contact.
+        assert_eq!(ev("ProjContactTime", &me), Value::Int(0));
+        // Bare boolean `ProjGuarded` true (something guarded this tick); bare
+        // `ProjHit` false (no hit landed *this* tick — 2000's was 2 ticks ago).
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit", &me), Value::Int(0));
+        // Bare `ProjContact` true (id 2001 contacted this tick).
+        assert_eq!(ev("ProjContact", &me), Value::Int(1));
+
+        // The comma-tail window form also folds for the no-id aggregate: a hit
+        // happened (value 1) and the most-recent hit is within 4 ticks.
+        assert_eq!(ev("ProjHit = 1, <= 4", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit = 1, < 2", &me), Value::Int(0));
+    }
+
+    /// T078 (AC2): `ProjCancel` / `ProjCancelTime` track projectile cancellation,
+    /// per-id and in the no-id aggregate, independent of contact/hit/guard.
+    #[test]
+    fn bare_proj_triggers_cancel_time() {
+        let mut me = Character::new();
+
+        // Never cancelled: bare and per-id forms read "no event".
+        assert_eq!(ev("ProjCancel", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjCancelTime", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+        assert_eq!(
+            ev("ProjCancelTime3000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Id 3000 is cancelled this tick. Cancel fires; contact/hit/guard do not.
+        me.record_proj_cancel(3000);
+        assert_eq!(ev("ProjCancel3000", &me), Value::Int(1));
+        assert_eq!(ev("ProjCancelTime3000", &me), Value::Int(0));
+        assert_eq!(ev("ProjContact3000", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjContactTime3000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+        // The no-id aggregate sees the cancel too.
+        assert_eq!(ev("ProjCancel", &me), Value::Int(1));
+        assert_eq!(ev("ProjCancelTime", &me), Value::Int(0));
+
+        // Cancel time counts up with the other counters.
+        me.tick_proj_events();
+        me.tick_proj_events();
+        me.tick_proj_events();
+        assert_eq!(ev("ProjCancelTime3000", &me), Value::Int(3));
+        assert_eq!(ev("ProjCancelTime", &me), Value::Int(3));
+        assert_eq!(ev("ProjCancel3000", &me), Value::Int(0)); // no longer "this tick"
+    }
+
+    /// T078 (AC2): `NumProjID(id)` counts the owner's live projectiles carrying
+    /// that projid; bare `NumProj` (the total) is unchanged.
+    #[test]
+    fn bare_proj_triggers_numprojid_counts_per_id() {
+        let me = Character::new();
+
+        // No projectiles wired: every form reads 0.
+        assert_eq!(
+            ev_graph("NumProjID(2000)", &me, EntityGraph::default()),
+            Value::Int(0)
+        );
+
+        // Owner has 2×2000 and 1×2001 live.
+        let own_proj_ids: [i32; 3] = [2000, 2000, 2001];
+        let graph = EntityGraph::default().with_own_proj_ids(&own_proj_ids);
+        assert_eq!(graph.num_proj_id(2000), 2, "direct accessor: two 2000s");
+        assert_eq!(graph.num_proj_id(2001), 1, "direct accessor: one 2001");
+        assert_eq!(graph.num_proj_id(9999), 0, "direct accessor: none of 9999");
+
+        assert_eq!(ev_graph("NumProjID(2000)", &me, graph), Value::Int(2));
+        assert_eq!(ev_graph("NumProjID(2001)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("NumProjID(9999)", &me, graph), Value::Int(0));
+        // The total `NumProj` is unaffected.
+        assert_eq!(ev_graph("NumProj", &me, graph), Value::Int(3));
+        // The spawn-once latch: `NumProjID(2000) = 0` is false while 2000s live.
+        assert_eq!(ev_graph("NumProjID(2000) = 0", &me, graph), Value::Int(0));
     }
 
     // =====================================================================

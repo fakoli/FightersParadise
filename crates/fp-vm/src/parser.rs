@@ -665,24 +665,26 @@ fn is_hitdefattr_trigger(name: &str) -> bool {
 }
 
 /// Returns whether `name` is a projectile-info trigger that accepts the
-/// two-argument `<trigger><id> = value, op time` comma-tail form (Task A):
-/// `ProjContact<id>`, `ProjHit<id>`, `ProjGuarded<id>`, `ProjContactTime<id>`,
-/// `ProjHitTime<id>`, `ProjGuardedTime<id>` (case-insensitive).
+/// two-argument `<trigger><id> = value, op time` comma-tail form (Task A, T078):
+/// `ProjContact<id>`, `ProjHit<id>`, `ProjGuarded<id>`, `ProjCancel<id>`, and
+/// their `*Time<id>` variants (case-insensitive). The id suffix is optional — the
+/// bare no-id aggregate form (`ProjHit = 1, op t`) also matches.
 ///
-/// These triggers are always written with a projectile-id suffix appended to the
-/// base name (`ProjContact2000`), so the match is a case-insensitive *prefix*
-/// test against the known projectile-trigger base names. Projectiles are not yet
-/// implemented, so the matched form parses (keeping a surrounding boolean alive)
-/// and evaluates to `0`.
+/// The match is a case-insensitive *prefix* test against the known
+/// projectile-trigger base names, so the matched form parses (keeping a
+/// surrounding boolean alive); the owner's [`crate::EvalContext`] resolves the
+/// value against its per-id contact trackers.
 fn is_proj_trigger(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Order longest-first so `projcontacttime` is preferred over `projcontact`.
-    const BASES: [&str; 6] = [
+    const BASES: [&str; 8] = [
         "projcontacttime",
         "projguardedtime",
+        "projcanceltime",
         "projhittime",
         "projcontact",
         "projguarded",
+        "projcancel",
         "projhit",
     ];
     BASES.iter().any(|base| lower.starts_with(base))
