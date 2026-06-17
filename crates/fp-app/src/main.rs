@@ -8297,6 +8297,26 @@ mod tests {
         m.round_state() == RoundState::Fight
     }
 
+    /// Drives `m` (no input) until P1 is actually controllable in the neutral
+    /// stand — i.e. it has finished the round-init intro (common1 5900 -> the
+    /// character's `[Statedef 191]` intro animation) and handed control back to
+    /// state [`STATE_STAND`]. Returns whether P1 became controllable in the stand
+    /// within the budget.
+    ///
+    /// `RoundState::Fight` alone does not imply P1 can move: KFM's authored intro
+    /// keeps the fighter in state 191 (no control) while its intro animation plays
+    /// out, only then `ChangeState`-ing to the stand. Tests that want to prove
+    /// locomotion must wait for this, not merely for the fight to go live.
+    fn run_until_p1_can_walk(m: &mut Match) -> bool {
+        for _ in 0..240 {
+            if m.p1().character.state_no == STATE_STAND && m.p1().character.ctrl {
+                return true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        m.p1().character.state_no == STATE_STAND && m.p1().character.ctrl
+    }
+
     /// AC3 (the headline headless integration test): build the same two-KFM Match
     /// the app builds, drive P1's keyboard inputs so a real KFM attack connects,
     /// and assert P2's life drops — proving the app-level two-player wiring works
@@ -9558,6 +9578,21 @@ mod tests {
         assert!(
             run_until_fight(&mut m),
             "fight must go live before driving input"
+        );
+        // The fight going live (RoundState::Fight) is necessary but not sufficient
+        // to drive locomotion: KFM's round-init (common1 5900 -> 190 -> its own
+        // [Statedef 191] intro) legitimately plays a finite intro animation before
+        // handing control back to the neutral stand (state 0). During that intro the
+        // fighter has no control and cannot walk — exactly as in MUGEN. So drive past
+        // the intro until P1 is actually controllable in the stand before asserting
+        // movement; otherwise the test would assert walking while the character is
+        // mid-intro (the T056 round-init <-> R2 regression).
+        assert!(
+            run_until_p1_can_walk(&mut m),
+            "P1 must hand back control from the round-init intro into a controllable \
+             stand within budget; got state {} ctrl {}",
+            m.p1().character.state_no,
+            m.p1().character.ctrl
         );
 
         // P1 faces right (toward P2); holding right is "fwd". The gap between the
