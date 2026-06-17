@@ -2498,7 +2498,6 @@ impl Character {
             // Seed the juggle pool from THIS character's `[Data] airjuggle`
             // (not the default), so each fighter starts with its own allowance.
             juggle_points: constants.airjuggle,
-            bound_time: 0,
             constants,
             ..Self::default()
         }
