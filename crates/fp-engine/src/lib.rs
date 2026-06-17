@@ -67,8 +67,8 @@ use fp_combat::{
 use fp_core::{Rect, SpriteId, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
-    logical_direction, AiDifficulty, AiObservation, Button, CommandDef, CommandMatcher, Direction,
-    InputBuffer, InputState, LeniencyConfig,
+    logical_direction, AiDifficulty, AiObservation, BehaviorMode, Button, CommandDef,
+    CommandMatcher, Direction, InputBuffer, InputState, LeniencyConfig,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
@@ -809,33 +809,68 @@ struct RedirectRelations<'a> {
 }
 
 /// What drives one side of a [`Match`]: a human input device or the baseline CPU
-/// AI at a chosen difficulty (T052).
+/// AI at a chosen difficulty and teaching [`BehaviorMode`] (T052 / T070).
 ///
-/// The coordinator uses this only to derive each fighter's
+/// The coordinator uses this to derive each fighter's
 /// [`Character::ai_level`](fp_character::Character::ai_level) at construction — a
 /// human ([`Human`](PlayerDriver::Human)) maps to level `0` and a
-/// [`Cpu`](PlayerDriver::Cpu) maps to its [`AiDifficulty::ai_level`] (`1..=8`). It
-/// does **not** itself produce inputs (the caller still feeds inputs each tick); it
-/// is a one-time identity declaration so the CNS `AILevel` trigger reads the right
-/// value. [`Human`](PlayerDriver::Human) is the [`Default`].
+/// [`Cpu`](PlayerDriver::Cpu) maps to its [`AiDifficulty::ai_level`] (`1..=8`) —
+/// and it also declares which teaching [`BehaviorMode`] the CPU plays (so a caller
+/// can read both knobs back off the driver when it builds the side's
+/// [`fp_input::CpuAi`]). It does **not** itself produce inputs (the caller still
+/// feeds inputs each tick); it is a one-time identity declaration so the CNS
+/// `AILevel` trigger reads the right value and the right teaching mode is wired in.
+/// [`Human`](PlayerDriver::Human) is the [`Default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerDriver {
     /// A human player (keyboard or gamepad). AI level `0`.
     #[default]
     Human,
-    /// The baseline CPU AI at the given difficulty. AI level `1..=8`.
-    Cpu(AiDifficulty),
+    /// The baseline CPU AI at the given difficulty and teaching [`BehaviorMode`].
+    /// AI level `1..=8`. The mode selects what the CPU tries to *teach* (the
+    /// default [`BehaviorMode::Ladder`] is the plain difficulty ladder).
+    Cpu(AiDifficulty, BehaviorMode),
 }
 
 impl PlayerDriver {
+    /// A CPU driver at `difficulty` playing the default [`BehaviorMode::Ladder`]
+    /// (the plain difficulty ladder) — the common case, so callers that don't pick
+    /// a teaching mode need not name [`BehaviorMode`].
+    #[must_use]
+    pub fn cpu(difficulty: AiDifficulty) -> Self {
+        PlayerDriver::Cpu(difficulty, BehaviorMode::Ladder)
+    }
+
     /// The [`Character::ai_level`](fp_character::Character::ai_level) this driver
     /// implies: `0` for a [`Human`](Self::Human), or the CPU difficulty's
-    /// [`AiDifficulty::ai_level`] (`1..=8`) for [`Cpu`](Self::Cpu).
+    /// [`AiDifficulty::ai_level`] (`1..=8`) for [`Cpu`](Self::Cpu). The teaching
+    /// [`BehaviorMode`] does not change the level.
     #[must_use]
     pub fn ai_level(self) -> u8 {
         match self {
             PlayerDriver::Human => 0,
-            PlayerDriver::Cpu(difficulty) => difficulty.ai_level(),
+            PlayerDriver::Cpu(difficulty, _) => difficulty.ai_level(),
+        }
+    }
+
+    /// The CPU difficulty this driver carries, or `None` for a human.
+    #[must_use]
+    pub fn difficulty(self) -> Option<AiDifficulty> {
+        match self {
+            PlayerDriver::Human => None,
+            PlayerDriver::Cpu(difficulty, _) => Some(difficulty),
+        }
+    }
+
+    /// The CPU teaching [`BehaviorMode`] this driver carries, or `None` for a
+    /// human. The caller uses it to construct the side's
+    /// [`fp_input::CpuAi`](fp_input::CpuAi) via
+    /// [`CpuAi::with_mode`](fp_input::CpuAi::with_mode) (T070).
+    #[must_use]
+    pub fn behavior_mode(self) -> Option<BehaviorMode> {
+        match self {
+            PlayerDriver::Human => None,
+            PlayerDriver::Cpu(_, mode) => Some(mode),
         }
     }
 }
@@ -12731,15 +12766,38 @@ time = 1
 
     // ---- T052: ai_level entity field + match/CPU plumbing -------------------
 
-    /// `PlayerDriver::ai_level` maps humans to 0 and CPU difficulties to 1..=8.
+    /// `PlayerDriver::ai_level` maps humans to 0 and CPU difficulties to 1..=8,
+    /// independent of the teaching `BehaviorMode` the CPU carries.
     #[test]
     fn player_driver_ai_level_mapping() {
         assert_eq!(PlayerDriver::Human.ai_level(), 0);
-        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Easy).ai_level(), 2);
-        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Normal).ai_level(), 4);
-        assert_eq!(PlayerDriver::Cpu(AiDifficulty::Hard).ai_level(), 7);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Easy).ai_level(), 2);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Normal).ai_level(), 4);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Hard).ai_level(), 7);
+        // The teaching mode does not change the AI level.
+        assert_eq!(
+            PlayerDriver::Cpu(AiDifficulty::Hard, BehaviorMode::ReactiveDP).ai_level(),
+            7
+        );
         // The human default is level 0 (a human is never mistaken for the CPU).
         assert_eq!(PlayerDriver::default().ai_level(), 0);
+    }
+
+    /// `PlayerDriver` round-trips its difficulty and teaching mode so a caller can
+    /// read both knobs back off the driver to construct the side's CPU AI (T070).
+    #[test]
+    fn player_driver_carries_difficulty_and_mode() {
+        let d = PlayerDriver::Cpu(AiDifficulty::Hard, BehaviorMode::WhiffPunisher);
+        assert_eq!(d.difficulty(), Some(AiDifficulty::Hard));
+        assert_eq!(d.behavior_mode(), Some(BehaviorMode::WhiffPunisher));
+        // The `cpu` shorthand defaults to the plain difficulty ladder.
+        assert_eq!(
+            PlayerDriver::cpu(AiDifficulty::Normal).behavior_mode(),
+            Some(BehaviorMode::Ladder)
+        );
+        // A human carries neither.
+        assert_eq!(PlayerDriver::Human.difficulty(), None);
+        assert_eq!(PlayerDriver::Human.behavior_mode(), None);
     }
 
     /// A bare, freshly-built `Character` (no coordinator) defaults to `ai_level == 0`.
@@ -12757,7 +12815,7 @@ time = 1
             tests_support::make_player(50.0),
             StageBounds::new(-200.0, 200.0),
         );
-        m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Hard));
+        m.set_drivers(PlayerDriver::Human, PlayerDriver::cpu(AiDifficulty::Hard));
         assert_eq!(m.p1().character.ai_level(), 0, "human P1 must be level 0");
         assert_eq!(
             m.p2().character.ai_level(),
@@ -12795,7 +12853,7 @@ time = 1
             StageBounds::new(-200.0, 200.0),
             TeamMode::Simul,
         );
-        tm.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(AiDifficulty::Normal));
+        tm.set_drivers(PlayerDriver::Human, PlayerDriver::cpu(AiDifficulty::Normal));
 
         // P1 side (human): active lead + reserve both level 0.
         assert_eq!(tm.active_player(Side::P1).character.ai_level(), 0);

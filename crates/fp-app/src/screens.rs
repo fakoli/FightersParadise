@@ -50,10 +50,11 @@ use fp_ui::{MenuItemKind, RosterEntry, SelectDef, SelectInfo, SelectSlot, System
 // matching how `InputConfig` and friends are namespaced under `screens`.
 pub use fp_ui::{BarColor, HudConfig, HudElement};
 
-// Re-export the CPU difficulty knob (T069) so the Setup/Options screen can own a
-// `screens::AiDifficulty` selector without `main.rs` reaching into `fp_input`,
-// matching how the HUD/input config types are namespaced under `screens`.
-pub use fp_input::AiDifficulty;
+// Re-export the CPU difficulty knob (T069) and teaching-mode knob (T070) so the
+// Setup/Options screen can own `screens::AiDifficulty` / `screens::BehaviorMode`
+// selectors without `main.rs` reaching into `fp_input`, matching how the HUD/input
+// config types are namespaced under `screens`.
+pub use fp_input::{AiDifficulty, BehaviorMode};
 
 // `SelectSlot` is used both in `SelectScreen::new` and `stage_entries_from_roster`.
 
@@ -842,6 +843,11 @@ pub struct InputConfig {
     /// at [`AiDifficulty::Normal`]; lives here so it persists across matches
     /// alongside the device preference and key bindings.
     pub cpu_difficulty: AiDifficulty,
+    /// The CPU teaching [`BehaviorMode`] the Setup/Options screen selects (T070),
+    /// applied to P2's [`CpuAi`](fp_input::CpuAi) at the next match start. Starts
+    /// at [`BehaviorMode::Ladder`] (the plain difficulty ladder, unchanged from
+    /// before); lives here so the chosen teaching mode persists across matches.
+    pub cpu_mode: BehaviorMode,
     /// The player-1 keyboard binding for every action, in [`InputAction::ALL`]
     /// order.
     bindings: Vec<(InputAction, KeyCode)>,
@@ -862,6 +868,7 @@ impl InputConfig {
         Self {
             device: InputDevice::Keyboard,
             cpu_difficulty: AiDifficulty::Normal,
+            cpu_mode: BehaviorMode::Ladder,
             bindings,
         }
     }
@@ -916,6 +923,9 @@ enum SetupRow {
     Device,
     /// The CPU-difficulty selector (Easy / Normal / Hard) (T069).
     CpuDifficulty,
+    /// The CPU teaching-mode selector (Ladder / Pure Blocker / Reactive DP /
+    /// Whiff Punisher) (T070).
+    CpuMode,
     /// Opens the HUD-customization screen (T046).
     HudCustomize,
     /// A remappable action's key binding.
@@ -931,6 +941,9 @@ pub enum SetupRowKind {
     Device,
     /// The CPU-difficulty selector row (Easy / Normal / Hard) (T069).
     CpuDifficulty,
+    /// The CPU teaching-mode selector row (Ladder / Pure Blocker / Reactive DP /
+    /// Whiff Punisher) (T070).
+    CpuMode,
     /// The HUD-customization entry row (T046).
     HudCustomize,
     /// A remappable action's key-binding row.
@@ -971,13 +984,15 @@ impl SetupScreen {
     /// Builds the setup screen: cursor on the first row, not capturing.
     ///
     /// Rows, in display order: the input-device toggle, the CPU-difficulty
-    /// selector (T069), the HUD-customization entry (T046), then one key-binding
-    /// row per [`InputAction`].
+    /// selector (T069), the CPU teaching-mode selector (T070), the
+    /// HUD-customization entry (T046), then one key-binding row per
+    /// [`InputAction`].
     #[must_use]
     pub fn new() -> Self {
         let mut rows = vec![
             SetupRow::Device,
             SetupRow::CpuDifficulty,
+            SetupRow::CpuMode,
             SetupRow::HudCustomize,
         ];
         rows.extend(InputAction::ALL.iter().map(|&a| SetupRow::Action(a)));
@@ -1012,6 +1027,12 @@ impl SetupScreen {
         matches!(self.rows.get(self.cursor), Some(SetupRow::CpuDifficulty))
     }
 
+    /// Whether the CPU teaching-mode selector row is highlighted (T070).
+    #[must_use]
+    pub fn on_cpu_mode_row(&self) -> bool {
+        matches!(self.rows.get(self.cursor), Some(SetupRow::CpuMode))
+    }
+
     /// Whether the HUD-customization row is highlighted (T046).
     #[must_use]
     pub fn on_hud_row(&self) -> bool {
@@ -1028,6 +1049,7 @@ impl SetupScreen {
             .map(|r| match r {
                 SetupRow::Device => SetupRowKind::Device,
                 SetupRow::CpuDifficulty => SetupRowKind::CpuDifficulty,
+                SetupRow::CpuMode => SetupRowKind::CpuMode,
                 SetupRow::HudCustomize => SetupRowKind::HudCustomize,
                 SetupRow::Action(a) => SetupRowKind::Action(*a),
             })
@@ -1053,9 +1075,13 @@ impl SetupScreen {
     ///   highlighted;
     /// - Left/Right step the [`AiDifficulty`] selector (Easy↔Normal↔Hard,
     ///   saturating) when the CPU-difficulty row is highlighted (T069);
+    /// - Left/Right step the [`BehaviorMode`] selector (Ladder↔Pure Blocker↔
+    ///   Reactive DP↔Whiff Punisher, wrapping) when the CPU teaching-mode row is
+    ///   highlighted (T070);
     /// - Confirm on the device row toggles it too; confirm on the CPU-difficulty
     ///   row steps it one harder (wrapping back to Easy from Hard so it stays
-    ///   reachable); confirm on an action row arms capture mode for that action;
+    ///   reachable); confirm on the CPU teaching-mode row steps it one forward
+    ///   (wrapping); confirm on an action row arms capture mode for that action;
     /// - Back returns [`SetupOutcome::Exit`] (to the title).
     pub fn update(&mut self, input: MenuInput, config: &mut InputConfig) -> SetupOutcome {
         if self.capturing.is_some() {
@@ -1101,6 +1127,16 @@ impl SetupScreen {
                     AiDifficulty::Hard => AiDifficulty::Easy,
                     other => other.harder(),
                 };
+            }
+            // CPU teaching-mode row (T070): Left/Right step the `BehaviorMode`
+            // selector (Ladder → Pure Blocker → Reactive DP → Whiff Punisher),
+            // wrapping both ways; Confirm steps forward too — so the selector is
+            // fully reachable with only a confirm key.
+            Some(SetupRow::CpuMode) if input.left => {
+                config.cpu_mode = config.cpu_mode.prev();
+            }
+            Some(SetupRow::CpuMode) if input.right || input.confirm => {
+                config.cpu_mode = config.cpu_mode.next();
             }
             // HUD-customization row + confirm: open the HUD-customization screen.
             Some(SetupRow::HudCustomize) if input.confirm => {
@@ -1973,9 +2009,9 @@ mod tests {
         assert_eq!(s.cursor, 0);
         assert!(s.on_device_row());
         assert!(!s.awaiting_key());
-        // Rows = device + CPU-difficulty (T069) + HUD-customization (T046) + one
-        // per action.
-        assert_eq!(s.row_count(), 3 + InputAction::ALL.len());
+        // Rows = device + CPU-difficulty (T069) + CPU teaching-mode (T070) +
+        // HUD-customization (T046) + one per action.
+        assert_eq!(s.row_count(), 4 + InputAction::ALL.len());
     }
 
     #[test]
@@ -1992,11 +2028,19 @@ mod tests {
         assert!(s.on_cpu_difficulty_row());
         assert_eq!(s.selected_action(), None, "the CPU row is not an action");
         s.update(down(), &mut cfg);
-        assert_eq!(s.cursor, 2, "row 2 is the HUD-customization row");
+        assert_eq!(s.cursor, 2, "row 2 is the CPU teaching-mode row");
+        assert!(s.on_cpu_mode_row());
+        assert_eq!(
+            s.selected_action(),
+            None,
+            "the CPU-mode row is not an action"
+        );
+        s.update(down(), &mut cfg);
+        assert_eq!(s.cursor, 3, "row 3 is the HUD-customization row");
         assert!(s.on_hud_row());
         assert_eq!(s.selected_action(), None, "the HUD row is not an action");
         s.update(down(), &mut cfg);
-        assert_eq!(s.cursor, 3);
+        assert_eq!(s.cursor, 4);
         assert_eq!(s.selected_action(), Some(InputAction::Up));
     }
 
@@ -2066,6 +2110,57 @@ mod tests {
     }
 
     #[test]
+    fn setup_cpu_mode_row_defaults_to_ladder_and_cycles() {
+        // T070 acceptance: the Setup/Options screen exposes a CPU teaching-mode
+        // selector (defaulting to Ladder), and stepping it changes the persisted
+        // `cpu_mode` the next match's CpuAi reads — so the three teaching modes are
+        // reachable from the menu, not just dead code.
+        let mut s = SetupScreen::new();
+        let mut cfg = config_with_index_keys();
+        assert_eq!(
+            cfg.cpu_mode,
+            BehaviorMode::Ladder,
+            "the selector defaults to the plain difficulty ladder"
+        );
+        // Move from device(0) -> CpuDifficulty(1) -> CpuMode(2).
+        s.update(down(), &mut cfg);
+        s.update(down(), &mut cfg);
+        assert!(s.on_cpu_mode_row());
+        assert_eq!(
+            s.selected_action(),
+            None,
+            "the CPU-mode row is not an action"
+        );
+
+        // Right cycles forward through every teaching mode and wraps.
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::PureBlocker);
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::ReactiveDP);
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::WhiffPunisher);
+        s.update(right(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::Ladder, "right wraps to Ladder");
+
+        // Left cycles the other way and wraps.
+        s.update(left(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::WhiffPunisher, "left wraps back");
+
+        // Confirm also steps forward (so the selector is reachable confirm-only).
+        s.update(confirm(), &mut cfg);
+        assert_eq!(cfg.cpu_mode, BehaviorMode::Ladder);
+    }
+
+    #[test]
+    fn setup_cpu_mode_row_kind_is_exposed() {
+        // The renderer walks `row_kinds()`; the CPU teaching-mode row must surface
+        // as its own kind so it can be labelled distinctly (T070).
+        let s = SetupScreen::new();
+        let kinds = s.row_kinds();
+        assert_eq!(kinds[2], SetupRowKind::CpuMode);
+    }
+
+    #[test]
     fn setup_cpu_difficulty_row_kind_is_exposed() {
         // The renderer walks `row_kinds()`; the CPU-difficulty row must surface as
         // its own kind so it can be labelled distinctly.
@@ -2073,7 +2168,8 @@ mod tests {
         let kinds = s.row_kinds();
         assert_eq!(kinds[0], SetupRowKind::Device);
         assert_eq!(kinds[1], SetupRowKind::CpuDifficulty);
-        assert_eq!(kinds[2], SetupRowKind::HudCustomize);
+        assert_eq!(kinds[2], SetupRowKind::CpuMode);
+        assert_eq!(kinds[3], SetupRowKind::HudCustomize);
     }
 
     #[test]
@@ -2092,8 +2188,8 @@ mod tests {
         let mut cfg = config_with_index_keys();
 
         // Walk down to the `A` action row: device(0), CpuDifficulty(1),
-        // HudCustomize(2), Up(3), Down(4), Left(5), Right(6), A(7).
-        for _ in 0..7 {
+        // CpuMode(2), HudCustomize(3), Up(4), Down(5), Left(6), Right(7), A(8).
+        for _ in 0..8 {
             s.update(down(), &mut cfg);
         }
         assert_eq!(s.selected_action(), Some(InputAction::A));
@@ -2122,8 +2218,9 @@ mod tests {
     fn setup_capture_ignores_navigation_until_key_or_cancel() {
         let mut s = SetupScreen::new();
         let mut cfg = config_with_index_keys();
-        // Arm capture on the Up action (row 3: device(0), CpuDifficulty(1),
-        // HudCustomize(2), Up(3)).
+        // Arm capture on the Up action (row 4: device(0), CpuDifficulty(1),
+        // CpuMode(2), HudCustomize(3), Up(4)).
+        s.update(down(), &mut cfg);
         s.update(down(), &mut cfg);
         s.update(down(), &mut cfg);
         s.update(down(), &mut cfg);
@@ -2134,7 +2231,7 @@ mod tests {
         // Navigation is suspended while capturing: the cursor must not move.
         s.update(down(), &mut cfg);
         s.update(up(), &mut cfg);
-        assert_eq!(s.cursor, 3, "cursor frozen during capture");
+        assert_eq!(s.cursor, 4, "cursor frozen during capture");
         assert!(s.awaiting_key(), "still capturing");
 
         // Back cancels the capture without binding and without leaving the screen.
@@ -2180,11 +2277,12 @@ mod tests {
     #[test]
     fn setup_has_a_hud_customization_row_reachable_from_options() {
         // Acceptance #2: the HUD-customization screen is reachable from the
-        // setup/options screen. Row 2 is the HUD row; confirming it opens it.
+        // setup/options screen. Row 3 is the HUD row; confirming it opens it.
         let mut s = SetupScreen::new();
         let mut cfg = config_with_index_keys();
         s.update(down(), &mut cfg); // device(0) -> CpuDifficulty(1)
-        s.update(down(), &mut cfg); // CpuDifficulty(1) -> HudCustomize(2)
+        s.update(down(), &mut cfg); // CpuDifficulty(1) -> CpuMode(2)
+        s.update(down(), &mut cfg); // CpuMode(2) -> HudCustomize(3)
         assert!(s.on_hud_row());
         assert_eq!(
             s.update(confirm(), &mut cfg),
@@ -2308,8 +2406,9 @@ mod tests {
         let mut hud_cfg = HudConfig::default();
 
         // Open the HUD screen from setup: device(0) -> CpuDifficulty(1) ->
-        // HudCustomize(2).
+        // CpuMode(2) -> HudCustomize(3).
         setup.update(down(), &mut input_cfg); // -> CPU-difficulty row
+        setup.update(down(), &mut input_cfg); // -> CPU teaching-mode row
         setup.update(down(), &mut input_cfg); // -> HUD row
         assert_eq!(
             setup.update(confirm(), &mut input_cfg),

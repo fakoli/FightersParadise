@@ -78,8 +78,8 @@ use fp_engine::{
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_input::{
-    map_controller, AiDifficulty, Button as PadButton, ControllerInput, CpuAi, RawController,
-    DEADZONE_DEFAULT,
+    map_controller, AiDifficulty, BehaviorMode, Button as PadButton, ControllerInput, CpuAi,
+    RawController, DEADZONE_DEFAULT,
 };
 use fp_render::{
     BlendMode, GlyphFont, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture, TextDrawParams,
@@ -3809,6 +3809,50 @@ fn parse_team_flag(args: &[String]) -> (TeamMode, Vec<String>) {
     (mode, rest)
 }
 
+/// Parses (and strips) the CPU teaching-mode flag from `args` (T070), returning
+/// the chosen [`BehaviorMode`] plus the remaining positional args.
+///
+/// `--ai-mode <token>` selects which teaching CPU drives P2 on the direct-CLI
+/// match path, where `<token>` is a [`BehaviorMode::token`] (or alias):
+/// `ladder` (the plain difficulty ladder, the default), `blocker` (Pure Blocker),
+/// `dp` (Reactive DP), or `punisher` (Whiff Punisher). With no flag the default is
+/// [`BehaviorMode::Ladder`], so omitting it is byte-identical to before. An unknown
+/// token (or a `--ai-mode` at the end with no value) warns and keeps the default;
+/// any other `--…` token passes through untouched. The last `--ai-mode` wins if
+/// repeated. Pure — unit-tested without a window.
+fn parse_ai_mode_flag(args: &[String]) -> (BehaviorMode, Vec<String>) {
+    let mut mode = BehaviorMode::default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.eq_ignore_ascii_case("--ai-mode") {
+            match args.get(i + 1) {
+                Some(value) => {
+                    match BehaviorMode::from_token(value) {
+                        Some(m) => mode = m,
+                        None => tracing::warn!(
+                            "--ai-mode: unknown teaching mode {value:?}; \
+                             using LADDER (try: ladder|blocker|dp|punisher)"
+                        ),
+                    }
+                    i += 2;
+                }
+                None => {
+                    tracing::warn!(
+                        "--ai-mode expects a teaching mode (ladder|blocker|dp|punisher); ignoring"
+                    );
+                    i += 1;
+                }
+            }
+        } else {
+            rest.push(arg.clone());
+            i += 1;
+        }
+    }
+    (mode, rest)
+}
+
 /// The two-player [`Match`] run state: the match plus the per-run rendering and
 /// audio resources held alongside it (per-side texture caches, the shared audio
 /// system, and per-side decoded-sound caches).
@@ -4018,6 +4062,7 @@ fn select_mode(
     args: &[String],
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     match args.len() {
@@ -4030,6 +4075,7 @@ fn select_mode(
                 stage,
                 pal,
                 team_mode,
+                cpu_mode,
                 renderer,
             )
         }
@@ -4052,7 +4098,7 @@ fn select_mode(
         n if n >= 2 && is_def_path(&args[1]) => {
             let def = Path::new(&args[1]);
             let stage = stage_arg(args, 2);
-            load_match_or_fallback(def, def, stage, pal, team_mode, renderer)
+            load_match_or_fallback(def, def, stage, pal, team_mode, cpu_mode, renderer)
         }
         // <sff> → legacy static sprite.
         2 => match load_sff_sprite(renderer, Path::new(&args[1])) {
@@ -4070,7 +4116,7 @@ fn select_mode(
                 tracing::info!("No files provided; loading two-KFM match from {DEFAULT_DEF}");
                 // No default stage ships (clean-room / asset-blocked), so the
                 // default match renders over the flat clear color.
-                load_match_or_fallback(&def, &def, None, pal, team_mode, renderer)
+                load_match_or_fallback(&def, &def, None, pal, team_mode, cpu_mode, renderer)
             } else {
                 tracing::info!("No files and no default character; showing test pattern");
                 tracing::info!("Usage: fp-app [p1.def [p2.def]] | <file.sff> [file.air]");
@@ -4159,12 +4205,18 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgba, info.width, info.height))
 }
 
+// The direct-CLI loader threads the same wide-but-flat set of independent inputs
+// as `load_match_with_backdrop` (chars, optional stage, palette/team selections,
+// the chosen teaching mode, and the renderer); bundling them would only move the
+// fields elsewhere, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn load_match_or_fallback(
     p1_def: &Path,
     p2_def: &Path,
     stage_def: Option<&Path>,
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     load_match_with_backdrop(
@@ -4178,6 +4230,10 @@ fn load_match_or_fallback(
         // play-out (default seed + Normal) is unchanged; the Setup/Options screen
         // (menu flow) is what selects a non-default difficulty (T069).
         AiDifficulty::Normal,
+        // The teaching `BehaviorMode` comes from the `--ai-mode` CLI flag (default
+        // `Ladder` = the plain difficulty ladder) so a player can pick a teaching
+        // CPU from the command line (T070).
+        cpu_mode,
         renderer,
     )
 }
@@ -4200,6 +4256,7 @@ fn load_match_with_backdrop(
     pal: PalSelection,
     team_mode: TeamMode,
     cpu_difficulty: AiDifficulty,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     match build_team_match(p1_def, p2_def, pal, team_mode) {
@@ -4211,7 +4268,10 @@ fn load_match_with_backdrop(
             // human controller still overrides the CPU's inputs per-frame in
             // `tick_match_run`, but the identity (and thus `AILevel`) is set once
             // here at construction.
-            m.set_drivers(PlayerDriver::Human, PlayerDriver::Cpu(cpu_difficulty));
+            m.set_drivers(
+                PlayerDriver::Human,
+                PlayerDriver::Cpu(cpu_difficulty, cpu_mode),
+            );
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the team's inner
             // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle
@@ -4265,11 +4325,15 @@ fn load_match_with_backdrop(
                 background,
                 // Drive the otherwise-idle P2 with the baseline CPU AI (T018),
                 // seeded deterministically (P2's derived per-player seed) so the
-                // demo replays identically. A second human controller, when
-                // present, overrides it per-frame in `tick_match_run`.
-                cpu_ai: Some(CpuAi::new(
+                // demo replays identically, in the Setup/Options- or CLI-selected
+                // teaching `BehaviorMode` (T070; default `Ladder` = the plain
+                // difficulty ladder, unchanged from before). A second human
+                // controller, when present, overrides it per-frame in
+                // `tick_match_run`.
+                cpu_ai: Some(CpuAi::with_mode(
                     derive_player_seed(DEFAULT_MATCH_SEED, 1),
                     cpu_difficulty,
+                    cpu_mode,
                 )),
                 dummy_mode: DummyMode::default(),
                 dummy_tick: 0,
@@ -4869,6 +4933,7 @@ impl MenuApp {
         stage: &screens::StageChoice,
         mode: screens::SelectMode,
         cpu_difficulty: AiDifficulty,
+        cpu_mode: BehaviorMode,
         renderer: &Renderer,
     ) {
         let game_mode = game_mode_for(mode);
@@ -4882,7 +4947,14 @@ impl MenuApp {
             stage.name,
             stage.path.display(),
         );
-        match build_match_run(&pick.p1_def, &pick.p2_def, stage, cpu_difficulty, renderer) {
+        match build_match_run(
+            &pick.p1_def,
+            &pick.p2_def,
+            stage,
+            cpu_difficulty,
+            cpu_mode,
+            renderer,
+        ) {
             Some(mut run) => {
                 // (T066) Flag the match's mode so Training disables round
                 // termination (no timeout, no auto-KO end) while Versus runs the
@@ -4959,11 +5031,16 @@ fn game_mode_for(mode: screens::SelectMode) -> GameMode {
 /// degrades to the flat clear color — the match still runs. Returns `None` on a
 /// character load failure so the caller can fall back to the title menu. Never
 /// panics.
+// `build_match_run` threads the player's stage, palette, difficulty, and teaching
+// mode selections plus the renderer into the loader; bundling them would only move
+// the same flat fields elsewhere, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn build_match_run(
     p1_def: &Path,
     p2_def: &Path,
     stage: &screens::StageChoice,
     cpu_difficulty: AiDifficulty,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Option<MatchRun> {
     // A `.def` stage becomes a MUGEN `[BGdef]` stage; a backdrop stage has no
@@ -4983,6 +5060,8 @@ fn build_match_run(
         TeamMode::Single,
         // P2's CPU difficulty as chosen on the Setup/Options screen (T069).
         cpu_difficulty,
+        // P2's CPU teaching mode as chosen on the Setup/Options screen (T070).
+        cpu_mode,
         renderer,
     ) {
         Mode::Match(run) => Some(*run),
@@ -5147,6 +5226,8 @@ fn draw_setup_screen(
         "DEVICE".to_string()
     } else if setup.on_cpu_difficulty_row() {
         "CPU".to_string()
+    } else if setup.on_cpu_mode_row() {
+        "CPU MODE".to_string()
     } else if setup.on_hud_row() {
         "HUD".to_string()
     } else {
@@ -5173,6 +5254,10 @@ fn draw_setup_screen(
             // The CPU-difficulty selector row (T069): Left/Right step it.
             screens::SetupRowKind::CpuDifficulty => {
                 format!("{marker} CPU: {}", config.cpu_difficulty.label())
+            }
+            // The CPU teaching-mode selector row (T070): Left/Right step it.
+            screens::SetupRowKind::CpuMode => {
+                format!("{marker} CPU MODE: {}", config.cpu_mode.label())
             }
             // The HUD-customization entry row (T046).
             screens::SetupRowKind::HudCustomize => format!("{marker} HUD CUSTOMIZE..."),
@@ -5655,6 +5740,10 @@ fn run() -> fp_core::FpResult<()> {
     // Team mode (T027): `--simul`/`--turns` select a multi-fighter match on the
     // direct-CLI path; the default is the classic 1v1 (`TeamMode::Single`).
     let (team_mode, args) = parse_team_flag(&args);
+    // CPU teaching mode (T070): `--ai-mode <token>` picks which teaching CPU drives
+    // P2 on the direct-CLI match path (default `Ladder` = the plain difficulty
+    // ladder). The menu flow instead reads the Setup/Options CPU-mode selector.
+    let (cli_cpu_mode, args) = parse_ai_mode_flag(&args);
 
     // The top-level launch route: no file args (or an explicit `menu`) launches
     // the in-app Title menu; a directory argument scans it for a character roster
@@ -5679,7 +5768,7 @@ fn run() -> fp_core::FpResult<()> {
     };
     // The direct-CLI content mode, only built on the Direct route.
     let mut mode = match &route {
-        CliRoute::Direct => Some(select_mode(&args, pal, team_mode, &renderer)),
+        CliRoute::Direct => Some(select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)),
         CliRoute::Menu | CliRoute::Directory(_) => None,
     };
 
@@ -5992,6 +6081,7 @@ fn run() -> fp_core::FpResult<()> {
                                 &stage,
                                 mode,
                                 input_config.cpu_difficulty,
+                                input_config.cpu_mode,
                                 &renderer,
                             );
                         }
@@ -6653,10 +6743,11 @@ mod tests {
 
         // Rebind `a` to `P` through the setup screen's capture path.
         let mut setup = screens::SetupScreen::new();
-        // Walk to the `A` action row (device, CPU-difficulty, HUD-customize, Up,
-        // Down, Left, Right, A — the CPU-difficulty (T069) and HUD-customization
-        // (T046) rows sit between device and Up).
-        for _ in 0..7 {
+        // Walk to the `A` action row (device, CPU-difficulty, CPU-mode,
+        // HUD-customize, Up, Down, Left, Right, A — the CPU-difficulty (T069),
+        // CPU teaching-mode (T070), and HUD-customization (T046) rows sit between
+        // device and Up).
+        for _ in 0..8 {
             setup.update(
                 screens::MenuInput {
                     down: true,
@@ -9897,6 +9988,64 @@ mod tests {
             "kfm.def".to_string(),
         ]);
         assert_eq!(mode, TeamMode::Turns);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+    }
+
+    /// T070: `--ai-mode <token>` selects the CPU teaching mode for the direct-CLI
+    /// match path and strips the flag (+value); a bad/missing token keeps the
+    /// default Ladder; other args pass through untouched; the last flag wins.
+    #[test]
+    fn parse_ai_mode_flag_selects_teaching_mode_and_strips_it() {
+        // No flag -> default Ladder, args untouched (CLI unchanged from before).
+        let (mode, rest) = parse_ai_mode_flag(&["fp-app".to_string(), "kfm.def".to_string()]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // --ai-mode dp -> Reactive DP, flag+value stripped, the .def passes through.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "dp".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::ReactiveDP);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // Case-insensitive flag + an alias token resolve.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--AI-MODE".to_string(),
+            "blocker".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::PureBlocker);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // An unknown token keeps the default (Ladder) but still strips flag+value.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "nonsense".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // A trailing `--ai-mode` with no value is dropped (default kept).
+        let (mode, rest) = parse_ai_mode_flag(&["fp-app".to_string(), "--ai-mode".to_string()]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string()]);
+
+        // The last --ai-mode wins if repeated (both flag+value pairs stripped).
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "dp".to_string(),
+            "--ai-mode".to_string(),
+            "punisher".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::WhiffPunisher);
         assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
     }
 

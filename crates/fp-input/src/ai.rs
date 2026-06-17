@@ -305,6 +305,75 @@ pub enum BehaviorMode {
     WhiffPunisher,
 }
 
+impl BehaviorMode {
+    /// Every mode in selector / display order, so a menu (or a CLI flag parser)
+    /// can enumerate and step through them without hardcoding the variant list.
+    pub const ALL: [BehaviorMode; 4] = [
+        BehaviorMode::Ladder,
+        BehaviorMode::PureBlocker,
+        BehaviorMode::ReactiveDP,
+        BehaviorMode::WhiffPunisher,
+    ];
+
+    /// A short uppercase label for the mode, for a menu/HUD renderer (matches the
+    /// menu font's glyph set: `0-9 A-Z`, space, colon). Used by the Setup/Options
+    /// CPU-mode selector row (T070).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            BehaviorMode::Ladder => "LADDER",
+            BehaviorMode::PureBlocker => "PURE BLOCKER",
+            BehaviorMode::ReactiveDP => "REACTIVE DP",
+            BehaviorMode::WhiffPunisher => "WHIFF PUNISHER",
+        }
+    }
+
+    /// A short, lowercase, space-free token for the mode, used by the `--ai-mode`
+    /// CLI flag (so a player can pick a teaching mode from the command line).
+    /// Round-trips with [`BehaviorMode::from_token`].
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            BehaviorMode::Ladder => "ladder",
+            BehaviorMode::PureBlocker => "blocker",
+            BehaviorMode::ReactiveDP => "dp",
+            BehaviorMode::WhiffPunisher => "punisher",
+        }
+    }
+
+    /// Parses a CLI/`--ai-mode` token (case-insensitive) into a mode, or `None`
+    /// for an unrecognized token. Accepts the canonical [`BehaviorMode::token`]
+    /// plus a couple of natural aliases.
+    #[must_use]
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ladder" | "default" => Some(BehaviorMode::Ladder),
+            "blocker" | "pureblocker" | "block" => Some(BehaviorMode::PureBlocker),
+            "dp" | "reactivedp" | "reversal" => Some(BehaviorMode::ReactiveDP),
+            "punisher" | "whiffpunisher" | "whiff" => Some(BehaviorMode::WhiffPunisher),
+            _ => None,
+        }
+    }
+
+    /// The next mode in [`BehaviorMode::ALL`] order, wrapping back to the first
+    /// after the last — so a single Right/Confirm key cycles every mode (T070).
+    #[must_use]
+    pub fn next(self) -> Self {
+        let all = Self::ALL;
+        let i = all.iter().position(|&m| m == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+
+    /// The previous mode in [`BehaviorMode::ALL`] order, wrapping from the first
+    /// back to the last — so a single Left key cycles every mode the other way.
+    #[must_use]
+    pub fn prev(self) -> Self {
+        let all = Self::ALL;
+        let i = all.iter().position(|&m| m == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
 /// A simple deterministic, command-driven CPU AI for a non-human player (T018).
 ///
 /// Construct one per AI-controlled fighter with a seed (for reproducibility) and
@@ -1139,6 +1208,62 @@ mod tests {
         assert!(
             lead.iter().any(|s| !s.direction.is_neutral()),
             "the DP motion holds directions before the punch"
+        );
+    }
+
+    /// The behaviour-mode selector cycles through every mode and wraps both ways,
+    /// and its tokens round-trip — so a Setup row (next/prev) and the `--ai-mode`
+    /// CLI flag (token/from_token) can both reach every teaching mode (T070).
+    #[test]
+    fn behavior_mode_selector_cycles_and_tokens_round_trip() {
+        // ALL is in selector order and covers exactly the four modes.
+        assert_eq!(BehaviorMode::ALL.len(), 4);
+        assert_eq!(BehaviorMode::ALL[0], BehaviorMode::Ladder);
+
+        // next() steps forward and wraps from the last back to the first.
+        assert_eq!(BehaviorMode::Ladder.next(), BehaviorMode::PureBlocker);
+        assert_eq!(BehaviorMode::PureBlocker.next(), BehaviorMode::ReactiveDP);
+        assert_eq!(BehaviorMode::ReactiveDP.next(), BehaviorMode::WhiffPunisher);
+        assert_eq!(BehaviorMode::WhiffPunisher.next(), BehaviorMode::Ladder);
+        // prev() is the inverse and wraps from the first back to the last.
+        assert_eq!(BehaviorMode::Ladder.prev(), BehaviorMode::WhiffPunisher);
+        assert_eq!(BehaviorMode::WhiffPunisher.prev(), BehaviorMode::ReactiveDP);
+
+        // Stepping next() ALL.len() times returns to the start (full cycle).
+        let mut m = BehaviorMode::Ladder;
+        for _ in 0..BehaviorMode::ALL.len() {
+            m = m.next();
+        }
+        assert_eq!(m, BehaviorMode::Ladder, "a full cycle returns to start");
+
+        // Every mode's canonical token parses back to itself (case-insensitively),
+        // and a bad token is rejected (not silently defaulted).
+        for mode in BehaviorMode::ALL {
+            assert_eq!(
+                BehaviorMode::from_token(mode.token()),
+                Some(mode),
+                "{mode:?} token must round-trip"
+            );
+            assert_eq!(
+                BehaviorMode::from_token(&mode.token().to_ascii_uppercase()),
+                Some(mode),
+                "{mode:?} token must parse case-insensitively"
+            );
+            // Labels are drawable in the menu glyph set (uppercase A-Z + space).
+            assert!(mode
+                .label()
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == ' '));
+        }
+        assert_eq!(BehaviorMode::from_token("nonsense"), None);
+        // A couple of natural aliases also resolve.
+        assert_eq!(
+            BehaviorMode::from_token("pureblocker"),
+            Some(BehaviorMode::PureBlocker)
+        );
+        assert_eq!(
+            BehaviorMode::from_token("whiff"),
+            Some(BehaviorMode::WhiffPunisher)
         );
     }
 
