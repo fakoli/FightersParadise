@@ -5984,6 +5984,183 @@ time = 1
         assert_eq!(m.winner(), Some(Winner::P1), "more life wins on time over");
     }
 
+    /// Regression (round-flow): a round decided by TIME OVER (not a KO) — with both
+    /// fighters at FULL life when the clock expires — must run the round clock its
+    /// full configured length, decide the round on the timer hitting `0`, and then
+    /// ADVANCE out of [`RoundState::Win`] just like a KO does. This locks in the
+    /// fix for the live "round ends instantly + freezes on P2 WINS" report: the
+    /// timer must start at `round_seconds * 60`, count down only during Fight, reach
+    /// `0` only after that many fight ticks, and the Win phase must transition to the
+    /// next round (and ultimately match-over) rather than sticking.
+    ///
+    /// P1 keeps strictly more life than P2 (no hits land in this neutral sim, so
+    /// "full life" is asymmetric only by the characters' configured maxima — here we
+    /// force P2 a hair lower so every timeout is a clean P1 win and the best-of-N
+    /// reaches a winner). A `Draw` (equal life) would credit neither side, so we
+    /// avoid it deliberately to prove the *advance-and-terminate* path.
+    #[test]
+    fn full_life_time_over_advances_through_win_to_match_over() {
+        // One-second rounds so the full clock is cheap to burn down; best-of-1 so a
+        // single decided round ends the match (the simplest match-over proof).
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::with_config(p1, p2, StageBounds::new(-200.0, 200.0), 1, 1);
+
+        // The clock starts at round_seconds * 60 and does NOT move during Intro.
+        assert_eq!(
+            m.timer(),
+            TICKS_PER_SECOND,
+            "timer initialises to round_seconds * 60"
+        );
+        // Drive the intro to its last frame manually so we can assert the clock is
+        // still full at the exact moment Fight begins (before any fight tick burns
+        // it). The Intro lasts INTRO_FRAMES ticks; the INTRO_FRAMES-th tick is the
+        // transition into Fight and does not yet count the clock down.
+        for _ in 0..INTRO_FRAMES {
+            assert_eq!(m.round_state(), RoundState::Intro);
+            assert_eq!(
+                m.timer(),
+                TICKS_PER_SECOND,
+                "the intro must not consume the round clock"
+            );
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.round_state(), RoundState::Fight, "intro ends -> Fight");
+        assert_eq!(
+            m.timer(),
+            TICKS_PER_SECOND,
+            "the round clock is full when Fight begins"
+        );
+
+        // Give P1 strictly more life so the time-over verdict is a clean P1 win, and
+        // make the win deterministic regardless of the characters' default maxima.
+        m.p1.character.life = 1000;
+        m.p2.character.life = 900;
+
+        // Burn the clock down. The round must stay live for exactly the configured
+        // number of fight ticks, then leave Fight on the timer reaching 0 — NOT
+        // earlier (the live bug was an instant timeout) and with both fighters still
+        // at the life we set (no KO; this is a genuine time over).
+        for tick in 0..TICKS_PER_SECOND {
+            assert_eq!(
+                m.round_state(),
+                RoundState::Fight,
+                "still fighting at {tick}"
+            );
+            assert_eq!(
+                m.timer(),
+                TICKS_PER_SECOND - tick,
+                "timer counts down one per fight tick"
+            );
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.timer(),
+            0,
+            "the clock reached zero after exactly N fight ticks"
+        );
+        assert_eq!(
+            m.round_state(),
+            RoundState::Ko,
+            "time over enters the KO/results hold"
+        );
+        assert_eq!(m.winner(), Some(Winner::P1), "more life wins on time over");
+        assert!(
+            m.p1().life() > 0 && m.p2().life() > 0,
+            "this is a time over, not a KO — both fighters are still alive"
+        );
+
+        // Hold through the KO results phase into Win, then prove Win ADVANCES: the
+        // match must terminate (best-of-1) rather than freezing on Win.
+        let mut reached_win = false;
+        for _ in 0..(KO_FRAMES + 5) {
+            if m.round_state() == RoundState::Win {
+                reached_win = true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.match_state() == MatchState::Over {
+                break;
+            }
+        }
+        assert!(reached_win, "the round passed through the Win phase");
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "Win must advance to match-over on a time-over-decided round (never stick)"
+        );
+        assert_eq!(
+            m.match_winner(),
+            Some(Winner::P1),
+            "the time-over winner wins the match"
+        );
+        // The match terminated (MatchState::Over) on the round-decision frame rather
+        // than looping the round-flow forever. A terminal match holds its final
+        // round's RoundState (here Win) by design — the anti-freeze guarantee is that
+        // the *match* is Over, and that further ticks are inert no-ops (below), not
+        // that round_state leaves Win on a best-of-1 finisher.
+        let terminal_round = m.round_number();
+        for _ in 0..10 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "a terminated match stays terminated under further ticks"
+        );
+        assert_eq!(
+            m.round_number(),
+            terminal_round,
+            "no new round starts after the match is over"
+        );
+    }
+
+    /// Regression (round-flow): a multi-round, all-time-over match still reaches a
+    /// winner. Every round is decided by the clock (full-life-ish time over) rather
+    /// than a KO; the best-of-N must advance round-by-round and finally end with a
+    /// match winner — never looping rounds forever or sticking on Win.
+    #[test]
+    fn best_of_n_time_over_match_reaches_a_winner() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        // One-second rounds, best of three.
+        let mut m = Match::with_config(p1, p2, StageBounds::new(-200.0, 200.0), 1, 2);
+
+        // Bound the whole simulation generously; each round is intro + 60 fight + KO
+        // hold + transition, and best-of-three needs at most three rounds.
+        for _ in 0..(10 * (INTRO_FRAMES + TICKS_PER_SECOND + KO_FRAMES + 2)) {
+            if m.match_state() == MatchState::Over {
+                break;
+            }
+            // Keep P1 ahead on life each fight frame so every time over is a P1 win
+            // (no KO — life never hits 0).
+            if m.round_state() == RoundState::Fight {
+                m.p1.character.life = 1000;
+                m.p2.character.life = 900;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "a best-of-N all-time-over match must terminate with a winner"
+        );
+        assert_eq!(
+            m.match_winner(),
+            Some(Winner::P1),
+            "P1 wins every time over"
+        );
+        assert_eq!(m.p1_round_wins(), 2, "P1 took the needed two rounds");
+    }
+
     #[test]
     fn neutral_character_refaces_opponent() {
         // Construct so P1 is to the RIGHT of P2 but facing the wrong way; a
