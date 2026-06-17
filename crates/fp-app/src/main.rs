@@ -65,7 +65,7 @@ mod screens;
 mod training;
 mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -963,10 +963,54 @@ fn clamp_elem(index: i32, len: usize) -> usize {
 /// [`SffFile`]); this holds only the lazily-decoded GPU textures, keyed by sprite
 /// id. One [`FighterRender`] is kept per side (P1, P2) so the two characters'
 /// textures never collide — the "per-character texture cache" the task requires.
+/// Why a sprite id failed to resolve to a drawable sprite in an [`SffFile`].
+///
+/// Returned by [`resolve_drawable_sprite`] so the caller can log the right
+/// once-only warning and record the id in its negative cache. Split out as a pure
+/// (GPU-free) decision so it is unit-testable without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpriteMiss {
+    /// No sprite with that `(group, image)` exists in the SFF.
+    NotFound,
+    /// The sprite exists but has a zero width or height (nothing to draw).
+    ZeroDimension { width: u16, height: u16 },
+}
+
+/// Resolves `sprite_id` to a drawable sprite index in `sff`, or reports why it
+/// cannot be drawn ([`SpriteMiss`]).
+///
+/// This is the pure decision the per-frame draw path makes before touching the
+/// GPU: it performs the linear `(group, image)` scan and the zero-dimension
+/// check. Both miss cases are terminal for a given id — the caller records the id
+/// in its negative cache so this scan (and the matching warning) runs **once**
+/// per id, not every frame. Resolvable sprites are unaffected.
+fn resolve_drawable_sprite(sff: &SffFile, sprite_id: SpriteId) -> Result<usize, SpriteMiss> {
+    let (index, sff_sprite) = sff
+        .sprites
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
+        .ok_or(SpriteMiss::NotFound)?;
+    if sff_sprite.width == 0 || sff_sprite.height == 0 {
+        return Err(SpriteMiss::ZeroDimension {
+            width: sff_sprite.width,
+            height: sff_sprite.height,
+        });
+    }
+    Ok(index)
+}
+
 #[derive(Default)]
 struct FighterRender {
     /// GPU sprite cache keyed by sprite id, decoded on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids that resolved to nothing (missing in the SFF, zero-dimension,
+    /// or failed to decode/palette). Recording them means the per-frame draw path
+    /// stops re-running the linear SFF scan and re-emitting the same warning every
+    /// frame for the same id — the warning fires **once** per sprite id and the
+    /// O(n) `sprites` scan is skipped thereafter. Behaviour for resolvable sprites
+    /// is unchanged (they still populate `sprite_cache` on first use).
+    missing: HashSet<SpriteId>,
 }
 
 impl FighterRender {
@@ -991,28 +1035,40 @@ impl FighterRender {
         if self.sprite_cache.contains_key(&sprite_id) {
             return self.sprite_cache.get(&sprite_id);
         }
+        // Already known to be unresolvable: skip the linear SFF scan and the
+        // (now once-only) warning. This is the fix for the per-frame warn flood +
+        // repeated O(n) rescan that froze the GUI on characters referencing
+        // many missing/zero-dimension sprites (e.g. clark's 5000-series).
+        if self.missing.contains(&sprite_id) {
+            return None;
+        }
 
-        let (index, sff_sprite) = sff
-            .sprites
-            .iter()
-            .enumerate()
-            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())?;
-
+        let index = match resolve_drawable_sprite(sff, sprite_id) {
+            Ok(index) => index,
+            Err(SpriteMiss::NotFound) => {
+                self.missing.insert(sprite_id);
+                return None;
+            }
+            Err(SpriteMiss::ZeroDimension { width, height }) => {
+                tracing::warn!("Sprite {sprite_id} has zero dimensions ({width}x{height})");
+                self.missing.insert(sprite_id);
+                return None;
+            }
+        };
+        // SAFETY of the index: `resolve_drawable_sprite` returned an in-bounds index
+        // into `sff.sprites`.
+        let sff_sprite = &sff.sprites[index];
         let axis_x = sff_sprite.axis_x;
         let axis_y = sff_sprite.axis_y;
         let width = sff_sprite.width;
         let height = sff_sprite.height;
         let pal_idx = sff_sprite.palette_index as usize;
 
-        if width == 0 || height == 0 {
-            tracing::warn!("Sprite {sprite_id} has zero dimensions ({width}x{height})");
-            return None;
-        }
-
         let pixels = match sff.decode_sprite(index) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to decode sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -1020,6 +1076,7 @@ impl FighterRender {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to load palette {pal_idx} for sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -3227,6 +3284,9 @@ struct StageRender {
     air: AirFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable (missing/zero-dim/decode-fail), so the
+    /// per-frame cache path skips the linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
 }
 
 impl StageRender {
@@ -3288,6 +3348,7 @@ impl StageRender {
             sff,
             air,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
         })
     }
 
@@ -3322,7 +3383,13 @@ impl StageRender {
             })
             .collect();
         for sprite_id in ids {
-            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+            cache_sff_sprite(
+                &mut self.sprite_cache,
+                &mut self.missing,
+                &self.sff,
+                sprite_id,
+                renderer,
+            );
         }
     }
 
@@ -3454,11 +3521,17 @@ fn bg_sprite_id(group: i32, image: i32) -> Option<SpriteId> {
 /// sprites are skipped with a warning, never a panic.
 fn cache_sff_sprite(
     cache: &mut HashMap<SpriteId, CachedSprite>,
+    missing: &mut HashSet<SpriteId>,
     sff: &SffFile,
     sprite_id: SpriteId,
     renderer: &Renderer,
 ) {
     if cache.contains_key(&sprite_id) {
+        return;
+    }
+    // Already known unresolvable: skip the per-frame linear SFF scan and the
+    // (now once-only) warning.
+    if missing.contains(&sprite_id) {
         return;
     }
     let Some((index, sff_sprite)) = sff
@@ -3468,6 +3541,7 @@ fn cache_sff_sprite(
         .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
     else {
         tracing::warn!("stage sprite {sprite_id} not found in stage SFF; skipping");
+        missing.insert(sprite_id);
         return;
     };
     let axis_x = sff_sprite.axis_x;
@@ -3477,12 +3551,14 @@ fn cache_sff_sprite(
     let pal_idx = sff_sprite.palette_index as usize;
     if width == 0 || height == 0 {
         tracing::warn!("stage sprite {sprite_id} has zero dimensions; skipping");
+        missing.insert(sprite_id);
         return;
     }
     let pixels = match sff.decode_sprite(index) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("failed to decode stage sprite {sprite_id}: {e}");
+            missing.insert(sprite_id);
             return;
         }
     };
@@ -3490,6 +3566,7 @@ fn cache_sff_sprite(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("failed to load palette {pal_idx} for stage sprite {sprite_id}: {e}");
+            missing.insert(sprite_id);
             return;
         }
     };
@@ -3604,6 +3681,9 @@ struct StoryboardOverlay {
     sff: SffFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable, so the per-frame cache path skips the
+    /// linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
     /// Per-RGB-color full-window quad cache (index 1 = the color). The renderer
     /// exposes no per-draw quad recolor, so a quad is built once per distinct
     /// color and reused; this backs both the per-scene `clearcolor` backdrop and
@@ -3670,6 +3750,7 @@ impl StoryboardOverlay {
             player: fp_storyboard::StoryboardPlayer::new(storyboard),
             sff,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
             color_quads: HashMap::new(),
         })
     }
@@ -3707,7 +3788,13 @@ impl StoryboardOverlay {
     fn cache_sprites(&mut self, renderer: &Renderer) {
         let ids: Vec<SpriteId> = self.player.draw_list().iter().map(|d| d.sprite).collect();
         for sprite_id in ids {
-            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+            cache_sff_sprite(
+                &mut self.sprite_cache,
+                &mut self.missing,
+                &self.sff,
+                sprite_id,
+                renderer,
+            );
         }
         // Build the per-scene clear-color quad (defaults to black) and, when a
         // fade is active this tick, its colored overlay quad. Both are cached by
@@ -3829,6 +3916,9 @@ struct AnimViewer {
     elem: usize,
     elem_time: i32,
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable, so the per-frame cache path skips the
+    /// linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
 }
 
 impl AnimViewer {
@@ -3845,6 +3935,7 @@ impl AnimViewer {
             elem: 0,
             elem_time: 0,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
         }
     }
 
@@ -3878,24 +3969,33 @@ impl AnimViewer {
         if self.sprite_cache.contains_key(&sprite_id) {
             return self.sprite_cache.get(&sprite_id);
         }
-        let (index, sff_sprite) = self
+        if self.missing.contains(&sprite_id) {
+            return None;
+        }
+        let Some((index, sff_sprite)) = self
             .sff
             .sprites
             .iter()
             .enumerate()
-            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())?;
+            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
+        else {
+            self.missing.insert(sprite_id);
+            return None;
+        };
         let axis_x = sff_sprite.axis_x;
         let axis_y = sff_sprite.axis_y;
         let width = sff_sprite.width;
         let height = sff_sprite.height;
         let pal_idx = sff_sprite.palette_index as usize;
         if width == 0 || height == 0 {
+            self.missing.insert(sprite_id);
             return None;
         }
         let pixels = match self.sff.decode_sprite(index) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to decode sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -3903,6 +4003,7 @@ impl AnimViewer {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to load palette {pal_idx}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -7291,6 +7392,90 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-assets")
             .join(rel)
+    }
+
+    /// Builds a synthetic SFF carrying exactly the given sprites (group, image,
+    /// width, height). Starts from [`synth_sff`] (a valid v1 header, no sprites)
+    /// and pushes [`fp_formats::sff::SffSprite::placeholder`]-derived entries with
+    /// the requested `(group, image)` and dimensions. Asset-free.
+    fn sff_with_sprites(specs: &[(u16, u16, u16, u16)]) -> SffFile {
+        let mut sff = synth_sff();
+        sff.sprites.clear();
+        for (idx, &(group, image, width, height)) in specs.iter().enumerate() {
+            let mut s = fp_formats::sff::SffSprite::placeholder(idx);
+            s.group = group;
+            s.image = image;
+            s.width = width;
+            s.height = height;
+            sff.sprites.push(s);
+        }
+        sff
+    }
+
+    #[test]
+    fn resolve_drawable_sprite_reports_misses_and_hits() {
+        // A normal sprite, a zero-width sprite, and a zero-height sprite.
+        let sff = sff_with_sprites(&[(0, 0, 32, 48), (5000, 0, 0, 0), (5000, 10, 12, 0)]);
+
+        // Resolvable sprite -> its index, no miss.
+        assert_eq!(resolve_drawable_sprite(&sff, SpriteId::new(0, 0)), Ok(0));
+
+        // Zero-dimension sprites -> ZeroDimension miss carrying the dims (this is
+        // the clark 5000-series case that drove the per-frame warn flood).
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(5000, 0)),
+            Err(SpriteMiss::ZeroDimension {
+                width: 0,
+                height: 0
+            })
+        );
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(5000, 10)),
+            Err(SpriteMiss::ZeroDimension {
+                width: 12,
+                height: 0
+            })
+        );
+
+        // Absent id -> NotFound miss.
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(9999, 9999)),
+            Err(SpriteMiss::NotFound)
+        );
+    }
+
+    #[test]
+    fn fighter_render_negative_cache_records_unresolvable_ids() {
+        // The negative cache (`FighterRender::missing`) is what turns the per-frame
+        // rescan + warn flood into a once-per-id event. Drive the resolve decision
+        // for each draw of a zero-dim id and confirm the id is recorded exactly
+        // once, so subsequent frames short-circuit.
+        let sff = sff_with_sprites(&[(0, 0, 32, 48), (5000, 0, 0, 0)]);
+        let mut render = FighterRender::default();
+        let zero_dim = SpriteId::new(5000, 0);
+        let good = SpriteId::new(0, 0);
+
+        // Simulate the early-return logic of `get_or_create_sprite` for the cases
+        // that never need a GPU: an id already known missing is skipped, and an
+        // unresolvable id gets recorded on first sight.
+        for _frame in 0..120 {
+            if render.missing.contains(&zero_dim) {
+                continue; // short-circuit: no scan, no warn
+            }
+            match resolve_drawable_sprite(&sff, zero_dim) {
+                Ok(_) => unreachable!("zero-dim sprite must not resolve"),
+                Err(_) => {
+                    render.missing.insert(zero_dim);
+                }
+            }
+        }
+        // Recorded once; every later frame short-circuited.
+        assert!(render.missing.contains(&zero_dim));
+        assert_eq!(render.missing.len(), 1);
+
+        // A resolvable id is never recorded as missing.
+        assert!(resolve_drawable_sprite(&sff, good).is_ok());
+        assert!(!render.missing.contains(&good));
     }
 
     /// A neutral input frame.
