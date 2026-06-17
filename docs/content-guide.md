@@ -232,6 +232,65 @@ cargo run -p fp-app -- /path/to/my-fighter/my-fighter.def test-assets/kfm/kfm.de
 
 ---
 
+## 3.5 Importing & repairing content (`fp-app import`)
+
+Community MUGEN content is famously messy: stray lines, empty keys, colon-style
+state headers, junk frame columns, frames pointing at sprites the `.sff` never
+shipped. The engine already **tolerates** all of this at load time (it warns and
+substitutes safe defaults — it never crashes). `fp-app import` makes that tolerant
+load *visible and actionable*: it runs the very same loader/parsers, collects every
+repair into a tiered report, and — opt-in — writes a **repaired, loadable overlay**
+you can run without ever touching the original files.
+
+```sh
+# Just report what the loader had to repair (exits 0 even with flags):
+cargo run -p fp-app -- import --report /path/to/my-fighter.def
+
+# Machine-readable, byte-stable JSON for CI/evidence:
+cargo run -p fp-app -- import /path/to/my-fighter.def --report-json /tmp/report.json
+
+# Fail the run if anything is FLAGGED (CI gate):
+cargo run -p fp-app -- import /path/to/my-fighter.def --strict
+
+# Write a loadable, repaired overlay directory, then run it:
+cargo run -p fp-app -- import --out /tmp/my-fighter.imported /path/to/my-fighter.def
+cargo run -p fp-app -- /tmp/my-fighter.imported          # discovers + runs the repaired char
+```
+
+### The three tiers
+
+Every repair the import finds is sorted into one of three severity tiers:
+
+| Tier | Meaning | Examples | Affects `--strict`? |
+| ---- | ------- | -------- | ------------------- |
+| **Repaired** | A provably-safe rewrite the import applied for you. | stray line commented out, empty key dropped, `[State 9999: Foo]` colon header → comma, junk frame column `2..A` → `2`. | No |
+| **Flagged** | Something the import could **not** auto-repair — a human should look. | a frame referencing a sprite absent from the `.sff`, a non-empty trigger expression that failed to compile (preserved verbatim). | **Yes** |
+| **Advisory** | A diagnostic note, not a problem. | a degenerate `0×0` sprite. | No |
+
+The shipped `assets/trainingdummy` imports with **zero Flagged** (`PASS`).
+
+### How the overlay works (`--out <dir>`)
+
+`--out` writes a self-contained, discoverable overlay in the standard
+`<dir>/<name>/<name>.def` layout the engine's directory discovery already
+recognises — so `fp-app <dir>` loads it like any roster directory, no extra
+wiring. The overlay is **text-only**:
+
+- **CNS / CMD / AIR** files are *repaired copies* written next to the overlay
+  `.def`, which references them locally.
+- **SFF / SND / ACT** (the binary assets) are **reported, never modified** — the
+  overlay `.def` references them at their **original absolute paths**, so the
+  repaired character runs against the unchanged binaries.
+
+> **Clean-room rule for overlays.** An overlay is **derived, local-only engine
+> output** — *not* clean-room source content. Keep it local; never commit it. The
+> import write-guard **refuses** any output destination inside the tracked
+> `assets/` tree (canonicalised + prefix-matched), and `*.imported/` + `.fp-cache/`
+> are git-ignored. Every run also prints the clean-room license reminder. As ever,
+> only ship content **you have the right to distribute**.
+
+---
+
 ## 4. What works vs. what doesn't
 
 Fighters Paradise already runs a complete fight loop on real data; the gaps are

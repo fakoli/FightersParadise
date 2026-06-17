@@ -351,6 +351,10 @@ struct ImportArgs {
     /// Where to write the repaired overlay, if requested (positional). `None` in
     /// report-only mode (`--report`/`--report-json` with no overlay-out).
     overlay_out: Option<String>,
+    /// `--out <dir>`: write a whole-character, **loadable** overlay directory
+    /// (the `.def` + repaired text files + report) under `<dir>`. Used with a
+    /// `.def` source (T088); ignored for a single text-file source.
+    out_dir: Option<String>,
     /// `--prune`: remove dead AIR frames (vs. only flagging them).
     prune: bool,
     /// `--report`: print the tiered human report to stdout.
@@ -373,6 +377,8 @@ fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
     let mut strict = false;
     let mut report_json: Option<String> = None;
 
+    let mut out_dir: Option<String> = None;
+
     let mut i = 2; // skip "fp-app" and "import"
     while i < args.len() {
         let a = &args[i];
@@ -386,6 +392,10 @@ fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
             // Path is the next token.
             i += 1;
             report_json = Some(args.get(i)?.clone());
+        } else if a.eq_ignore_ascii_case("--out") {
+            // Whole-character overlay directory. Path is the next token.
+            i += 1;
+            out_dir = Some(args.get(i)?.clone());
         } else if a.starts_with("--") {
             // Unknown flag: a usage error.
             return None;
@@ -400,6 +410,7 @@ fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
     Some(ImportArgs {
         src,
         overlay_out,
+        out_dir,
         prune,
         report,
         report_json,
@@ -430,10 +441,16 @@ fn run_import(args: &[String]) -> i32 {
     let Some(parsed) = parse_import_args(args) else {
         eprintln!(
             "usage: fp-app import <file.cns|.cmd|.air|char.def> [<overlay-out>] \
-             [--prune] [--report] [--report-json <path>] [--strict]"
+             [--out <dir>] [--prune] [--report] [--report-json <path>] [--strict]"
         );
         return 2;
     };
+
+    // The clean-room license/usage reminder prints on EVERY import run (to stderr,
+    // so it never pollutes a `--report`/`--report-json` consumer reading stdout),
+    // regardless of which branch handles the source.
+    eprintln!("{}", validate::LICENSE_REMINDER);
+
     let src = Path::new(&parsed.src);
 
     // A `.def` is a whole **character** import: load it through the live loader,
@@ -601,6 +618,30 @@ fn run_import_char(src: &Path, parsed: &ImportArgs) -> i32 {
             return 1;
         }
         tracing::info!("import: wrote report JSON {json_path}");
+    }
+
+    // `--out <dir>`: write a whole-character, loadable overlay directory (the
+    // engine-adoption path — feed `<dir>` to `fp-app` and it discovers + runs the
+    // repaired character). The clean-room write guard refuses an `assets/` dir.
+    if let Some(out) = &parsed.out_dir {
+        match import::write_character_overlay(src, Some(&report), Path::new(out)) {
+            Ok(written) => {
+                tracing::info!(
+                    "import: overlay written to {} — load with: fp-app {}",
+                    written.def_path.display(),
+                    out
+                );
+                println!(
+                    "import: loadable overlay written to {}",
+                    written.def_path.display()
+                );
+            }
+            Err(e) => {
+                tracing::error!("import: cannot write overlay dir {out}: {e}");
+                eprintln!("import: failed to write overlay dir {out}: {e}");
+                return 1;
+            }
+        }
     }
 
     if parsed.strict && report.has_flags() {

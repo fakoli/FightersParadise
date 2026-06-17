@@ -35,7 +35,7 @@
 //! this: a destination whose path contains an `assets` component is refused with
 //! [`fp_core::FpError`], regardless of the repair outcome.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use fp_core::{FpError, FpResult};
 use fp_formats::air::{begin_action_number, salvage_frame_columns};
@@ -309,6 +309,11 @@ pub fn repair_cns_text(text: &str) -> CnsOverlay {
 
 /// Returns `true` if any path component (case-insensitively) is `assets` — the
 /// tracked clean-room asset tree the overlay must never be written into.
+///
+/// A fast, lexical pre-check used by [`assert_writable`] before the (stronger,
+/// filesystem-resolving) canonicalize + prefix-match. It catches an `assets/`
+/// destination even when the path (or any of its parents) does not yet exist on
+/// disk, which `canonicalize` cannot resolve.
 fn path_touches_assets(path: &Path) -> bool {
     path.components().any(|c| match c {
         Component::Normal(os) => os
@@ -316,6 +321,118 @@ fn path_touches_assets(path: &Path) -> bool {
             .is_some_and(|s| s.eq_ignore_ascii_case("assets")),
         _ => false,
     })
+}
+
+/// Resolves `path` to an absolute, symlink-free form for the write guard.
+///
+/// `path` itself usually does not exist yet (it is an output destination), so
+/// `canonicalize` is applied to its nearest **existing** ancestor and the
+/// remaining (not-yet-created) components are re-appended. The result is an
+/// absolute path with all `.`/`..`/symlink ancestors resolved — exactly what the
+/// prefix-match in [`assert_writable`] needs to compare against the canonical
+/// tracked `assets/` tree. Falls back to `absolutize` (cwd-join) when even the
+/// current directory cannot be canonicalized.
+fn canonicalize_or_parent(path: &Path) -> PathBuf {
+    // Walk up to the first ancestor that exists, canonicalize it, then re-attach
+    // the tail. This handles a destination several non-existent dirs deep.
+    let mut existing = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if existing.exists() {
+            break;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name);
+                match existing.parent() {
+                    Some(p) => existing = p,
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    let base = existing
+        .canonicalize()
+        .unwrap_or_else(|_| absolutize(existing));
+    let mut out = base;
+    for name in tail.iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
+/// Joins `path` onto the current working directory when it is relative, yielding
+/// an absolute (but not necessarily symlink-free) path. The last-resort fallback
+/// for [`canonicalize_or_parent`] when `canonicalize` fails on every ancestor.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Returns the canonical path of the tracked clean-room `assets/` tree, when it
+/// can be resolved from the current working directory.
+///
+/// Imports are run from the repo root (or a content root), so the tracked
+/// `assets/` — the only directory the write guard must protect — is `./assets`.
+/// Returns `None` when no `assets/` directory exists relative to the cwd (a
+/// content root that simply has none), in which case the lexical pre-check is the
+/// only guard that can fire.
+fn tracked_assets_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let assets = cwd.join("assets");
+    assets.canonicalize().ok()
+}
+
+/// The clean-room write guard: refuses any output destination inside the tracked
+/// `assets/` tree.
+///
+/// Two layers, both required by the clean-room contract (overlays/reports/caches
+/// are engine *output*, never tracked source content):
+///
+/// 1. **Lexical** — rejects a `dest` with an `assets` path component
+///    ([`path_touches_assets`]). Catches a not-yet-existing destination that
+///    `canonicalize` cannot resolve, and a deliberately-crafted relative
+///    `.../assets/...` path.
+/// 2. **Canonical prefix-match** — canonicalizes `dest` (via its nearest existing
+///    ancestor, since the destination usually does not exist) and the tracked
+///    `assets/` root, then refuses when the former is the latter or lives beneath
+///    it. This defeats symlink/`..` tricks the lexical check would miss.
+///
+/// # Errors
+///
+/// Returns [`FpError::Other`] when `dest` resolves inside the tracked `assets/`
+/// tree — the caller must **not** write in that case. A destination outside
+/// `assets/` returns `Ok(())`.
+pub fn assert_writable(dest: &Path) -> FpResult<()> {
+    let refuse = || {
+        Err(FpError::Other(format!(
+            "refusing to write import output inside the tracked assets/ tree: {} \
+             (overlays/reports are engine output, derived & local-only — never \
+             committed clean-room source content)",
+            dest.display()
+        )))
+    };
+
+    // Layer 1: lexical component check (works on non-existent paths).
+    if path_touches_assets(dest) {
+        return refuse();
+    }
+
+    // Layer 2: canonical prefix-match against the tracked assets/ root.
+    if let Some(assets) = tracked_assets_root() {
+        let resolved = canonicalize_or_parent(dest);
+        if resolved == assets || resolved.starts_with(&assets) {
+            return refuse();
+        }
+    }
+
+    Ok(())
 }
 
 /// Writes an overlay's repaired text to `dest`, refusing any destination inside
@@ -334,13 +451,7 @@ pub fn write_overlay(overlay: &CnsOverlay, dest: &Path) -> FpResult<()> {
 /// Shared overlay-write core: enforces the clean-room `assets/` write guard,
 /// creates the parent directory, and writes `text` to `dest`.
 fn write_overlay_text(text: &str, dest: &Path) -> FpResult<()> {
-    if path_touches_assets(dest) {
-        return Err(FpError::Other(format!(
-            "refusing to write import overlay inside an assets/ tree: {} \
-             (overlays are engine output, not clean-room source content)",
-            dest.display()
-        )));
-    }
+    assert_writable(dest)?;
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -610,6 +721,281 @@ pub fn repair_air_text(
 ///   written.
 pub fn write_air_overlay(overlay: &AirOverlay, dest: &Path) -> FpResult<()> {
     write_overlay_text(&overlay.text, dest)
+}
+
+// ---------------------------------------------------------------------------
+// Whole-character overlay directory + engine adoption (T088)
+// ---------------------------------------------------------------------------
+
+/// The result of writing a whole-character overlay directory with
+/// [`write_character_overlay`].
+///
+/// The [`def_path`](CharacterOverlay::def_path) is a self-contained, **loadable**
+/// `.def` laid out in the nested `<out>/<name>/<name>.def` shape the directory
+/// scanner recognises, so `fp-app <out>` discovers and runs the repaired
+/// character with no further wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterOverlay {
+    /// The written overlay `.def` — feed `<out>` (its grandparent) to the engine's
+    /// directory-discovery path, or this `.def` directly, to load the character.
+    pub def_path: PathBuf,
+    /// The text overlay files written (CNS/CMD/AIR), each as an absolute path.
+    pub text_files: Vec<PathBuf>,
+    /// Where the import report JSON was written, if a report was provided.
+    pub report_path: Option<PathBuf>,
+}
+
+/// Writes a whole-character **overlay directory** under `out_dir` that the engine
+/// can load and run, and returns the loadable `.def`'s location.
+///
+/// The overlay is the *opt-in*, derived, local-only counterpart to the original
+/// content (clean-room contract): it carries **repaired text** files (CNS/CMD/AIR)
+/// produced from the originals, while the binary assets (SFF/SND/ACT) are
+/// **reported, never modified** — the overlay `.def` references them at their
+/// original **absolute** paths (MUGEN's `[Files]` resolution treats an absolute
+/// reference as-is). The original content tree is never touched.
+///
+/// Layout (the nested form [`fp_ui::discovery::discover_chars`] recognises):
+///
+/// ```text
+/// <out_dir>/<name>/<name>.def        # rewritten [Files]: text -> local, binaries -> abs original
+/// <out_dir>/<name>/<text overlays>   # repaired .cns/.cmd/.air alongside the .def
+/// <out_dir>/<name>/import-report.json # the tiered repair report (when provided)
+/// ```
+///
+/// `name` is the source `.def`'s file stem. Every write goes through the
+/// clean-room [`assert_writable`] guard, so an `out_dir` inside the tracked
+/// `assets/` tree is refused before anything is written.
+///
+/// # Errors
+///
+/// - [`FpError::Other`] if `out_dir` resolves inside the tracked `assets/` tree
+///   (nothing is written), or if the source `.def` cannot be read/parsed.
+/// - [`FpError::Io`] on a directory-create or file-write failure.
+pub fn write_character_overlay(
+    src_def: &Path,
+    report: Option<&ImportReport>,
+    out_dir: &Path,
+) -> FpResult<CharacterOverlay> {
+    // Guard the whole output root up-front so a refused destination writes nothing.
+    assert_writable(out_dir)?;
+
+    let stem = src_def
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            FpError::Other(format!(
+                "import overlay: source .def has no usable file stem: {}",
+                src_def.display()
+            ))
+        })?
+        .to_string();
+
+    let def_text = fp_formats::text::read_text_file(src_def)?;
+    // The overlay .def lives in a different directory, so every original asset it
+    // re-references (SFF/SND/ACT) must be an ABSOLUTE path — a relative source dir
+    // (e.g. invoked as `import assets/foo/foo.def`) would otherwise resolve
+    // against the overlay's own dir and fail to load. Canonicalize to a stable,
+    // absolute, symlink-free base.
+    let src_dir_raw = src_def.parent().unwrap_or(Path::new("."));
+    let src_dir = canonicalize_or_parent(src_dir_raw);
+
+    let char_dir = out_dir.join(&stem);
+    let def_dest = char_dir.join(format!("{stem}.def"));
+
+    // Decide, per [Files] key, whether it is a TEXT key (overlay locally) or a
+    // BINARY/asset key (point the overlay .def at the original, absolute path).
+    // The values come from the already-parsed source .def.
+    let def = fp_formats::def::DefFile::load(src_def)?;
+    let text_keys: &[&str] = &[
+        "cmd", "cns", "st", "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7", "st8", "st9",
+        "stcommon", "anim",
+    ];
+
+    // Build the overlay text files (CNS/CMD repair; AIR column salvage) and a
+    // map of source-key -> overlay-relative-filename so the .def can be rewritten.
+    let mut overlay_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut text_files: Vec<PathBuf> = Vec::new();
+    for key in text_keys {
+        let Some(rel) = def.get("Files", key) else {
+            continue;
+        };
+        let rel = rel.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        let resolved = fp_formats::def::DefFile::resolve_path(src_def, rel);
+        let Ok(text) = fp_formats::text::read_text_file(&resolved) else {
+            // Engine-default stcommon (a missing file) and the like: skip the
+            // overlay; the .def will keep referencing the original (absolute) path
+            // below via the binary fallback so the loader's own fallback applies.
+            continue;
+        };
+
+        // Flatten the overlay filename so a `cns = states/foo.cns` lands beside
+        // the .def, prefixed by the key to avoid collisions across subdirs.
+        let leaf = Path::new(rel)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(rel);
+        let overlay_name = format!("{key}.{leaf}");
+        let dest = char_dir.join(&overlay_name);
+
+        let repaired = if key.eq_ignore_ascii_case("anim") {
+            // Column salvage only (no pruning, no sprite-presence flagging): the
+            // overlay is a fidelity rewrite, never a content change.
+            repair_air_text(&text, false, |_, _| true).text
+        } else {
+            repair_cns_text(&text).text
+        };
+        write_overlay_text(&repaired, &dest)?;
+        text_files.push(dest);
+        overlay_names.insert((*key).to_string(), overlay_name);
+    }
+
+    // Rewrite the .def line-by-line: only the [Files] section's value lines change
+    // — text keys point at the local overlay file, every other path key is
+    // absolutized to the original (so binaries load unmodified). All other
+    // sections are copied verbatim, preserving comments/order/formatting.
+    let rewritten = rewrite_def_files_section(&def_text, &src_dir, &overlay_names);
+    write_overlay_text(&rewritten, &def_dest)?;
+
+    // The report rides alongside the .def (also guarded, also outside assets/).
+    let report_path = match report {
+        Some(r) => {
+            let p = char_dir.join("import-report.json");
+            r.write_json(&p)?;
+            Some(p)
+        }
+        None => None,
+    };
+
+    tracing::info!(
+        "import: wrote loadable overlay {} ({} text overlay(s){})",
+        def_dest.display(),
+        text_files.len(),
+        if report_path.is_some() {
+            " + report"
+        } else {
+            ""
+        }
+    );
+
+    Ok(CharacterOverlay {
+        def_path: def_dest,
+        text_files,
+        report_path,
+    })
+}
+
+/// Rewrites only the `[Files]` section of a `.def`'s raw text, preserving every
+/// other line (comments, ordering, whitespace) verbatim.
+///
+/// Within `[Files]`, each `key = value` line is rewritten so that:
+/// - a **text key** present in `overlay_names` points at its local overlay file
+///   (a bare relative name, since the overlay sits beside the `.def`), and
+/// - any **other path-bearing key** (`sprite`, `sound`, `pal1`..`pal12`, and a
+///   text key with no overlay) is absolutized against `src_dir` so the original
+///   binary/asset loads from its source location, unmodified.
+///
+/// Non-`[Files]` lines, blank lines, and comments pass through unchanged.
+fn rewrite_def_files_section(
+    def_text: &str,
+    src_dir: &Path,
+    overlay_names: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(def_text.len() + 256);
+    let mut in_files = false;
+
+    for (raw, term) in split_keep_terminators(def_text) {
+        let trimmed = raw.trim();
+        // Section header? Update our in-[Files] state, emit verbatim.
+        if trimmed.starts_with('[') {
+            let header = trimmed.trim_start_matches('[');
+            let header = header.split(']').next().unwrap_or(header).trim();
+            in_files = header.eq_ignore_ascii_case("Files");
+            out.push_str(raw);
+            out.push_str(term);
+            continue;
+        }
+
+        // Outside [Files], or a non `key = value` line: pass through verbatim.
+        let no_comment = strip_comment(trimmed);
+        if !in_files || !no_comment.contains('=') {
+            out.push_str(raw);
+            out.push_str(term);
+            continue;
+        }
+
+        let (key_part, val_part) = no_comment.split_once('=').unwrap_or((no_comment, ""));
+        let key = key_part.trim();
+        let key_lc = key.to_ascii_lowercase();
+        // The value, with surrounding quotes stripped (MUGEN allows quoted paths).
+        let rel = {
+            let v = val_part.trim();
+            v.strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(v)
+                .trim()
+                .to_string()
+        };
+
+        // Keys we never rewrite (non-path config such as localcoord lives in
+        // [Info], so [Files] keys are all paths — but be defensive).
+        let new_value: Option<String> = if let Some(name) = overlay_names.get(&key_lc) {
+            // Text key with an overlay: reference the local overlay file.
+            Some(name.clone())
+        } else if is_path_files_key(&key_lc) && !rel.is_empty() {
+            // Any other asset/path key: absolutize to the original source so the
+            // binary/asset loads unmodified from where it lives.
+            let abs = if Path::new(&rel).is_absolute() {
+                PathBuf::from(&rel)
+            } else {
+                src_dir.join(&rel)
+            };
+            Some(abs.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        match new_value {
+            Some(v) => {
+                // Preserve the original indentation + key spelling; replace value.
+                let indent: String = raw.chars().take_while(|c| c.is_whitespace()).collect();
+                out.push_str(&format!("{indent}{key} = {v}"));
+                out.push_str(term);
+            }
+            None => {
+                out.push_str(raw);
+                out.push_str(term);
+            }
+        }
+    }
+    out
+}
+
+/// `true` if `key` (already lowercased) is a `[Files]` key whose value is a path
+/// to an asset the overlay should absolutize to the original source.
+fn is_path_files_key(key: &str) -> bool {
+    if matches!(
+        key,
+        "sprite" | "anim" | "sound" | "cmd" | "cns" | "st" | "stcommon"
+    ) {
+        return true;
+    }
+    // `st0`..`st9` and `pal1`..`pal12`: a known prefix + a numeric suffix.
+    if let Some(n) = key.strip_prefix("st") {
+        if n.parse::<u8>().is_ok() {
+            return true;
+        }
+    }
+    if let Some(n) = key.strip_prefix("pal") {
+        if n.parse::<u8>().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,6 +2131,202 @@ type = Null
             report.is_clean(),
             "trainingdummy must import with zero Flagged; report:\n{}",
             report.render()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Write-guard + whole-character overlay (engine adoption) — T088
+    // -------------------------------------------------------------------
+
+    /// A unique scratch dir under the OS temp dir, fully removed first so each run
+    /// starts clean.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fp-import-guard-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn import_guard_refuses_assets_component_path() {
+        // A relative path with an `assets` component is refused lexically even when
+        // it does not exist on disk (canonicalize cannot resolve it).
+        let dest = Path::new("some/assets/overlay/kfm.cns");
+        let err = assert_writable(dest).expect_err("assets/ component must be refused");
+        assert!(matches!(err, FpError::Other(_)));
+    }
+
+    #[test]
+    fn import_guard_refuses_uppercase_assets_component() {
+        // The lexical check is case-insensitive.
+        let dest = Path::new("ASSETS/kfm.cns");
+        assert!(assert_writable(dest).is_err());
+    }
+
+    #[test]
+    fn import_guard_allows_non_assets_temp_dir() {
+        let dir = scratch("ok-dest");
+        let dest = dir.join(".fp-cache/report.json");
+        assert!(
+            assert_writable(&dest).is_ok(),
+            "a temp-dir destination outside assets/ must be allowed"
+        );
+    }
+
+    #[test]
+    fn import_guard_write_overlay_refuses_assets_and_writes_nothing() {
+        let overlay = repair_cns_text("[Statedef 0]\nStray cancelling\n");
+        let dest = Path::new("assets/data/overlay/over.cns");
+        let err = write_overlay(&overlay, dest).expect_err("must refuse assets/");
+        assert!(matches!(err, FpError::Other(_)));
+        assert!(!dest.exists(), "no file may be created when refused");
+    }
+
+    /// A minimal but real, loadable character written to disk: a 1×1 SFF, a 1-frame
+    /// AIR, and a `.def` wiring them with a stray CNS line to repair. Returns the
+    /// `.def` path. Uses only synthetic bytes (no copyrighted assets).
+    fn write_synthetic_character(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let sff_bytes = synthetic_sff_bytes_1x1(&[(0, 0)]);
+        std::fs::write(dir.join("c.sff"), &sff_bytes).unwrap();
+        std::fs::write(
+            dir.join("c.air"),
+            "[Begin Action 0]\n0,0, 0,0, 10\n".as_bytes(),
+        )
+        .unwrap();
+        // A CNS with one stray (no `=`, not a header) line that import repairs.
+        std::fs::write(
+            dir.join("c.cns"),
+            "[Statedef 0]\ntype = S\nStray cancelling\n[State 0, 1]\ntype = Null\ntrigger1 = 1\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        let def = dir.join("c.def");
+        std::fs::write(
+            &def,
+            "[Info]\nname = \"C\"\n[Files]\nsprite = c.sff\nanim = c.air\ncns = c.cns\n".as_bytes(),
+        )
+        .unwrap();
+        def
+    }
+
+    /// 1×1 raw SFF v2 bytes (the [`sff_with`] shape with fixed 1×1 dims), split out
+    /// so a test can write a real `.sff` to disk for the loader.
+    fn synthetic_sff_bytes_1x1(coords: &[(u16, u16)]) -> Vec<u8> {
+        let n = coords.len();
+        let sprite_off = 512usize;
+        let palette_off = sprite_off + 28 * n;
+        let ldata_off = palette_off + 16;
+        let ldata_len = 768 + n;
+        let total = ldata_off + ldata_len;
+        let mut buf = vec![0u8; total];
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[15] = 2;
+        buf[36..40].copy_from_slice(&(sprite_off as u32).to_le_bytes());
+        buf[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[44..48].copy_from_slice(&(palette_off as u32).to_le_bytes());
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes());
+        buf[52..56].copy_from_slice(&(ldata_off as u32).to_le_bytes());
+        buf[56..60].copy_from_slice(&(ldata_len as u32).to_le_bytes());
+        buf[60..64].copy_from_slice(&(total as u32).to_le_bytes());
+        buf[64..68].copy_from_slice(&0u32.to_le_bytes());
+        for (i, (g, im)) in coords.iter().enumerate() {
+            let o = sprite_off + i * 28;
+            buf[o..o + 2].copy_from_slice(&g.to_le_bytes());
+            buf[o + 2..o + 4].copy_from_slice(&im.to_le_bytes());
+            buf[o + 4..o + 6].copy_from_slice(&1u16.to_le_bytes());
+            buf[o + 6..o + 8].copy_from_slice(&1u16.to_le_bytes());
+            buf[o + 12..o + 14].copy_from_slice(&(i as u16).to_le_bytes());
+            buf[o + 14] = 0;
+            buf[o + 15] = 8;
+            let px_off = 768 + i;
+            buf[o + 16..o + 20].copy_from_slice(&(px_off as u32).to_le_bytes());
+            buf[o + 20..o + 24].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let p = palette_off;
+        buf[p + 4..p + 6].copy_from_slice(&256u16.to_le_bytes());
+        buf[p + 12..p + 16].copy_from_slice(&768u32.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn import_guard_overlay_dir_is_written_loadable_and_repaired() {
+        let root = scratch("overlay-roundtrip");
+        let src_dir = root.join("src");
+        let out_dir = root.join("out");
+        let src_def = write_synthetic_character(&src_dir);
+
+        // Build the import report (graph + text overlays) the way run_import_char does.
+        let loaded = LoadedCharacter::load(&src_def).expect("synthetic char loads");
+        let mut report = ImportReport::from_character("c.def", &loaded);
+        report.add_cns(
+            "c.cns",
+            &repair_cns_text(&std::fs::read_to_string(src_dir.join("c.cns")).unwrap()),
+        );
+
+        let written =
+            write_character_overlay(&src_def, Some(&report), &out_dir).expect("overlay written");
+
+        // (1) The overlay .def exists in the nested <out>/<name>/<name>.def layout.
+        assert!(written.def_path.exists(), "overlay .def must exist");
+        assert_eq!(written.def_path, out_dir.join("c/c.def"));
+        assert!(written.report_path.as_ref().is_some_and(|p| p.exists()));
+        // The repaired CNS overlay was written and its stray line is commented out.
+        let cns_overlay = std::fs::read_to_string(out_dir.join("c/cns.c.cns")).unwrap();
+        assert!(
+            cns_overlay.contains("; Stray cancelling"),
+            "stray line must be repaired in the overlay; got:\n{cns_overlay}"
+        );
+
+        // The overlay .def must reference the original binary (sprite) by an
+        // ABSOLUTE path so it loads from a different directory (regression guard:
+        // a relative source dir must be absolutized before being re-referenced).
+        let def_overlay = std::fs::read_to_string(&written.def_path).unwrap();
+        let sprite_line = def_overlay
+            .lines()
+            .find(|l| l.trim_start().to_ascii_lowercase().starts_with("sprite"))
+            .expect("overlay .def has a sprite line");
+        let sprite_val = sprite_line.split_once('=').unwrap().1.trim();
+        assert!(
+            Path::new(sprite_val).is_absolute(),
+            "overlay .def must point sprite at an absolute original path; got: {sprite_val:?}"
+        );
+        assert!(
+            sprite_val.ends_with("c.sff"),
+            "sprite must still reference the original c.sff; got: {sprite_val:?}"
+        );
+
+        // (2) The directory-discovery path finds it.
+        let roster = fp_ui::discovery::discover_chars(&out_dir);
+        assert_eq!(roster.len(), 1, "exactly one discovered character");
+        assert_eq!(roster[0].name, "c");
+
+        // (3) The overlay .def actually LOADS and RUNS (the engine-adoption AC):
+        // the repaired character loads through the live loader, binaries resolved
+        // from their original absolute paths, text from the local overlays.
+        let reloaded = LoadedCharacter::load(&written.def_path)
+            .expect("the written overlay .def must load and run");
+        assert_eq!(reloaded.name, "C");
+        assert!(reloaded.states.contains_key(&0), "state 0 must survive");
+        assert!(reloaded
+            .sff
+            .sprites
+            .iter()
+            .any(|s| (s.group, s.image) == (0, 0)));
+    }
+
+    #[test]
+    fn import_guard_overlay_refuses_assets_out_dir() {
+        let root = scratch("overlay-assets-refused");
+        let src_dir = root.join("src");
+        let src_def = write_synthetic_character(&src_dir);
+        // An out dir with an `assets` component is refused before any write.
+        let out = root.join("assets");
+        let err = write_character_overlay(&src_def, None, &out)
+            .expect_err("an assets/ out dir must be refused");
+        assert!(matches!(err, FpError::Other(_)));
+        assert!(
+            !out.join("c/c.def").exists(),
+            "no overlay file may be created when refused"
         );
     }
 }
