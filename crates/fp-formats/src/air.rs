@@ -137,7 +137,11 @@ pub enum BlendMode {
 impl AirFile {
     /// Loads and parses an AIR file from the given path.
     pub fn load(path: &Path) -> FpResult<Self> {
-        let text = std::fs::read_to_string(path)?;
+        // Route through the encoding-tolerant reader so non-UTF-8 (Shift-JIS)
+        // community `.air` files decode instead of erroring — consistent with
+        // the `.def`/`.cns`/`.cmd` parsers and the never-crash philosophy.
+        // `read_text_file` also strips a leading BOM, which `from_str` tolerates.
+        let text = crate::text::read_text_file(path)?;
         Self::from_str(&text)
     }
 
@@ -714,6 +718,42 @@ mod tests {
 0,2, 0,0, 7
 0,3, 0,0, 40
 ";
+
+    /// Regression test for the community-content load bug: `AirFile::load` used
+    /// strict `std::fs::read_to_string`, so a non-UTF-8 (Shift-JIS) `.air` —
+    /// common in real MUGEN content — failed with "stream did not contain valid
+    /// UTF-8". `load` now routes through the encoding-tolerant reader. This test
+    /// synthesizes its own Shift-JIS bytes (clean-room: no external content) and
+    /// asserts the file loads instead of erroring.
+    #[test]
+    fn load_shift_jis_air_file_decodes_instead_of_erroring() {
+        // A `.air` with a non-ASCII (Japanese) comment, encoded as Shift-JIS so
+        // the raw bytes are NOT valid UTF-8.
+        let src = "; 波動拳アニメ\n[Begin Action 0]\n0,0, 0,0, 7\n";
+        let (sjis, _enc, had_errors) = encoding_rs::SHIFT_JIS.encode(src);
+        assert!(!had_errors, "fixture must be Shift-JIS-encodable");
+        assert!(
+            std::str::from_utf8(&sjis).is_err(),
+            "fixture must be invalid UTF-8 to exercise the fallback"
+        );
+
+        // Write to a unique temp path and load through the real `load` entry point.
+        let path = std::env::temp_dir().join(format!(
+            "fp_air_sjis_{}_{}.air",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &sjis).expect("write temp .air");
+        let result = AirFile::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let air = result.expect("Shift-JIS .air must load, not error on UTF-8");
+        assert_eq!(air.actions.len(), 1);
+        assert_eq!(air.action(0).unwrap().frames.len(), 1);
+    }
 
     #[test]
     fn parse_simple_action() {
