@@ -43,6 +43,13 @@ pub enum CommandElement {
         /// the input frame directly preceding the *next* element in the
         /// sequence, with no other distinct input frame between them.
         strict: bool,
+        /// MUGEN charge hold-duration: the minimum number of consecutive ticks
+        /// the input must have been held immediately before the
+        /// [`Release`](InputModifier::Release) edge (e.g. `~60B` requires Back
+        /// held for at least 60 ticks before it is let go). `0` means no charge
+        /// requirement. Only meaningful with [`InputModifier::Release`]; the
+        /// 60-frame ring buffer clamps the effective maximum to 60.
+        min_hold: u32,
     },
     /// A button input with a modifier.
     Button {
@@ -54,6 +61,13 @@ pub enum CommandElement {
         /// the input frame directly preceding the *next* element in the
         /// sequence, with no other distinct input frame between them.
         strict: bool,
+        /// MUGEN charge hold-duration: the minimum number of consecutive ticks
+        /// the button must have been held immediately before the
+        /// [`Release`](InputModifier::Release) edge (e.g. `~30a` requires the A
+        /// button held for at least 30 ticks before it is let go). `0` means no
+        /// charge requirement. Only meaningful with [`InputModifier::Release`];
+        /// the 60-frame ring buffer clamps the effective maximum to 60.
+        min_hold: u32,
     },
     /// Multiple inputs that must occur on the same frame.
     Simultaneous(Vec<CommandElement>),
@@ -444,6 +458,7 @@ impl CommandMatcher {
                 token,
                 modifier,
                 detect,
+                min_hold,
                 ..
             } => {
                 let Some(current) = buffer.get(frame_offset) else {
@@ -458,6 +473,14 @@ impl CommandMatcher {
                     } else {
                         dir_matches(l, *token)
                     }
+                };
+                // Per-frame "held" predicate used both for the release edge and
+                // for counting the charge run before it.
+                let held_at = |ago: usize| -> bool {
+                    buffer
+                        .get(ago)
+                        .map(|s| dir_hit(&logical_direction(&s.direction, facing_right)))
+                        .unwrap_or(false)
                 };
 
                 match modifier {
@@ -478,23 +501,29 @@ impl CommandMatcher {
                         if dir_hit(&logical) {
                             return false;
                         }
-                        // For release, the previous frame SHOULD match
-                        if let Some(prev) = buffer.get(frame_offset + 1) {
-                            let prev_logical = logical_direction(&prev.direction, facing_right);
-                            dir_hit(&prev_logical)
-                        } else {
-                            false
+                        // For release, the previous frame SHOULD match.
+                        if !held_at(frame_offset + 1) {
+                            return false;
                         }
+                        // Charge: require the direction held for >= min_hold
+                        // consecutive ticks immediately before the release.
+                        charge_satisfied(*min_hold, frame_offset + 1, held_at, buffer.len())
                     }
                 }
             }
             CommandElement::Button {
-                button, modifier, ..
+                button,
+                modifier,
+                min_hold,
+                ..
             } => {
                 let Some(current) = buffer.get(frame_offset) else {
                     return false;
                 };
                 let pressed = current.button(*button);
+                let held_at = |ago: usize| -> bool {
+                    buffer.get(ago).map(|s| s.button(*button)).unwrap_or(false)
+                };
 
                 match modifier {
                     InputModifier::Hold => pressed,
@@ -513,12 +542,13 @@ impl CommandMatcher {
                         if pressed {
                             return false;
                         }
-                        // Previous frame SHOULD have the button pressed
-                        if let Some(prev) = buffer.get(frame_offset + 1) {
-                            prev.button(*button)
-                        } else {
-                            false
+                        // Previous frame SHOULD have the button pressed.
+                        if !held_at(frame_offset + 1) {
+                            return false;
                         }
+                        // Charge: require the button held for >= min_hold
+                        // consecutive ticks immediately before the release.
+                        charge_satisfied(*min_hold, frame_offset + 1, held_at, buffer.len())
                     }
                 }
             }
@@ -527,6 +557,52 @@ impl CommandMatcher {
                 .all(|e| Self::element_matches(e, buffer, frame_offset, facing_right)),
         }
     }
+}
+
+/// Returns whether a charge hold-duration is satisfied at a release edge.
+///
+/// `release_held_offset` is the buffer offset of the *held* frame immediately
+/// preceding the release (i.e. `frame_offset + 1` for the matched release). The
+/// `held` predicate reports whether the charged input was held at a given
+/// buffer offset. The function walks backward from `release_held_offset`,
+/// counting consecutive held frames, and returns `true` once the run reaches
+/// `min_hold`.
+///
+/// `min_hold == 0` is the no-charge case and returns `true` immediately (the
+/// caller has already verified the release edge).
+///
+/// Boundary behaviour (the documented 60-tick ring clamp): the buffer holds at
+/// most 60 frames, so a long charge can run off the oldest recorded frame. When
+/// the consecutive-held run reaches the end of the buffer (the oldest frame is
+/// still held and there is no earlier frame to disprove the charge), the charge
+/// is treated as satisfied — the input was held since before the window opened.
+/// This is what lets a buffer saturated with the charged direction fire a
+/// `~60`-class command; a charge that is interrupted by a non-held frame within
+/// the window is bounded by that gap and must reach `min_hold` to count.
+fn charge_satisfied(
+    min_hold: u32,
+    release_held_offset: usize,
+    held: impl Fn(usize) -> bool,
+    buffer_len: usize,
+) -> bool {
+    if min_hold == 0 {
+        return true;
+    }
+    let mut count: u32 = 0;
+    let mut ago = release_held_offset;
+    while held(ago) {
+        count += 1;
+        if count >= min_hold {
+            return true;
+        }
+        // Ran off the oldest recorded frame while still held: the charge began
+        // before the window, so it cannot be disproven — treat it as charged.
+        if ago + 1 >= buffer_len {
+            return true;
+        }
+        ago += 1;
+    }
+    false
 }
 
 /// Parses a MUGEN command string into a vector of command elements.
@@ -539,6 +615,10 @@ impl CommandMatcher {
 /// - Button tokens: `a`, `b`, `c`, `x`, `y`, `z`, `s` (case-insensitive)
 /// - `~` prefix: release modifier
 /// - `/` prefix: hold modifier
+/// - `~NN`/`/NN` prefix: charge hold-duration — the input must have been held
+///   for at least `NN` consecutive ticks immediately before the release/hold
+///   edge (e.g. `~60B` = release Back after holding it ≥60 ticks). The 60-frame
+///   ring buffer clamps the effective maximum to 60.
 /// - `$` prefix (directions only): direction-detect — the token only requires
 ///   its component axis to be held, so `$F` matches F, UF, or DF. This is the
 ///   basis of MUGEN's `holdfwd`/`holdback`/etc. commands (`/$F`, `/$B`, ...).
@@ -604,6 +684,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
     let mut detect = false;
     let mut strict = false;
     let mut have_modifier = false;
+    let mut min_hold: u32 = 0;
 
     // Consume any leading prefix symbols. Order is not enforced (real `.cmd`
     // files vary), but each prefix may appear at most once.
@@ -637,6 +718,25 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
                 };
                 have_modifier = true;
                 chars.next();
+
+                // MUGEN charge syntax: a `~`/`/` prefix may be followed by a
+                // run of digits giving the minimum hold duration in ticks
+                // (e.g. `~60B`). Parse them here so the charge count enforces
+                // the hold window in the matcher.
+                let mut digits = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        digits.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !digits.is_empty() {
+                    // Saturating parse: an absurdly large charge clamps to the
+                    // ring-buffer cap during matching rather than erroring.
+                    min_hold = digits.parse::<u32>().unwrap_or(u32::MAX);
+                }
             }
             _ => break,
         }
@@ -667,6 +767,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
             button,
             modifier,
             strict,
+            min_hold,
         });
     }
 
@@ -696,6 +797,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
             modifier,
             detect,
             strict,
+            min_hold,
         }),
         None => Err(FpError::parse(
             "CMD",
@@ -718,6 +820,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -733,6 +836,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -742,6 +846,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -751,6 +856,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -759,6 +865,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -773,6 +880,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Release,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -787,6 +895,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Hold,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -804,6 +913,7 @@ mod tests {
                         button: Button::A,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
                 assert_eq!(
@@ -812,6 +922,7 @@ mod tests {
                         button: Button::B,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -831,6 +942,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -847,6 +959,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -863,6 +976,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: true,
+                min_hold: 0,
             }
         );
     }
@@ -878,6 +992,7 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Release,
                 strict: true,
+                min_hold: 0,
             }
         );
     }
@@ -1023,6 +1138,265 @@ mod tests {
         buffer.push(InputState::default());
         matcher.check_commands(&buffer, true);
         assert!(!matcher.command_active("test_expire"));
+    }
+
+    // ---- T059: charge hold-duration enforcement ----
+
+    /// `~60$B` must parse into a Release direction element carrying
+    /// `min_hold == 60` and `detect == true`, the canonical charge form.
+    #[test]
+    fn compile_charge_token() {
+        let elements = compile_command("~60$B").unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+        // A plain release (no digits) keeps min_hold == 0 (unchanged behaviour).
+        assert_eq!(
+            compile_command("~B").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+        // Charge on a button (`~30a`) parses too.
+        assert_eq!(
+            compile_command("~30a").unwrap()[0],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Release,
+                strict: false,
+                min_hold: 30,
+            }
+        );
+    }
+
+    /// Builds a hardware Back direction (logical Back when facing right).
+    fn back_dir() -> Direction {
+        Direction {
+            left: true,
+            ..Default::default()
+        }
+    }
+
+    /// Builds a hardware Forward direction (logical Forward when facing right).
+    fn fwd_dir() -> Direction {
+        Direction {
+            right: true,
+            ..Default::default()
+        }
+    }
+
+    /// Pushes a `gap?`-Back-release-Forward-x charge sequence onto `buffer`:
+    /// optionally a leading non-held (neutral) frame that *bounds* the charge
+    /// run, then `hold` ticks of Back held, a neutral frame (the Back release
+    /// edge), a Forward frame (the F press), then a Forward+x frame (button).
+    /// The release edge sits on its own frame so it does not collide with F.
+    ///
+    /// With `lead_gap = true`, the run is bounded to exactly `hold` ticks (the
+    /// charge count cannot exceed it). With `lead_gap = false`, the Back run
+    /// runs off the start of the buffer (held since before the window) — the
+    /// documented saturated-ring case.
+    fn push_charge_seq(buffer: &mut InputBuffer, hold: u32, lead_gap: bool) {
+        if lead_gap {
+            buffer.push(InputState::default());
+        }
+        for _ in 0..hold {
+            buffer.push(make_state(back_dir(), &[]));
+        }
+        buffer.push(InputState::default());
+        buffer.push(make_state(fwd_dir(), &[]));
+        buffer.push(make_state(fwd_dir(), &[Button::X]));
+    }
+
+    /// `~60$B, F, x` fires when Back is held for the full charge (a ring
+    /// saturated with Back, then F, x). This is the literal acceptance case.
+    /// The exact 60-vs-59 boundary needs a non-held frame to bound the run, and
+    /// a 60-tick run + release + F + x cannot all fit the 60-frame ring (the
+    /// documented clamp), so the strict N-vs-(N-1) boundary is exercised at a
+    /// sub-ring charge in [`charge_boundary_is_exact`].
+    #[test]
+    fn charge_requires_hold() {
+        let cmd = CommandDef {
+            name: "charge".into(),
+            elements: compile_command("~60$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Ring saturated with Back (held since before the window) -> fires.
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 60, false);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge"),
+            "Back held for the full charge then F, x must fire ~60$B,F,x"
+        );
+
+        // No charge at all (Back tapped once, bounded, then released) -> no fire.
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 1, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge"),
+            "a single-tick Back must NOT fire a 60-tick charge"
+        );
+    }
+
+    /// The charge boundary is exact: at a sub-ring charge `N` (so a bounding
+    /// non-held frame fits in the 60-frame ring), `N` held ticks fire and
+    /// `N - 1` do not. `min_hold == 0` is unchanged (a plain release fires
+    /// after a single held tick).
+    #[test]
+    fn charge_boundary_is_exact() {
+        let cmd = CommandDef {
+            name: "charge50".into(),
+            elements: compile_command("~50$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Exactly 50 held ticks (bounded by a leading gap) -> fires.
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 50, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge50"),
+            "exactly 50 held ticks must fire ~50$B"
+        );
+
+        // 49 held ticks (bounded) -> does NOT fire (one short).
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 49, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge50"),
+            "49 held ticks must NOT fire ~50$B (one short of the charge)"
+        );
+
+        // min_hold == 0 unchanged: a plain `~B, F, x` fires after a single
+        // bounded Back tick.
+        let plain = CommandDef {
+            name: "plain".into(),
+            elements: compile_command("~B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![plain]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 1, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("plain"),
+            "a plain (min_hold==0) ~B release must be unchanged"
+        );
+    }
+
+    /// Direction-detect: a `~$B` charge counts diagonal Back-down (DB) frames
+    /// toward the hold, since `$B` matches B / DB / UB.
+    #[test]
+    fn charge_dollar_directiondetect() {
+        let cmd = CommandDef {
+            name: "charge_detect".into(),
+            // Lower charge so the whole sequence fits the 60-frame ring with
+            // room for the post-release frames.
+            elements: compile_command("~20$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+
+        buffer.push(InputState::default());
+        // Charge held as Down-Back (DB) the whole time — only counts because
+        // `$B` is direction-detect (axis held), not an exact-cardinal Back.
+        for _ in 0..20 {
+            buffer.push(make_state(
+                Direction {
+                    left: true,
+                    down: true,
+                    ..Default::default()
+                },
+                &[],
+            ));
+        }
+        // Release the back axis (neutral edge), then forward, then the button.
+        buffer.push(InputState::default());
+        buffer.push(make_state(fwd_dir(), &[]));
+        buffer.push(make_state(fwd_dir(), &[Button::X]));
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge_detect"),
+            "DB held should count toward the ~$B charge via direction-detect"
+        );
+
+        // Negative control: a plain `~20B` (no `$`) does NOT accept DB as the
+        // charge, because exact-cardinal Back is never satisfied by DB.
+        let cmd_exact = CommandDef {
+            name: "charge_exact".into(),
+            elements: compile_command("~20B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd_exact]);
+        // Same DB-held buffer.
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge_exact"),
+            "DB must NOT satisfy an exact (non-$) Back charge"
+        );
+    }
+
+    /// Documented 60-frame ring clamp. A charge larger than the ring cannot be
+    /// distinguished from a saturated ring: when the held run runs off the
+    /// oldest recorded frame, the charge is treated as satisfied (held since
+    /// before the window) — so a ring saturated with Back fires even a
+    /// `~120`-class charge. But a charge run that is *bounded* by a non-held
+    /// frame within the window and falls short of `min_hold` never fires,
+    /// regardless of how large `min_hold` is.
+    #[test]
+    fn charge_above_ring_clamp() {
+        let cmd = CommandDef {
+            name: "huge".into(),
+            elements: compile_command("~120$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Saturated ring (Back since before the window) -> fires (clamp).
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 120, false);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("huge"),
+            "a ring saturated with Back satisfies any charge (held since before window)"
+        );
+
+        // Bounded run shorter than the charge -> never fires.
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 30, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("huge"),
+            "a bounded 30-tick run must not fire a 120-tick charge"
+        );
     }
 
     #[test]
@@ -1352,6 +1726,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -1361,6 +1736,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1392,6 +1768,7 @@ mod tests {
                 button: Button::B,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
         // Uppercase B = Back direction.
@@ -1402,6 +1779,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1417,6 +1795,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1431,6 +1810,7 @@ mod tests {
             modifier: InputModifier::Hold,
             detect: true,
             strict: true,
+            min_hold: 0,
         };
         for src in [">/$F", ">$/F", "/$>F", "$/>F", "/>$F"] {
             let got = compile_command(src).unwrap();
@@ -1449,6 +1829,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1473,6 +1854,7 @@ mod tests {
                     modifier: InputModifier::Press,
                     detect: false,
                     strict: false,
+                    min_hold: 0,
                 },
                 "reversed-diagonal `{src}` should alias to {want:?}"
             );
@@ -1491,6 +1873,7 @@ mod tests {
                     modifier: InputModifier::Press,
                     detect: false,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` should alias to UF regardless of case"
             );
@@ -1508,6 +1891,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1526,6 +1910,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "the third element `FU` must alias to UF"
         );
@@ -1539,6 +1924,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "the third element `BU` must alias to UB"
         );
@@ -1564,6 +1950,7 @@ mod tests {
                         button: Button::X,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
                 assert_eq!(
@@ -1572,6 +1959,7 @@ mod tests {
                         button: Button::Y,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -1585,6 +1973,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -2262,6 +2651,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
 
@@ -2329,6 +2719,7 @@ mod tests {
                     modifier: InputModifier::Hold,
                     detect: true,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` must be hold + direction-detect {token:?}"
             );
@@ -2396,6 +2787,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
 
@@ -2804,6 +3196,7 @@ mod tests {
                         button: Button::A,
                         modifier: InputModifier::Press,
                         strict: true,
+                        min_hold: 0,
                     },
                     "first member of `>a+b` must carry the strict flag"
                 );
@@ -2813,6 +3206,7 @@ mod tests {
                         button: Button::B,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -2840,6 +3234,7 @@ mod tests {
                     button: btn,
                     modifier: InputModifier::Press,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` should compile to button {btn:?}"
             );
@@ -2875,6 +3270,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -2907,6 +3303,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -2934,6 +3331,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 0 must be ~D (release Down)"
         );
@@ -2945,6 +3343,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 1 must be DF"
         );
@@ -2956,6 +3355,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 2 must be F"
         );
@@ -2966,6 +3366,7 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             },
             "element 3 must be the A button"
         );
@@ -2989,6 +3390,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 0 must be F"
         );
@@ -2999,6 +3401,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 1 must be D"
         );
@@ -3009,6 +3412,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 2 must be DF"
         );
@@ -3018,6 +3422,7 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             },
             "element 3 must be the A button"
         );

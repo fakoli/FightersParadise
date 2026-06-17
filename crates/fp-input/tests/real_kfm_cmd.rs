@@ -183,6 +183,7 @@ fn real_kfm_holdfwd_compiles_and_matches() {
             modifier: InputModifier::Hold,
             detect: true,
             strict: false,
+            min_hold: 0,
         },
         "holdfwd `/$F` must be hold + direction-detect forward"
     );
@@ -368,6 +369,7 @@ fn real_kfm_all_holddir_commands_parse() {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             },
             "`{name}` value `{value}` must be hold + direction-detect {token:?}"
         );
@@ -421,6 +423,7 @@ fn real_kfm_forward_dash_double_tap() {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -575,6 +578,7 @@ fn real_kfm_down_a_hold_detect_then_button() {
             modifier: InputModifier::Hold,
             detect: true,
             strict: false,
+            min_hold: 0,
         },
         "first element must be hold + direction-detect Down"
     );
@@ -584,6 +588,7 @@ fn real_kfm_down_a_hold_detect_then_button() {
             button: Button::A,
             modifier: InputModifier::Press,
             strict: false,
+            min_hold: 0,
         }
     );
 
