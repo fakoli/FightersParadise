@@ -1650,14 +1650,14 @@ fn opponent_is_recovering(p: &Player) -> bool {
     let Some(fd) = MoveFrameData::compute(action) else {
         return false;
     };
-    // Elapsed ticks within the current action = ticks of all elements before the
-    // current one + ticks spent in the current element.
-    let prior_ticks: i32 = action
-        .frames
-        .iter()
-        .take(c.anim_elem.max(0) as usize)
-        .map(|f| f.ticks.max(0))
-        .sum();
+    // Elapsed ticks within the current action: the start offset of the current
+    // element (precomputed by the executor for AnimElemTime) plus time spent in
+    // it. Falls back to the current-element time alone if the table is empty.
+    let prior_ticks = c
+        .anim_elem_start_offsets
+        .get(c.anim_elem.max(0) as usize)
+        .copied()
+        .unwrap_or(0);
     let elapsed = prior_ticks.saturating_add(c.anim_elem_time.max(0));
     elapsed >= fd.startup.saturating_add(fd.active)
 }
