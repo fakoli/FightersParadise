@@ -4861,6 +4861,99 @@ time = 1
         assert_eq!(m.winner(), Some(Winner::P1));
     }
 
+    // ---- Hitstop strength-scaling (T073, feature F030) -------------------
+
+    /// Arms a single connecting punch on a fresh fight-phase match, with the
+    /// given attacker `pausetime.p1`, and returns the attacker's `hitpause`
+    /// (the impact-freeze duration) observed on the connecting tick.
+    ///
+    /// This drives the *real* coordinator pipeline (`Match::tick` →
+    /// `resolve_attack` → the attacker's `hitpause` set from the HitDef's
+    /// `pausetime.p1`), so the value it reports is the genuine end-to-end
+    /// hit-stop, not a unit shortcut.
+    fn attacker_hitpause_for_pause(p1_pause: i32) -> i32 {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        // High life so the hit connects without KO-ing and ending the round.
+        p2c.life = 1000;
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Pin the attacker on its punch frame and arm the single HitDef once.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        // Vary only the attacker's pausetime.p1; hold pausetime.p2 constant.
+        m.p1.character.active_hitdef = Some(HitDef {
+            pausetime: PauseTime {
+                p1: p1_pause,
+                p2: 8,
+            },
+            ..sample_hitdef()
+        });
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        let life_before = m.p2().life();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(
+            m.p2().life() < life_before,
+            "the punch must connect for the hit-stop reading to be meaningful \
+             (pausetime.p1 = {p1_pause})"
+        );
+        m.p1().character.hitpause
+    }
+
+    /// AC: the attacker's hit-stop duration scales with the connecting HitDef's
+    /// `pausetime.p1`, surfaced from existing data through the live coordinator —
+    /// a heavy-`pausetime` hit freezes the attacker longer than a light one, so
+    /// heavy hits read heavier. This is the readability payoff of T073.
+    #[test]
+    fn attacker_hitstop_scales_with_hitdef_pausetime() {
+        let light = attacker_hitpause_for_pause(4);
+        let heavy = attacker_hitpause_for_pause(16);
+
+        // The freeze is surfaced verbatim from `pausetime.p1` (minus the one tick
+        // this connecting frame already consumes is NOT applied here — the value
+        // is read on the connecting tick before any freeze elapses).
+        assert_eq!(
+            light, 4,
+            "light hit freezes the attacker for pausetime.p1 = 4"
+        );
+        assert_eq!(
+            heavy, 16,
+            "heavy hit freezes the attacker for pausetime.p1 = 16"
+        );
+        assert!(
+            heavy > light,
+            "a heavy-pausetime hit must yield a longer attacker hit-stop than a \
+             light one (heavy {heavy} vs light {light})"
+        );
+    }
+
+    /// Negative control: a `pausetime.p1 = 0` hit imparts NO attacker hit-stop —
+    /// the freeze is genuinely driven by the data, not a constant baseline. This
+    /// guards against a regression that would flatten light/heavy distinction by
+    /// always applying some fixed pause.
+    #[test]
+    fn zero_pausetime_hit_gives_no_attacker_hitstop() {
+        assert_eq!(
+            attacker_hitpause_for_pause(0),
+            0,
+            "pausetime.p1 = 0 must leave the attacker un-paused (no invented baseline)"
+        );
+    }
+
     // ---- Frame-advantage readout (T065, feature F026) --------------------
 
     /// An attacker whose action 200 has a real startup / active / recovery shape so
