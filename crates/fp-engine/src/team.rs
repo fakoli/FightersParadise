@@ -374,6 +374,56 @@ impl TeamMatch {
         self.inner_ref()
     }
 
+    /// Seeds the active pair's RNG streams from `match_seed` (T076).
+    ///
+    /// Delegates to [`Match::seed_players`] on the inner match. Used by the replay
+    /// viewer, which reproduces a recorded 1v1 ([`TeamMode::Single`]) match from its
+    /// seed + recorded inputs; reserves (none, in Single) are unaffected.
+    pub fn seed_players(&mut self, match_seed: i32) {
+        self.inner_mut().seed_players(match_seed);
+        // Rewinding the active pair to a from-scratch state means the team-level
+        // verdict no longer holds: clear it so a subsequent `tick` re-simulates
+        // instead of early-returning on a latched `Over` (the replay viewer's
+        // restore-failure fallback path).
+        self.state = TeamMatchState::InProgress;
+        self.outcome = None;
+    }
+
+    /// Captures the active 1v1 pair's runtime state as a typed [`MatchSnapshot`]
+    /// (T076), the save-state primitive the replay viewer scrubs with.
+    ///
+    /// Delegates to [`Match::snapshot_state`] on the inner match. For the
+    /// [`TeamMode::Single`] replay path this is the whole observable state; in the
+    /// multi-fighter modes it captures only the active pair (reserves are not part of
+    /// the replay-study surface).
+    #[must_use]
+    pub fn snapshot_active(&self) -> crate::MatchSnapshot {
+        self.inner_ref().snapshot_state()
+    }
+
+    /// Restores a previously [`snapshot_active`](Self::snapshot_active)d state onto
+    /// the active 1v1 pair (T076) — the restore half of the replay viewer's
+    /// seek-via-restore-and-re-sim.
+    ///
+    /// Delegates to [`Match::restore_snapshot_state`] on the inner match.
+    ///
+    /// # Errors
+    ///
+    /// [`fp_core::FpError::Mismatch`] if the snapshot's character fingerprints do not
+    /// match the active fighters (the inner match is left unchanged).
+    pub fn restore_active(&mut self, snap: &crate::MatchSnapshot) -> fp_core::FpResult<()> {
+        self.inner_mut().restore_snapshot_state(snap)?;
+        // Rewinding the active pair invalidates any decided team-level verdict.
+        // In `TeamMode::Single`, `sync_single_result` latches `state == Over` once
+        // the recorded match reaches its KO/time-over end; without clearing it here
+        // every re-sim `tick` early-returns (team.rs `tick`), freezing the inner
+        // match while the viewer's frame counter keeps advancing. Resetting to
+        // `InProgress` lets the seek-via-restore-and-re-sim path actually advance.
+        self.state = TeamMatchState::InProgress;
+        self.outcome = None;
+        Ok(())
+    }
+
     /// The active (front-line) fighter on the given side.
     #[must_use]
     pub fn active_player(&self, side: Side) -> &Player {
@@ -701,7 +751,7 @@ fn outcome_of(winner: Winner) -> TeamOutcome {
 mod tests {
     use super::*;
     use crate::tests_support::*;
-    use crate::INTRO_FRAMES;
+    use crate::{INTRO_FRAMES, KO_FRAMES};
 
     /// Drives a team match out of its inner intro into live combat.
     fn into_fight(m: &mut TeamMatch) {
@@ -869,6 +919,106 @@ mod tests {
 
         assert_eq!(m.state(), TeamMatchState::Over);
         assert_eq!(m.winner(), Some(Side::P1));
+    }
+
+    /// Regression (T076): the replay viewer's seek path drives a recorded
+    /// Single-mode [`TeamMatch`] to its decided end (`state == Over`), then
+    /// scrubs back by [`restore_active`](TeamMatch::restore_active)ing an earlier
+    /// keyframe and re-simulating forward. Before the fix, `restore_active` only
+    /// touched the inner [`Match`]; the team-level `state == Over` latch (set by
+    /// `sync_single_result`) survived, so every re-sim `tick` early-returned and
+    /// the match froze at the keyframe while the viewer's frame counter advanced.
+    ///
+    /// This reproduces that exact path on the engine type the viewer depends on:
+    /// it asserts the re-sim after a post-`Over` restore actually advances the
+    /// inner match (diverges from the frozen keyframe) and matches a clean
+    /// from-scratch re-sim from the same keyframe.
+    #[test]
+    fn single_mode_restore_after_over_resumes_simulation() {
+        const RESIM_FRAMES: usize = 20;
+
+        // A reference team match: capture the keyframe right after the intro, then
+        // re-sim RESIM_FRAMES with the viewer's seek primitives but *without* ever
+        // reaching `Over` — this is the known-good "scrub then re-sim" baseline.
+        let mut reference = TeamMatch::new(
+            make_player(-50.0),
+            make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        // Match the under-test setup exactly (incl. one-round mode) so the two
+        // keyframes — and thus the two re-sims — are directly comparable.
+        reference.inner_mut_for_test().set_rounds_to_win(1);
+        into_fight(&mut reference);
+        let keyframe = reference.snapshot_active();
+        reference
+            .restore_active(&keyframe)
+            .expect("restore must accept the same characters");
+        for _ in 0..RESIM_FRAMES {
+            reference.tick(MatchInput::none(), MatchInput::none());
+        }
+        let reference_snap = reference.snapshot_active();
+
+        // The keyframe itself must differ from the re-simmed state, otherwise the
+        // "advanced" assertion below would be vacuous.
+        assert_ne!(
+            keyframe, reference_snap,
+            "the re-sim must move state forward (else the test proves nothing)"
+        );
+
+        // The match under test: same setup, same keyframe, but driven all the way
+        // to a decided result (`state == Over`) before the scrub-back.
+        let mut m = TeamMatch::new(
+            make_player(-50.0),
+            make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        // One KO decides a one-round match, so we reach `Over` deterministically.
+        m.inner_mut_for_test().set_rounds_to_win(1);
+        into_fight(&mut m);
+        let m_keyframe = m.snapshot_active();
+        assert_eq!(
+            keyframe, m_keyframe,
+            "both matches start from an identical post-intro keyframe"
+        );
+
+        // Drive to a decided end: KO P2 and hold through the KO -> Win flow until
+        // the team-level state latches `Over`.
+        m.kill_active(Side::P2);
+        for _ in 0..(KO_FRAMES + 2) {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.state(),
+            TeamMatchState::Over,
+            "a one-round Single match must be decided after the KO settles"
+        );
+
+        // The viewer's seek: restore the frame-0 keyframe, then re-sim forward. The
+        // fix clears the team-level verdict on restore so these ticks are not
+        // no-ops.
+        m.restore_active(&m_keyframe)
+            .expect("restore must accept the same characters");
+        assert_eq!(
+            m.state(),
+            TeamMatchState::InProgress,
+            "restoring an earlier keyframe must clear the decided verdict"
+        );
+        assert!(m.outcome().is_none(), "the latched outcome is cleared too");
+        for _ in 0..RESIM_FRAMES {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        let resumed_snap = m.snapshot_active();
+
+        // The re-sim actually advanced (it is not frozen at the keyframe)...
+        assert_ne!(
+            m_keyframe, resumed_snap,
+            "re-sim after a post-Over restore must advance the inner match, not freeze it"
+        );
+        // ...and it reproduces the clean from-scratch re-sim bit-for-bit.
+        assert_eq!(
+            reference_snap, resumed_snap,
+            "scrub-back-and-re-sim after Over must match a fresh re-sim from the same keyframe"
+        );
     }
 
     #[test]

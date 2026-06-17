@@ -81,7 +81,9 @@ mod team;
 
 pub use dummy::{dummy_input, DummyMode};
 pub use record::{TrainingPlayback, TrainingRecorder, TrainingRecording, RECORDING_FORMAT_VERSION};
-pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
+pub use replay::{
+    replay_match, MatchRecorder, ReplayError, ReplayLog, ReplayPlayer, DEFAULT_KEYFRAME_INTERVAL,
+};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
 pub use team::{Side, TeamMatch, TeamMatchState, TeamMode, TeamOutcome};
 

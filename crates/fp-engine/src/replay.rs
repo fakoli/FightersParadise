@@ -32,11 +32,21 @@ use serde::{Deserialize, Serialize};
 
 use fp_character::CharacterFingerprint;
 
+use crate::snapshot::MatchSnapshot;
 use crate::{Match, MatchInput, StageBounds, DEFAULT_MATCH_SEED};
 
 /// The format version stamped into every [`ReplayLog`], so a future on-disk
 /// schema change can be detected rather than silently misread.
 pub const REPLAY_FORMAT_VERSION: u32 = 1;
+
+/// The default keyframe interval used by [`ReplayPlayer`]: a [`MatchSnapshot`] is
+/// cached every this-many frames so a seek restores the nearest earlier keyframe
+/// and re-simulates only the remainder, rather than re-running from frame 0.
+///
+/// 30 frames (half a second at 60Hz) keeps the worst-case re-sim from a keyframe
+/// bounded to under one in-game second while keeping the cache small — a sensible
+/// default for the interactive replay viewer (T076).
+pub const DEFAULT_KEYFRAME_INTERVAL: u32 = 30;
 
 /// An error from encoding, decoding, or replaying a [`ReplayLog`].
 #[derive(Debug, thiserror::Error)]
@@ -304,6 +314,26 @@ impl<'m> MatchRecorder<'m> {
 /// [`ReplayError::CharacterMismatch`] if a stamped fingerprint in the log does not
 /// match the corresponding loaded character in `game`.
 pub fn replay_match(game: &mut Match, log: &ReplayLog) -> Result<(), ReplayError> {
+    check_replay_fingerprints(game, log)?;
+    game.seed_players(log.match_seed);
+    for &(p1, p2) in &log.inputs {
+        game.tick(p1, p2);
+    }
+    Ok(())
+}
+
+/// Validates that a `log`'s recorded per-player [`CharacterFingerprint`]s match the
+/// characters loaded into `game`, skipping a side whose recorded fingerprint is the
+/// [`UNSTAMPED`] sentinel.
+///
+/// Shared by [`replay_match`] (one-shot reproduce) and [`ReplayPlayer::new`] (the
+/// interactive viewer), so both reject a replay into the wrong characters by the
+/// same rule rather than corrupting state.
+///
+/// # Errors
+///
+/// [`ReplayError::CharacterMismatch`] if a stamped fingerprint differs.
+fn check_replay_fingerprints(game: &Match, log: &ReplayLog) -> Result<(), ReplayError> {
     let (actual_p1, actual_p2) = game.character_fingerprints();
     if log.p1_fingerprint != UNSTAMPED && log.p1_fingerprint != actual_p1 {
         return Err(ReplayError::CharacterMismatch {
@@ -319,11 +349,265 @@ pub fn replay_match(game: &mut Match, log: &ReplayLog) -> Result<(), ReplayError
             actual: actual_p2.0,
         });
     }
-    game.seed_players(log.match_seed);
-    for &(p1, p2) in &log.inputs {
-        game.tick(p1, p2);
-    }
     Ok(())
+}
+
+/// An interactive replay-study transport over a [`ReplayLog`] (T076).
+///
+/// Wraps an already-loaded [`Match`] (built from the **same two characters** the
+/// log was recorded with) and drives it through the log's recorded inputs, exposing
+/// VCR-style transport controls — **play / pause**, **step ±1 frame**, and **seek
+/// (scrub)** to an arbitrary frame — for a replay-study UI. The F026 overlays
+/// (hitbox view, input display, frame data) are pure draw layers over the live
+/// match reachable via [`match_ref`](ReplayPlayer::match_ref), so they apply to the
+/// replay unchanged.
+///
+/// # Forward-only re-simulation
+///
+/// The engine tick is deterministic but forward-only — there is no reverse
+/// integration. A seek therefore *restores* the nearest earlier cached
+/// [`MatchSnapshot`] ("keyframe") and *re-simulates* forward, feeding the recorded
+/// inputs:
+///
+/// ```text
+/// seek(f): kf = nearest_keyframe <= f; restore(kf.snapshot); for i in kf.frame..f: tick(inputs[i])
+/// ```
+///
+/// Frame 0 (the freshly-seeded, pre-first-tick state) is always a keyframe, so a
+/// seek can always re-sim from a valid base. Keyframes are cached lazily every
+/// [`keyframe_interval`](ReplayPlayer::keyframe_interval) frames as playback /
+/// seeking visits them, bounding the worst-case re-sim distance.
+///
+/// **Step-back is seek-to-(current − 1)** — a re-sim, never reverse integration.
+///
+/// # Determinism
+///
+/// Because re-sim is deterministic, seeking to a frame `f` always yields the
+/// **identical** match state regardless of the path taken to get there:
+/// `seek(f)` then `seek(f)` again (or `seek(g)` then `seek(f)`) leaves the match
+/// byte-equal. This is the viewer's correctness invariant and is unit-tested.
+///
+/// # Never panics
+///
+/// [`new`](ReplayPlayer::new) validates the log's character fingerprints (returning
+/// [`ReplayError::CharacterMismatch`] and changing nothing on a mismatch) before
+/// seeding. All transport methods clamp their target frame to `0..=len` and never
+/// block on I/O.
+pub struct ReplayPlayer<'m> {
+    game: &'m mut Match,
+    log: ReplayLog,
+    /// The current frame: the number of recorded input pairs applied so far, in
+    /// `0..=log.len()`. `0` is the freshly-seeded pre-tick state.
+    frame: u32,
+    /// Whether the transport is in "play" (advancing) vs. "pause" — a flag the
+    /// caller's run loop reads to decide whether to [`advance`](ReplayPlayer::advance).
+    playing: bool,
+    /// How often (in frames) a keyframe snapshot is cached.
+    keyframe_interval: u32,
+    /// Cached keyframes as `(frame, snapshot)`, kept sorted ascending by frame and
+    /// always containing frame 0. Used as seek bases for restore + re-sim.
+    keyframes: Vec<(u32, MatchSnapshot)>,
+}
+
+impl<'m> ReplayPlayer<'m> {
+    /// Opens a replay-study transport over `log`, driving `game`.
+    ///
+    /// `game` must be a freshly-built match from the **same two characters** the log
+    /// was recorded with. This validates the log's recorded character fingerprints
+    /// (skipping the [`UNSTAMPED`] sentinel), seeds the players from the log's match
+    /// seed, and captures frame 0 as the first keyframe. On a fingerprint mismatch
+    /// it returns [`ReplayError::CharacterMismatch`] and **changes nothing** (no
+    /// seeding), exactly like [`replay_match`].
+    ///
+    /// Uses [`DEFAULT_KEYFRAME_INTERVAL`]; for a custom cadence use
+    /// [`with_keyframe_interval`](ReplayPlayer::with_keyframe_interval).
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::CharacterMismatch`] if a stamped fingerprint in the log does
+    /// not match `game`'s loaded characters.
+    pub fn new(game: &'m mut Match, log: ReplayLog) -> Result<Self, ReplayError> {
+        Self::with_keyframe_interval(game, log, DEFAULT_KEYFRAME_INTERVAL)
+    }
+
+    /// Like [`new`](ReplayPlayer::new) but with an explicit keyframe interval.
+    ///
+    /// An `interval` of `0` is treated as `1` (cache every frame). A larger interval
+    /// caches fewer keyframes (less memory) at the cost of a longer worst-case
+    /// re-sim per seek.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::CharacterMismatch`] if a stamped fingerprint in the log does
+    /// not match `game`'s loaded characters.
+    pub fn with_keyframe_interval(
+        game: &'m mut Match,
+        log: ReplayLog,
+        interval: u32,
+    ) -> Result<Self, ReplayError> {
+        check_replay_fingerprints(game, &log)?;
+        game.seed_players(log.match_seed);
+        let frame0 = game.snapshot_state();
+        Ok(Self {
+            game,
+            log,
+            frame: 0,
+            playing: false,
+            keyframe_interval: interval.max(1),
+            keyframes: vec![(0, frame0)],
+        })
+    }
+
+    /// The total number of recorded frames (the seekable range is `0..=len`).
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.log.inputs.len() as u32
+    }
+
+    /// Whether the log has no recorded frames.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.log.inputs.is_empty()
+    }
+
+    /// The current playhead frame (recorded input pairs applied so far), `0..=len`.
+    #[must_use]
+    pub fn current_frame(&self) -> u32 {
+        self.frame
+    }
+
+    /// Whether the transport is in the "play" (advancing) state.
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Whether the playhead is at the end of the log (nothing left to advance).
+    #[must_use]
+    pub fn at_end(&self) -> bool {
+        self.frame >= self.len()
+    }
+
+    /// Read access to the live match the replay is driving — the surface the F026
+    /// overlays draw over.
+    #[must_use]
+    pub fn match_ref(&self) -> &Match {
+        self.game
+    }
+
+    /// Sets play (advancing); a no-op transport flag the run loop reads.
+    pub fn play(&mut self) {
+        self.playing = true;
+    }
+
+    /// Sets pause (holding the current frame).
+    pub fn pause(&mut self) {
+        self.playing = false;
+    }
+
+    /// Toggles between play and pause, returning the new playing state.
+    pub fn toggle_play(&mut self) -> bool {
+        self.playing = !self.playing;
+        self.playing
+    }
+
+    /// Advances exactly one frame if not already at the end, feeding the next
+    /// recorded input pair, and returns whether a frame was consumed.
+    ///
+    /// This is the "play" step the run loop calls each tick while
+    /// [`is_playing`](ReplayPlayer::is_playing). It also opportunistically caches a
+    /// keyframe when it lands on an interval boundary. At the end it auto-pauses and
+    /// returns `false`.
+    pub fn advance(&mut self) -> bool {
+        if self.at_end() {
+            self.playing = false;
+            return false;
+        }
+        let (p1, p2) = self.log.inputs[self.frame as usize];
+        self.game.tick(p1, p2);
+        self.frame += 1;
+        self.cache_keyframe_if_due();
+        true
+    }
+
+    /// Steps the playhead forward one frame (alias of [`advance`](ReplayPlayer::advance)).
+    pub fn step_forward(&mut self) -> bool {
+        self.advance()
+    }
+
+    /// Steps the playhead **back** one frame by seeking to `current − 1` (re-sim
+    /// from the nearest keyframe). A no-op (returns `false`) at frame 0.
+    pub fn step_back(&mut self) -> bool {
+        if self.frame == 0 {
+            return false;
+        }
+        self.seek(self.frame - 1);
+        true
+    }
+
+    /// Seeks (scrubs) the playhead to `target` (clamped to `0..=len`).
+    ///
+    /// Restores the nearest cached keyframe at or before `target`, then re-simulates
+    /// forward feeding the recorded inputs, caching new keyframes on interval
+    /// boundaries along the way. Pausing is implied — seeking does not resume play.
+    /// Returns the actual (clamped) frame landed on.
+    ///
+    /// Determinism guarantees seeking to the same frame twice yields byte-equal
+    /// match state regardless of the prior playhead position.
+    pub fn seek(&mut self, target: u32) -> u32 {
+        let target = target.min(self.len());
+        // Find the nearest keyframe at or before `target` (keyframes are sorted and
+        // always include frame 0, so this never fails).
+        let (kf_frame, kf_snap) = self
+            .keyframes
+            .iter()
+            .rev()
+            .find(|(f, _)| *f <= target)
+            .map(|(f, s)| (*f, s.clone()))
+            .expect("frame-0 keyframe always present");
+        // Restore is infallible for a snapshot taken from this same match (the
+        // fingerprints match by construction); on the impossible mismatch we fall
+        // back to re-seeding from frame 0 rather than panicking.
+        if self.game.restore_snapshot_state(&kf_snap).is_err() {
+            // Impossible-mismatch fallback: re-seed from frame 0 rather than panic.
+            self.game.seed_players(self.log.match_seed);
+            self.frame = 0;
+        } else {
+            self.frame = kf_frame;
+        }
+        self.resim_to(target);
+        target
+    }
+
+    /// Re-simulates forward from the current `frame` up to `target`, feeding the
+    /// recorded inputs and caching keyframes on interval boundaries.
+    fn resim_to(&mut self, target: u32) {
+        while self.frame < target {
+            let (p1, p2) = self.log.inputs[self.frame as usize];
+            self.game.tick(p1, p2);
+            self.frame += 1;
+            self.cache_keyframe_if_due();
+        }
+    }
+
+    /// Caches a keyframe at the current frame if it is on an interval boundary and
+    /// not already cached, keeping [`keyframes`](Self::keyframes) sorted ascending.
+    fn cache_keyframe_if_due(&mut self) {
+        if !self.frame.is_multiple_of(self.keyframe_interval) {
+            return;
+        }
+        // Binary-search for the insertion point; skip if already present.
+        match self
+            .keyframes
+            .binary_search_by_key(&self.frame, |(f, _)| *f)
+        {
+            Ok(_) => {}
+            Err(pos) => {
+                let snap = self.game.snapshot_state();
+                self.keyframes.insert(pos, (self.frame, snap));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

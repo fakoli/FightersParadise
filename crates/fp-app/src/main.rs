@@ -3795,6 +3795,18 @@ enum CliRoute {
     /// `chars/<name>/<name>.def` layout, or a flat dir of `*.def`) and launch the
     /// menu over the discovered roster augmenting the motif's `select.def`.
     Directory(PathBuf),
+    /// `replay <log> <p1.def> [p2.def]` (T076): open the replay-study viewer over a
+    /// recorded [`fp_engine::ReplayLog`], driving the two named characters. The
+    /// remaining `.def` paths are the [`absolutize`]d character files the log was
+    /// recorded with (one `.def` = same character both sides).
+    Replay {
+        /// The recorded `.bin` replay-log path.
+        log: PathBuf,
+        /// Player-1 character `.def`.
+        p1: PathBuf,
+        /// Player-2 character `.def`, or `None` to reuse `p1` on both sides.
+        p2: Option<PathBuf>,
+    },
 }
 
 /// Decides whether the (palette-flag-stripped) positional `args` launch the
@@ -3811,6 +3823,22 @@ fn cli_route(args: &[String]) -> CliRoute {
     match args.get(1) {
         None => CliRoute::Menu,
         Some(a) if a.eq_ignore_ascii_case("menu") => CliRoute::Menu,
+        // `replay <log> <p1.def> [p2.def]` (T076): open the replay-study viewer.
+        // Falls back to the Menu route when the log/character args are missing (so
+        // a bare `fp-app replay` does not crash) — warn-logged at build time.
+        Some(a) if a.eq_ignore_ascii_case("replay") => match (args.get(2), args.get(3)) {
+            (Some(log), Some(p1)) => CliRoute::Replay {
+                log: absolutize(Path::new(log)),
+                p1: absolutize(Path::new(p1)),
+                p2: args.get(4).map(|p| absolutize(Path::new(p))),
+            },
+            _ => {
+                tracing::warn!(
+                    "`replay` needs <log> <p1.def> [p2.def]; launching the menu instead"
+                );
+                CliRoute::Menu
+            }
+        },
         // Absolutize the directory up-front so the discovered character `.def`s
         // are absolute paths. `SelectScreen::build_pick` later resolves a roster
         // entry via `base_dir.join(def_path)` (base = the motif's `select.def`
@@ -4166,6 +4194,9 @@ impl MatchRun {
 enum Mode {
     /// Two-player [`Match`] (the playable demo): match + per-run render/audio.
     Match(Box<MatchRun>),
+    /// Replay-study viewer (T076): a [`MatchRun`] driven through a recorded
+    /// [`fp_engine::ReplayLog`] with VCR transport (play/pause/step/seek).
+    Replay(Box<ReplayViewer>),
     /// Legacy SFF+AIR animation viewer.
     Viewer(Box<AnimViewer>),
     /// Single static sprite.
@@ -4473,6 +4504,230 @@ fn load_match_with_backdrop(
         }
         Err(e) => {
             tracing::warn!("match failed to load: {e}; showing test pattern");
+            let (s, p) = generate_test_pattern(renderer);
+            Mode::TestPattern(s, p)
+        }
+    }
+}
+
+/// The replay-study viewer (T076): a live [`MatchRun`] driven through a recorded
+/// [`fp_engine::ReplayLog`]'s inputs, with VCR-style transport controls.
+///
+/// Wraps a freshly-loaded `MatchRun` (built from the *same* two characters the log
+/// was recorded with) and steps it through the recorded `(p1, p2)` input pairs.
+/// Because the engine tick is forward-only + deterministic, seeking restores the
+/// nearest cached keyframe ([`fp_engine::TeamMatch::snapshot_active`]) and
+/// re-simulates forward — exactly the engine-tested
+/// [`fp_engine::ReplayPlayer`] algorithm, applied over the renderer-bearing
+/// `MatchRun`. The F026 overlays (`F1`/`F3` hitboxes, `F8`/`F9` input + frame data)
+/// are pure draw layers over the live match, so they apply to the replay unchanged.
+///
+/// Transport keys are sampled in the run loop separately from match input
+/// (recorded inputs are fixed): Space toggles play/pause, `,`/`.` step ∓1 frame,
+/// Left/Right arrows seek ∓10 frames, Home/End jump to the start/end.
+struct ReplayViewer {
+    /// The live match the recorded inputs drive — the render/HUD/overlay surface.
+    run: Box<MatchRun>,
+    /// The recorded log being replayed (owned; never blocks on I/O after load).
+    log: fp_engine::ReplayLog,
+    /// The current playhead frame (recorded input pairs applied), in `0..=len`.
+    frame: u32,
+    /// Whether the transport is advancing (play) vs. holding (pause).
+    playing: bool,
+    /// Cached inner-match keyframes `(frame, snapshot)`, sorted ascending and always
+    /// containing frame 0 — the seek bases for restore + re-sim.
+    keyframes: Vec<(u32, fp_engine::MatchSnapshot)>,
+}
+
+impl ReplayViewer {
+    /// Builds a viewer for `log`, loading a `MatchRun` from `p1_def`/`p2_def` (the
+    /// characters the log was recorded with), seeding it from the log's seed, and
+    /// capturing frame 0. Returns `None` (logged) if the match fails to load or the
+    /// log's character fingerprints do not match the loaded characters.
+    fn load(
+        log: fp_engine::ReplayLog,
+        p1_def: &Path,
+        p2_def: &Path,
+        renderer: &Renderer,
+    ) -> Option<Self> {
+        // Reuse the standard match-load path (assets, stage, screenpack, HUD), then
+        // unwrap the MatchRun. The CPU AI it installs is irrelevant — the viewer
+        // feeds recorded inputs directly, bypassing P2 resolution.
+        let mode = load_match_or_fallback(
+            p1_def,
+            p2_def,
+            None,
+            PalSelection::default(),
+            TeamMode::Single,
+            BehaviorMode::default(),
+            renderer,
+        );
+        let mut run = match mode {
+            Mode::Match(run) => run,
+            _ => {
+                tracing::warn!(
+                    "replay: characters {} / {} failed to load a match; cannot open viewer",
+                    p1_def.display(),
+                    p2_def.display()
+                );
+                return None;
+            }
+        };
+        // Validate fingerprints + seed exactly as `replay_match` does, via the engine
+        // primitives, then capture frame 0.
+        run.team.seed_players(log.match_seed);
+        let frame0 = run.team.snapshot_active();
+        // A fingerprint mismatch surfaces on the first restore; verify up-front by a
+        // round-trip restore of frame 0 (cheap, never ticks).
+        if run.team.restore_active(&frame0).is_err() {
+            tracing::warn!("replay: snapshot/restore self-check failed; cannot open viewer");
+            return None;
+        }
+        Some(Self {
+            run,
+            log,
+            frame: 0,
+            playing: false,
+            keyframes: vec![(0, frame0)],
+        })
+    }
+
+    /// The total number of recorded frames (seekable range `0..=len`).
+    fn len(&self) -> u32 {
+        self.log.inputs.len() as u32
+    }
+
+    /// Whether the playhead is at the end of the log.
+    fn at_end(&self) -> bool {
+        self.frame >= self.len()
+    }
+
+    /// Drives the inner team one tick with the **exact** given inputs (no CPU/dummy
+    /// resolution — the recorded inputs are authoritative), then advances audio +
+    /// stage scroll, mirroring [`tick_match_run`] minus P2 resolution.
+    fn raw_tick(&mut self, p1: MatchInput, p2: MatchInput) {
+        self.run.dummy_tick = self.run.dummy_tick.wrapping_add(1);
+        self.run.team.tick(p1, p2);
+        self.run.p1_audio.play_requests(
+            &mut self.run.audio,
+            self.run.team.active().p1(),
+            self.run.team.active().p1_sound_requests(),
+        );
+        self.run.p2_audio.play_requests(
+            &mut self.run.audio,
+            self.run.team.active().p2(),
+            self.run.team.active().p2_sound_requests(),
+        );
+        if let Some(stage) = self.run.stage.as_mut() {
+            stage.advance_scroll();
+            stage.advance_anim();
+        }
+    }
+
+    /// Caches an inner-match keyframe at the current frame if it lands on a
+    /// [`fp_engine::DEFAULT_KEYFRAME_INTERVAL`] boundary and is not already cached.
+    fn cache_keyframe_if_due(&mut self) {
+        if !self
+            .frame
+            .is_multiple_of(fp_engine::DEFAULT_KEYFRAME_INTERVAL)
+        {
+            return;
+        }
+        if let Err(pos) = self
+            .keyframes
+            .binary_search_by_key(&self.frame, |(f, _)| *f)
+        {
+            let snap = self.run.team.snapshot_active();
+            self.keyframes.insert(pos, (self.frame, snap));
+        }
+    }
+
+    /// Advances exactly one recorded frame (the play step). Auto-pauses at the end.
+    /// Returns whether a frame was consumed.
+    fn advance(&mut self) -> bool {
+        if self.at_end() {
+            self.playing = false;
+            return false;
+        }
+        let (p1, p2) = self.log.inputs[self.frame as usize];
+        self.raw_tick(p1, p2);
+        self.frame += 1;
+        self.cache_keyframe_if_due();
+        true
+    }
+
+    /// Seeks (scrubs) the playhead to `target` (clamped to `0..=len`) by restoring
+    /// the nearest earlier keyframe and re-simulating forward. Seeking pauses.
+    fn seek(&mut self, target: u32) {
+        let target = target.min(self.len());
+        let (kf_frame, kf_snap) = self
+            .keyframes
+            .iter()
+            .rev()
+            .find(|(f, _)| *f <= target)
+            .map(|(f, s)| (*f, s.clone()))
+            .expect("frame-0 keyframe always present");
+        // Restore is infallible for a snapshot from this same match; on the
+        // impossible mismatch, re-seed from frame 0 rather than panic.
+        if self.run.team.restore_active(&kf_snap).is_err() {
+            self.run.team.seed_players(self.log.match_seed);
+            self.frame = 0;
+        } else {
+            self.frame = kf_frame;
+        }
+        while self.frame < target {
+            let (p1, p2) = self.log.inputs[self.frame as usize];
+            self.raw_tick(p1, p2);
+            self.frame += 1;
+            self.cache_keyframe_if_due();
+        }
+        self.playing = false;
+    }
+
+    /// Steps the playhead back one frame (seek to current − 1). No-op at 0.
+    fn step_back(&mut self) {
+        if self.frame > 0 {
+            self.seek(self.frame - 1);
+        }
+    }
+
+    /// Toggles play/pause.
+    fn toggle_play(&mut self) {
+        self.playing = !self.playing;
+    }
+}
+
+/// Loads a replay log from disk and opens a [`ReplayViewer`] over it (T076),
+/// degrading to the test pattern on any failure (never a panic).
+///
+/// Reads + decodes the `.bin` log, then builds the viewer from the named character
+/// `.def`s (one `.def` reused on both sides when `p2` is `None`). A missing/bad log
+/// or a character/log mismatch logs and falls back to the test pattern.
+fn load_replay_mode(log_path: &Path, p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Mode {
+    let bytes = match std::fs::read(log_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("replay: cannot read log {}: {e}", log_path.display());
+            let (s, p) = generate_test_pattern(renderer);
+            return Mode::TestPattern(s, p);
+        }
+    };
+    let log = match fp_engine::ReplayLog::decode(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("replay: cannot decode log {}: {e}", log_path.display());
+            let (s, p) = generate_test_pattern(renderer);
+            return Mode::TestPattern(s, p);
+        }
+    };
+    tracing::info!(
+        "replay: opening viewer over {} ({} frames)",
+        log_path.display(),
+        log.inputs.len()
+    );
+    match ReplayViewer::load(log, p1_def, p2_def, renderer) {
+        Some(v) => Mode::Replay(Box::new(v)),
+        None => {
             let (s, p) = generate_test_pattern(renderer);
             Mode::TestPattern(s, p)
         }
@@ -6031,11 +6286,16 @@ fn run() -> fp_core::FpResult<()> {
             motif_selector.as_deref(),
             Some(dir.as_path()),
         )),
-        CliRoute::Direct => None,
+        CliRoute::Direct | CliRoute::Replay { .. } => None,
     };
-    // The direct-CLI content mode, only built on the Direct route.
+    // The direct-CLI content mode, only built on the Direct route; the Replay route
+    // builds the replay-study viewer (T076).
     let mut mode = match &route {
         CliRoute::Direct => Some(select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)),
+        CliRoute::Replay { log, p1, p2 } => {
+            let p2_def = p2.as_deref().unwrap_or(p1.as_path());
+            Some(load_replay_mode(log, p1, p2_def, &renderer))
+        }
         CliRoute::Menu | CliRoute::Directory(_) => None,
     };
 
@@ -6094,6 +6354,16 @@ fn run() -> fp_core::FpResult<()> {
         let mut toggle_inf_life_pressed = false;
         let mut toggle_inf_meter_pressed = false;
         let mut reset_positions_pressed = false;
+        // Replay-study transport edges (T076), applied to a `Mode::Replay` viewer
+        // after the event loop; inert in every other mode. Net seek delta this
+        // frame (frames; − = rewind), and the discrete play/pause + step + jump
+        // edges.
+        let mut replay_play_toggle = false;
+        let mut replay_step_back = false;
+        let mut replay_step_fwd = false;
+        let mut replay_seek_delta: i64 = 0;
+        let mut replay_jump_start = false;
+        let mut replay_jump_end = false;
         // Poll events
         for event in event_pump.poll_iter() {
             match event {
@@ -6183,6 +6453,54 @@ fn run() -> fp_core::FpResult<()> {
                     ..
                 } => {
                     reset_positions_pressed = true;
+                }
+                // Replay-study transport (T076): play/pause, step ∓1, seek ∓10,
+                // jump to start/end. Inert outside `Mode::Replay`. Key repeat is
+                // allowed on step/seek so a held key scrubs.
+                Event::KeyDown {
+                    keycode: Some(Keycode::P),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_play_toggle = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Comma),
+                    ..
+                } => {
+                    replay_step_back = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Period),
+                    ..
+                } => {
+                    replay_step_fwd = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    ..
+                } => {
+                    replay_seek_delta -= 10;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    ..
+                } => {
+                    replay_seek_delta += 10;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Home),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_jump_start = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::End),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_jump_end = true;
                 }
                 // Any other physical key press: record the first one this frame so
                 // the setup screen's remap-capture can bind it. (Esc/Return/Space/
@@ -6429,6 +6747,33 @@ fn run() -> fp_core::FpResult<()> {
             }
         }
 
+        // Apply this frame's replay-study transport edges (T076) to a viewer; inert
+        // in every other mode. Seek/step happen here (outside the tick loop), so a
+        // scrub is one discrete restore-and-re-sim per real frame; play advances in
+        // the fixed-timestep loop below.
+        if let Some(Mode::Replay(v)) = mode.as_mut() {
+            if replay_play_toggle {
+                v.toggle_play();
+            }
+            if replay_jump_start {
+                v.seek(0);
+            }
+            if replay_jump_end {
+                v.seek(v.len());
+            }
+            if replay_step_back {
+                v.step_back();
+            }
+            if replay_step_fwd {
+                v.advance();
+            }
+            if replay_seek_delta != 0 {
+                let cur = v.frame as i64;
+                let target = (cur + replay_seek_delta).clamp(0, v.len() as i64) as u32;
+                v.seek(target);
+            }
+        }
+
         // --- Fixed-timestep tick (catch-up loop) ---
         // Both the direct-CLI match and the menu Fight screen drive their match at
         // a fixed 60Hz here; the Title/Select menu screens are event-driven (no
@@ -6437,6 +6782,13 @@ fn run() -> fp_core::FpResult<()> {
         while accumulator >= TICK_DURATION {
             match mode.as_mut() {
                 Some(Mode::Match(run)) => tick_match_run(run, p1_input, p2_input),
+                // A replay viewer advances one recorded frame per tick only while
+                // playing; paused, it holds the current frame (transport seeks above).
+                Some(Mode::Replay(v)) => {
+                    if v.playing {
+                        v.advance();
+                    }
+                }
                 Some(Mode::Viewer(v)) => v.tick(),
                 Some(Mode::Static(..)) | Some(Mode::TestPattern(..)) | None => {}
             }
@@ -6464,6 +6816,7 @@ fn run() -> fp_core::FpResult<()> {
         // borrowed, so it must happen before `begin_frame`.
         match mode.as_mut() {
             Some(Mode::Match(run)) => cache_match_run(run, &renderer),
+            Some(Mode::Replay(v)) => cache_match_run(&mut v.run, &renderer),
             Some(Mode::Viewer(v)) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
                     v.get_or_create_sprite(sid, &renderer);
@@ -6495,6 +6848,29 @@ fn run() -> fp_core::FpResult<()> {
                     win_hf,
                     frame_counter,
                 );
+            }
+            // Replay-study viewer (T076): the live match + its overlays draw through
+            // the exact same path as a normal match (the F026 overlays "just work"
+            // over the live state), with a transport status line on top.
+            Some(Mode::Replay(v)) => {
+                draw_match_run(
+                    &mut frame,
+                    &v.run,
+                    &hud,
+                    overlays,
+                    win_wf,
+                    win_hf,
+                    frame_counter,
+                );
+                if let Some(font) = hud.font() {
+                    let status = format!(
+                        "REPLAY {} {}/{}  P:PLAY ,/.:STEP <>:SEEK10",
+                        if v.playing { "PLAY" } else { "PAUSE" },
+                        v.frame,
+                        v.len()
+                    );
+                    draw_centered_text(&mut frame, font, &status, win_wf, 8.0, 1.0, 1.0);
+                }
             }
             Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -10342,6 +10718,51 @@ mod tests {
         assert_eq!(
             cli_route(&["fp-app".to_string(), "kfm.sff".to_string()]),
             CliRoute::Direct
+        );
+    }
+
+    /// `replay <log> <p1.def> [p2.def]` routes to the replay-study viewer (T076),
+    /// absolutizing each path; a missing log/character degrades to the Menu.
+    #[test]
+    fn cli_route_replay() {
+        // Full form: log + two characters.
+        match cli_route(&[
+            "fp-app".to_string(),
+            "replay".to_string(),
+            "match.bin".to_string(),
+            "p1.def".to_string(),
+            "p2.def".to_string(),
+        ]) {
+            CliRoute::Replay { log, p1, p2 } => {
+                assert!(log.is_absolute(), "log path absolutized");
+                assert!(log.ends_with("match.bin"));
+                assert!(p1.ends_with("p1.def"));
+                assert_eq!(p2.as_ref().map(|p| p.ends_with("p2.def")), Some(true));
+            }
+            other => panic!("expected Replay route, got {other:?}"),
+        }
+        // One-character form: P2 reuses P1 (p2 is None).
+        match cli_route(&[
+            "fp-app".to_string(),
+            "REPLAY".to_string(), // case-insensitive
+            "m.bin".to_string(),
+            "kfm.def".to_string(),
+        ]) {
+            CliRoute::Replay { p2, .. } => assert!(p2.is_none(), "single-def replay reuses P1"),
+            other => panic!("expected Replay route, got {other:?}"),
+        }
+        // Missing args degrade to the Menu (no panic).
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "replay".to_string()]),
+            CliRoute::Menu
+        );
+        assert_eq!(
+            cli_route(&[
+                "fp-app".to_string(),
+                "replay".to_string(),
+                "only-a-log.bin".to_string()
+            ]),
+            CliRoute::Menu
         );
     }
 
