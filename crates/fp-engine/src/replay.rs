@@ -476,12 +476,6 @@ impl<'m> ReplayPlayer<'m> {
         self.frame
     }
 
-    /// The keyframe interval this player caches snapshots at.
-    #[must_use]
-    pub fn keyframe_interval(&self) -> u32 {
-        self.keyframe_interval
-    }
-
     /// Whether the transport is in the "play" (advancing) state.
     #[must_use]
     pub fn is_playing(&self) -> bool {
@@ -575,18 +569,12 @@ impl<'m> ReplayPlayer<'m> {
         // fingerprints match by construction); on the impossible mismatch we fall
         // back to re-seeding from frame 0 rather than panicking.
         if self.game.restore_snapshot_state(&kf_snap).is_err() {
+            // Impossible-mismatch fallback: re-seed from frame 0 rather than panic.
             self.game.seed_players(self.log.match_seed);
             self.frame = 0;
-            return self.seek_from_zero(target);
+        } else {
+            self.frame = kf_frame;
         }
-        self.frame = kf_frame;
-        self.resim_to(target);
-        target
-    }
-
-    /// Re-seeds from scratch then re-sims to `target` — the cold fallback path used
-    /// only if a keyframe restore unexpectedly fails. Frame is assumed already 0.
-    fn seek_from_zero(&mut self, target: u32) -> u32 {
         self.resim_to(target);
         target
     }
@@ -619,12 +607,6 @@ impl<'m> ReplayPlayer<'m> {
                 self.keyframes.insert(pos, (self.frame, snap));
             }
         }
-    }
-
-    /// Consumes the player, returning the owned [`ReplayLog`].
-    #[must_use]
-    pub fn into_log(self) -> ReplayLog {
-        self.log
     }
 }
 
