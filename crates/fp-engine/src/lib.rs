@@ -1782,12 +1782,11 @@ pub struct Match {
     p1_infinite_meter: bool,
     /// When `true`, P2's `power` is restored to `power_max` after each tick.
     p2_infinite_meter: bool,
-    /// Whether P1 took a connecting hit on the most recent [`Match::tick`]
-    /// (recomputed every tick). Read via [`Match::p1_was_hit`]; the training
-    /// dummy ([`DummyMode::BlockAfterFirst`]) latches on the *opponent*'s signal.
-    p1_was_hit: bool,
-    /// Whether P2 took a connecting hit on the most recent tick. See
-    /// [`Match::p2_was_hit`].
+    /// Whether P2 took a connecting hit on the most recent [`Match::tick`]
+    /// (recomputed every tick). Read via [`Match::p2_was_hit`]; the training
+    /// dummy ([`DummyMode::BlockAfterFirst`], always P2) latches on it to start
+    /// guarding once the first hit lands. P1 is always the controller, so no
+    /// symmetric P1 signal is tracked.
     p2_was_hit: bool,
 }
 
@@ -1956,7 +1955,6 @@ impl Match {
             p2_infinite_life: false,
             p1_infinite_meter: false,
             p2_infinite_meter: false,
-            p1_was_hit: false,
             p2_was_hit: false,
         };
         // Drive each fighter through its round-init state (5900) for round 1, the
@@ -2089,17 +2087,10 @@ impl Match {
         }
     }
 
-    /// Whether player 1 took a connecting hit on the most recent [`Match::tick`]
+    /// Whether player 2 took a connecting hit on the most recent [`Match::tick`]
     /// (F027 / T067). Recomputed every tick; the training dummy's
-    /// [`DummyMode::BlockAfterFirst`] latches off the *opponent*'s signal to start
-    /// guarding once the first hit lands.
-    #[must_use]
-    pub fn p1_was_hit(&self) -> bool {
-        self.p1_was_hit
-    }
-
-    /// Whether player 2 took a connecting hit on the most recent tick (F027 /
-    /// T067). See [`Match::p1_was_hit`].
+    /// [`DummyMode::BlockAfterFirst`] latches off it to start guarding once the
+    /// first hit lands. P1 is always the controller, so there is no P1 signal.
     #[must_use]
     pub fn p2_was_hit(&self) -> bool {
         self.p2_was_hit
@@ -2130,7 +2121,6 @@ impl Match {
         self.freeze = Freeze::inactive();
         self.p1_sound_requests.clear();
         self.p2_sound_requests.clear();
-        self.p1_was_hit = false;
         self.p2_was_hit = false;
 
         tracing::info!("training: reset fighters to start positions");
@@ -2733,12 +2723,11 @@ impl Match {
         //     (mirrored onto the attacker's `TickReport::frame_advantage`).
         self.p1.frame_advantage = None;
         self.p2.frame_advantage = None;
-        // (3·T067) Snapshot each fighter's life BEFORE combat so the per-tick
-        // "was hit" signal can be recomputed by comparing afterwards. This covers
-        // every damage path (melee, projectile, chip) without threading a flag
-        // through each resolve branch; the training dummy's `BlockAfterFirst`
+        // (3·T067) Snapshot P2's life BEFORE combat so the per-tick "was hit"
+        // signal can be recomputed by comparing afterwards. This covers every
+        // damage path (melee, projectile, chip) without threading a flag through
+        // each resolve branch; the training dummy (always P2) `BlockAfterFirst`
         // latches off it.
-        let p1_life_before = self.p1.character.life;
         let p2_life_before = self.p2.character.life;
         if fighting {
             // (3a) Priority / trade clash arbitration (audit #20). BEFORE the two
@@ -2855,12 +2844,11 @@ impl Match {
             resolve_projectile_hits(&mut self.p2, &mut self.p1);
         }
 
-        // (3·T067) Recompute the per-tick "was hit" signals from the life delta
-        // (a fighter that lost life this tick took a hit), THEN apply the
-        // training infinite-life / infinite-meter clamps. Order matters: the
-        // signal is read before the heal so `BlockAfterFirst` still latches even
-        // with infinite life on, and the heal then masks the damage as intended.
-        self.p1_was_hit = self.p1.character.life < p1_life_before;
+        // (3·T067) Recompute the per-tick "was hit" signal from P2's life delta
+        // (the dummy lost life this tick ⇒ took a hit), THEN apply the training
+        // infinite-life / infinite-meter clamps. Order matters: the signal is read
+        // before the heal so `BlockAfterFirst` still latches even with infinite
+        // life on, and the heal then masks the damage as intended.
         self.p2_was_hit = self.p2.character.life < p2_life_before;
         self.apply_training_clamps();
 
