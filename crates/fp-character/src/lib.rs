@@ -80,7 +80,7 @@ pub mod snapshot;
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{
     ExplodOp, ExplodPosType, ExplodSpawn, FreezeKind, FreezeRequest, HelperPosType, HelperSpawn,
-    ProjectileSpawn, SoundRequest, TargetOp, TickReport,
+    ProjectileSpawn, SoundRequest, SuperPauseEffect, TargetOp, TickReport,
 };
 pub use framedata::{frame_advantage, MoveFrameData};
 pub use identity::CharacterFingerprint;
@@ -1837,6 +1837,22 @@ pub struct Character {
     /// more). Persists until changed or the round resets.
     pub defence_mul: f32,
 
+    /// The `SuperPause` defence / invulnerability window (T080).
+    ///
+    /// Installed on the player that triggered an active `SuperPause` for the
+    /// pause's duration: while it holds, [`unhittable`](SuperPauseEffect::unhittable)
+    /// makes this character immune to incoming hits (they pass through like a
+    /// `NotHitBy` window) and [`p2defmul`](SuperPauseEffect::p2defmul) scales the
+    /// **opponent's** effective defence (so this character's super deals tuned
+    /// damage during its own flash). The match coordinator (`fp-engine`) sets it
+    /// when it arms the freeze and ages it down in lockstep, clearing it with the
+    /// freeze. Hit resolution ([`combat::resolve_attack`](crate::combat::resolve_attack))
+    /// consults the **defender's** effect for `unhittable` and the **attacker's**
+    /// for `p2defmul`. Defaults to the inert
+    /// [`inactive`](SuperPauseEffect::inactive) window (blocks nothing, scales by
+    /// `1.0`); reset on a round boundary.
+    pub superpause_effect: SuperPauseEffect,
+
     /// Current sprite-draw priority (MUGEN `[Statedef] sprpriority` and the
     /// `SprPriority` controller; faithfulness audit #16).
     ///
@@ -2388,6 +2404,7 @@ impl Default for Character {
             hit_overridden: false,
             attack_mul: 1.0,
             defence_mul: 1.0,
+            superpause_effect: SuperPauseEffect::inactive(),
             cur_sprpriority: 0,
             // Seed the juggle pool from the character's `[Data] airjuggle`
             // allowance; refilled whenever the character touches the ground.

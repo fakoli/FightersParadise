@@ -2929,6 +2929,16 @@ impl Match {
             remaining: req.time,
             exempt,
         };
+        // T080: install the triggerer's SuperPause defence/invuln window for the
+        // pause duration. A `Pause` (`FreezeExempt::None`) has no triggerer, so it
+        // carries the inert window and installs nothing. The window is aged down in
+        // lockstep with the freeze (`tick_frozen`) and cleared when it ends, so
+        // `unhittable` / `p2defmul` apply for exactly the pause window.
+        match exempt {
+            FreezeExempt::P1 => self.p1.character.superpause_effect = req.effect,
+            FreezeExempt::P2 => self.p2.character.superpause_effect = req.effect,
+            FreezeExempt::None => {}
+        }
         tracing::debug!(
             ?req.kind,
             time = req.time,
@@ -2988,6 +2998,14 @@ impl Match {
             // A `Pause` exempts no one — nothing ticks this frame.
             FreezeExempt::None => {}
         }
+
+        // T080: age the SuperPause defence/invuln window in lockstep with the
+        // freeze. The triggerer (exempt player) carries it; it is cleared back to
+        // the inert default when it reaches `0`, so `unhittable`/`p2defmul` hold for
+        // exactly the pause window. A `Pause` exempts no one and installs no window,
+        // so ticking both sides is a harmless no-op for the frozen player.
+        self.p1.character.superpause_effect.tick_down();
+        self.p2.character.superpause_effect.tick_down();
 
         // Count the freeze down; `GameTime` and the round timer do NOT advance.
         self.freeze.remaining -= 1;
@@ -3947,6 +3965,9 @@ fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
 
     // Transient combat state must not leak across the round boundary.
     c.active_hitdef = None;
+    // T080: a SuperPause defence/invuln window does not survive a round boundary
+    // (the freeze that drove it is cleared too, above in `next_round`).
+    c.superpause_effect = fp_character::SuperPauseEffect::inactive();
     c.hitpause = 0;
     c.shaketime = 0;
     c.get_hit_vars = fp_character::GetHitVars::default();
@@ -9130,6 +9151,160 @@ time = 1
         assert_eq!(m.freeze_time(), 0, "time=0 leaves no freeze armed");
         assert!(!m.p1_frozen());
         assert!(!m.p2_frozen());
+    }
+
+    // ---- SuperPause defence / invuln windows (T080) ----------------------
+
+    /// Builds a fight-phase match with P1 (attacker, action 200 punch) overlapping a
+    /// standing, open P2 (defender) so P1's HitDef connects this tick. Both at full
+    /// life. Mirrors the geometry of `connecting_attack_drops_life_and_ko_advances_round`.
+    fn superpause_attack_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Poses P1 on its punch frame with a fresh HitDef and P2 open on its hurt
+    /// frame, then runs one `Match::tick` so P1's attack resolves against P2.
+    fn run_one_attack(m: &mut Match) {
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.tick(MatchInput::none(), MatchInput::none());
+    }
+
+    #[test]
+    fn superpause_unhittable_blocks_incoming_hit() {
+        // T080 acceptance: with an active SuperPause `unhittable` window on the
+        // DEFENDER (P2), an incoming hit during the pause deals no damage (it passes
+        // through like a NotHitBy block).
+        let mut m = superpause_attack_match();
+        m.p2.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        assert_eq!(
+            m.p2().life(),
+            life_before,
+            "unhittable SuperPause window blocks the hit entirely"
+        );
+    }
+
+    #[test]
+    fn superpause_unhittable_zero_does_not_block() {
+        // Negative control: `unhittable = 0` (window active) does NOT protect — the
+        // hit lands normally, proving the gate keys off the flag, not mere activity.
+        let mut m = superpause_attack_match();
+        m.p2.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        assert!(
+            m.p2().life() < life_before,
+            "a non-unhittable window must not block the hit"
+        );
+    }
+
+    #[test]
+    fn superpause_p2defmul_scales_opponent_damage() {
+        // T080 acceptance: `p2defmul = 2.0` on the ATTACKER (the triggerer) doubles
+        // the damage its opponent takes for the pause window. Compare against an
+        // identical hit with no window (the neutral baseline).
+        let mut baseline = superpause_attack_match();
+        let baseline_life = baseline.p2().life();
+        run_one_attack(&mut baseline);
+        let baseline_damage = baseline_life - baseline.p2().life();
+        assert!(baseline_damage > 0, "baseline hit must deal damage");
+
+        let mut m = superpause_attack_match();
+        m.p1.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        let scaled_damage = life_before - m.p2().life();
+        assert_eq!(
+            scaled_damage,
+            baseline_damage * 2,
+            "p2defmul = 2.0 doubles the opponent's damage taken"
+        );
+    }
+
+    #[test]
+    fn superpause_window_installed_on_triggerer_and_cleared_with_pause() {
+        // End-to-end: a real `SuperPause` controller (default unhittable, time = 5)
+        // installs the defence/invuln window on the triggering player (P1, exempt)
+        // for exactly the pause duration, leaves the opponent's window inert, and
+        // clears it when the freeze ends.
+        let mut m = freeze_match("SuperPause", "5");
+        m.p1.character.vars[0] = 1;
+        m.tick(MatchInput::none(), MatchInput::none()); // fire tick: freeze armed
+        assert_eq!(m.freeze_time(), 5, "5-tick SuperPause armed");
+        assert!(
+            m.p1().character.superpause_effect.active(),
+            "the triggerer (P1) carries an active window"
+        );
+        assert!(
+            m.p1().character.superpause_effect.unhittable,
+            "default SuperPause is unhittable"
+        );
+        assert!(
+            !m.p2().character.superpause_effect.active(),
+            "the opponent (P2) has no window"
+        );
+
+        // Run the whole freeze; the window ages down in lockstep with the pause.
+        for _ in 0..5 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.freeze_time(), 0, "freeze expired");
+        assert!(
+            !m.p1().character.superpause_effect.active(),
+            "the window ends with the pause"
+        );
+    }
+
+    #[test]
+    fn superpause_window_does_not_survive_round_reset() {
+        // A SuperPause window must not leak across a round boundary.
+        let mut m = superpause_attack_match();
+        m.p1.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 30,
+        };
+        m.reset_positions();
+        assert!(
+            !m.p1.character.superpause_effect.active(),
+            "round reset clears the SuperPause window"
+        );
+        assert!(
+            (m.p1.character.superpause_effect.active_p2defmul() - 1.0).abs() < 1e-6,
+            "round reset restores the neutral p2defmul"
+        );
     }
 
     // ---- Hit-spark effects (audit #17) -----------------------------------
