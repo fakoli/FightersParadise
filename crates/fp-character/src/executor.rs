@@ -4426,11 +4426,29 @@ impl Character {
     /// Applies the statedef `physics` to velocity for this tick: stand/crouch
     /// physics multiply x-velocity by the matching friction coefficient; air
     /// physics adds gravity (`yaccel`) to y-velocity; none/unchanged do nothing.
+    ///
+    /// For stand/crouch, after the friction multiply the residual x-velocity is
+    /// snapped to `0` once its magnitude falls below the per-mode friction
+    /// threshold (`stand_friction_threshold` / `crouch_friction_threshold`).
+    /// This is MUGEN's stop-floor: without it geometric friction decay leaves a
+    /// tiny non-zero velocity that drifts the character forever. A threshold of
+    /// `0` disables the snap (nothing is `< 0`), preserving the pure-decay
+    /// behavior. Air/None/Unchanged modes never snap.
     fn apply_physics(&mut self) {
         let mv = &self.constants.movement;
         match self.physics {
-            Physics::Stand => self.vel.x *= mv.stand_friction,
-            Physics::Crouch => self.vel.x *= mv.crouch_friction,
+            Physics::Stand => {
+                self.vel.x *= mv.stand_friction;
+                if self.vel.x.abs() < mv.stand_friction_threshold {
+                    self.vel.x = 0.0;
+                }
+            }
+            Physics::Crouch => {
+                self.vel.x *= mv.crouch_friction;
+                if self.vel.x.abs() < mv.crouch_friction_threshold {
+                    self.vel.x = 0.0;
+                }
+            }
             // Y increases downward, so gravity (a downward acceleration) is a
             // positive addition to y-velocity.
             Physics::Air => self.vel.y += mv.yaccel,
@@ -5502,6 +5520,92 @@ mod tests {
         lcn.tick(&mut ch2);
         assert!((ch2.vel.x - 2.0).abs() < 1e-6);
         assert!((ch2.vel.y - 3.0).abs() < 1e-6);
+    }
+
+    // ---- T057: friction snap-to-zero stop-floor ----------------------------
+
+    /// After the friction multiply, residual x-velocity below the per-mode
+    /// friction threshold snaps to exactly `0` (the stop-floor), while a
+    /// threshold of `0` disables the snap (pure decay), and Air/None modes are
+    /// never affected.
+    #[test]
+    fn friction_snaps_to_zero() {
+        // Stand: vel.x=1.0, threshold 2.0 -> 1.0*0.85=0.85, |0.85|<2.0 -> snap 0.
+        let mut ch = Character::new();
+        ch.physics = Physics::Stand;
+        ch.constants = CharacterConstants::default();
+        ch.constants.movement.stand_friction = 0.85;
+        ch.constants.movement.stand_friction_threshold = 2.0;
+        ch.vel = Vec2::new(1.0, 0.0);
+        ch.apply_physics();
+        assert_eq!(ch.vel.x, 0.0, "stand: below-threshold residual snaps to 0");
+
+        // Stand above threshold: vel.x=10.0 -> 8.5, |8.5|>=2.0 -> decays only.
+        let mut ch_big = Character::new();
+        ch_big.physics = Physics::Stand;
+        ch_big.constants = CharacterConstants::default();
+        ch_big.constants.movement.stand_friction = 0.85;
+        ch_big.constants.movement.stand_friction_threshold = 2.0;
+        ch_big.vel = Vec2::new(10.0, 0.0);
+        ch_big.apply_physics();
+        assert!(
+            (ch_big.vel.x - 8.5).abs() < 1e-6,
+            "stand: above-threshold velocity decays without snapping, got {}",
+            ch_big.vel.x
+        );
+
+        // Threshold 0 means "never snap": pure geometric decay, never reaches 0.
+        let mut ch_zero = Character::new();
+        ch_zero.physics = Physics::Stand;
+        ch_zero.constants = CharacterConstants::default();
+        ch_zero.constants.movement.stand_friction = 0.85;
+        ch_zero.constants.movement.stand_friction_threshold = 0.0;
+        ch_zero.vel = Vec2::new(1.0, 0.0);
+        ch_zero.apply_physics();
+        assert!(
+            (ch_zero.vel.x - 0.85).abs() < 1e-6,
+            "threshold 0 disables snap (decay only), got {}",
+            ch_zero.vel.x
+        );
+
+        // Crouch uses the crouch threshold: vel.x=0.05 -> 0.05*0.82=0.041,
+        // |0.041| < 0.05 -> snap 0.
+        let mut ch_c = Character::new();
+        ch_c.physics = Physics::Crouch;
+        ch_c.constants = CharacterConstants::default();
+        ch_c.constants.movement.crouch_friction = 0.82;
+        ch_c.constants.movement.crouch_friction_threshold = 0.05;
+        ch_c.vel = Vec2::new(0.05, 0.0);
+        ch_c.apply_physics();
+        assert_eq!(
+            ch_c.vel.x, 0.0,
+            "crouch: below-threshold residual snaps to 0"
+        );
+
+        // Air must never snap, even with a tiny x-velocity below any threshold.
+        let mut ch_air = Character::new();
+        ch_air.physics = Physics::Air;
+        ch_air.constants = CharacterConstants::default();
+        ch_air.constants.movement.stand_friction_threshold = 2.0;
+        ch_air.vel = Vec2::new(0.5, -8.0);
+        ch_air.apply_physics();
+        assert!(
+            (ch_air.vel.x - 0.5).abs() < 1e-6,
+            "air physics leaves x-velocity untouched (no snap), got {}",
+            ch_air.vel.x
+        );
+
+        // None must never snap either.
+        let mut ch_none = Character::new();
+        ch_none.physics = Physics::None;
+        ch_none.constants = CharacterConstants::default();
+        ch_none.vel = Vec2::new(0.5, 0.0);
+        ch_none.apply_physics();
+        assert!(
+            (ch_none.vel.x - 0.5).abs() < 1e-6,
+            "none physics leaves velocity untouched, got {}",
+            ch_none.vel.x
+        );
     }
 
     // ---- A.P15: ground-plane Y clamp (falling characters land) -------------
