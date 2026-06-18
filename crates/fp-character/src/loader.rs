@@ -65,13 +65,40 @@ use fp_core::Vec2;
 
 use crate::{CharacterConstants, MovementConstants, SizeConstants, VelocityConstants};
 
+/// Deterministic serialization helper for `HashMap` fields.
+///
+/// `HashMap` iteration order is unspecified, so two serializations of the same
+/// map can differ byte-for-byte — which would defeat the content-addressed IR
+/// cache (F034). This module serializes a map through a sorted intermediate
+/// (`BTreeMap`) so the encoding is **deterministic**: identical maps always
+/// produce identical bytes, with keys emitted in sorted order. Deserialization
+/// uses serde's stock `HashMap` path (order does not matter on the way back in),
+/// so only [`serialize`](sorted_map::serialize) is provided.
+pub(crate) mod sorted_map {
+    use std::collections::{BTreeMap, HashMap};
+
+    use serde::{Serialize, Serializer};
+
+    /// Serializes a `HashMap` as a sorted (`BTreeMap`) sequence so the byte
+    /// output is deterministic across runs.
+    pub(crate) fn serialize<S, K, V>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        K: Serialize + Ord,
+        V: Serialize,
+    {
+        let sorted: BTreeMap<&K, &V> = map.iter().collect();
+        sorted.serialize(serializer)
+    }
+}
+
 /// A trigger expression compiled at load time.
 ///
 /// Wraps the parsed [`Expr`] together with the original source text
 /// for diagnostics. When an expression fails to parse, the engine substitutes a
 /// constant-`0` expression (so the trigger can never fire) and records that fact
 /// via [`is_fallback`](CompiledExpr::is_fallback).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledExpr {
     /// The compiled abstract syntax tree (a constant `0` if compilation failed).
     pub expr: Expr,
@@ -143,7 +170,7 @@ impl CompiledExpr {
 /// parameter therefore yields a one-element [`components`](CompiledParam::components)
 /// list, and a genuine parse failure of an individual component still warns
 /// (real malformed content stays visible).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledParam {
     /// The compiled components, in source order. Always at least one element
     /// (an empty or whitespace-only raw value yields one const-`0` component).
@@ -252,7 +279,7 @@ fn split_top_level_commas(source: &str) -> Vec<&str> {
 /// Mirrors [`fp_formats::cns::TriggerGroup`]: the controller fires if any group
 /// is fully satisfied (OR across groups), and within a group every condition is
 /// AND'd. Each condition here is a [`CompiledExpr`] rather than a raw string.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledTriggerGroup {
     /// The group number `N` from `triggerN`.
     pub number: u32,
@@ -267,7 +294,7 @@ pub struct CompiledTriggerGroup {
 /// [`triggerall`](CompiledController::triggerall) conditions, the compiled
 /// numbered [`triggers`](CompiledController::triggers) groups, and the compiled
 /// [`params`](CompiledController::params).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledController {
     /// The owning state number (the `N` in `[State N, label]`).
     pub state_number: i32,
@@ -296,6 +323,10 @@ pub struct CompiledController {
     /// its own expression (const-`0` on a genuine single-component failure).
     /// A scalar parameter has exactly one component (index `0`); read it with
     /// [`CompiledParam::component`].
+    ///
+    /// Serialized through [`sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "sorted_map::serialize")]
     pub params: HashMap<String, CompiledParam>,
 }
 
@@ -354,7 +385,7 @@ impl CompiledController {
 /// fill the fields explicitly. The `Default` impl lets downstream code build a
 /// minimal `CompiledState` with struct-update syntax (`..Default::default()`)
 /// so adding a new optional header field does not force every literal to change.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompiledState {
     /// The state number.
     pub number: i32,
@@ -452,10 +483,17 @@ impl CompiledState {
 /// The executor (task 5.3) instantiates a live [`Character`](crate::Character)
 /// from a `LoadedCharacter` and steps its state machine using
 /// [`states`](LoadedCharacter::states).
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedCharacter {
     /// Display name from `[Info] name` (empty if absent).
     pub name: String,
+    /// Human-facing display name from `[Info] displayname` (falls back to
+    /// [`name`](Self::name) when the `.def` omits it, matching MUGEN's screenpack
+    /// behaviour). Used by the in-app character-info / movelist screen (T071).
+    pub displayname: String,
+    /// Author credit from `[Info] author` (empty if absent). Surfaced verbatim by
+    /// the character-info screen (T071) — never invented.
+    pub author: String,
     /// Local coordinate space `(width, height)` from `[Info] localcoord`,
     /// defaulting to MUGEN's `(320, 240)` when absent or malformed.
     pub localcoord: (i32, i32),
@@ -465,6 +503,10 @@ pub struct LoadedCharacter {
     /// The merged, compiled state graph keyed by state number. On a number
     /// collision the **first** definition wins (earlier CNS files and the
     /// character's own states beat `stcommon`).
+    ///
+    /// Serialized through [`sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "sorted_map::serialize")]
     pub states: HashMap<i32, CompiledState>,
     /// Loaded sprite container (required).
     pub sff: SffFile,
@@ -495,7 +537,7 @@ pub struct LoadedCharacter {
 /// runtime selection ([`Character::active_palette`](crate::Character::active_palette))
 /// can be resolved back to the bytes the GPU palette-lookup uploads. See
 /// [`LoadedCharacter::palettes`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedPalette {
     /// The 1-based MUGEN palette slot (`palN` → `N`, so `1..=12`).
     pub slot: u32,
@@ -528,8 +570,39 @@ impl LoadedCharacter {
             FpError::parse("DEF", format!("failed to read {}: {e}", def_path.display()))
         })?;
 
+        // ---- IR cache probe (F034 T087) -------------------------------------
+        // Compute a content-addressed key over the `.def` + every file it
+        // references + the parser/compiler version consts, then probe the cache.
+        // A verified hit short-circuits the slow parse/compile path (and its warn
+        // flood). The whole compiled-IR graph (`CompiledState`, SFF, AIR) is not
+        // yet serde-serializable (that lands with T086), so a hit currently still
+        // re-parses; what the cache proves end-to-end today is the keying,
+        // probe/write, invalidation, and corruption-safety. Any cache error is a
+        // silent fall-through — the cache can only speed a load up, never fail it.
+        let cache_key = {
+            let referenced = referenced_source_files(&def, def_path);
+            crate::ir_cache::IrCacheKey::build(def_path, &referenced)
+        };
+        let ir_cache =
+            workspace_root_for(def_path).and_then(|root| crate::ir_cache::IrCache::resolve(&root));
+        if let Some(cache) = ir_cache.as_ref() {
+            // ponytail: read-and-discard probe. Ceiling: no load speedup today —
+            // the manifest can't replace the parse until the compiled-IR graph is
+            // serde-serializable (T086). Upgrade path: when T086 lands, return the
+            // deserialized IR here and short-circuit the parse below.
+            let _: Option<crate::ir_cache::CachedManifest> = cache.read(&cache_key);
+        }
+
         // ---- [Info] ----
         let name = def.get("Info", "name").unwrap_or("").to_string();
+        // `displayname` is the screenpack-facing label; MUGEN falls back to `name`
+        // when it is absent, so mirror that rather than showing an empty string.
+        let displayname = def
+            .get("Info", "displayname")
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.clone());
+        let author = def.get("Info", "author").unwrap_or("").to_string();
         let localcoord = parse_localcoord(def.get("Info", "localcoord"));
 
         // ---- [Files]: required assets ----
@@ -666,8 +739,26 @@ impl LoadedCharacter {
             air.actions.len(),
         );
 
+        // ---- IR cache write (F034 T087) -------------------------------------
+        // The full load succeeded; record a cache entry keyed by `cache_key` so a
+        // subsequent unchanged load can probe it. The write is atomic (temp +
+        // rename) and best-effort — any error is logged at debug and ignored.
+        if let Some(cache) = ir_cache.as_ref() {
+            let manifest = crate::ir_cache::CachedManifest {
+                name: name.clone(),
+                compiled_states: compiled_states as u32,
+                sprite_count: sff.sprites.len() as u32,
+                anim_count: air.actions.len() as u32,
+            };
+            if let Err(e) = cache.write(&cache_key, &manifest) {
+                tracing::debug!("IR cache write skipped: {e}");
+            }
+        }
+
         Ok(Self {
             name,
+            displayname,
+            author,
             localcoord,
             constants,
             states,
@@ -796,6 +887,62 @@ fn push_ref(refs: &mut Vec<String>, value: Option<&str>) {
             refs.push(v.to_string());
         }
     }
+}
+
+/// Enumerates every source file a `.def` references, as `(relpath, resolved)`
+/// pairs, for the IR cache key (F034 T087).
+///
+/// Walks the `[Files]` keys the loader actually consumes — `sprite`, `anim`,
+/// `sound`, `cmd`, `cns`, the `st`/`st0`..`st9` state slots, `stcommon`, and the
+/// `pal1`..`pal12` external palettes — so the cache key changes when **any** of
+/// them is edited (AC2). Each referenced relpath is recorded verbatim (the stable
+/// key) alongside the path it resolves to relative to the `.def` (the bytes that
+/// get hashed). Absent / empty keys are skipped; a referenced-but-missing
+/// optional file is still listed (its hash is all-zero, so creating it later
+/// re-keys). De-duplicates case-insensitively so a relpath named under two keys
+/// is hashed once.
+fn referenced_source_files(def: &DefFile, def_path: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let mut rels: Vec<String> = Vec::new();
+    push_ref(&mut rels, def.get("Files", "sprite"));
+    push_ref(&mut rels, def.get("Files", "anim"));
+    push_ref(&mut rels, def.get("Files", "sound"));
+    push_ref(&mut rels, def.get("Files", "cmd"));
+    push_ref(&mut rels, def.get("Files", "cns"));
+    push_ref(&mut rels, def.get("Files", "st"));
+    for i in 0..=9 {
+        push_ref(&mut rels, def.get("Files", &format!("st{i}")));
+    }
+    push_ref(&mut rels, def.get("Files", "stcommon"));
+    for slot in 1..=MAX_ACT_PALETTE_SLOTS {
+        push_ref(&mut rels, def.get("Files", &format!("pal{slot}")));
+    }
+    rels.into_iter()
+        .map(|rel| {
+            let resolved = DefFile::resolve_path(def_path, &rel);
+            (rel, resolved)
+        })
+        .collect()
+}
+
+/// Resolves the workspace root used as the default IR-cache parent
+/// (`<workspace>/.fp-cache/`), given a character's `.def` path (F034 T087).
+///
+/// Walks up from the `.def` directory looking for a workspace marker — a `.git`
+/// entry or a `Cargo.toml` — and returns the first ancestor that has one. Falls
+/// back to the `.def`'s own directory when no marker is found (so a standalone
+/// content folder still caches next to itself). Returns `None` only when the
+/// `.def` has no parent directory at all. `$FP_CACHE_DIR` overrides this entirely
+/// (handled in [`crate::ir_cache::IrCache::resolve`]).
+fn workspace_root_for(def_path: &Path) -> Option<std::path::PathBuf> {
+    let start = def_path.parent()?;
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() || dir.join("Cargo.toml").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    Some(start.to_path_buf())
 }
 
 /// Loads an optional asset referenced by `value`, returning `None` (with a
@@ -2358,6 +2505,93 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, contents).expect("write scratch file");
         path
+    }
+
+    // ---- IR cache wiring (F034 T087): the loader's key-input enumeration ----
+
+    #[test]
+    fn ir_cache_referenced_source_files_covers_all_files_keys() {
+        // Every `[Files]` slot the loader consumes must be enumerated for the
+        // cache key, so editing any of them re-imports (AC2).
+        let dir = scratch_dir("ircache_refs");
+        let def_text = "\
+[Files]
+sprite = c.sff
+anim = c.air
+sound = c.snd
+cmd = c.cmd
+cns = c.cns
+st = states.cns
+st0 = st0.cns
+stcommon = common1.cns
+pal1 = a.act
+pal3 = b.act
+";
+        let def_path = write_file(&dir, "c.def", def_text);
+        let def = DefFile::load(&def_path).unwrap();
+        let refs = referenced_source_files(&def, &def_path);
+        let rels: Vec<&str> = refs.iter().map(|(r, _)| r.as_str()).collect();
+        for expected in [
+            "c.sff",
+            "c.air",
+            "c.snd",
+            "c.cmd",
+            "c.cns",
+            "states.cns",
+            "st0.cns",
+            "common1.cns",
+            "a.act",
+            "b.act",
+        ] {
+            assert!(
+                rels.contains(&expected),
+                "missing referenced file {expected}"
+            );
+        }
+        // Resolved paths sit next to the .def.
+        assert!(refs.iter().all(|(_, p)| p.starts_with(&dir)));
+    }
+
+    #[test]
+    fn ir_cache_key_changes_when_a_referenced_file_is_edited() {
+        // End-to-end through the loader's own key builder: editing a referenced
+        // CNS must change the cache key (AC2).
+        let dir = scratch_dir("ircache_edit");
+        let def_path = write_file(&dir, "c.def", "[Files]\nsprite=c.sff\ncns=c.cns\n");
+        write_file(&dir, "c.sff", "binary-sff-bytes");
+        write_file(&dir, "c.cns", "[Statedef 0]\n");
+        let def = DefFile::load(&def_path).unwrap();
+        let refs = referenced_source_files(&def, &def_path);
+        let before = crate::ir_cache::IrCacheKey::build(&def_path, &refs).digest_hex();
+
+        write_file(&dir, "c.cns", "[Statedef 0]\n; edited\n");
+        let after = crate::ir_cache::IrCacheKey::build(&def_path, &refs).digest_hex();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn ir_cache_no_cache_env_disables_resolution() {
+        // FP_NO_CACHE=1 disables the cache (AC3). Set/reset around the call; this
+        // mutates a process-global env var, so keep it tightly scoped.
+        let dir = scratch_dir("ircache_nocache");
+        std::env::set_var("FP_NO_CACHE", "1");
+        let resolved = crate::ir_cache::IrCache::resolve(&dir);
+        std::env::remove_var("FP_NO_CACHE");
+        assert!(resolved.is_none(), "FP_NO_CACHE=1 must disable the cache");
+    }
+
+    #[test]
+    fn ir_cache_workspace_root_finds_marker_ancestor() {
+        // `workspace_root_for` walks up to a Cargo.toml/.git ancestor so the
+        // default `.fp-cache/` lands at the workspace root, not in the chars dir.
+        let dir = scratch_dir("ircache_root");
+        let nested = dir.join("chars").join("guy");
+        fs::create_dir_all(&nested).unwrap();
+        write_file(&dir, "Cargo.toml", "[workspace]\n");
+        let def_path = nested.join("guy.def");
+        fs::write(&def_path, "[Files]\nsprite=guy.sff\n").unwrap();
+        let root = workspace_root_for(&def_path).unwrap();
+        assert_eq!(root, dir, "must climb to the Cargo.toml ancestor");
     }
 
     // ---- AC1: CompiledExpr stores the compiled AST and round-trips derives ----
@@ -4788,6 +5022,75 @@ damage = 60, 0
     }
 
     #[test]
+    fn common1_guard_and_round_states() {
+        // T056: the shipped engine-default common1.cns must define the guard
+        // (120/130/131/132/140), guard-hit (150-155), win/lose/draw (170/175),
+        // intro (190/191), and round-init (5900) states, AND the fallback merge
+        // must supply them to a character that authors none (so e.g. evilken
+        // inherits 120/130/5900). Pins the T056 acceptance criteria.
+        let path = shipped_common1();
+        if !path.exists() {
+            eprintln!("skipping: shipped common1.cns absent");
+            return;
+        }
+        let cns = CnsFile::load(&path).expect("shipped common1.cns must parse");
+        let numbers: std::collections::HashSet<i32> =
+            cns.statedefs.iter().map(|d| d.number).collect();
+        for n in [
+            120, 130, 131, 132, 140, // guard stance
+            150, 151, 152, 153, 154, 155, // guard-hit reactions
+            170, 175, // lose / draw
+            190, 191,  // pre-intro / intro
+            5900, // round init
+        ] {
+            assert!(
+                numbers.contains(&n),
+                "shipped common1.cns must define [Statedef {n}]"
+            );
+        }
+
+        // The 5900 round-init state must read full life and converge to stand:
+        // it carries a LifeSet (re-assert life) and a ChangeState (back to 0).
+        let s5900 = cns
+            .statedefs
+            .iter()
+            .find(|d| d.number == 5900)
+            .expect("5900 present");
+        let kinds: Vec<String> = s5900
+            .controllers
+            .iter()
+            .filter_map(|c| c.controller_type.as_ref().map(|t| t.to_ascii_lowercase()))
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "lifeset"),
+            "5900 must re-assert life (LifeSet); got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "changestate"),
+            "5900 must hand back to a movement state (ChangeState); got {kinds:?}"
+        );
+
+        // Fallback merge: a character that authors none of these inherits them
+        // from the engine default (resolving a MISSING `stcommon`, as evilken does).
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        states.insert(0, CompiledState::from_parsed(&Statedef::default()));
+        assert!(
+            !states.contains_key(&120) && !states.contains_key(&5900),
+            "precondition: no guard/round-init states yet"
+        );
+        let missing = Path::new("/nonexistent/dir/common1.cns");
+        merge_default_common_states(&mut states, "common1.cns", missing);
+        for n in [120, 130, 131, 132, 140, 150, 170, 190, 191, 5900] {
+            assert!(
+                states.contains_key(&n),
+                "fallback must supply guard/win/intro/round-init [Statedef {n}]"
+            );
+        }
+        // The character's own state 0 still wins (first-wins merge unchanged).
+        assert!(states.contains_key(&0), "existing state 0 preserved");
+    }
+
+    #[test]
     fn engine_default_common1_path_finds_shipped_asset() {
         // The resolver walks CWD then ancestors; tests run with CWD at the crate
         // dir (`crates/fp-character`), so the workspace `assets/data/common1.cns`
@@ -4995,6 +5298,283 @@ damage = 60, 0
             assert!(
                 loaded.state(required).is_some(),
                 "pre-existing state {required} must still be present after T049 changes"
+            );
+        }
+    }
+
+    // ====================================================================
+    // T055: common1.cns movement / idle states (0, 10-12, 20, 40/45/50/52,
+    // 100, 105/106). These states are the engine-default LOCOMOTION fallback a
+    // character (e.g. evilken) inherits when it ships none of its own. The
+    // tests below build the state graph from the SHIPPED `assets/data/common1.cns`
+    // (the real fallback content) and drive `Character::tick_with` to prove the
+    // states (a) exist, (b) are data-driven via the character's own
+    // `const(velocity.*)`, and (c) animate when entered directly via
+    // `change_state` (not only via the engine `[Statedef -1]`).
+    // ====================================================================
+
+    /// Loads the shipped engine-default `assets/data/common1.cns` and compiles
+    /// it into a state graph keyed by statedef number, exactly as the loader's
+    /// fallback merge does. Locates the file via the same ancestor-walking
+    /// resolver the loader uses ([`engine_default_common1_path`]), so the test
+    /// passes regardless of the working directory `cargo test` runs from.
+    fn shipped_common1_graph() -> HashMap<i32, CompiledState> {
+        let path = engine_default_common1_path()
+            .expect("shipped assets/data/common1.cns must be resolvable from the workspace");
+        let cns = CnsFile::load(&path).expect("shipped common1.cns must parse");
+        let mut states: HashMap<i32, CompiledState> = HashMap::new();
+        for d in &cns.statedefs {
+            states.insert(d.number, CompiledState::from_parsed(d));
+        }
+        states
+    }
+
+    /// A one-action AIR file whose single action is numbered `action` (a single
+    /// 1-tick frame). Lets the direct-animate test give a state's `ChangeAnim`
+    /// target an action that actually exists, so the anim resolves.
+    fn tiny_air_action(action: i32) -> AirFile {
+        let mut actions = HashMap::new();
+        actions.insert(
+            action,
+            AnimAction {
+                action_number: action,
+                frames: vec![AnimFrame {
+                    sprite: fp_core::SpriteId::new(0, 0),
+                    offset: Vec2::new(0, 0),
+                    ticks: 1,
+                    flip_h: false,
+                    flip_v: false,
+                    blend: BlendMode::Normal,
+                    clsn1: Vec::new(),
+                    clsn2: Vec::new(),
+                    ..Default::default()
+                }],
+                loopstart: 0,
+            },
+        );
+        AirFile { actions }
+    }
+
+    /// A jumpy test character: distinctive, non-default velocity constants so a
+    /// data-driven `const(velocity.*)` read is provably the CHARACTER's value
+    /// (not a hard-coded engine number or the default). The values below are all
+    /// off the [`CharacterConstants::default`] speeds.
+    fn jumpy_character() -> Character {
+        let mut consts = CharacterConstants::default();
+        consts.velocity.walk_fwd = Vec2::new(3.0, 0.0);
+        consts.velocity.walk_back = Vec2::new(-2.0, 0.0);
+        consts.velocity.run_fwd = Vec2::new(7.0, 0.0);
+        consts.velocity.run_back = Vec2::new(-5.0, -3.0);
+        // `velocity.jump.neu.y` resolves to the single upward jump speed
+        // (`jump_up`), so the test's expected -9.5 must live there.
+        consts.velocity.jump_neu = Vec2::new(0.0, -9.5);
+        consts.velocity.jump_up = -9.5;
+        consts.velocity.jump_fwd = Vec2::new(2.7, 0.0);
+        consts.velocity.jump_back = Vec2::new(-2.7, 0.0);
+        Character::with_constants(consts)
+    }
+
+    /// Enters a state directly (not via the engine `[Statedef -1]`) and seeds
+    /// `anim_time` to reflect the freshly-entered single-tick animation.
+    ///
+    /// The out-of-tick [`Character::change_state`] seam uses an empty `AnimSet`,
+    /// so it deliberately does NOT seed `anim_time` (it leaves the next tick's
+    /// `advance_animation` to compute it). In-engine, a state entered MID-tick is
+    /// seeded immediately, so a `trigger = AnimTime = 0` exit waits for the anim
+    /// to finish. The tests here enter from out-of-tick, so they replicate that
+    /// seeding manually: a 1-tick action reports `AnimTime = -1` on its first
+    /// tick (one tick remaining), reaching `0` after one advance.
+    fn enter_state_seeded(ch: &mut Character, states: &HashMap<i32, CompiledState>, state: i32) {
+        ch.change_state(states, state);
+        ch.anim_time = -1;
+    }
+
+    #[test]
+    fn common1_movement_states_all_present_in_fallback() {
+        // AC1: every movement/idle state exists in the shipped fallback graph.
+        let states = shipped_common1_graph();
+        for n in [0, 10, 11, 12, 20, 40, 45, 50, 52, 100, 105, 106] {
+            assert!(
+                states.contains_key(&n),
+                "movement state {n} must exist in the engine-default common1 fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn common1_movement_states_are_data_driven_not_hardcoded() {
+        // AC1: the velocity-bearing states read the character's OWN constants via
+        // `const(velocity.*)` (not a hard-coded literal). Assert the controller
+        // source mentions `const(velocity.` in 20 (walk), 40 (jump), 100 (run).
+        let states = shipped_common1_graph();
+        let mentions_const_velocity = |state: i32| -> bool {
+            states.get(&state).is_some_and(|s| {
+                s.controllers.iter().any(|c| {
+                    c.params.values().any(|p| {
+                        p.components
+                            .iter()
+                            .any(|e| e.source.to_ascii_lowercase().contains("const(velocity."))
+                    })
+                })
+            })
+        };
+        for state in [20, 40, 100] {
+            assert!(
+                mentions_const_velocity(state),
+                "state {state} must read the character's own const(velocity.*), not a hard-coded speed"
+            );
+        }
+    }
+
+    #[test]
+    fn common1_movement_states_jumpstart_40_launches_with_character_jump_velocity() {
+        // AC2: state 40 (jumpstart) launches with the CHARACTER's own jump
+        // velocity at the end of the jump-start anim (`AnimTime = 0`), then goes
+        // airborne (50). The jumpy fixture authors jump.neu.y = -9.5 (upward).
+        let states = shipped_common1_graph();
+        // Action 40 is a single 1-tick frame: AnimTime is -1 on entry and reaches
+        // 0 after one advance, so the `AnimTime = 0` launch fires on the 2nd tick.
+        let air = tiny_air_action(40);
+        let mut ch = jumpy_character();
+        enter_state_seeded(&mut ch, &states, 40);
+        ch.vel = Vec2::new(0.0, 0.0);
+        // Tick 1: AnimTime advances from -1 to 0 (no launch yet). Tick 2: the
+        // `AnimTime = 0` launch fires VelSet y = const(velocity.jump.neu.y) and
+        // transitions to the airborne jump (50). Entering 50 sets `physics = A`,
+        // so exactly one Air-gravity step (`yaccel`) is applied that same tick,
+        // after the controller — the faithful post-launch velocity is therefore
+        // `jump.neu.y + yaccel`.
+        ch.tick_with(&states, &air, None, StageView::default());
+        ch.tick_with(&states, &air, None, StageView::default());
+        let expected = -9.5 + ch.constants.movement.yaccel;
+        assert!(
+            (ch.vel.y - expected).abs() < 1e-4,
+            "state 40 must launch with y = const(velocity.jump.neu.y) (-9.5), \
+             observed (after one Air-gravity step) {} vs expected {expected}",
+            ch.vel.y
+        );
+        // Clearly the character's OWN -9.5, not the default jump speed (-8.4 would
+        // land at -7.96 after the same gravity step).
+        assert!(
+            ch.vel.y < -8.5,
+            "jump velocity must be the character's data-driven speed, got {}",
+            ch.vel.y
+        );
+        assert_eq!(
+            ch.state_no, 50,
+            "state 40 must transition to the airborne jump (50) once jump-start finishes"
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_jumpstart_40_resets_air_jump_counter_at_time_0() {
+        // AC2: entering state 40 (jumpstart) resets the air-jump counter. State 40
+        // is authored `type = S` (grounded) precisely so the engine's grounded
+        // air-jump-counter reset fires on entry — restoring the full air-jump
+        // allowance before the character leaves the ground.
+        let states = shipped_common1_graph();
+        let air = tiny_air_action(40);
+        let mut ch = jumpy_character();
+        ch.air_jump_count = 3; // pretend air jumps were spent earlier
+        enter_state_seeded(&mut ch, &states, 40);
+        ch.physics = Physics::None;
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.air_jump_count, 0,
+            "jumpstart (40, type S) must reset the air-jump counter at time=0"
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_walk_20_picks_direction_by_held_command() {
+        // AC2: state 20 (walk) chooses walk.fwd vs walk.back by the held
+        // direction, each read from the character's own constants.
+        let states = shipped_common1_graph();
+        let air = tiny_air_action(20);
+
+        // holdfwd -> walk.fwd (+3.0).
+        let mut fwd = jumpy_character();
+        fwd.set_command_source(Box::new(crate::ActiveCommands::from_names(["holdfwd"])));
+        fwd.change_state(&states, 20);
+        fwd.physics = Physics::None;
+        fwd.tick_with(&states, &air, None, StageView::default());
+        assert!(
+            (fwd.vel.x - 3.0).abs() < 1e-4,
+            "holdfwd walk must set x = const(velocity.walk.fwd) (3.0), got {}",
+            fwd.vel.x
+        );
+
+        // holdback -> walk.back (-2.0).
+        let mut back = jumpy_character();
+        back.set_command_source(Box::new(crate::ActiveCommands::from_names(["holdback"])));
+        back.change_state(&states, 20);
+        back.physics = Physics::None;
+        back.tick_with(&states, &air, None, StageView::default());
+        assert!(
+            (back.vel.x - (-2.0)).abs() < 1e-4,
+            "holdback walk must set x = const(velocity.walk.back) (-2.0), got {}",
+            back.vel.x
+        );
+    }
+
+    #[test]
+    fn common1_movement_states_land_50_to_52_to_0_via_engine_builtin() {
+        // AC2: a character in the airborne jump (50) that hits the floor
+        // (`Vel Y > 0 && Pos Y >= 0`) lands. The 50/51->52 transition is the
+        // engine `[Statedef -1]` auto-land built-in; common1's state 52 then
+        // carries 52 -> 0 once the land anim finishes. Build the graph WITH the
+        // built-in injected so the full land chain is exercised.
+        let mut states = shipped_common1_graph();
+        append_builtin_ground_locomotion(&mut states);
+        // Provide the anims the land chain touches (41 for state 50, 52 for the
+        // jump-land) so their `AnimTime` advances predictably.
+        let mut air = tiny_air_action(41);
+        air.actions.extend(tiny_air_action(52).actions);
+        let mut ch = jumpy_character();
+        ch.change_state(&states, 50);
+        ch.pos = Vec2::new(0.0, FLOOR_Y);
+        ch.physics = Physics::None;
+        ch.vel = Vec2::new(0.0, 1.0); // descending, at the floor
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(
+            ch.state_no, 52,
+            "airborne jump (50) at the floor descending must land to 52"
+        );
+        // 52 snaps to ground and zeroes velocity on entry; the 1-tick land anim
+        // then carries 52 -> 0 (stand) on the next tick.
+        ch.tick_with(&states, &air, None, StageView::default());
+        assert_eq!(ch.state_no, 0, "jump land (52) must return to stand (0)");
+    }
+
+    #[test]
+    fn common1_movement_states_animate_when_entered_directly() {
+        // AC3: a character that `ChangeState`s DIRECTLY into 0/20/40 (not via the
+        // engine `[Statedef -1]`) animates — i.e. each state's `ChangeAnim` fires
+        // and sets the expected anim number on entry. This proves the state
+        // BODIES (not just the -1 transitions) are present and run.
+        let states = shipped_common1_graph();
+        // `(state, anim, held)` — state 20's body anim is direction-gated, so it
+        // is driven with `holdfwd` (the forward walk anim is 20); 0 and 40 need no
+        // held direction.
+        for (state, expected_anim, held) in
+            [(0, 0, None), (20, 20, Some("holdfwd")), (40, 40, None)]
+        {
+            let air = tiny_air_action(expected_anim);
+            let mut ch = jumpy_character();
+            if let Some(cmd) = held {
+                ch.set_command_source(Box::new(crate::ActiveCommands::from_names([cmd])));
+            }
+            // Enter the state directly (not via the engine `[Statedef -1]`), then
+            // force a WRONG anim: the state's guarded body `ChangeAnim` must drive
+            // the character back onto the expected anim — proving the state BODY
+            // (not just the header) runs when entered directly.
+            enter_state_seeded(&mut ch, &states, state);
+            ch.anim = 999;
+            ch.physics = Physics::None;
+            ch.tick_with(&states, &air, None, StageView::default());
+            assert_eq!(
+                ch.anim, expected_anim,
+                "entering state {state} directly must animate to anim {expected_anim}"
             );
         }
     }

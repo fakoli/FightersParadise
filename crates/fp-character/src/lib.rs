@@ -70,16 +70,20 @@
 
 pub mod combat;
 pub mod executor;
+pub mod framedata;
 pub mod identity;
 pub mod invuln;
+pub mod ir_cache;
 pub mod loader;
+pub mod movelist;
 pub mod snapshot;
 
 pub use combat::{resolve_attack, AttackResolution};
 pub use executor::{
     ExplodOp, ExplodPosType, ExplodSpawn, FreezeKind, FreezeRequest, HelperPosType, HelperSpawn,
-    ProjectileSpawn, SoundRequest, TargetOp, TickReport,
+    ProjectileSpawn, SoundRequest, SuperPauseEffect, TargetOp, TickReport,
 };
+pub use framedata::{frame_advantage, MoveFrameData};
 pub use identity::CharacterFingerprint;
 pub use invuln::{AttackAttrSet, InvulnMask, InvulnMode, InvulnSlot};
 pub use snapshot::CharacterSnapshot;
@@ -91,6 +95,7 @@ pub use loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
     LoadedCharacter, LoadedPalette,
 };
+pub use movelist::{format_motion, movelist_from_cmd, MoveEntry};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -372,7 +377,7 @@ fn clamp_usize(index: i32, len: usize) -> usize {
 /// (player widths, walk/jump velocities, gravity and friction). Every field has
 /// a safe MUGEN-style default; unknown/unmodeled constants resolve to the safe
 /// default rather than failing the load.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CharacterConstants {
     /// Maximum life (`[Data] life`). Defaults to MUGEN's `1000`.
     pub life_max: i32,
@@ -441,7 +446,7 @@ impl Default for CharacterConstants {
 /// Only the fields the executor and physics need are modeled here (player
 /// widths and height); the remaining `[Size]` keys (`xscale`, `head.pos`, …)
 /// are not read yet. Each defaults to KFM's value, MUGEN's de-facto baseline.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SizeConstants {
     /// `ground.front` — player half-width forward, on the ground (pixels).
     pub ground_front: i32,
@@ -477,7 +482,7 @@ impl Default for SizeConstants {
 /// whose stored `y` is `0`; the y component of a jump comes from `jump.neu.y`
 /// (mirrored into [`jump_up`](Self::jump_up)) or, for air jumps, from
 /// `airjump.neu.y` (mirrored into [`airjump_y`](Self::airjump_y)).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VelocityConstants {
     /// `walk.fwd` — forward walking velocity `(x, y)`. MUGEN authors this as a
     /// bare x value; `y` is `0`.
@@ -547,7 +552,7 @@ impl Default for VelocityConstants {
 /// `yaccel` is the per-tick downward acceleration applied by air physics
 /// (`Physics::Air`). `stand.friction`/`crouch.friction` are the multiplicative
 /// coefficients applied to x-velocity each tick by stand/crouch physics.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MovementConstants {
     /// `yaccel` — downward acceleration in pixels/tick² (gravity).
     pub yaccel: f32,
@@ -1834,6 +1839,22 @@ pub struct Character {
     /// more). Persists until changed or the round resets.
     pub defence_mul: f32,
 
+    /// The `SuperPause` defence / invulnerability window (T080).
+    ///
+    /// Installed on the player that triggered an active `SuperPause` for the
+    /// pause's duration: while it holds, [`unhittable`](SuperPauseEffect::unhittable)
+    /// makes this character immune to incoming hits (they pass through like a
+    /// `NotHitBy` window) and [`p2defmul`](SuperPauseEffect::p2defmul) scales the
+    /// **opponent's** effective defence (so this character's super deals tuned
+    /// damage during its own flash). The match coordinator (`fp-engine`) sets it
+    /// when it arms the freeze and ages it down in lockstep, clearing it with the
+    /// freeze. Hit resolution ([`combat::resolve_attack`](crate::combat::resolve_attack))
+    /// consults the **defender's** effect for `unhittable` and the **attacker's**
+    /// for `p2defmul`. Defaults to the inert
+    /// [`inactive`](SuperPauseEffect::inactive) window (blocks nothing, scales by
+    /// `1.0`); reset on a round boundary.
+    pub superpause_effect: SuperPauseEffect,
+
     /// Current sprite-draw priority (MUGEN `[Statedef] sprpriority` and the
     /// `SprPriority` controller; faithfulness audit #16).
     ///
@@ -1857,6 +1878,20 @@ pub struct Character {
     /// grounded defender is never gated on juggle. See
     /// [`combat::resolve_attack`](crate::combat::resolve_attack).
     pub juggle_points: i32,
+
+    /// Remaining ticks this character is held by a binder's `TargetBind`
+    /// (MUGEN's target-bound state; the source of `GetHitVar(isbound)`).
+    ///
+    /// Set to the bind `time` whenever a binder applies a `TargetBind`
+    /// ([`TargetOp::Bind`](crate::TargetOp::Bind)) to this character, and counted
+    /// down one per non-hit-paused tick (like the other per-tick timers). While it
+    /// is positive the character is "bound", so [`combat::resolve_attack`] records
+    /// `GetHitVar(isbound) = 1`; once it reaches `0` the character is free again.
+    /// A `time` of `-1` (MUGEN's "bind forever") is stored verbatim and never
+    /// counts down, so it stays bound until explicitly released. Public only
+    /// because the entity is struct-based; callers other than the engine /
+    /// executor should not touch it.
+    pub bound_time: i32,
 
     /// The air-juggle points the character's **current move** costs when it lands
     /// on an airborne defender (MUGEN `[Statedef] juggle`; faithfulness audit #16).
@@ -1944,6 +1979,19 @@ pub struct Character {
     /// `stateno` on an attribute match and consuming the slot. See [`HitOverrides`].
     pub hit_overrides: HitOverrides,
 
+    /// `true` while this character's **current** get-hit reaction is one that a
+    /// [`HitOverride`](HitOverrides) slot redirected — the state behind the
+    /// `HitOverridden` trigger (T061).
+    ///
+    /// Set by hit resolution
+    /// ([`combat::resolve_attack`](crate::combat::resolve_attack)) on the tick an
+    /// armed slot matches and the defender is sent to the slot's `stateno` instead
+    /// of the normal get-hit. It stays `true` for the duration of that overridden
+    /// reaction and is cleared when a **normal** (non-overridden) get-hit lands —
+    /// the next hit replaces the reaction, so `HitOverridden` reverts to `0`. A
+    /// freshly-built character (no hit taken) reports `false`.
+    pub hit_overridden: bool,
+
     /// The raw Park–Miller RNG state backing the MUGEN `random` trigger
     /// (faithfulness audit #28).
     ///
@@ -1982,6 +2030,21 @@ pub struct Character {
     /// `RoundsExisted 0`), so the triggers read their safe defaults when there is
     /// no coordinator in view. See [`RoundView`].
     pub round_view: RoundView,
+
+    /// The engine-assigned AI difficulty level this character runs at, `0` for a
+    /// human-controlled fighter and `1..=8` for a CPU opponent (the value the
+    /// MUGEN `AILevel` trigger reads — higher = stronger CPU, T052).
+    ///
+    /// Like [`round_view`](Self::round_view), this is **owned by the round
+    /// coordinator** (`fp-engine`'s `Match`/`TeamMatch`), which sets it once at
+    /// match construction from the player's input driver (keyboard / gamepad → `0`;
+    /// a [`fp_input::CpuAi`] → its [`fp_input::AiDifficulty`] mapped to `1..=8`).
+    /// The character never assigns it itself — it is a read-only identity bit the
+    /// CNS reads to gate cheap-AI-only behaviour. A bare /
+    /// freshly-[`new`](Self::new)'d `Character` (no coordinator) defaults to `0`,
+    /// so a human is never mistaken for the CPU. Set it via
+    /// [`Character::set_ai_level`] and read it via [`Character::ai_level`].
+    pub ai_level: u8,
 
     /// The selected external `.act` palette override, as a 0-based index into the
     /// owning [`LoadedCharacter::palettes`](crate::LoadedCharacter::palettes), or
@@ -2067,6 +2130,21 @@ pub struct Character {
     /// renderer reads [`Character::cur_trans`] to pick the sprite blend. See
     /// [`TransMode`].
     pub cur_trans: Option<TransMode>,
+
+    /// Which roster side this entity belongs to — MUGEN's `TeamSide` trigger
+    /// (1 = left/P1 team, 2 = right/P2 team); T062.
+    ///
+    /// This is a fixed per-entity attribute decided at side assignment, the same
+    /// way `ai_level` is plumbed in: the match coordinator (`fp-engine`'s `Match`)
+    /// stamps it once via [`Character::set_team_side`] when a player joins a side,
+    /// and a helper inherits its owner's side. It is **not** `Facing` — a
+    /// left-team fighter can turn to face either direction without changing teams,
+    /// so this stays tied to the roster slot, never the facing flag.
+    ///
+    /// A bare / freshly-constructed `Character` defaults to `1` (the P1/left team),
+    /// the documented safe default for a single-character context. See
+    /// [`Character::trigger`]'s `TeamSide` arm.
+    pub team_side: i32,
 }
 
 /// A sprite-draw rotation set by the `AngleDraw` family of controllers (T015).
@@ -2219,6 +2297,10 @@ pub struct ProjContactTracker {
     hit_time: i32,
     /// Ticks since this id was last guarded/blocked, or [`NEVER`](Self::NEVER).
     guarded_time: i32,
+    /// Ticks since a projectile of this id was last cancelled (collided with an
+    /// opposing projectile and removed), or [`NEVER`](Self::NEVER) (T078,
+    /// `ProjCancelTime<id>`).
+    cancel_time: i32,
 }
 
 impl Default for ProjContactTracker {
@@ -2241,6 +2323,7 @@ impl ProjContactTracker {
             contact_time: Self::NEVER,
             hit_time: Self::NEVER,
             guarded_time: Self::NEVER,
+            cancel_time: Self::NEVER,
         }
     }
 
@@ -2264,6 +2347,13 @@ impl ProjContactTracker {
         self.guarded_time
     }
 
+    /// Ticks since a projectile of this id was last cancelled, `-1` if never
+    /// (`ProjCancelTime<id>`, T078).
+    #[must_use]
+    pub const fn cancel_time(self) -> i32 {
+        self.cancel_time
+    }
+
     /// Advances each *active* counter by one tick (a counter still at
     /// [`NEVER`](Self::NEVER) stays there). Saturating so a long-lived id can
     /// never overflow `i32`.
@@ -2272,6 +2362,7 @@ impl ProjContactTracker {
             &mut self.contact_time,
             &mut self.hit_time,
             &mut self.guarded_time,
+            &mut self.cancel_time,
         ] {
             if *t >= 0 {
                 *t = t.saturating_add(1);
@@ -2288,6 +2379,14 @@ impl ProjContactTracker {
         } else {
             self.hit_time = 0;
         }
+    }
+
+    /// Records that a projectile of this id was cancelled this tick (its
+    /// cancel-time counter resets to `0`, T078). Independent of the
+    /// contact/hit/guard counters — a cancel is a projectile-vs-projectile
+    /// removal, not a connection on the opponent.
+    fn record_cancel(&mut self) {
+        self.cancel_time = 0;
     }
 }
 
@@ -2339,12 +2438,15 @@ impl Default for Character {
             cur_palfx: CurPalFx::default(),
             afterimage: AfterImageState::default(),
             hit_overrides: HitOverrides::default(),
+            hit_overridden: false,
             attack_mul: 1.0,
             defence_mul: 1.0,
+            superpause_effect: SuperPauseEffect::inactive(),
             cur_sprpriority: 0,
             // Seed the juggle pool from the character's `[Data] airjuggle`
             // allowance; refilled whenever the character touches the ground.
             juggle_points: constants.airjuggle,
+            bound_time: 0,
             cur_juggle_cost: 0,
             hitdef_set_this_tick: false,
             // Deterministic fixed seed (never wall-clock); the cell is kept in
@@ -2353,6 +2455,9 @@ impl Default for Character {
             // Safe default round clock (intro / time 0 / not over) until a
             // coordinator pushes the live view in via `set_round_view`.
             round_view: RoundView::default(),
+            // Human by default (level 0); the coordinator raises it for a CPU
+            // opponent via `set_ai_level`. A bare character is never the CPU.
+            ai_level: 0,
             // No external palette override by default: render with the
             // SFF-embedded palette, byte-identical to today.
             active_palette: None,
@@ -2365,6 +2470,9 @@ impl Default for Character {
             draw_angle: DrawAngle::default(),
             pos_frozen: false,
             cur_trans: None,
+            // Safe default roster side: the P1/left team (T062). The match
+            // coordinator overrides this via `set_team_side` at side assignment.
+            team_side: 1,
         }
     }
 }
@@ -2409,6 +2517,47 @@ impl Character {
         // Round-trip through `Rng::new` so the stored cell is always a valid,
         // in-range Park–Miller state regardless of the caller's seed.
         self.rng_seed.set(Rng::new(seed).seed());
+    }
+
+    /// The engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU) this
+    /// character runs at — the value the MUGEN `AILevel` trigger reads (T052).
+    ///
+    /// A freshly-[`new`](Self::new)'d character (no coordinator) returns `0`, so a
+    /// human is never mistaken for the CPU. See [`Character::ai_level`](Self::ai_level)
+    /// (the field) and [`Character::set_ai_level`].
+    #[must_use]
+    pub fn ai_level(&self) -> u8 {
+        self.ai_level
+    }
+
+    /// Sets the engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU).
+    ///
+    /// Owned by the round coordinator (`fp-engine`'s `Match`/`TeamMatch`), which
+    /// calls this once at match construction from the player's input driver. The
+    /// character never assigns it itself — it is a read-only identity bit the CNS
+    /// reads (the `AILevel` trigger). Read it back with
+    /// [`Character::ai_level`](Self::ai_level).
+    pub fn set_ai_level(&mut self, level: u8) {
+        self.ai_level = level;
+    }
+
+    /// Zeroes every variable bank — `var(0..)`, `fvar(0..)`, `sysvar(0..)`, and
+    /// `sysfvar(0..)` — back to their construction-time defaults (T054).
+    ///
+    /// MUGEN clears a fighter's variables at the top of every round, so no value
+    /// seeded in a prior round (notably the evilken cheap-AI `Var(30)=59` trap)
+    /// can survive into the next one. The round coordinator (`fp-engine`) calls
+    /// this from its per-round reset. The per-var `IntPersist`/`FloatPersist`
+    /// opt-out is not yet modelled, so every bank is treated as non-persistent —
+    /// the conservative, safety-preserving default. Any pending in-expression
+    /// `:=` assignments ([`var_assignments`](Character::flush_var_assignments))
+    /// are also dropped so a half-evaluated write cannot leak across the reset.
+    pub fn clear_vars(&mut self) {
+        self.vars = [0; NUM_VARS];
+        self.fvars = [0.0; NUM_FVARS];
+        self.sysvars = [0; NUM_SYSVARS];
+        self.sysfvars = [0.0; NUM_SYSFVARS];
+        self.var_assignments.borrow_mut().clear();
     }
 
     /// Returns the selected external `.act` palette override as a 0-based index
@@ -2504,6 +2653,25 @@ impl Character {
         self.round_view = view;
     }
 
+    /// Sets this entity's roster side for the `TeamSide` trigger (1 = left/P1
+    /// team, 2 = right/P2 team); T062.
+    ///
+    /// Called once at side assignment by the match coordinator (`fp-engine`'s
+    /// `Match`), the same way `ai_level` is plumbed in. A value other than `1` or
+    /// `2` is clamped to the nearest valid side (`<= 1` → `1`, `>= 2` → `2`) so
+    /// the trigger never reports a bogus team. A character that is never assigned a
+    /// side keeps the default `1` (the P1/left team).
+    pub fn set_team_side(&mut self, side: i32) {
+        self.team_side = side.clamp(1, 2);
+    }
+
+    /// This entity's roster side — MUGEN's `TeamSide` (1 = left/P1 team,
+    /// 2 = right/P2 team); T062. Defaults to `1` for a single-character context.
+    #[must_use]
+    pub fn team_side(&self) -> i32 {
+        self.team_side
+    }
+
     /// Advances every tracked projectile-id contact/hit/guard counter by one tick
     /// (T026), aging the values the `ProjContact<id>` / `ProjHit<id>` /
     /// `ProjGuarded<id>` / `Proj*Time<id>` triggers report.
@@ -2540,6 +2708,24 @@ impl Character {
         let known = self.proj_events.contains_key(&projid);
         if known || self.proj_events.len() < Self::MAX_PROJ_IDS {
             self.proj_events.entry(projid).or_default().record(guarded);
+        }
+    }
+
+    /// Records that one of this owner's projectiles with the given `projid` was
+    /// cancelled this tick (collided with an opposing projectile and removed),
+    /// feeding the `ProjCancel<id>` / `ProjCancelTime<id>` triggers (T078).
+    ///
+    /// The round coordinator (`fp-engine`) is the writer, exactly as for
+    /// [`record_proj_event`](Self::record_proj_event): when a projectile is
+    /// cancelled it calls this on the **owning** character. Resets the id's
+    /// cancel time to `0`; the contact/hit/guard counters are left untouched (a
+    /// cancel is not a connection on the opponent). A not-yet-tracked id is
+    /// inserted, bounded by [`MAX_PROJ_IDS`](Self::MAX_PROJ_IDS) so a flood of
+    /// distinct ids can never grow the map without limit. Never panics.
+    pub fn record_proj_cancel(&mut self, projid: i32) {
+        let known = self.proj_events.contains_key(&projid);
+        if known || self.proj_events.len() < Self::MAX_PROJ_IDS {
+            self.proj_events.entry(projid).or_default().record_cancel();
         }
     }
 
@@ -3134,57 +3320,76 @@ impl Character {
 }
 
 /// Which member of the projectile-trigger family a `Proj*<id>` trigger names, and
-/// whether it is the "time since" (`*Time`) form (T026).
+/// whether it is the "time since" (`*Time`) form (T026, T078).
 ///
 /// `ProjContact2000` → `(Contact, time = false)`; `ProjHitTime2000` →
-/// `(Hit, time = true)`. The owner's [`EvalContext::trigger`] resolves the value
-/// from the [`ProjContactTracker`] keyed by the parsed id.
+/// `(Hit, time = true)`; `ProjCancelTime5` → `(Cancel, time = true)`. The owner's
+/// [`EvalContext::trigger`] resolves the value from the [`ProjContactTracker`]
+/// keyed by the parsed id (or aggregated across all ids for the no-id form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjTriggerKind {
     Contact,
     Hit,
     Guarded,
+    /// Ticks since a projectile was cancelled (`ProjCancel` / `ProjCancelTime`,
+    /// T078).
+    Cancel,
 }
 
 /// Parses a bare projectile-info trigger name into its family, whether it is the
 /// `*Time` form, and the trailing projectile id — `None` if `name` is not a
-/// projectile-info trigger (T026).
+/// projectile-info trigger (T026, T078).
 ///
-/// MUGEN writes these as a fixed base name with the `projid` appended, e.g.
-/// `ProjContact2000`, `ProjHitTime340`, `ProjGuarded5`. The match is
-/// case-insensitive on the base and requires a parseable integer id suffix; a
-/// negative id (`ProjContact-1`) and a missing/garbage suffix are rejected
-/// (returns `None`), so a malformed name falls through to the ordinary trigger
-/// path and the engine-wide "unknown trigger → 0" default. Longest bases are
-/// tested first so `projcontacttime` is preferred over `projcontact`.
-fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
+/// MUGEN writes these as a fixed base name with the `projid` optionally appended,
+/// e.g. `ProjContact2000`, `ProjHitTime340`, `ProjGuarded5`, `ProjCancelTime7`.
+/// The id is **optional**: the bare no-id form (`ProjHit`, `ProjContact`,
+/// `ProjGuarded`, `ProjCancel`, and their `*Time` variants) parses with
+/// `id == None` and aggregates across all of the owner's projectile ids (T078).
+/// The match is case-insensitive on the base and accepts either an empty suffix
+/// (no-id) or a parseable **non-negative** integer id suffix; a negative id
+/// (`ProjContact-1`) and a garbage suffix are rejected (returns `None`), so a
+/// malformed name falls through to the ordinary trigger path and the engine-wide
+/// "unknown trigger → 0" default. Longest bases are tested first so
+/// `projcontacttime` is preferred over `projcontact`.
+fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, Option<i32>)> {
     // Cheap allocation-free guard: this runs as the FIRST check for every
     // bare-ident trigger the executor evaluates each tick (`Time`, `StateNo`,
     // `Anim`, …), so it must NOT heap-allocate on the common non-proj path. Every
     // projectile-info trigger begins with a case-insensitive `proj`; anything that
     // does not is rejected before any prefix matching (and well before the old
-    // `to_ascii_lowercase()` String allocation that lived here).
-    if name.len() < "projhit0".len() || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
+    // `to_ascii_lowercase()` String allocation that lived here). The shortest
+    // valid name is the bare no-id `projhit` (7 chars).
+    if name.len() < "projhit".len() || !name.as_bytes()[..4].eq_ignore_ascii_case(b"proj") {
         return None;
     }
     // (base, kind, is_time) — `*time` variants listed first so they win the prefix
     // test over their non-time counterparts. Matched case-insensitively against the
     // name slice without lowercasing the whole string.
-    const BASES: [(&str, ProjTriggerKind, bool); 6] = [
+    const BASES: [(&str, ProjTriggerKind, bool); 8] = [
         ("projcontacttime", ProjTriggerKind::Contact, true),
         ("projguardedtime", ProjTriggerKind::Guarded, true),
+        ("projcanceltime", ProjTriggerKind::Cancel, true),
         ("projhittime", ProjTriggerKind::Hit, true),
         ("projcontact", ProjTriggerKind::Contact, false),
         ("projguarded", ProjTriggerKind::Guarded, false),
+        ("projcancel", ProjTriggerKind::Cancel, false),
         ("projhit", ProjTriggerKind::Hit, false),
     ];
     for (base, kind, is_time) in BASES {
         if let Some(prefix) = name.get(..base.len()) {
             if prefix.eq_ignore_ascii_case(base) {
-                // The id suffix must be a non-negative integer; anything else
-                // (empty, signed, non-numeric) is not a projectile-info trigger.
+                // The id suffix is optional: an empty suffix is the no-id
+                // aggregate form (`id == None`); otherwise it must be a
+                // non-negative integer. Anything else (signed, non-numeric) is
+                // not a projectile-info trigger.
                 let suffix = &name[base.len()..];
-                return suffix.parse::<i32>().ok().map(|id| (kind, is_time, id));
+                if suffix.is_empty() {
+                    return Some((kind, is_time, None));
+                }
+                return suffix
+                    .parse::<i32>()
+                    .ok()
+                    .map(|id| (kind, is_time, Some(id)));
             }
         }
     }
@@ -3192,12 +3397,32 @@ fn parse_proj_trigger(name: &str) -> Option<(ProjTriggerKind, bool, i32)> {
 }
 
 impl Character {
+    /// Reads the counter named by `kind` (the family member) from a single
+    /// projectile-id tracker (T026, T078) — the time-since-event in ticks, or
+    /// [`ProjContactTracker::NEVER`] (`-1`) if that event never happened for the
+    /// id.
+    fn proj_counter(kind: ProjTriggerKind, tracker: ProjContactTracker) -> i32 {
+        match kind {
+            ProjTriggerKind::Contact => tracker.contact_time(),
+            ProjTriggerKind::Hit => tracker.hit_time(),
+            ProjTriggerKind::Guarded => tracker.guarded_time(),
+            ProjTriggerKind::Cancel => tracker.cancel_time(),
+        }
+    }
+
     /// Resolves a bare projectile-info trigger (`ProjContact<id>` / `ProjHit<id>`
-    /// / `ProjGuarded<id>` / `Proj*Time<id>`) against this owner's
-    /// [`proj_events`](Self::proj_events) tracker (T026), or `None` when `name` is
-    /// not such a trigger.
+    /// / `ProjGuarded<id>` / `ProjCancel<id>` / `Proj*Time<id>`, and their no-id
+    /// aggregate forms) against this owner's [`proj_events`](Self::proj_events)
+    /// trackers (T026, T078), or `None` when `name` is not such a trigger.
     ///
-    /// The `*Time` form returns the ticks since the event for that id
+    /// With an **id** the value comes from that id's tracker. With **no id** the
+    /// value is aggregated across **all** of the owner's projectile ids (T078):
+    /// the `*Time` form returns the **most-recent** matching event (the minimum
+    /// non-`NEVER` time, since a smaller "ticks since" is more recent), or
+    /// [`ProjContactTracker::NEVER`] (`-1`) if no id ever had that event; the
+    /// boolean form is true iff **any** id had the event this exact tick.
+    ///
+    /// The `*Time` form returns the ticks since the event
     /// ([`ProjContactTracker::NEVER`] = `-1` if it never happened). The boolean
     /// form (`ProjContact<id>`) returns `1` iff the event happened **this tick**
     /// (the stored time is `0`), else `0` — the comma-tail
@@ -3205,11 +3430,19 @@ impl Character {
     /// `*Time` value to compare against a window. Never panics.
     fn proj_trigger(&self, name: &str) -> Option<Value> {
         let (kind, is_time, id) = parse_proj_trigger(name)?;
-        let tracker = self.proj_tracker(id);
-        let time = match kind {
-            ProjTriggerKind::Contact => tracker.contact_time(),
-            ProjTriggerKind::Hit => tracker.hit_time(),
-            ProjTriggerKind::Guarded => tracker.guarded_time(),
+        let time = match id {
+            // Per-id form: read that id's tracker directly.
+            Some(id) => Self::proj_counter(kind, self.proj_tracker(id)),
+            // No-id aggregate form (T078): the most-recent matching event across
+            // all owner projectile ids — the minimum non-`NEVER` counter — or
+            // `NEVER` when no id ever had this event.
+            None => self
+                .proj_events
+                .values()
+                .map(|t| Self::proj_counter(kind, *t))
+                .filter(|&x| x != ProjContactTracker::NEVER)
+                .min()
+                .unwrap_or(ProjContactTracker::NEVER),
         };
         Some(if is_time {
             Value::Int(time)
@@ -3316,6 +3549,15 @@ impl EvalContext for Character {
         if name.eq_ignore_ascii_case("PowerMax") {
             return Value::Int(self.power_max);
         }
+        // `AILevel` is the CPU difficulty this fighter is running at: `0` for a
+        // human (the field's default — `ai_level` is only raised via
+        // [`Character::set_ai_level`] when the coordinator installs the CPU
+        // opponent, T052). A human therefore can never satisfy an
+        // `AILevel`-gated trigger, which is exactly what keeps the evilken
+        // cheap-AI `Var(30)=59` trap from firing for a human player (T054).
+        if name.eq_ignore_ascii_case("AILevel") {
+            return Value::Int(i32::from(self.ai_level));
+        }
         if name.eq_ignore_ascii_case("Facing") {
             return Value::Int(self.facing.sign());
         }
@@ -3326,6 +3568,26 @@ impl EvalContext for Character {
         }
         if name.eq_ignore_ascii_case("Vel") {
             return Value::Float(Self::axis_component(self.vel, args));
+        }
+
+        // `HitVel X` / `HitVel Y` (T061) — the velocity the most recent hit taken
+        // imparted, read from this character's [`GetHitVars`] (the `xvel`/`yvel`
+        // members the engine populated on the connecting hit). Per-axis, routed
+        // through the same `X = 0` / `Y = 1` axis coding as `Vel`/`Pos`; a missing
+        // or malformed axis falls back to the X component, matching the
+        // evaluator's lowering. With no hit taken the GetHitVars default to `0`,
+        // so `HitVel` reports `0` — never a panic.
+        if name.eq_ignore_ascii_case("HitVel") {
+            let hit_vel = Vec2::new(self.get_hit_vars.xvel, self.get_hit_vars.yvel);
+            return Value::Float(Self::axis_component(hit_vel, args));
+        }
+
+        // `HitOverridden` (T061) — 1 iff this character's current get-hit reaction
+        // was redirected by an active [`HitOverride`](HitOverrides) slot, else 0.
+        // The flag is set by hit resolution when a slot matches and cleared by the
+        // next normal (non-overridden) hit. See [`Character::hit_overridden`].
+        if name.eq_ignore_ascii_case("HitOverridden") {
+            return Value::from(self.hit_overridden);
         }
 
         // Coordinate-scaling triggers (MUGEN 1.1). `Const720p(v)` / `Const1280p(v)`
@@ -3431,6 +3693,19 @@ impl EvalContext for Character {
         }
         if name.eq_ignore_ascii_case("RoundsExisted") {
             return Value::Int(self.round_view.rounds_existed);
+        }
+
+        // ---- Team / identity (T062) -----------------------------------------
+        // `TeamSide` is the fixed roster side this entity belongs to (1 = left/P1
+        // team, 2 = right/P2 team), stamped at side assignment by the coordinator
+        // (`fp-engine`'s `Match`) via `set_team_side` — NOT the `Facing` flag (a
+        // left-team fighter can face either way). A bare `Character` reads the
+        // safe default `1` (P1/left team) for a single-character context.
+        // (`PlayerIDExist(n)` needs the playerid id-space, so it is answered on the
+        // cross-entity wrapper `EvalCtx`, not here; a self-only `Character` has no
+        // id table and reports `0`.)
+        if name.eq_ignore_ascii_case("TeamSide") {
+            return Value::Int(self.team_side);
         }
 
         // ---- Deferred triggers (documented, not silently wrong) -------------
@@ -3667,23 +3942,106 @@ pub struct StageView {
     pub left: f32,
     /// World X of the right playfield edge (currently the stage `boundright`).
     pub right: f32,
+    /// `GameWidth` — the stage's logical screen **width** in localcoord units
+    /// (the 320×240-class space the edge / `ScreenPos` triggers measure in).
+    /// Set from the stage's `[StageInfo] localcoord` width; defaults to MUGEN's
+    /// classic `320` for the no-stage driver paths. See [`StageView::DEFAULT_GAME_WIDTH`].
+    pub game_width: f32,
+    /// `GameHeight` — the stage's logical screen **height** in localcoord units.
+    /// Set from the stage's `[StageInfo] localcoord` height; defaults to `240`.
+    /// See [`StageView::DEFAULT_GAME_HEIGHT`].
+    pub game_height: f32,
 }
 
 impl StageView {
-    /// Creates a stage view from the left and right screen-edge world X values.
+    /// MUGEN's classic logical screen width (`320`), used when no stage
+    /// `localcoord` is in hand.
+    pub const DEFAULT_GAME_WIDTH: f32 = 320.0;
+    /// MUGEN's classic logical screen height (`240`), used when no stage
+    /// `localcoord` is in hand.
+    pub const DEFAULT_GAME_HEIGHT: f32 = 240.0;
+
+    /// Creates a stage view from the left and right screen-edge world X values,
+    /// using the classic `320×240` logical screen dimensions for
+    /// `GameWidth`/`GameHeight`.
     #[must_use]
     pub const fn new(left: f32, right: f32) -> Self {
-        Self { left, right }
+        Self {
+            left,
+            right,
+            game_width: Self::DEFAULT_GAME_WIDTH,
+            game_height: Self::DEFAULT_GAME_HEIGHT,
+        }
+    }
+
+    /// Creates a stage view with explicit left/right world-X edges **and**
+    /// logical `GameWidth`/`GameHeight` (localcoord) dimensions. Used by
+    /// `fp-engine` to thread a stage's parsed `localcoord` onto the view that
+    /// answers the game-dimension and screen-edge triggers (T060).
+    #[must_use]
+    pub const fn with_dims(left: f32, right: f32, game_width: f32, game_height: f32) -> Self {
+        Self {
+            left,
+            right,
+            game_width,
+            game_height,
+        }
+    }
+
+    /// The world X of the **visible left screen edge**, camera-relative.
+    ///
+    /// The visible window is the logical [`game_width`](Self::game_width) span
+    /// centered on the playfield midpoint `(left + right) / 2` (the camera is
+    /// modelled as centred — the only case modelled today). This keeps
+    /// `right_edge() - left_edge() == game_width` exactly, in the same world-X
+    /// convention the edge-distance triggers use.
+    #[must_use]
+    pub fn left_edge(&self) -> f32 {
+        self.center_x() - self.game_width / 2.0
+    }
+
+    /// The world X of the **visible right screen edge**, camera-relative.
+    /// See [`left_edge`](Self::left_edge).
+    #[must_use]
+    pub fn right_edge(&self) -> f32 {
+        self.center_x() + self.game_width / 2.0
+    }
+
+    /// The world Y of the **visible top screen edge**.
+    ///
+    /// World Y increases downward with the ground plane at `Y = 0` (up is
+    /// negative Y), so the top of the visible window sits `game_height` units
+    /// **above** the floor: `top_edge() == -game_height`, `bottom_edge() == 0`.
+    /// This keeps `bottom_edge() - top_edge() == game_height`.
+    #[must_use]
+    pub fn top_edge(&self) -> f32 {
+        -self.game_height
+    }
+
+    /// The world Y of the **visible bottom screen edge** (the ground plane,
+    /// `Y = 0`). See [`top_edge`](Self::top_edge).
+    #[must_use]
+    pub fn bottom_edge(&self) -> f32 {
+        0.0
+    }
+
+    /// The world X midpoint of the playfield — the modelled (centred) camera
+    /// center used to anchor the visible screen edges.
+    fn center_x(&self) -> f32 {
+        (self.left + self.right) / 2.0
     }
 }
 
 impl Default for StageView {
     /// A symmetric default view matching `fp-engine`'s default stage bounds
-    /// (`[-200, 200]`), used by the single-character / no-stage driver paths.
+    /// (`[-200, 200]`) with the classic `320×240` logical screen, used by the
+    /// single-character / no-stage driver paths.
     fn default() -> Self {
         Self {
             left: -200.0,
             right: 200.0,
+            game_width: Self::DEFAULT_GAME_WIDTH,
+            game_height: Self::DEFAULT_GAME_HEIGHT,
         }
     }
 }
@@ -3868,11 +4226,24 @@ pub struct EntityGraph<'a> {
     /// Built once per tick by the owner (`fp-engine`) from its projectile
     /// slot-map and installed on the context, exactly as
     /// [`own_helper_ids`](Self::own_helper_ids) is for `NumHelper`. Bare `NumProj`
-    /// reports its length (the total live count). Empty for a player with no live
-    /// projectiles (and for a bare/test context), in which case `NumProj` is `0`.
-    /// (MUGEN's `NumProjID(id)` per-id form is not exposed by the parser today;
-    /// the slice is id-keyed so it can be added without a shape change.)
+    /// reports its length (the total live count); `NumProjID(id)` reports the
+    /// number of entries equal to `id` (T078). Empty for a player with no live
+    /// projectiles (and for a bare/test context), in which case both report `0`.
     own_proj_ids: &'a [i32],
+    /// The owning player's currently-bound *target* ids — the character id of every
+    /// entity this player has hit and still holds as a `Target*` victim, for the
+    /// `NumTarget` / `NumTarget(id)` count trigger (T061).
+    ///
+    /// Built once per tick by the owner (`fp-engine`) and installed exactly as
+    /// [`own_helper_ids`](Self::own_helper_ids) / [`own_proj_ids`](Self::own_proj_ids)
+    /// are. Bare `NumTarget` reports its length (the total bound-target count);
+    /// `NumTarget(id)` counts only entries whose id matches. Empty when the owner
+    /// holds no target (and for a bare/test context); in the flat 1-v-1 model the
+    /// slice carries at most the single opponent the player most recently hit, so
+    /// `NumTarget` is `0` or `1`. When no slice is wired, the self-only fallback in
+    /// [`cross_entity_trigger`](EvalCtx::cross_entity_trigger) reads
+    /// [`Character::has_target`] instead.
+    own_target_ids: &'a [i32],
 }
 
 impl<'a> EntityGraph<'a> {
@@ -3901,6 +4272,7 @@ impl<'a> EntityGraph<'a> {
             players: &[],
             own_helper_ids: &[],
             own_proj_ids: &[],
+            own_target_ids: &[],
         }
     }
 
@@ -3959,6 +4331,51 @@ impl<'a> EntityGraph<'a> {
         self
     }
 
+    /// Installs the owning player's currently-bound target id list — the source for
+    /// the `NumTarget` / `NumTarget(id)` count trigger (T061), returning the updated
+    /// graph.
+    ///
+    /// The owner (`fp-engine`) builds this once per tick, exactly as
+    /// [`with_own_proj_ids`](Self::with_own_proj_ids) does for projectiles. In the
+    /// flat 1-v-1 model the slice carries at most the single opponent the player
+    /// most recently hit (its character id). The slice must outlive the [`EvalCtx`]
+    /// the graph is installed on. A builder method so existing
+    /// [`EntityGraph::new`] call sites keep working unchanged.
+    #[must_use]
+    pub fn with_own_target_ids(mut self, own_target_ids: &'a [i32]) -> Self {
+        self.own_target_ids = own_target_ids;
+        self
+    }
+
+    /// Whether a target-id list was wired on this graph (via
+    /// [`with_own_target_ids`](Self::with_own_target_ids)).
+    ///
+    /// `false` for a bare/test context whose owner installed no list — in which
+    /// case the `NumTarget` trigger falls back to [`Character::has_target`] rather
+    /// than reporting the empty-slice count.
+    #[must_use]
+    pub fn has_own_target_ids(&self) -> bool {
+        !self.own_target_ids.is_empty()
+    }
+
+    /// Counts the owning player's currently-bound targets for the `NumTarget`
+    /// trigger (T061): with `id = None` the **total** number bound; with
+    /// `id = Some(n)` the number whose target id matches `n`. Returns `0` when the
+    /// owner holds none (or wired no list — e.g. a bare/test context); never panics.
+    ///
+    /// Counts the flat [`own_target_ids`](Self::own_target_ids) slice the owner
+    /// installs (via [`with_own_target_ids`](Self::with_own_target_ids)).
+    #[must_use]
+    pub fn num_targets(&self, id: Option<i32>) -> i32 {
+        let count = match id {
+            None => self.own_target_ids.len(),
+            Some(n) => self.own_target_ids.iter().filter(|&&tid| tid == n).count(),
+        };
+        // The flat slice is bounded by the live opponent count, so this never
+        // overflows i32; saturate defensively anyway rather than risk a panic.
+        i32::try_from(count).unwrap_or(i32::MAX)
+    }
+
     /// Counts the owning player's live projectiles for the `NumProj` trigger
     /// (T026): the total number alive. Returns `0` when the owner has none (or
     /// wired no list — e.g. a bare/test context); never panics.
@@ -3971,6 +4388,21 @@ impl<'a> EntityGraph<'a> {
         // The slot-map is bounded (`MAX_PROJECTILES_PER_PLAYER`), so this never
         // overflows i32; saturate defensively anyway rather than risk a panic.
         i32::try_from(self.own_proj_ids.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Counts the owning player's live projectiles carrying `projid` for the
+    /// `NumProjID(id)` trigger (T078): the number of live projectiles whose
+    /// `projid` equals the argument. Returns `0` when the owner has none (or
+    /// wired no list — e.g. a bare/test context); never panics.
+    ///
+    /// Counts matching entries in the flat `own_proj_ids` slice the owner
+    /// installs (via [`with_own_proj_ids`](Self::with_own_proj_ids)), so the
+    /// answer is the owning player's per-id live-projectile count.
+    #[must_use]
+    pub fn num_proj_id(&self, projid: i32) -> i32 {
+        let count = self.own_proj_ids.iter().filter(|&&id| id == projid).count();
+        // Bounded by `own_proj_ids.len()`; saturate defensively rather than panic.
+        i32::try_from(count).unwrap_or(i32::MAX)
     }
 
     /// Counts the owning player's live helpers for the `NumHelper` triggers
@@ -4225,6 +4657,38 @@ impl<'a> EvalCtx<'a> {
             }));
         }
 
+        // `GameWidth` / `GameHeight` (T060) — the stage's logical screen
+        // dimensions in localcoord units (the 320×240-class space the
+        // `ScreenPos` / edge math already lives in). Zero-arg constants threaded
+        // from the stage's `[StageInfo] localcoord` onto the `StageView`; the
+        // no-stage driver paths report the classic `320×240`. Never panics.
+        if name.eq_ignore_ascii_case("GameWidth") {
+            return Some(Value::Float(self.stage.game_width));
+        }
+        if name.eq_ignore_ascii_case("GameHeight") {
+            return Some(Value::Float(self.stage.game_height));
+        }
+
+        // `LeftEdge` / `RightEdge` / `TopEdge` / `BottomEdge` (T060) — the
+        // camera-relative world coords of the visible screen edges, in the same
+        // coordinate convention `FrontEdgeDist`/`BackEdgeDist` measure against.
+        // The visible window is the `GameWidth × GameHeight` logical span
+        // centred on the playfield (the camera is modelled centred), so
+        // `RightEdge - LeftEdge == GameWidth` and (world Y down, floor at Y=0)
+        // `BottomEdge - TopEdge == GameHeight`. Zero-arg; never panics.
+        if name.eq_ignore_ascii_case("LeftEdge") {
+            return Some(Value::Float(self.stage.left_edge()));
+        }
+        if name.eq_ignore_ascii_case("RightEdge") {
+            return Some(Value::Float(self.stage.right_edge()));
+        }
+        if name.eq_ignore_ascii_case("TopEdge") {
+            return Some(Value::Float(self.stage.top_edge()));
+        }
+        if name.eq_ignore_ascii_case("BottomEdge") {
+            return Some(Value::Float(self.stage.bottom_edge()));
+        }
+
         // `SelfAnimExist(n)` — does action number `n` exist in `me`'s loaded
         // `.air` table? Resolved here because the action set lives with the
         // executor's `AirFile`, not on the self-only `Character`. The VM parses
@@ -4254,6 +4718,20 @@ impl<'a> EvalCtx<'a> {
             return Some(Value::Int(self.graph.num_helpers(id)));
         }
 
+        // `NumProjID(id)` — the count of the owning player's live projectiles
+        // carrying a specific `projid` (T078). The VM parses the parenthesized
+        // form as a function-call trigger, so `id` arrives as the first argument;
+        // resolved here against the owner's installed live-projectile id list,
+        // exactly like `NumProj`. With no argument (a bare `NumProjID`) it falls
+        // back to the total count. A player with no matching projectile — or any
+        // context with no list wired — reports `0`. Never panics.
+        if name.eq_ignore_ascii_case("NumProjID") {
+            return Some(Value::Int(match args.first().map(|v| v.to_int()) {
+                Some(id) => self.graph.num_proj_id(id),
+                None => self.graph.num_proj(),
+            }));
+        }
+
         // `NumProj` — the count of the owning player's live projectiles (T026).
         // Resolved here (not on the self-only `Character`) because the projectile
         // slot-map lives with the entity owner (`fp-engine`'s `Player`); the owner
@@ -4262,6 +4740,47 @@ impl<'a> EvalCtx<'a> {
         // or any context with no list wired — reports `0`. Never panics.
         if name.eq_ignore_ascii_case("NumProj") {
             return Some(Value::Int(self.graph.num_proj()));
+        }
+
+        // `NumTarget` / `NumTarget(id)` — the count of the owning player's
+        // currently-bound throw/hit targets (T061). Resolved here (not on the
+        // self-only `Character`) because the bound-target set lives with the entity
+        // owner (`fp-engine`), which installs its target id list on the graph each
+        // tick (see [`EntityGraph::with_own_target_ids`]). Bare `NumTarget` is the
+        // total; `NumTarget(id)` (the VM parses the parenthesized form as a
+        // function-call trigger, so `id` arrives as the first argument) counts only
+        // targets carrying that id. When the owner wired a list, the count comes
+        // from it; otherwise (a self-only / bare / test context with no list) it
+        // falls back to the entity's own [`has_target`](Character::has_target)
+        // flag, so the single 1-v-1 target is still reported as `0` or `1`. A
+        // `NumTarget(id)` with no list wired cannot match a specific id, so it
+        // reports `0`. Never panics.
+        if name.eq_ignore_ascii_case("NumTarget") {
+            let id = args.first().map(|v| v.to_int());
+            if self.graph.has_own_target_ids() {
+                return Some(Value::Int(self.graph.num_targets(id)));
+            }
+            return Some(Value::Int(match id {
+                None => i32::from(self.me.has_target),
+                Some(_) => 0,
+            }));
+        }
+
+        // `PlayerIDExist(n)` — `1` iff a player/helper carrying global id `n` is
+        // currently alive, else `0` (T062). It reuses the same `playerid(n)`
+        // id-space the `playerid` redirect resolves against (T014): the owner
+        // (`fp-engine`'s `Match`) installs the live `(id, entity)` table on the
+        // graph each tick (see [`EntityGraph::with_players`]), so this answers
+        // from the real roster. The VM parses the parenthesized form as a
+        // function-call trigger, so `n` arrives as the first argument; a missing
+        // or non-integer argument resolves to `0` (no id requested → nothing
+        // matches). A context with no id table wired (bare `Character` /
+        // single-character / test seam) reports `0` for every id. Never panics.
+        if name.eq_ignore_ascii_case("PlayerIDExist") {
+            let exists = args
+                .first()
+                .is_some_and(|v| self.graph.player(v.to_int()).is_some());
+            return Some(Value::from(exists));
         }
 
         // Standalone `P2<field>` triggers that read the opponent's OWN self-field.
@@ -4563,6 +5082,33 @@ mod tests {
         ch.set_round_view(RoundView::new(1, 60, false, 1, 0));
         assert_eq!(ev("RoundState = 1 && !MatchOver", &ch), Value::Int(1));
         assert_eq!(ev("RoundNo = 1 && RoundsExisted = 0", &ch), Value::Int(1));
+    }
+
+    #[test]
+    fn ailevel_trigger() {
+        // `AILevel` reads `Character::ai_level` as an i32 and takes no args. A
+        // bare/human character defaults to 0, so an `AILevel`-gated controller
+        // never fires for a human — exactly what keeps a cheap-AI trap (e.g.
+        // evilken's `Var(30)=59` under `AILevel`) from triggering for a player
+        // (T052/T054). The engine owns the value via `set_ai_level`; the
+        // character never assigns it.
+        let mut ch = sample();
+
+        // Default: human → AILevel 0. `AILevel = 0` is true, `AILevel != 0`
+        // false, through both the direct trigger call and the VM eval path
+        // (case-insensitive trigger name).
+        assert_eq!(ch.ai_level, 0);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(0));
+        assert_eq!(ch.trigger("ailevel", &[]), Value::Int(0));
+        assert_eq!(ev("AILevel = 0", &ch), Value::Int(1));
+        assert_eq!(ev("AILevel != 0", &ch), Value::Int(0));
+
+        // CPU at difficulty 5 → AILevel returns 5.
+        ch.set_ai_level(5);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(5));
+        assert_eq!(ch.trigger("AILEVEL", &[]), Value::Int(5));
+        assert_eq!(ev("AILevel = 5", &ch), Value::Int(1));
+        assert_eq!(ev("AILevel != 0", &ch), Value::Int(1));
     }
 
     #[test]
@@ -7551,6 +8097,81 @@ mod tests {
         assert_eq!(empty.num_helpers(Some(3)), 0);
     }
 
+    /// T062 (AC: `TeamSide` defaults to 1 on a single-character context). A bare
+    /// `Character` reports the P1/left team, both through the direct `trigger`
+    /// accessor and through the VM eval path — never a panic, never 0.
+    #[test]
+    fn team_triggers_team_side_defaults_to_one() {
+        let me = Character::new();
+        assert_eq!(me.team_side(), 1, "default roster side is the P1/left team");
+        assert_eq!(me.trigger("TeamSide", &[]), Value::Int(1));
+        // Same answer through the real VM eval path (case-insensitive).
+        assert_eq!(ev("TeamSide", &me), Value::Int(1));
+        assert_eq!(ev("teamside = 1", &me), Value::Int(1));
+    }
+
+    /// T062 (AC: `TeamSide` returns 1 (left/P1) or 2 (right/P2)). The side is
+    /// stamped by `set_team_side` (as `fp-engine` does at side assignment) and is
+    /// independent of `Facing` — turning the fighter around does not change teams.
+    #[test]
+    fn team_triggers_team_side_reflects_assigned_side() {
+        let mut p2 = Character::new();
+        p2.set_team_side(2);
+        // Even facing left (toward a P1 on the right), the team is still P2/right.
+        p2.facing = Facing::Left;
+        assert_eq!(p2.team_side(), 2);
+        assert_eq!(ev("TeamSide", &p2), Value::Int(2));
+        // Flipping facing does not change the team.
+        p2.facing = Facing::Right;
+        assert_eq!(ev("TeamSide = 2", &p2), Value::Int(1));
+
+        // An out-of-range side is clamped to the nearest valid team (never bogus).
+        let mut clamped = Character::new();
+        clamped.set_team_side(5);
+        assert_eq!(clamped.team_side(), 2, "side > 2 clamps to the right team");
+        clamped.set_team_side(-3);
+        assert_eq!(clamped.team_side(), 1, "side < 1 clamps to the left team");
+    }
+
+    /// T062 (AC: safe default for a single-character context). With no playerid
+    /// id-table wired (a bare `Character` / single-character match), every
+    /// `PlayerIDExist(n)` reports `0` — the documented absence default.
+    #[test]
+    fn team_triggers_playerid_exist_defaults_to_zero() {
+        let me = Character::new();
+        // No id table → nothing exists, for any id, including a missing argument.
+        assert_eq!(ev("PlayerIDExist(1)", &me), Value::Int(0));
+        assert_eq!(ev("PlayerIDExist(42)", &me), Value::Int(0));
+        // Through the graph-less EvalCtx wrapper too.
+        let graph = EntityGraph::default();
+        assert_eq!(ev_graph("PlayerIDExist(1)", &me, graph), Value::Int(0));
+    }
+
+    /// T062 (AC: `PlayerIDExist(n)` returns 1 iff a player/helper with that id
+    /// currently exists). With the live `(id, entity)` table installed (the same
+    /// `playerid(n)` id-space `fp-engine` wires each tick), the trigger answers
+    /// from the real roster: 1 for a present id, 0 for an absent one — end-to-end
+    /// through the VM eval path the executor uses.
+    #[test]
+    fn team_triggers_playerid_exist_reflects_live_roster() {
+        let me = Character::new();
+        // Two live entities addressable by global id (a player and a helper).
+        let p2 = Character::new();
+        let helper = Character::new();
+        let players: [(i32, &Character); 2] = [(2, &p2), (1001, &helper)];
+        let graph = EntityGraph::default().with_players(&players);
+
+        // Present ids → 1; absent id → 0.
+        assert_eq!(ev_graph("PlayerIDExist(2)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("PlayerIDExist(1001)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("PlayerIDExist(3)", &me, graph), Value::Int(0));
+
+        // It shares the playerid redirect's id-space: a redirect to a present id
+        // resolves, and PlayerIDExist agrees on which ids are live.
+        assert!(graph.player(2).is_some());
+        assert!(graph.player(3).is_none());
+    }
+
     /// NUMHELPER (AC: `fp-character` unit test): with the owning player's
     /// live-helper id list installed, [`EntityGraph::num_helpers`] returns the
     /// total (`None`) or the per-id count (`Some(id)`), and the `NumHelper` /
@@ -7713,6 +8334,135 @@ mod tests {
     }
 
     // =====================================================================
+    // T078 — id-less (aggregate) Proj* triggers + ProjCancelTime + NumProjID.
+    // =====================================================================
+
+    /// T078 (AC1): bare no-id `ProjHit` / `ProjContact` / `ProjGuarded` aggregate
+    /// across all owner projectile ids — true iff **any** id matches this tick,
+    /// and the `*Time` aggregate is the **most-recent** matching event (the
+    /// minimum non-`NEVER` time). The per-id `Proj*<id>` triggers stay unchanged.
+    #[test]
+    fn bare_proj_triggers_aggregate_across_all_ids() {
+        let mut me = Character::new();
+
+        // No events yet: the bare boolean is false; the bare `*Time` reads NEVER.
+        assert_eq!(ev("ProjHit", &me), Value::Int(0));
+        assert_eq!(ev("ProjContact", &me), Value::Int(0));
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjHitTime", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Id 2000 lands a clean HIT now; id 2001 has had nothing.
+        me.record_proj_event(2000, false);
+        // Bare `ProjHit` is true (id 2000 hit this tick); `ProjGuarded` is not.
+        assert_eq!(ev("ProjHit", &me), Value::Int(1));
+        assert_eq!(ev("ProjContact", &me), Value::Int(1));
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(0));
+        assert_eq!(ev("ProjHitTime", &me), Value::Int(0));
+        // Per-id triggers are unchanged: 2000 hit, 2001 never did.
+        assert_eq!(ev("ProjHit2000", &me), Value::Int(1));
+        assert_eq!(
+            ev("ProjHitTime2001", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Age two ticks, then id 2001 GUARDS a hit. Now two ids have events at
+        // different ages: 2000's hit is 2 ticks old, 2001's guard is fresh.
+        me.tick_proj_events();
+        me.tick_proj_events();
+        me.record_proj_event(2001, true);
+
+        // Aggregate `ProjHitTime` = most recent HIT = id 2000's, now 2 ticks old
+        // (2001 guarded, so it has no hit time to contribute).
+        assert_eq!(ev("ProjHitTime", &me), Value::Int(2));
+        // Aggregate `ProjGuardedTime` = id 2001's fresh guard = 0.
+        assert_eq!(ev("ProjGuardedTime", &me), Value::Int(0));
+        // Aggregate `ProjContactTime` = MOST recent contact across both ids = 0
+        // (2001 just contacted), not 2000's older contact.
+        assert_eq!(ev("ProjContactTime", &me), Value::Int(0));
+        // Bare boolean `ProjGuarded` true (something guarded this tick); bare
+        // `ProjHit` false (no hit landed *this* tick — 2000's was 2 ticks ago).
+        assert_eq!(ev("ProjGuarded", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit", &me), Value::Int(0));
+        // Bare `ProjContact` true (id 2001 contacted this tick).
+        assert_eq!(ev("ProjContact", &me), Value::Int(1));
+
+        // The comma-tail window form also folds for the no-id aggregate: a hit
+        // happened (value 1) and the most-recent hit is within 4 ticks.
+        assert_eq!(ev("ProjHit = 1, <= 4", &me), Value::Int(1));
+        assert_eq!(ev("ProjHit = 1, < 2", &me), Value::Int(0));
+    }
+
+    /// T078 (AC2): `ProjCancel` / `ProjCancelTime` track projectile cancellation,
+    /// per-id and in the no-id aggregate, independent of contact/hit/guard.
+    #[test]
+    fn bare_proj_triggers_cancel_time() {
+        let mut me = Character::new();
+
+        // Never cancelled: bare and per-id forms read "no event".
+        assert_eq!(ev("ProjCancel", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjCancelTime", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+        assert_eq!(
+            ev("ProjCancelTime3000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+
+        // Id 3000 is cancelled this tick. Cancel fires; contact/hit/guard do not.
+        me.record_proj_cancel(3000);
+        assert_eq!(ev("ProjCancel3000", &me), Value::Int(1));
+        assert_eq!(ev("ProjCancelTime3000", &me), Value::Int(0));
+        assert_eq!(ev("ProjContact3000", &me), Value::Int(0));
+        assert_eq!(
+            ev("ProjContactTime3000", &me),
+            Value::Int(ProjContactTracker::NEVER)
+        );
+        // The no-id aggregate sees the cancel too.
+        assert_eq!(ev("ProjCancel", &me), Value::Int(1));
+        assert_eq!(ev("ProjCancelTime", &me), Value::Int(0));
+
+        // Cancel time counts up with the other counters.
+        me.tick_proj_events();
+        me.tick_proj_events();
+        me.tick_proj_events();
+        assert_eq!(ev("ProjCancelTime3000", &me), Value::Int(3));
+        assert_eq!(ev("ProjCancelTime", &me), Value::Int(3));
+        assert_eq!(ev("ProjCancel3000", &me), Value::Int(0)); // no longer "this tick"
+    }
+
+    /// T078 (AC2): `NumProjID(id)` counts the owner's live projectiles carrying
+    /// that projid; bare `NumProj` (the total) is unchanged.
+    #[test]
+    fn bare_proj_triggers_numprojid_counts_per_id() {
+        let me = Character::new();
+
+        // No projectiles wired: every form reads 0.
+        assert_eq!(
+            ev_graph("NumProjID(2000)", &me, EntityGraph::default()),
+            Value::Int(0)
+        );
+
+        // Owner has 2×2000 and 1×2001 live.
+        let own_proj_ids: [i32; 3] = [2000, 2000, 2001];
+        let graph = EntityGraph::default().with_own_proj_ids(&own_proj_ids);
+        assert_eq!(graph.num_proj_id(2000), 2, "direct accessor: two 2000s");
+        assert_eq!(graph.num_proj_id(2001), 1, "direct accessor: one 2001");
+        assert_eq!(graph.num_proj_id(9999), 0, "direct accessor: none of 9999");
+
+        assert_eq!(ev_graph("NumProjID(2000)", &me, graph), Value::Int(2));
+        assert_eq!(ev_graph("NumProjID(2001)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("NumProjID(9999)", &me, graph), Value::Int(0));
+        // The total `NumProj` is unaffected.
+        assert_eq!(ev_graph("NumProj", &me, graph), Value::Int(3));
+        // The spawn-once latch: `NumProjID(2000) = 0` is false while 2000s live.
+        assert_eq!(ev_graph("NumProjID(2000) = 0", &me, graph), Value::Int(0));
+    }
+
+    // =====================================================================
     // T014 — target / partner / playerid(n) redirects resolve through EvalCtx
     // against an installed EntityGraph, exercised end-to-end through the same VM
     // eval path the executor uses.
@@ -7865,6 +8615,70 @@ mod tests {
             ev_cross("ScreenPos Y", &me, None, stage),
             Value::Float(me.pos.y)
         );
+    }
+
+    /// T060: `GameWidth`/`GameHeight` report the stage's localcoord dimensions
+    /// and `LeftEdge`/`RightEdge`/`TopEdge`/`BottomEdge` report the
+    /// camera-relative world coords of the visible screen edges, with the
+    /// invariant `RightEdge - LeftEdge == GameWidth` (and
+    /// `BottomEdge - TopEdge == GameHeight`).
+    #[test]
+    fn edge_and_game_dim_triggers() {
+        let me = Character::new();
+
+        // A stage whose body-clamp bounds [-300, 300] are WIDER than its logical
+        // screen (GameWidth = 320, GameHeight = 240), centred on the origin:
+        // visible edges = origin ± GameWidth/2 = ±160, independent of the wider
+        // playfield bounds. Position/facing must not affect these (screen edges,
+        // not body distances).
+        let stage = StageView::with_dims(-300.0, 300.0, 320.0, 240.0);
+
+        // Game dimensions are the localcoord constants verbatim.
+        assert_eq!(ev_cross("GameWidth", &me, None, stage), Value::Float(320.0));
+        assert_eq!(
+            ev_cross("GameHeight", &me, None, stage),
+            Value::Float(240.0)
+        );
+
+        // Visible screen edges: centred on (left+right)/2 = 0, spanning GameWidth.
+        assert_eq!(ev_cross("LeftEdge", &me, None, stage), Value::Float(-160.0));
+        assert_eq!(ev_cross("RightEdge", &me, None, stage), Value::Float(160.0));
+        // World Y is down with the floor at Y=0, so the top edge is GameHeight
+        // above the floor and the bottom edge is the floor.
+        assert_eq!(ev_cross("TopEdge", &me, None, stage), Value::Float(-240.0));
+        assert_eq!(ev_cross("BottomEdge", &me, None, stage), Value::Float(0.0));
+
+        // The pinned invariants the AC names.
+        let left = ev_cross("LeftEdge", &me, None, stage).to_float();
+        let right = ev_cross("RightEdge", &me, None, stage).to_float();
+        let gw = ev_cross("GameWidth", &me, None, stage).to_float();
+        assert_eq!(right - left, gw, "RightEdge - LeftEdge == GameWidth");
+        let top = ev_cross("TopEdge", &me, None, stage).to_float();
+        let bottom = ev_cross("BottomEdge", &me, None, stage).to_float();
+        let gh = ev_cross("GameHeight", &me, None, stage).to_float();
+        assert_eq!(bottom - top, gh, "BottomEdge - TopEdge == GameHeight");
+
+        // An off-centre camera window: bounds centred at x=100 shift both X edges
+        // by +100 but keep the GameWidth span (consistent, single coord space).
+        let off = StageView::with_dims(0.0, 200.0, 320.0, 240.0);
+        assert_eq!(
+            ev_cross("LeftEdge", &me, None, off),
+            Value::Float(100.0 - 160.0)
+        );
+        assert_eq!(
+            ev_cross("RightEdge", &me, None, off),
+            Value::Float(100.0 + 160.0)
+        );
+        assert_eq!(
+            ev_cross("RightEdge", &me, None, off).to_float()
+                - ev_cross("LeftEdge", &me, None, off).to_float(),
+            320.0
+        );
+
+        // The classic `StageView::new` / default carry the 320×240 localcoord.
+        let dflt = StageView::default();
+        assert_eq!(ev_cross("GameWidth", &me, None, dflt), Value::Float(320.0));
+        assert_eq!(ev_cross("GameHeight", &me, None, dflt), Value::Float(240.0));
     }
 
     #[test]
@@ -8652,5 +9466,89 @@ mod tests {
                 case.name, case.expect_pos_y
             );
         }
+    }
+
+    // =====================================================================
+    // T061 — Target/hit introspection triggers: `NumTarget` / `NumTarget(id)`,
+    // `HitVel X` / `HitVel Y`, and `HitOverridden`. Each reads existing entity
+    // state (the bound-target list, GetHitVars, the override flag) and resolves
+    // through the same VM eval path the executor uses.
+    // =====================================================================
+
+    /// AC: `NumTarget` (and `NumTarget(id)`) reports the count of currently bound
+    /// targets. With a target id list wired on the graph (as `fp-engine` does each
+    /// tick), a binder with one bound target reads `1`; `NumTarget(id)` matches by
+    /// id; an unbound binder reads `0`.
+    #[test]
+    fn target_and_hit_triggers_num_target_from_graph() {
+        let me = Character::new();
+
+        // One bound target with id 2 (the 1-v-1 opponent's player id).
+        let target_ids = [2_i32];
+        let graph = EntityGraph::default().with_own_target_ids(&target_ids);
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(1));
+        // `NumTarget(id)` filters by id: 2 matches, 7 does not.
+        assert_eq!(ev_graph("NumTarget(2)", &me, graph), Value::Int(1));
+        assert_eq!(ev_graph("NumTarget(7)", &me, graph), Value::Int(0));
+
+        // No target bound (empty list wired is the same as no list): 0.
+        let none = EntityGraph::default();
+        assert_eq!(ev_graph("NumTarget", &me, none), Value::Int(0));
+    }
+
+    /// AC: with no target id list wired (a bare/self-only context, e.g. before the
+    /// engine installs one), `NumTarget` falls back to the entity's own
+    /// `has_target` flag, so a binder that has connected reads `1` and one that has
+    /// not reads `0`. A specific-id query with no list cannot match → `0`.
+    #[test]
+    fn target_and_hit_triggers_num_target_self_only_fallback() {
+        let mut me = Character::new();
+        let graph = EntityGraph::default();
+
+        // No target yet → 0.
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(0));
+
+        // Connected a hit → has_target set → 1 (bare form).
+        me.has_target = true;
+        assert_eq!(ev_graph("NumTarget", &me, graph), Value::Int(1));
+        // Without a wired id list, the id form has nothing to match → 0.
+        assert_eq!(ev_graph("NumTarget(2)", &me, graph), Value::Int(0));
+    }
+
+    /// AC: `HitVel X` / `HitVel Y` return the velocity the most recent hit taken
+    /// imparted, read from this character's GetHitVars (`xvel`/`yvel`). A
+    /// freshly-built character (no hit) reads `0` on both axes.
+    #[test]
+    fn target_and_hit_triggers_hit_vel_by_axis() {
+        let mut ch = Character::new();
+        // No hit taken yet — both axes default to 0.
+        assert_eq!(ev("HitVel X", &ch), Value::Float(0.0));
+        assert_eq!(ev("HitVel Y", &ch), Value::Float(0.0));
+
+        // Populate GetHitVars as hit resolution would.
+        ch.get_hit_vars.xvel = -4.5;
+        ch.get_hit_vars.yvel = -7.0;
+        assert_eq!(ev("HitVel X", &ch), Value::Float(-4.5));
+        assert_eq!(ev("HitVel Y", &ch), Value::Float(-7.0));
+        // A bare `HitVel` (no/garbage axis) falls back to the X component.
+        assert_eq!(ev("HitVel", &ch), Value::Float(-4.5));
+        // Threads through comparison operators like the other vel triggers.
+        assert_eq!(ev("HitVel Y < 0", &ch), Value::Int(1));
+    }
+
+    /// AC: `HitOverridden` returns 1 iff the current get-hit is redirected by an
+    /// active HitOverride slot — modeled by the `hit_overridden` flag. Default is
+    /// 0; set it and the trigger reads 1.
+    #[test]
+    fn target_and_hit_triggers_hit_overridden_flag() {
+        let mut ch = Character::new();
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(0));
+
+        ch.hit_overridden = true;
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(1));
+
+        // Cleared again → 0.
+        ch.hit_overridden = false;
+        assert_eq!(ev("HitOverridden", &ch), Value::Int(0));
     }
 }

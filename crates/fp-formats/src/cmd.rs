@@ -33,7 +33,7 @@ use fp_core::FpResult;
 ///
 /// These values apply to any [`CmdCommand`] that does not explicitly specify
 /// its own `time` or `buffer.time`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CmdDefaults {
     /// Default time window for command input (in ticks). Default: 15.
     pub command_time: u32,
@@ -54,7 +54,7 @@ impl Default for CmdDefaults {
 ///
 /// Each command maps a name (used in state controller triggers) to a raw
 /// input sequence string with associated timing parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CmdCommand {
     /// The command name (e.g., "QCF_x").
     pub name: String,
@@ -71,7 +71,7 @@ pub struct CmdCommand {
 /// Contains the default timing values and all command definitions. Statedef
 /// and State sections are intentionally skipped — those are handled by the
 /// CNS parser.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CmdFile {
     /// Default timing values.
     pub defaults: CmdDefaults,

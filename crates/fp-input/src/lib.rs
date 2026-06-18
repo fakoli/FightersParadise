@@ -10,16 +10,20 @@ pub mod ai;
 pub mod buffer;
 pub mod command;
 pub mod controller;
+pub mod display;
 pub mod state;
 pub mod synth;
 
-pub use ai::{AiDifficulty, AiObservation, AiTuning, CpuAi};
+pub use ai::{AiDifficulty, AiObservation, AiTuning, BehaviorMode, CpuAi};
 pub use buffer::{InputBuffer, InputBufferSnapshot};
 pub use command::{
     compile_command, CommandDef, CommandElement, CommandMatcher, CommandMatcherSnapshot,
-    InputModifier,
+    InputModifier, LeniencyConfig,
 };
 pub use controller::{map_controller, ControllerInput, RawController, DEADZONE_DEFAULT};
+pub use display::{
+    button_glyphs, input_display_rows, numpad_digit, InputDisplayRow, DEFAULT_DISPLAY_ROWS,
+};
 pub use state::{
     dir_matches, dir_matches_detect, logical_direction, Button, DirToken, Direction, InputState,
     LogicalDirection, BUTTON_COUNT,

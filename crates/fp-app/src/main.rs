@@ -60,10 +60,12 @@
 //! pattern. Missing or unloadable assets degrade gracefully to the test pattern
 //! with a clear log message; the app never panics.
 
+mod import;
 mod screens;
+mod training;
 mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -71,14 +73,14 @@ use fp_audio::{AudioSystem, Sound};
 use fp_character::{Character, LoadedCharacter, SoundRequest};
 use fp_core::{SpriteId, Vec2};
 use fp_engine::{
-    derive_player_seed, EffectSide, Match, MatchInput, Player, RoundState, StageBounds, TeamMatch,
-    TeamMode, Winner, DEFAULT_MATCH_SEED,
+    derive_player_seed, dummy_input, DummyMode, EffectSide, GameMode, Match, MatchInput, Player,
+    PlayerDriver, RoundState, Side, StageBounds, TeamMatch, TeamMode, Winner, DEFAULT_MATCH_SEED,
 };
 use fp_formats::air::{AirFile, AnimAction};
 use fp_formats::sff::SffFile;
 use fp_input::{
-    map_controller, AiDifficulty, Button as PadButton, ControllerInput, CpuAi, RawController,
-    DEADZONE_DEFAULT,
+    map_controller, AiDifficulty, BehaviorMode, Button as PadButton, ControllerInput, CpuAi,
+    RawController, DEADZONE_DEFAULT,
 };
 use fp_render::{
     BlendMode, GlyphFont, PaletteTexture, Renderer, SpriteDrawParams, SpriteTexture, TextDrawParams,
@@ -104,6 +106,34 @@ const WINDOW_WIDTH: u32 = 640;
 const WINDOW_HEIGHT: u32 = 480;
 /// Fixed timestep duration: 1/60th of a second (~16.667ms).
 const TICK_DURATION: Duration = Duration::from_nanos(16_666_667);
+
+/// Maximum number of fixed-timestep sub-ticks the catch-up loop will run for a
+/// single rendered frame (spiral-of-death guard, T051).
+///
+/// The accumulator pattern drains elapsed wall-time in fixed [`TICK_DURATION`]
+/// steps. If a single tick ever costs *more* than the frame budget (e.g. a
+/// community character that legitimately spawns dozens of helpers, so every tick
+/// is expensive), the accumulator grows faster than the loop can drain it: the
+/// loop never exits, the window stops pumping SDL events, and the app **hard
+/// freezes** at 100% CPU. Capping the sub-ticks per frame breaks that spiral —
+/// the simulation degrades to slow-motion under sustained overload (correct,
+/// recoverable behaviour) instead of locking up. Any unspent accumulator beyond
+/// the cap is dropped (clamped below), so the clock cannot keep snowballing.
+///
+/// `5` lets a frame catch up several missed ticks (so a brief hitch still keeps
+/// real-time pace) while bounding the worst case to a handful of ticks.
+const MAX_CATCHUP_TICKS: u32 = 5;
+
+/// How long (in 60Hz ticks) the direct-CLI match holds on the decided-winner
+/// screen before auto-rematching.
+///
+/// A direct-CLI match (`fp-app <p1.def> <p2.def>`) has no menu to return to, so
+/// once the engine reports a `match_winner` it would otherwise render the final
+/// "P_ WINS" frame forever (a static screen the player reads as a freeze).
+/// Instead the app keeps drawing that winner frame for this many ticks — long
+/// enough to read the result — then rebuilds a fresh identical match and play
+/// continues. `180` ticks ≈ 3s at 60Hz.
+const MATCH_OVER_HOLD_FRAMES: u32 = 180;
 
 /// Default character `.def` loaded when no CLI argument is given.
 const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
@@ -179,6 +209,25 @@ fn main() {
         std::process::exit(run_validate(&args));
     }
 
+    // The `import` subcommand writes a repaired CNS/CMD overlay; it is also a
+    // headless CLI path and must not open a window.
+    if args
+        .get(1)
+        .is_some_and(|a| a.eq_ignore_ascii_case("import"))
+    {
+        std::process::exit(run_import(&args));
+    }
+
+    // The `tutorial` subcommand lists the Trials lesson flow (and, with `--demo`,
+    // drives the runner to completion with synthesized success signals). It is a
+    // headless CLI path — no window — so it is intercepted here, before `run()`.
+    if args
+        .get(1)
+        .is_some_and(|a| a.eq_ignore_ascii_case("tutorial"))
+    {
+        std::process::exit(run_tutorial(&args));
+    }
+
     if let Err(e) = run() {
         tracing::error!("Fatal error: {e}");
         std::process::exit(1);
@@ -220,6 +269,535 @@ fn run_validate(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Default directory the Trials lesson scripts ship in (relative to a game root).
+const TUTORIAL_DIR: &str = "assets/data/tutorial";
+
+/// Runs the `tutorial [dir] [--demo]` subcommand: a headless view of the Trials
+/// flow.
+///
+/// Without `--demo` it loads the ordered lesson list (from `[dir]/tutorial.def`,
+/// or the optional path, falling back to the built-in clean-room set when the
+/// scripts are absent) and prints each lesson's goal + dummy/overlay config — so
+/// the flow is inspectable without a window.
+///
+/// With `--demo` it additionally drives a [`training::tutorial::TutorialRunner`]
+/// through the whole trial, feeding the synthesized success signal for each
+/// lesson, and prints the advance trace — proving the runner advances through the
+/// list and detects each success exactly once, with the always-works Skip never
+/// soft-locking. Always exits 0 (a tutorial flow has no failure mode — bad/missing
+/// assets degrade to the built-in set).
+fn run_tutorial(args: &[String]) -> i32 {
+    use training::tutorial::{load_lessons, TickOutcome, TutorialRunner};
+
+    let demo = args.iter().any(|a| a.eq_ignore_ascii_case("--demo"));
+    // First non-flag positional after `tutorial` is an optional lesson dir.
+    let dir = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(TUTORIAL_DIR));
+
+    let lessons = load_lessons(&dir);
+    println!("Trials — {} lesson(s):", lessons.len());
+    for (i, lesson) in lessons.iter().enumerate() {
+        println!(
+            "  {}. {} [dummy={:?}] — {}",
+            i + 1,
+            lesson.title,
+            lesson.dummy,
+            lesson.instruction
+        );
+    }
+
+    if !demo {
+        return 0;
+    }
+
+    println!("\n--demo: driving the runner with synthesized success signals:");
+    let mut runner = TutorialRunner::new(lessons);
+    if runner.is_empty() {
+        println!("  (no lessons — trial is already complete)");
+    }
+    let total = runner.len();
+    while let Some(lesson) = runner.current() {
+        let step = runner.index() + 1;
+        let title = format!("[{step}/{total}] {}", lesson.title);
+        let Some(event) = synth_success_event(&lesson.success) else {
+            // No synthesizable signal (only `Unsatisfiable`, which the runner
+            // auto-skips) — use the always-works Skip so we never hang.
+            let outcome = runner.skip();
+            println!("  skipped: {title} -> {outcome:?}");
+            continue;
+        };
+        // Some conditions need repeated signals (e.g. BlockNHits feeds one guarded
+        // hit at a time). Feed until the lesson advances, capped so a lesson that
+        // never advances cannot spin (it can't — every non-`Unsatisfiable` cond is
+        // satisfiable by `synth_success_event`).
+        let mut outcome = TickOutcome::InProgress;
+        for _ in 0..64 {
+            outcome = runner.observe(std::slice::from_ref(&event));
+            if outcome != TickOutcome::InProgress {
+                break;
+            }
+        }
+        println!("  completed: {title} -> {outcome:?}");
+    }
+    println!("Trial complete: {}", runner.is_complete());
+    0
+}
+
+/// Maps a [`training::tutorial::SuccessCond`] to the [`training::tutorial::LessonEvent`]
+/// that satisfies it — used by `tutorial --demo` to drive the runner headlessly,
+/// and shared with the runner's own tests. Returns `None` for an unsatisfiable
+/// condition (the runner auto-skips those).
+fn synth_success_event(
+    cond: &training::tutorial::SuccessCond,
+) -> Option<training::tutorial::LessonEvent> {
+    use training::tutorial::{LessonEvent, SuccessCond};
+    match cond {
+        SuccessCond::LandCommand(name) => Some(LessonEvent::CommandRecognized(name.clone())),
+        SuccessCond::BlockNHits(_) => Some(LessonEvent::HitConnected {
+            defender_airborne: false,
+            guarded: true,
+        }),
+        SuccessCond::ComboCount(n) => Some(LessonEvent::ComboCount(*n)),
+        SuccessCond::AntiAir => Some(LessonEvent::HitConnected {
+            defender_airborne: true,
+            guarded: false,
+        }),
+        SuccessCond::ThrowConnected => Some(LessonEvent::ThrowConnected),
+        SuccessCond::Unsatisfiable => None,
+    }
+}
+
+/// Parsed flags / positionals for the `import` subcommand.
+struct ImportArgs {
+    /// The source `.cns`/`.cmd`/`.air` file to import.
+    src: String,
+    /// Where to write the repaired overlay, if requested (positional). `None` in
+    /// report-only mode (`--report`/`--report-json` with no overlay-out).
+    overlay_out: Option<String>,
+    /// `--out <dir>`: write a whole-character, **loadable** overlay directory
+    /// (the `.def` + repaired text files + report) under `<dir>`. Used with a
+    /// `.def` source (T088); ignored for a single text-file source.
+    out_dir: Option<String>,
+    /// `--prune`: remove dead AIR frames (vs. only flagging them).
+    prune: bool,
+    /// `--report`: print the tiered human report to stdout.
+    report: bool,
+    /// `--report-json <path>`: write the stable, sorted JSON report.
+    report_json: Option<String>,
+    /// `--strict`: exit non-zero iff the report has Flagged entries.
+    strict: bool,
+}
+
+/// Parses the `import` argv (everything after `fp-app import`) into [`ImportArgs`].
+///
+/// Positionals are `<src>` then an optional `<overlay-out>`; the rest are flags.
+/// Returns `None` on a usage error (no source, or `--report-json` missing its
+/// path) so the caller can print usage and exit `2`.
+fn parse_import_args(args: &[String]) -> Option<ImportArgs> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut prune = false;
+    let mut report = false;
+    let mut strict = false;
+    let mut report_json: Option<String> = None;
+
+    let mut out_dir: Option<String> = None;
+
+    let mut i = 2; // skip "fp-app" and "import"
+    while i < args.len() {
+        let a = &args[i];
+        if a.eq_ignore_ascii_case("--prune") {
+            prune = true;
+        } else if a.eq_ignore_ascii_case("--report") {
+            report = true;
+        } else if a.eq_ignore_ascii_case("--strict") {
+            strict = true;
+        } else if a.eq_ignore_ascii_case("--report-json") {
+            // Path is the next token.
+            i += 1;
+            report_json = Some(args.get(i)?.clone());
+        } else if a.eq_ignore_ascii_case("--out") {
+            // Whole-character overlay directory. Path is the next token.
+            i += 1;
+            out_dir = Some(args.get(i)?.clone());
+        } else if a.starts_with("--") {
+            // Unknown flag: a usage error.
+            return None;
+        } else {
+            positionals.push(a);
+        }
+        i += 1;
+    }
+
+    let src = (*positionals.first()?).to_string();
+    let overlay_out = positionals.get(1).map(|s| (*s).to_string());
+    Some(ImportArgs {
+        src,
+        overlay_out,
+        out_dir,
+        prune,
+        report,
+        report_json,
+        strict,
+    })
+}
+
+/// Runs the `import <file.cns|.cmd|.air> [<overlay-out>] [--prune] [--report]
+/// [--report-json <path>] [--strict]` subcommand: reads a CNS/CMD/AIR file,
+/// produces a repaired-text overlay (see [`import`]), optionally writes it,
+/// builds a tiered repair report, and renders it (human + stable JSON).
+///
+/// `.cns`/`.cmd` files take the CNS line-repair path. `.air` files take the AIR
+/// overlay path: junk frame columns (`2..A` → `2`) are always salvaged, and with
+/// `--prune` dead frames (whose sprite is absent from the sibling `.sff`) are
+/// removed — but never an action's last frame.
+///
+/// - `--report` prints the human, tier-grouped report to stdout.
+/// - `--report-json <path>` writes the stable, sorted JSON report (refusing an
+///   `assets/` destination).
+/// - `--strict` makes the process exit non-zero iff the report carries any
+///   **Flagged** entry (default exits 0 even with flags); it is for CI/evidence.
+///
+/// Every clean-room write path refuses an `assets/` destination. Returns the
+/// process exit code: `2` for a usage error, `1` on read/write failure, `0` on
+/// success — except under `--strict` with flags, which returns `1`.
+fn run_import(args: &[String]) -> i32 {
+    let Some(parsed) = parse_import_args(args) else {
+        eprintln!(
+            "usage: fp-app import <file.cns|.cmd|.air|char.def> [<overlay-out>] \
+             [--out <dir>] [--prune] [--report] [--report-json <path>] [--strict]"
+        );
+        return 2;
+    };
+
+    // The clean-room license/usage reminder prints on EVERY import run (to stderr,
+    // so it never pollutes a `--report`/`--report-json` consumer reading stdout),
+    // regardless of which branch handles the source.
+    eprintln!("{}", validate::LICENSE_REMINDER);
+
+    let src = Path::new(&parsed.src);
+
+    // A `.def` is a whole **character** import: load it through the live loader,
+    // then walk the compiled graph + assets for repairs (T082). It never produces
+    // a text overlay (there is no single file to rewrite), so `<overlay-out>` is
+    // ignored for a `.def`.
+    if src
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("def"))
+    {
+        return run_import_char(src, &parsed);
+    }
+
+    let text = match fp_formats::text::read_text_file(src) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("import: cannot read {}: {e}", src.display());
+            eprintln!("import: failed to read {}: {e}", src.display());
+            return 1;
+        }
+    };
+
+    let mut report = import::ImportReport::new();
+
+    // `.air` files take the AIR overlay path (column salvage + dead-frame prune).
+    let write_result = if src
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("air"))
+    {
+        run_import_air(src, &text, &parsed, &mut report)
+    } else {
+        run_import_cns(src, &text, &parsed, &mut report)
+    };
+    if write_result != 0 {
+        return write_result;
+    }
+
+    // Emit the report face(s).
+    if parsed.report {
+        print!("{}", report.render());
+    }
+    if let Some(json_path) = &parsed.report_json {
+        if let Err(e) = report.write_json(Path::new(json_path)) {
+            tracing::error!("import: cannot write report JSON {json_path}: {e}");
+            eprintln!("import: failed to write report JSON {json_path}: {e}");
+            return 1;
+        }
+        tracing::info!("import: wrote report JSON {json_path}");
+    }
+
+    // `--strict` is the only flag-tied exit-code behavior.
+    if parsed.strict && report.has_flags() {
+        eprintln!("import: --strict failed — the report contains flagged entries");
+        return 1;
+    }
+    0
+}
+
+/// Resolves the character's text state files (`cmd`, `cns`, `st`/`st0`..`st9`,
+/// `stcommon`) from its `.def`'s `[Files]` section, each as a
+/// `(display-relpath, absolute-path)` pair, for the import text-overlay pass.
+///
+/// `stcommon` is included so an authored common-state library is overlaid too;
+/// the engine's built-in clean-room fallback (a `stcommon` that resolves to a
+/// missing file) simply does not exist on disk and is skipped by the caller. A
+/// `.def` that fails to parse yields an empty list (the graph-walk pass still
+/// runs). De-duplicates case-insensitively so a file named under two keys is
+/// overlaid once.
+fn character_text_files(def_path: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(def) = fp_formats::def::DefFile::load(def_path) else {
+        return Vec::new();
+    };
+    let mut rels: Vec<String> = Vec::new();
+    let mut push = |v: Option<&str>| {
+        if let Some(s) = v {
+            let s = s.trim();
+            if !s.is_empty() && !rels.iter().any(|r| r.eq_ignore_ascii_case(s)) {
+                rels.push(s.to_string());
+            }
+        }
+    };
+    push(def.get("Files", "cmd"));
+    push(def.get("Files", "cns"));
+    push(def.get("Files", "st"));
+    for i in 0..=9 {
+        push(def.get("Files", &format!("st{i}")));
+    }
+    push(def.get("Files", "stcommon"));
+    rels.into_iter()
+        .map(|rel| {
+            let resolved = fp_formats::def::DefFile::resolve_path(def_path, &rel);
+            (rel, resolved)
+        })
+        .collect()
+}
+
+/// The character (`.def`) branch of [`run_import`] — the import core (T082).
+///
+/// Loads the character through the live [`fp_character::LoadedCharacter::load`]
+/// path (the same one the match uses), then builds an [`import::ImportReport`]
+/// from the compiled state graph + assets (failed-compile expressions, AIR frames
+/// referencing absent sprites, degenerate `0×0` sprites). It writes **no** overlay
+/// — a character is many files, not one rewritable text — so `<overlay-out>` is
+/// ignored here.
+///
+/// Per the import contract the process **exits 0 even with flags** (the report
+/// body carries them); `--strict` is the only flag that turns flags into a
+/// non-zero exit. A `.def` that cannot be loaded at all (a missing required
+/// SFF/AIR) is exit `1`.
+fn run_import_char(src: &Path, parsed: &ImportArgs) -> i32 {
+    let loaded = match fp_character::LoadedCharacter::load(src) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("import: cannot load character {}: {e}", src.display());
+            eprintln!("import: failed to load character {}: {e}", src.display());
+            return 1;
+        }
+    };
+
+    // (1) Compiled-graph + asset walk (failed exprs, missing/zero-dim sprites).
+    let mut report = import::ImportReport::from_character(&parsed.src, &loaded);
+    // (2) Text-overlay repairs over the character's own CNS/CMD source files
+    // (stray lines, empty keys, colon/malformed headers). Re-read each `[Files]`
+    // state file relative to the `.def`; a missing/unreadable file is skipped.
+    for (rel, path) in character_text_files(src) {
+        match fp_formats::text::read_text_file(&path) {
+            Ok(text) => report.add_cns(&rel, &import::repair_cns_text(&text)),
+            Err(e) => tracing::warn!(
+                "import: skipping text-overlay of {} ({}): {e}",
+                rel,
+                path.display()
+            ),
+        }
+    }
+
+    // Emit the report face(s). `import --report <char.def>` prints the human
+    // report; `--report-json <path>` writes the stable JSON. With neither flag the
+    // command is a quiet load-and-classify (findings still log through tracing).
+    if parsed.report {
+        print!("{}", report.render());
+    } else {
+        // No --report: surface a one-line summary so the run is not silent.
+        let missing = report.count_kind(import::RepairKind::MissingSpriteRef);
+        let truncated = report.count_kind(import::RepairKind::TruncatedExpr);
+        if report.is_clean() {
+            tracing::info!(
+                "import: {} imported with no flags ({} entr(y/ies) total)",
+                src.display(),
+                report.entries.len()
+            );
+        } else {
+            tracing::warn!(
+                "import: {} imported with flags ({} missing-sprite, {} truncated-expr); \
+                 pass --report to see them",
+                src.display(),
+                missing,
+                truncated
+            );
+        }
+    }
+    if let Some(json_path) = &parsed.report_json {
+        if let Err(e) = report.write_json(Path::new(json_path)) {
+            tracing::error!("import: cannot write report JSON {json_path}: {e}");
+            eprintln!("import: failed to write report JSON {json_path}: {e}");
+            return 1;
+        }
+        tracing::info!("import: wrote report JSON {json_path}");
+    }
+
+    // `--out <dir>`: write a whole-character, loadable overlay directory (the
+    // engine-adoption path — feed `<dir>` to `fp-app` and it discovers + runs the
+    // repaired character). The clean-room write guard refuses an `assets/` dir.
+    if let Some(out) = &parsed.out_dir {
+        match import::write_character_overlay(src, Some(&report), Path::new(out)) {
+            Ok(written) => {
+                tracing::info!(
+                    "import: overlay written to {} — load with: fp-app {}",
+                    written.def_path.display(),
+                    out
+                );
+                println!(
+                    "import: loadable overlay written to {}",
+                    written.def_path.display()
+                );
+            }
+            Err(e) => {
+                tracing::error!("import: cannot write overlay dir {out}: {e}");
+                eprintln!("import: failed to write overlay dir {out}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    if parsed.strict && report.has_flags() {
+        eprintln!("import: --strict failed — the report contains flagged entries");
+        return 1;
+    }
+    0
+}
+
+/// The CNS/CMD branch of [`run_import`]: repairs the text, optionally writes the
+/// overlay, folds the repairs into `report`. Returns a non-zero exit code only on
+/// a write failure.
+fn run_import_cns(
+    src: &Path,
+    text: &str,
+    parsed: &ImportArgs,
+    report: &mut import::ImportReport,
+) -> i32 {
+    let overlay = import::repair_cns_text(text);
+    if let Some(out_arg) = &parsed.overlay_out {
+        if let Err(e) = import::write_overlay(&overlay, Path::new(out_arg)) {
+            tracing::error!("import: cannot write overlay {out_arg}: {e}");
+            eprintln!("import: failed to write overlay {out_arg}: {e}");
+            return 1;
+        }
+        if overlay.is_clean() {
+            tracing::info!(
+                "import: {} is clean; overlay is byte-identical",
+                src.display()
+            );
+        } else {
+            use import::RepairKind::*;
+            tracing::info!(
+                "import: wrote overlay {} ({} repair(s): {} stray, {} empty-key, {} colon-header, {} malformed-header)",
+                out_arg,
+                overlay.repairs.len(),
+                overlay.count(StrayLine),
+                overlay.count(EmptyKey),
+                overlay.count(ColonHeader),
+                overlay.count(MalformedHeader),
+            );
+        }
+    }
+    for repair in &overlay.repairs {
+        tracing::info!(
+            "import: {}:{} {:?} — {}",
+            src.display(),
+            repair.line_no,
+            repair.kind,
+            repair.original.trim()
+        );
+    }
+    report.add_cns(&parsed.src, &overlay);
+    0
+}
+
+/// The AIR branch of [`run_import`]: produces a repaired AIR overlay (column
+/// salvage + opt-in dead-frame prune), optionally writes it, and folds the
+/// repairs into `report`.
+///
+/// The dead-frame oracle is the `.sff` sitting next to `src` (same stem). When
+/// no sibling `.sff` is found or it fails to load, every sprite is assumed
+/// present: pruning becomes a no-op and only column salvage applies. Returns a
+/// non-zero exit code only on a write failure.
+fn run_import_air(
+    src: &Path,
+    text: &str,
+    parsed: &ImportArgs,
+    report: &mut import::ImportReport,
+) -> i32 {
+    // Locate a sibling `.sff` (`foo.air` -> `foo.sff`) as the sprite-presence
+    // oracle. If absent/unloadable, fall back to "all present" so salvage still
+    // runs and prune is a safe no-op (warn-logged so the user knows).
+    let sff = src.with_extension("sff").canonicalize().ok().and_then(|p| {
+        match fp_formats::sff::SffFile::load(&p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("import: could not load sibling SFF {}: {e}", p.display());
+                None
+            }
+        }
+    });
+    if parsed.prune && sff.is_none() {
+        tracing::warn!(
+            "import: --prune requested but no loadable sibling .sff for {}; \
+             treating every sprite as present (no frame will be pruned)",
+            src.display()
+        );
+    }
+
+    let overlay = import::repair_air_text(text, parsed.prune, |g, i| {
+        sff.as_ref().is_none_or(|s| s.has_renderable_sprite(g, i))
+    });
+
+    if let Some(out_arg) = &parsed.overlay_out {
+        if let Err(e) = import::write_air_overlay(&overlay, Path::new(out_arg)) {
+            tracing::error!("import: cannot write AIR overlay {out_arg}: {e}");
+            eprintln!("import: failed to write AIR overlay {out_arg}: {e}");
+            return 1;
+        }
+        use import::AirRepairKind::*;
+        if overlay.is_clean() {
+            tracing::info!(
+                "import: {} is clean; AIR overlay is byte-identical",
+                src.display()
+            );
+        } else {
+            tracing::info!(
+                "import: wrote AIR overlay {} ({} junk-column, {} dead-frame pruned, {} missing-sprite flagged)",
+                out_arg,
+                overlay.count(JunkColumn),
+                overlay.count(DeadFrame),
+                overlay.count(MissingSpriteRef),
+            );
+        }
+    }
+    for repair in &overlay.repairs {
+        tracing::info!(
+            "import: {}:{} {:?} (action {:?}) — {}",
+            src.display(),
+            repair.line_no,
+            repair.kind,
+            repair.action,
+            repair.original.trim()
+        );
+    }
+    report.add_air(&parsed.src, &overlay);
+    0
 }
 
 /// Cached GPU textures for a single sprite.
@@ -315,7 +893,12 @@ impl CnsCharacter {
             loaded,
             entity,
             input_buffer: InputBuffer::new(),
-            matcher: CommandMatcher::new(command_defs.clone()),
+            // Input leniency (T075): small jump buffer over the built-in `holdup`
+            // gate, matching the two-player engine path.
+            matcher: CommandMatcher::with_leniency(
+                command_defs.clone(),
+                fp_input::LeniencyConfig::with_jump_buffer(),
+            ),
             command_defs,
         }
     }
@@ -391,10 +974,54 @@ fn clamp_elem(index: i32, len: usize) -> usize {
 /// [`SffFile`]); this holds only the lazily-decoded GPU textures, keyed by sprite
 /// id. One [`FighterRender`] is kept per side (P1, P2) so the two characters'
 /// textures never collide — the "per-character texture cache" the task requires.
+/// Why a sprite id failed to resolve to a drawable sprite in an [`SffFile`].
+///
+/// Returned by [`resolve_drawable_sprite`] so the caller can log the right
+/// once-only warning and record the id in its negative cache. Split out as a pure
+/// (GPU-free) decision so it is unit-testable without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpriteMiss {
+    /// No sprite with that `(group, image)` exists in the SFF.
+    NotFound,
+    /// The sprite exists but has a zero width or height (nothing to draw).
+    ZeroDimension { width: u16, height: u16 },
+}
+
+/// Resolves `sprite_id` to a drawable sprite index in `sff`, or reports why it
+/// cannot be drawn ([`SpriteMiss`]).
+///
+/// This is the pure decision the per-frame draw path makes before touching the
+/// GPU: it performs the linear `(group, image)` scan and the zero-dimension
+/// check. Both miss cases are terminal for a given id — the caller records the id
+/// in its negative cache so this scan (and the matching warning) runs **once**
+/// per id, not every frame. Resolvable sprites are unaffected.
+fn resolve_drawable_sprite(sff: &SffFile, sprite_id: SpriteId) -> Result<usize, SpriteMiss> {
+    let (index, sff_sprite) = sff
+        .sprites
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
+        .ok_or(SpriteMiss::NotFound)?;
+    if sff_sprite.width == 0 || sff_sprite.height == 0 {
+        return Err(SpriteMiss::ZeroDimension {
+            width: sff_sprite.width,
+            height: sff_sprite.height,
+        });
+    }
+    Ok(index)
+}
+
 #[derive(Default)]
 struct FighterRender {
     /// GPU sprite cache keyed by sprite id, decoded on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids that resolved to nothing (missing in the SFF, zero-dimension,
+    /// or failed to decode/palette). Recording them means the per-frame draw path
+    /// stops re-running the linear SFF scan and re-emitting the same warning every
+    /// frame for the same id — the warning fires **once** per sprite id and the
+    /// O(n) `sprites` scan is skipped thereafter. Behaviour for resolvable sprites
+    /// is unchanged (they still populate `sprite_cache` on first use).
+    missing: HashSet<SpriteId>,
 }
 
 impl FighterRender {
@@ -419,28 +1046,40 @@ impl FighterRender {
         if self.sprite_cache.contains_key(&sprite_id) {
             return self.sprite_cache.get(&sprite_id);
         }
+        // Already known to be unresolvable: skip the linear SFF scan and the
+        // (now once-only) warning. This is the fix for the per-frame warn flood +
+        // repeated O(n) rescan that froze the GUI on characters referencing
+        // many missing/zero-dimension sprites (e.g. clark's 5000-series).
+        if self.missing.contains(&sprite_id) {
+            return None;
+        }
 
-        let (index, sff_sprite) = sff
-            .sprites
-            .iter()
-            .enumerate()
-            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())?;
-
+        let index = match resolve_drawable_sprite(sff, sprite_id) {
+            Ok(index) => index,
+            Err(SpriteMiss::NotFound) => {
+                self.missing.insert(sprite_id);
+                return None;
+            }
+            Err(SpriteMiss::ZeroDimension { width, height }) => {
+                tracing::warn!("Sprite {sprite_id} has zero dimensions ({width}x{height})");
+                self.missing.insert(sprite_id);
+                return None;
+            }
+        };
+        // SAFETY of the index: `resolve_drawable_sprite` returned an in-bounds index
+        // into `sff.sprites`.
+        let sff_sprite = &sff.sprites[index];
         let axis_x = sff_sprite.axis_x;
         let axis_y = sff_sprite.axis_y;
         let width = sff_sprite.width;
         let height = sff_sprite.height;
         let pal_idx = sff_sprite.palette_index as usize;
 
-        if width == 0 || height == 0 {
-            tracing::warn!("Sprite {sprite_id} has zero dimensions ({width}x{height})");
-            return None;
-        }
-
         let pixels = match sff.decode_sprite(index) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to decode sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -448,6 +1087,7 @@ impl FighterRender {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to load palette {pal_idx} for sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -1257,6 +1897,13 @@ impl Hud {
         }
     }
 
+    /// The loaded HUD font, if any. `None` when `assets/data/font.fnt` is missing
+    /// or failed to load. Shared with overlays (e.g. the T063 training overlay's
+    /// legend) so they reuse the one loaded font rather than reloading it.
+    fn font(&self) -> Option<&GlyphFont> {
+        self.font.as_ref()
+    }
+
     /// Draws a solid-color filled `rect` by drawing the given color's 1x1 quad
     /// scaled up.
     fn fill(&self, frame: &mut fp_render::RenderFrame<'_>, color: &HudColor, rect: HudRect) {
@@ -1273,7 +1920,7 @@ impl Hud {
     /// Draws the full match HUD: a life bar for each fighter (P1 top-left, P2
     /// top-right), a smaller power (super-meter) bar directly beneath each, and a
     /// round/KO indicator. Crude by design.
-    fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match) {
+    fn draw(&self, frame: &mut fp_render::RenderFrame<'_>, win_w: f32, m: &Match, tick: u64) {
         const MARGIN: f32 = 12.0;
         const BAR_W: f32 = 200.0;
         const BAR_H: f32 = 16.0;
@@ -1299,7 +1946,7 @@ impl Hud {
             w: POWER_BAR_W,
             h: POWER_BAR_H,
         };
-        self.draw_power_bar(frame, p1_power, m.p1(), false);
+        self.draw_power_bar(frame, p1_power, m.p1(), false, tick);
         // P2 life bar, top-right, draining toward the center (mirrored).
         let p2_bar = HudRect {
             x: win_w - MARGIN - BAR_W,
@@ -1315,7 +1962,7 @@ impl Hud {
             w: POWER_BAR_W,
             h: POWER_BAR_H,
         };
-        self.draw_power_bar(frame, p2_power, m.p2(), true);
+        self.draw_power_bar(frame, p2_power, m.p2(), true, tick);
 
         // The round timer (remaining whole seconds), centered near the top, drawn
         // as bitmap text when the font is available. Always rendered during a live
@@ -1385,8 +2032,13 @@ impl Hud {
 
         let frac = life_fraction(player.life(), player.life_max());
         let fill_w = bar.w * frac;
-        // Color shifts from green (healthy) to red (near death).
-        let color = if frac > 0.33 { &self.green } else { &self.red };
+        // Color shifts from green (healthy) to red at low life (<25%, T074),
+        // using the same threshold the screenpack HUD uses so both readouts agree.
+        let color = if !fp_ui::low_life_tint(frac).is_neutral() {
+            &self.red
+        } else {
+            &self.green
+        };
         if fill_w > 0.0 {
             let fill_x = if mirror {
                 bar.x + (bar.w - fill_w)
@@ -1409,18 +2061,33 @@ impl Hud {
     /// then a blue fill proportional to `power / power_max`. When `mirror` is set
     /// the fill is anchored to the right edge (so P2's bar fills toward the
     /// center, matching its life bar above).
+    ///
+    /// At max meter (a super is available) the fill **flashes** (T074): it
+    /// alternates between blue and a bright yellow on a deterministic, frame-keyed
+    /// pulse (the quad HUD cannot multiply a per-draw tint, so it swaps between
+    /// pre-built color quads instead). `tick` drives the pulse — no RNG, so the
+    /// flash is replay-safe.
     fn draw_power_bar(
         &self,
         frame: &mut fp_render::RenderFrame<'_>,
         bar: HudRect,
         player: &Player,
         mirror: bool,
+        tick: u64,
     ) {
         // Backing.
         self.fill(frame, &self.dark, bar);
 
         let frac = power_fraction(player.power(), player.power_max());
         let fill_w = bar.w * frac;
+        // At max meter, flash: the shared helper returns a non-neutral tint only
+        // during the flash's "dim" phase, which we render as the bright yellow
+        // accent so the full bar pulses; otherwise the normal blue fill.
+        let color = if fp_ui::max_power_flash_tint(frac, tick).is_neutral() {
+            &self.blue
+        } else {
+            &self.yellow
+        };
         if fill_w > 0.0 {
             let fill_x = if mirror {
                 bar.x + (bar.w - fill_w)
@@ -1429,7 +2096,7 @@ impl Hud {
             };
             self.fill(
                 frame,
-                &self.blue,
+                color,
                 HudRect {
                     x: fill_x,
                     w: fill_w,
@@ -2124,11 +2791,110 @@ fn clsn_to_screen_box(
 const CLSN1_COLOR: [f32; 4] = [1.0, 0.25, 0.25, 1.0];
 /// Blue (Clsn2 = hurt/collision box), MUGEN debug convention. RGBA in 0.0–1.0.
 const CLSN2_COLOR: [f32; 4] = [0.3, 0.55, 1.0, 1.0];
+/// Green (player push / `Width` box), the third overlay color. RGBA in 0.0–1.0.
+const PUSH_COLOR: [f32; 4] = [0.3, 0.95, 0.4, 1.0];
+
+/// Which kind of collision box a [`collect_clsn_boxes`] entry represents, so a
+/// caller can style each independently. `Hurt` is Clsn2 (blue), `Hit` is Clsn1
+/// (red), and `Push` is the player-push / `Width` box (green).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClsnKind {
+    /// Clsn1 — the attack / hit box (red).
+    Hit,
+    /// Clsn2 — the hurt / collision box (blue).
+    Hurt,
+    /// The player-push / `Width` box (green), derived from the size half-widths
+    /// rather than from the AIR frame.
+    Push,
+}
+
+impl ClsnKind {
+    /// The MUGEN-convention overlay color for this kind, RGBA in 0.0–1.0.
+    fn color(self) -> [f32; 4] {
+        match self {
+            ClsnKind::Hit => CLSN1_COLOR,
+            ClsnKind::Hurt => CLSN2_COLOR,
+            ClsnKind::Push => PUSH_COLOR,
+        }
+    }
+}
+
+/// Maps the player-push half-widths into a character-local Clsn-style rect (the
+/// same Y-down, axis-relative convention as an AIR frame's Clsn rects), so the
+/// push box flows through the *same* [`clsn_to_screen_box`] facing-mirror path as
+/// the hit/hurt boxes.
+///
+/// `front`/`back` are the facing-relative half-widths from
+/// [`Player::push_widths`](fp_engine::Player::push_widths): `front` extends toward
+/// the facing direction (local +X before mirroring), `back` the other way. The
+/// box stands on the axis and is given a small fixed visual height so it reads as
+/// a footprint band at the fighter's feet; push collision itself is width-only.
+fn push_box_local(front: f32, back: f32) -> fp_core::Rect {
+    // Local +X is "forward"; clsn_to_screen_box mirrors it for left-facing.
+    // Height is purely cosmetic — a thin band just above the ground line.
+    const PUSH_BOX_HEIGHT: f32 = 14.0;
+    fp_core::Rect::new(-back, -PUSH_BOX_HEIGHT, front + back, PUSH_BOX_HEIGHT)
+}
+
+/// Collects one fighter's current-frame collision boxes as screen-space
+/// [`fp_render::DebugBox`]es tagged with their [`ClsnKind`], in draw order: every
+/// Clsn2 (hurt) first, then every Clsn1 (hit), then the single push/`Width` box
+/// last so it reads over the others. The boxes are facing-mirrored exactly like
+/// the rendered sprite (via [`clsn_to_screen_box`], which mirrors
+/// `fp_physics::place_clsn`). A missing/empty current frame yields only the push
+/// box (which has no AIR dependency); a `None` would never be a panic.
+///
+/// This is the single box-mapping math shared by **both** the raw F1 dev overlay
+/// and the player-facing [`TrainingOverlay`] — they differ only in styling and
+/// toggle scope, never in geometry.
+fn collect_clsn_boxes(
+    player: &Player,
+    camera_x: f32,
+    win_w: f32,
+    win_h: f32,
+) -> Vec<(fp_render::DebugBox, ClsnKind)> {
+    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), camera_x, win_w, win_h);
+    let facing = player.facing();
+    let mut boxes = Vec::new();
+
+    if let Some(anim_frame) = player_current_frame(player) {
+        for hurt in &anim_frame.clsn2 {
+            boxes.push((
+                clsn_to_screen_box(hurt, anchor_x, anchor_y, facing, ClsnKind::Hurt.color()),
+                ClsnKind::Hurt,
+            ));
+        }
+        for attack in &anim_frame.clsn1 {
+            boxes.push((
+                clsn_to_screen_box(attack, anchor_x, anchor_y, facing, ClsnKind::Hit.color()),
+                ClsnKind::Hit,
+            ));
+        }
+    }
+
+    // Push/Width box: derived from the player half-widths (not the AIR frame), so
+    // it is always available even on a frame with no Clsn data.
+    let (front, back) = player.push_widths();
+    let push_local = push_box_local(front, back);
+    boxes.push((
+        clsn_to_screen_box(
+            &push_local,
+            anchor_x,
+            anchor_y,
+            facing,
+            ClsnKind::Push.color(),
+        ),
+        ClsnKind::Push,
+    ));
+
+    boxes
+}
 
 /// Draws one fighter's current-frame collision boxes when the debug overlay is
-/// on: every Clsn2 (hurtbox, blue) first, then every Clsn1 (attack box, red) on
-/// top so attack boxes read clearly where the two overlap. A missing frame draws
-/// nothing.
+/// on, in [`collect_clsn_boxes`] order (Clsn2 hurt, then Clsn1 hit, then the
+/// push/`Width` box). A missing frame still draws the push box. This is the raw
+/// F1 dev overlay; the player-facing [`TrainingOverlay`] reuses the same
+/// `collect_clsn_boxes` math with its own scoping/legend.
 fn draw_player_clsn(
     frame: &mut fp_render::RenderFrame<'_>,
     player: &Player,
@@ -2136,29 +2902,373 @@ fn draw_player_clsn(
     win_w: f32,
     win_h: f32,
 ) {
-    let Some(anim_frame) = player_current_frame(player) else {
-        return;
-    };
-    let (anchor_x, anchor_y) = player_screen_anchor(player.pos(), camera_x, win_w, win_h);
-    let facing = player.facing();
-
-    for hurt in &anim_frame.clsn2 {
-        frame.draw_debug_box(&clsn_to_screen_box(
-            hurt,
-            anchor_x,
-            anchor_y,
-            facing,
-            CLSN2_COLOR,
-        ));
+    for (b, _kind) in collect_clsn_boxes(player, camera_x, win_w, win_h) {
+        frame.draw_debug_box(&b);
     }
-    for attack in &anim_frame.clsn1 {
-        frame.draw_debug_box(&clsn_to_screen_box(
-            attack,
-            anchor_x,
-            anchor_y,
-            facing,
-            CLSN1_COLOR,
-        ));
+}
+
+// ---------------------------------------------------------------------------
+// Player-facing training overlay (T063)
+// ---------------------------------------------------------------------------
+
+/// Which fighter(s) the player-facing [`TrainingOverlay`] draws Clsn boxes for.
+///
+/// Distinct from the raw F1 dev overlay (which is always both-or-nothing): the
+/// training overlay can scope to a single side so a player can study just their
+/// own hurtboxes or just the opponent's hit reach. Cycled with the
+/// [`TrainingOverlay`] toggle key; the order is `Off → P1 → P2 → Both → Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OverlayScope {
+    /// No boxes drawn (overlay disabled).
+    #[default]
+    Off,
+    /// Player 1's boxes only.
+    P1,
+    /// Player 2's boxes only.
+    P2,
+    /// Both fighters' boxes.
+    Both,
+}
+
+impl OverlayScope {
+    /// The next scope in the cycle `Off → P1 → P2 → Both → Off`, used by the
+    /// toggle key so one key walks every per-side state and back to off.
+    fn next(self) -> Self {
+        match self {
+            OverlayScope::Off => OverlayScope::P1,
+            OverlayScope::P1 => OverlayScope::P2,
+            OverlayScope::P2 => OverlayScope::Both,
+            OverlayScope::Both => OverlayScope::Off,
+        }
+    }
+
+    /// Whether player 1's boxes should be drawn under this scope.
+    fn shows_p1(self) -> bool {
+        matches!(self, OverlayScope::P1 | OverlayScope::Both)
+    }
+
+    /// Whether player 2's boxes should be drawn under this scope.
+    fn shows_p2(self) -> bool {
+        matches!(self, OverlayScope::P2 | OverlayScope::Both)
+    }
+
+    /// A short human label for the legend / logs.
+    fn label(self) -> &'static str {
+        match self {
+            OverlayScope::Off => "OFF",
+            OverlayScope::P1 => "P1",
+            OverlayScope::P2 => "P2",
+            OverlayScope::Both => "BOTH",
+        }
+    }
+}
+
+/// The player-facing hitbox/hurtbox training overlay (T063): a styled,
+/// per-side-scopable view of each fighter's Clsn1 (hit, red), Clsn2 (hurt, blue),
+/// and push/`Width` (green) boxes, plus a small on-screen legend.
+///
+/// It reuses the exact same box-mapping math as the raw F1 dev overlay
+/// ([`collect_clsn_boxes`]); only the scope (per-side, via [`OverlayScope`]) and
+/// the legend differ. State persists for the session in the run loop. The dev F1
+/// overlay is unaffected and keeps drawing both sides whenever it is on.
+#[derive(Debug, Clone, Copy, Default)]
+struct TrainingOverlay {
+    /// Which side(s) to draw; `Off` disables the overlay entirely.
+    scope: OverlayScope,
+}
+
+impl TrainingOverlay {
+    /// Cycles the scope one step (`Off → P1 → P2 → Both → Off`); the toggle key
+    /// calls this so a single key walks every per-side state.
+    fn cycle(&mut self) {
+        self.scope = self.scope.next();
+    }
+
+    /// Whether the overlay is currently drawing anything.
+    fn is_active(&self) -> bool {
+        self.scope != OverlayScope::Off
+    }
+
+    /// Draws the in-scope fighters' Clsn boxes (reusing [`collect_clsn_boxes`])
+    /// plus, when a HUD font is available, a small top-left legend. A `None` font
+    /// simply omits the text (no regression, no panic). Nothing is drawn when the
+    /// scope is `Off`.
+    fn draw(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        m: &Match,
+        font: Option<&GlyphFont>,
+        camera_x: f32,
+        win_w: f32,
+        win_h: f32,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        if self.scope.shows_p1() {
+            for (b, _kind) in collect_clsn_boxes(m.p1(), camera_x, win_w, win_h) {
+                frame.draw_debug_box(&b);
+            }
+        }
+        if self.scope.shows_p2() {
+            for (b, _kind) in collect_clsn_boxes(m.p2(), camera_x, win_w, win_h) {
+                frame.draw_debug_box(&b);
+            }
+        }
+        if let Some(font) = font {
+            self.draw_legend(frame, font);
+            // T065: per-side frame-data readout under the legend.
+            if self.scope.shows_p1() {
+                self.draw_frame_data(frame, font, m.p1(), Self::FRAME_DATA_P1_X);
+            }
+            if self.scope.shows_p2() {
+                self.draw_frame_data(frame, font, m.p2(), win_w - Self::FRAME_DATA_P2_INSET);
+            }
+        }
+    }
+
+    /// X anchor of P1's frame-data readout.
+    const FRAME_DATA_P1_X: f32 = 8.0;
+    /// Right-edge inset of P2's frame-data readout.
+    const FRAME_DATA_P2_INSET: f32 = 120.0;
+    /// Vertical anchor of the (single-line) frame-data readout.
+    const FRAME_DATA_TOP: f32 = 124.0;
+
+    /// Draws one player's frame-data readout (T065): the startup / active /
+    /// recovery of the action it is currently executing.
+    ///
+    /// The readout is **self-gating** via [`format_frame_data`]: it shows real
+    /// numbers only for an action [`fp_character::MoveFrameData::compute`] can
+    /// count (one with a real attack window), and `S/A/R —` otherwise — never a
+    /// wrong number. A `None` font would have short-circuited the caller, so a
+    /// font is always in hand here.
+    fn draw_frame_data(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        font: &GlyphFont,
+        player: &fp_engine::Player,
+        x: f32,
+    ) {
+        let text = format_frame_data(player);
+        frame.draw_text(
+            font,
+            &text,
+            &TextDrawParams {
+                x,
+                y: Self::FRAME_DATA_TOP,
+                scale: 1.0,
+                alpha: 1.0,
+                blend: BlendMode::Normal,
+            },
+        );
+    }
+
+    /// Draws the color legend: a labeled line per box kind plus the current scope.
+    /// Each line is prefixed with a small solid swatch in that kind's color so the
+    /// mapping reads at a glance. Top-left, under the lifebars.
+    fn draw_legend(&self, frame: &mut fp_render::RenderFrame<'_>, font: &GlyphFont) {
+        const LEGEND_X: f32 = 8.0;
+        const LEGEND_TOP: f32 = 64.0;
+        const LINE_H: f32 = 14.0;
+        const SCALE: f32 = 1.0;
+        const SWATCH: f32 = 10.0;
+        // Order matches collect_clsn_boxes draw order, then the scope.
+        let rows: [(&str, [f32; 4]); 4] = [
+            ("HURT", ClsnKind::Hurt.color()),
+            ("HIT", ClsnKind::Hit.color()),
+            ("PUSH", ClsnKind::Push.color()),
+            (self.scope.label(), [1.0, 1.0, 1.0, 1.0]),
+        ];
+        for (i, (text, color)) in rows.iter().enumerate() {
+            let y = LEGEND_TOP + i as f32 * LINE_H;
+            // Color swatch (skip for the scope row, which uses white text only).
+            if i < 3 {
+                frame.draw_debug_box(&fp_render::DebugBox {
+                    x: LEGEND_X,
+                    y,
+                    w: SWATCH,
+                    h: SWATCH,
+                    color: *color,
+                });
+            }
+            frame.draw_text(
+                font,
+                text,
+                &TextDrawParams {
+                    x: LEGEND_X + SWATCH + 4.0,
+                    y,
+                    scale: SCALE,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
+    }
+}
+
+/// Formats a player's frame-data readout line (T065): `S<start> A<active>
+/// R<recovery>` for the action it is currently executing, or `S/A/R —` when that
+/// action is not a countable attack (idle / movement / looping / `time = -1`).
+///
+/// When the player's move **connected on the most recent tick**, the on-block /
+/// on-hit **frame advantage** is appended in the `ADV +3` / `ADV −5` form (a
+/// signed number of ticks; positive = the attacker recovers first). On a tick with
+/// no connection the advantage segment reads `ADV —`, so the readout never shows a
+/// stale advantage number.
+///
+/// Looks up the current action ([`Player::anim`]) in the player's loaded `.air`
+/// table and runs [`fp_character::MoveFrameData::compute`]; a missing action or
+/// an uncountable one both fall to the `—` form (never a wrong number, never a
+/// panic) per the project's error philosophy. The advantage is read from
+/// [`fp_engine::Player::frame_advantage`], which the engine recomputes each tick.
+fn format_frame_data(player: &fp_engine::Player) -> String {
+    let fd = player
+        .loaded
+        .air
+        .actions
+        .get(&player.anim())
+        .and_then(fp_character::MoveFrameData::compute);
+    let sar = match fd {
+        Some(fd) => format!("S{} A{} R{}", fd.startup, fd.active, fd.recovery),
+        None => "S/A/R —".to_string(),
+    };
+    format!(
+        "{sar}  {}",
+        format_frame_advantage(player.frame_advantage())
+    )
+}
+
+/// Formats the on-block / on-hit frame-advantage segment of the frame-data readout
+/// (T065): `ADV +3` / `ADV −5` (signed ticks, positive = the attacker recovers
+/// first) when the move connected this tick, or `ADV —` when it did not (`None`),
+/// so a stale advantage number is never shown.
+///
+/// Split out so the rendering form is unit-testable without scripting a whole
+/// match: the engine computes the [`Option<i32>`] advantage at contact and stashes
+/// it on the attacker [`fp_engine::Player`]; this turns it into the on-screen text.
+fn format_frame_advantage(advantage: Option<i32>) -> String {
+    match advantage {
+        // U+2212 MINUS SIGN for negatives (matches the rest of the HUD), explicit
+        // `+` for non-negative so advantage reads at a glance.
+        Some(n) if n < 0 => format!("ADV \u{2212}{}", -n),
+        Some(n) => format!("ADV +{n}"),
+        None => "ADV —".to_string(),
+    }
+}
+
+/// The three player-facing match overlays, bundled so the match draw path takes
+/// one argument instead of three (the F1 dev Clsn toggle, the T063 training
+/// hitbox overlay, and the T064 input display). All default to off.
+#[derive(Debug, Clone, Copy, Default)]
+struct MatchOverlays {
+    /// Raw F1 dev Clsn overlay (both sides or nothing).
+    dev_clsn: bool,
+    /// T063 player-facing, per-side hitbox/hurtbox overlay.
+    training: TrainingOverlay,
+    /// T064 player-facing, per-side input-history display.
+    input_display: InputDisplay,
+}
+
+// ---------------------------------------------------------------------------
+// On-screen input display (T064)
+// ---------------------------------------------------------------------------
+
+/// The player-facing input-history display (T064): a vertical strip per side of
+/// the last ~16 frames of input — coalesced into numpad direction glyphs + lit
+/// button letters with a `*N` repeat count — newest at the top, plus a flash of
+/// any special command name the instant its motion completes.
+///
+/// Toggled with F3 (`Off → P1 → P2 → Both → Off`, reusing [`OverlayScope`]) and
+/// **off by default**. The strip reads each player's
+/// rolling [`fp_input::InputBuffer`] (via `Player::input_buffer`) and folds the
+/// absolute directions to facing-relative numpad notation; the command flash
+/// reads `Player::just_matched_commands`. Pure draw — no game state mutated.
+#[derive(Debug, Clone, Copy, Default)]
+struct InputDisplay {
+    /// Which side(s) to draw; `Off` disables the strip entirely.
+    scope: OverlayScope,
+}
+
+impl InputDisplay {
+    /// Number of coalesced rows shown (~16 frames of history once collapsed).
+    const ROWS: usize = fp_input::DEFAULT_DISPLAY_ROWS;
+    /// Row pitch in pixels (one coalesced input per line).
+    const LINE_H: f32 = 12.0;
+    /// Vertical anchor of the strip's top row.
+    const TOP: f32 = 96.0;
+    /// Inset of P1's strip from the left edge.
+    const P1_X: f32 = 8.0;
+    /// Inset of P2's strip from the right edge (the strip is right-aligned by
+    /// drawing at `win_w - P2_INSET`).
+    const P2_INSET: f32 = 64.0;
+
+    /// Cycles the scope one step (`Off → P1 → P2 → Both → Off`); the F3 toggle
+    /// key calls this so a single key walks every per-side state.
+    fn cycle(&mut self) {
+        self.scope = self.scope.next();
+    }
+
+    /// Draws the in-scope side strips. A `None` font omits all text (no panic,
+    /// no regression); `Off` scope draws nothing.
+    fn draw(
+        &self,
+        frame: &mut fp_render::RenderFrame<'_>,
+        m: &Match,
+        font: Option<&GlyphFont>,
+        win_w: f32,
+    ) {
+        let Some(font) = font else { return };
+        if self.scope.shows_p1() {
+            Self::draw_side(frame, font, m.p1(), Self::P1_X);
+        }
+        if self.scope.shows_p2() {
+            Self::draw_side(frame, font, m.p2(), win_w - Self::P2_INSET);
+        }
+    }
+
+    /// Draws one player's input strip anchored at `x`: newest run on top, each as
+    /// its numpad-direction + button label, then a one-line command flash under
+    /// the strip naming any special recognized this frame.
+    fn draw_side(
+        frame: &mut fp_render::RenderFrame<'_>,
+        font: &GlyphFont,
+        player: &fp_engine::Player,
+        x: f32,
+    ) {
+        let facing_right = player.facing() == fp_character::Facing::Right;
+        let rows = fp_input::input_display_rows(player.input_buffer(), Self::ROWS);
+        for (i, row) in rows.iter().enumerate() {
+            let y = Self::TOP + i as f32 * Self::LINE_H;
+            frame.draw_text(
+                font,
+                &row.label(facing_right),
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: 1.0,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
+        // Command flash: the first command recognized this frame, drawn under the
+        // strip. Only the recognition frame lists it (see `just_matched`), so it
+        // naturally flashes for `buffer_time`-independent single frames as inputs
+        // continue. Empty on a no-recognition frame.
+        if let Some(name) = player.just_matched_commands().first() {
+            let y = Self::TOP + Self::ROWS as f32 * Self::LINE_H;
+            frame.draw_text(
+                font,
+                name,
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: 1.0,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+        }
     }
 }
 
@@ -2185,6 +3295,9 @@ struct StageRender {
     air: AirFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable (missing/zero-dim/decode-fail), so the
+    /// per-frame cache path skips the linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
 }
 
 impl StageRender {
@@ -2246,6 +3359,7 @@ impl StageRender {
             sff,
             air,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
         })
     }
 
@@ -2280,7 +3394,13 @@ impl StageRender {
             })
             .collect();
         for sprite_id in ids {
-            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+            cache_sff_sprite(
+                &mut self.sprite_cache,
+                &mut self.missing,
+                &self.sff,
+                sprite_id,
+                renderer,
+            );
         }
     }
 
@@ -2412,11 +3532,17 @@ fn bg_sprite_id(group: i32, image: i32) -> Option<SpriteId> {
 /// sprites are skipped with a warning, never a panic.
 fn cache_sff_sprite(
     cache: &mut HashMap<SpriteId, CachedSprite>,
+    missing: &mut HashSet<SpriteId>,
     sff: &SffFile,
     sprite_id: SpriteId,
     renderer: &Renderer,
 ) {
     if cache.contains_key(&sprite_id) {
+        return;
+    }
+    // Already known unresolvable: skip the per-frame linear SFF scan and the
+    // (now once-only) warning.
+    if missing.contains(&sprite_id) {
         return;
     }
     let Some((index, sff_sprite)) = sff
@@ -2426,6 +3552,7 @@ fn cache_sff_sprite(
         .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
     else {
         tracing::warn!("stage sprite {sprite_id} not found in stage SFF; skipping");
+        missing.insert(sprite_id);
         return;
     };
     let axis_x = sff_sprite.axis_x;
@@ -2435,12 +3562,14 @@ fn cache_sff_sprite(
     let pal_idx = sff_sprite.palette_index as usize;
     if width == 0 || height == 0 {
         tracing::warn!("stage sprite {sprite_id} has zero dimensions; skipping");
+        missing.insert(sprite_id);
         return;
     }
     let pixels = match sff.decode_sprite(index) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("failed to decode stage sprite {sprite_id}: {e}");
+            missing.insert(sprite_id);
             return;
         }
     };
@@ -2448,6 +3577,7 @@ fn cache_sff_sprite(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("failed to load palette {pal_idx} for stage sprite {sprite_id}: {e}");
+            missing.insert(sprite_id);
             return;
         }
     };
@@ -2562,6 +3692,9 @@ struct StoryboardOverlay {
     sff: SffFile,
     /// GPU sprite cache keyed by sprite id, decoded from `sff` on first use.
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable, so the per-frame cache path skips the
+    /// linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
     /// Per-RGB-color full-window quad cache (index 1 = the color). The renderer
     /// exposes no per-draw quad recolor, so a quad is built once per distinct
     /// color and reused; this backs both the per-scene `clearcolor` backdrop and
@@ -2628,6 +3761,7 @@ impl StoryboardOverlay {
             player: fp_storyboard::StoryboardPlayer::new(storyboard),
             sff,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
             color_quads: HashMap::new(),
         })
     }
@@ -2665,7 +3799,13 @@ impl StoryboardOverlay {
     fn cache_sprites(&mut self, renderer: &Renderer) {
         let ids: Vec<SpriteId> = self.player.draw_list().iter().map(|d| d.sprite).collect();
         for sprite_id in ids {
-            cache_sff_sprite(&mut self.sprite_cache, &self.sff, sprite_id, renderer);
+            cache_sff_sprite(
+                &mut self.sprite_cache,
+                &mut self.missing,
+                &self.sff,
+                sprite_id,
+                renderer,
+            );
         }
         // Build the per-scene clear-color quad (defaults to black) and, when a
         // fade is active this tick, its colored overlay quad. Both are cached by
@@ -2787,6 +3927,9 @@ struct AnimViewer {
     elem: usize,
     elem_time: i32,
     sprite_cache: HashMap<SpriteId, CachedSprite>,
+    /// Sprite ids known to be unresolvable, so the per-frame cache path skips the
+    /// linear scan + repeated warning for them.
+    missing: HashSet<SpriteId>,
 }
 
 impl AnimViewer {
@@ -2803,6 +3946,7 @@ impl AnimViewer {
             elem: 0,
             elem_time: 0,
             sprite_cache: HashMap::new(),
+            missing: HashSet::new(),
         }
     }
 
@@ -2836,24 +3980,33 @@ impl AnimViewer {
         if self.sprite_cache.contains_key(&sprite_id) {
             return self.sprite_cache.get(&sprite_id);
         }
-        let (index, sff_sprite) = self
+        if self.missing.contains(&sprite_id) {
+            return None;
+        }
+        let Some((index, sff_sprite)) = self
             .sff
             .sprites
             .iter()
             .enumerate()
-            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())?;
+            .find(|(_, s)| s.group == sprite_id.group() && s.image == sprite_id.image())
+        else {
+            self.missing.insert(sprite_id);
+            return None;
+        };
         let axis_x = sff_sprite.axis_x;
         let axis_y = sff_sprite.axis_y;
         let width = sff_sprite.width;
         let height = sff_sprite.height;
         let pal_idx = sff_sprite.palette_index as usize;
         if width == 0 || height == 0 {
+            self.missing.insert(sprite_id);
             return None;
         }
         let pixels = match self.sff.decode_sprite(index) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to decode sprite {sprite_id}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -2861,6 +4014,7 @@ impl AnimViewer {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to load palette {pal_idx}: {e}");
+                self.missing.insert(sprite_id);
                 return None;
             }
         };
@@ -2940,6 +4094,18 @@ enum CliRoute {
     /// `chars/<name>/<name>.def` layout, or a flat dir of `*.def`) and launch the
     /// menu over the discovered roster augmenting the motif's `select.def`.
     Directory(PathBuf),
+    /// `replay <log> <p1.def> [p2.def]` (T076): open the replay-study viewer over a
+    /// recorded [`fp_engine::ReplayLog`], driving the two named characters. The
+    /// remaining `.def` paths are the [`absolutize`]d character files the log was
+    /// recorded with (one `.def` = same character both sides).
+    Replay {
+        /// The recorded `.bin` replay-log path.
+        log: PathBuf,
+        /// Player-1 character `.def`.
+        p1: PathBuf,
+        /// Player-2 character `.def`, or `None` to reuse `p1` on both sides.
+        p2: Option<PathBuf>,
+    },
 }
 
 /// Decides whether the (palette-flag-stripped) positional `args` launch the
@@ -2956,6 +4122,22 @@ fn cli_route(args: &[String]) -> CliRoute {
     match args.get(1) {
         None => CliRoute::Menu,
         Some(a) if a.eq_ignore_ascii_case("menu") => CliRoute::Menu,
+        // `replay <log> <p1.def> [p2.def]` (T076): open the replay-study viewer.
+        // Falls back to the Menu route when the log/character args are missing (so
+        // a bare `fp-app replay` does not crash) — warn-logged at build time.
+        Some(a) if a.eq_ignore_ascii_case("replay") => match (args.get(2), args.get(3)) {
+            (Some(log), Some(p1)) => CliRoute::Replay {
+                log: absolutize(Path::new(log)),
+                p1: absolutize(Path::new(p1)),
+                p2: args.get(4).map(|p| absolutize(Path::new(p))),
+            },
+            _ => {
+                tracing::warn!(
+                    "`replay` needs <log> <p1.def> [p2.def]; launching the menu instead"
+                );
+                CliRoute::Menu
+            }
+        },
         // Absolutize the directory up-front so the discovered character `.def`s
         // are absolute paths. `SelectScreen::build_pick` later resolves a roster
         // entry via `base_dir.join(def_path)` (base = the motif's `select.def`
@@ -3086,6 +4268,50 @@ fn parse_team_flag(args: &[String]) -> (TeamMode, Vec<String>) {
     (mode, rest)
 }
 
+/// Parses (and strips) the CPU teaching-mode flag from `args` (T070), returning
+/// the chosen [`BehaviorMode`] plus the remaining positional args.
+///
+/// `--ai-mode <token>` selects which teaching CPU drives P2 on the direct-CLI
+/// match path, where `<token>` is a [`BehaviorMode::token`] (or alias):
+/// `ladder` (the plain difficulty ladder, the default), `blocker` (Pure Blocker),
+/// `dp` (Reactive DP), or `punisher` (Whiff Punisher). With no flag the default is
+/// [`BehaviorMode::Ladder`], so omitting it is byte-identical to before. An unknown
+/// token (or a `--ai-mode` at the end with no value) warns and keeps the default;
+/// any other `--…` token passes through untouched. The last `--ai-mode` wins if
+/// repeated. Pure — unit-tested without a window.
+fn parse_ai_mode_flag(args: &[String]) -> (BehaviorMode, Vec<String>) {
+    let mut mode = BehaviorMode::default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.eq_ignore_ascii_case("--ai-mode") {
+            match args.get(i + 1) {
+                Some(value) => {
+                    match BehaviorMode::from_token(value) {
+                        Some(m) => mode = m,
+                        None => tracing::warn!(
+                            "--ai-mode: unknown teaching mode {value:?}; \
+                             using LADDER (try: ladder|blocker|dp|punisher)"
+                        ),
+                    }
+                    i += 2;
+                }
+                None => {
+                    tracing::warn!(
+                        "--ai-mode expects a teaching mode (ladder|blocker|dp|punisher); ignoring"
+                    );
+                    i += 1;
+                }
+            }
+        } else {
+            rest.push(arg.clone());
+            i += 1;
+        }
+    }
+    (mode, rest)
+}
+
 /// The two-player [`Match`] run state: the match plus the per-run rendering and
 /// audio resources held alongside it (per-side texture caches, the shared audio
 /// system, and per-side decoded-sound caches).
@@ -3149,6 +4375,14 @@ struct MatchRun {
     /// opponent position each tick and emits an approach/attack/block/jump input.
     /// Seeded deterministically from the match seed so the demo replays.
     cpu_ai: Option<CpuAi>,
+    /// The training-mode P2 dummy stance (F027 / T067). Only consulted when the
+    /// match is in [`GameMode::Training`]; cycled by the training quick-key. In
+    /// [`DummyMode::Cpu`] (and in Versus) P2 falls back to the baseline CPU AI /
+    /// human input. The default [`DummyMode::Stand`] makes the dummy stand idle.
+    dummy_mode: DummyMode,
+    /// A monotonic frame counter used only to phase [`DummyMode::JumpLoop`]'s
+    /// jump cadence (F027 / T067). Incremented once per match tick.
+    dummy_tick: u64,
 }
 
 /// Which storyboard overlay (if any) is *active* for the current frame, given the
@@ -3259,6 +4493,9 @@ impl MatchRun {
 enum Mode {
     /// Two-player [`Match`] (the playable demo): match + per-run render/audio.
     Match(Box<MatchRun>),
+    /// Replay-study viewer (T076): a [`MatchRun`] driven through a recorded
+    /// [`fp_engine::ReplayLog`] with VCR transport (play/pause/step/seek).
+    Replay(Box<ReplayViewer>),
     /// Legacy SFF+AIR animation viewer.
     Viewer(Box<AnimViewer>),
     /// Single static sprite.
@@ -3287,6 +4524,7 @@ fn select_mode(
     args: &[String],
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     match args.len() {
@@ -3299,6 +4537,7 @@ fn select_mode(
                 stage,
                 pal,
                 team_mode,
+                cpu_mode,
                 renderer,
             )
         }
@@ -3321,7 +4560,7 @@ fn select_mode(
         n if n >= 2 && is_def_path(&args[1]) => {
             let def = Path::new(&args[1]);
             let stage = stage_arg(args, 2);
-            load_match_or_fallback(def, def, stage, pal, team_mode, renderer)
+            load_match_or_fallback(def, def, stage, pal, team_mode, cpu_mode, renderer)
         }
         // <sff> → legacy static sprite.
         2 => match load_sff_sprite(renderer, Path::new(&args[1])) {
@@ -3339,7 +4578,7 @@ fn select_mode(
                 tracing::info!("No files provided; loading two-KFM match from {DEFAULT_DEF}");
                 // No default stage ships (clean-room / asset-blocked), so the
                 // default match renders over the flat clear color.
-                load_match_or_fallback(&def, &def, None, pal, team_mode, renderer)
+                load_match_or_fallback(&def, &def, None, pal, team_mode, cpu_mode, renderer)
             } else {
                 tracing::info!("No files and no default character; showing test pattern");
                 tracing::info!("Usage: fp-app [p1.def [p2.def]] | <file.sff> [file.air]");
@@ -3428,12 +4667,18 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgba, info.width, info.height))
 }
 
+// The direct-CLI loader threads the same wide-but-flat set of independent inputs
+// as `load_match_with_backdrop` (chars, optional stage, palette/team selections,
+// the chosen teaching mode, and the renderer); bundling them would only move the
+// fields elsewhere, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn load_match_or_fallback(
     p1_def: &Path,
     p2_def: &Path,
     stage_def: Option<&Path>,
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     load_match_with_backdrop(
@@ -3443,6 +4688,14 @@ fn load_match_or_fallback(
         DEFAULT_STAGE_BG,
         pal,
         team_mode,
+        // The direct-CLI path keeps the default difficulty so its deterministic
+        // play-out (default seed + Normal) is unchanged; the Setup/Options screen
+        // (menu flow) is what selects a non-default difficulty (T069).
+        AiDifficulty::Normal,
+        // The teaching `BehaviorMode` comes from the `--ai-mode` CLI flag (default
+        // `Ladder` = the plain difficulty ladder) so a player can pick a teaching
+        // CPU from the command line (T070).
+        cpu_mode,
         renderer,
     )
 }
@@ -3452,6 +4705,11 @@ fn load_match_or_fallback(
 /// stage-select screen lets the player choose the backdrop). All the same
 /// best-effort guarantees apply: a missing/bad backdrop simply leaves the flat
 /// clear color.
+// The match-loading path threads a wide but flat set of independent inputs
+// (the two characters, optional stage, backdrop, palette/team/difficulty
+// selections, and the renderer); bundling them into a struct would only move the
+// same fields elsewhere without clarifying the call, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn load_match_with_backdrop(
     p1_def: &Path,
     p2_def: &Path,
@@ -3459,10 +4717,23 @@ fn load_match_with_backdrop(
     backdrop_path: &str,
     pal: PalSelection,
     team_mode: TeamMode,
+    cpu_difficulty: AiDifficulty,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Mode {
     match build_team_match(p1_def, p2_def, pal, team_mode) {
         Ok(mut m) => {
+            // Declare each side's input driver so the engine assigns the right
+            // `AILevel` (T052): P1 is the human at the keyboard (level 0), P2 is
+            // the baseline CPU AI at the Setup/Options-selected difficulty the
+            // `CpuAi` below runs (T069; default `Normal` -> level 4). A second
+            // human controller still overrides the CPU's inputs per-frame in
+            // `tick_match_run`, but the identity (and thus `AILevel`) is set once
+            // here at construction.
+            m.set_drivers(
+                PlayerDriver::Human,
+                PlayerDriver::Cpu(cpu_difficulty, cpu_mode),
+            );
             // The shipped common-effects (`fightfx`) set is loaded best-effort
             // (audit #17): when present, its AIR is installed on the team's inner
             // match so common (`fightfx`) hit-sparks spawn, and its SFF render bundle
@@ -3516,16 +4787,246 @@ fn load_match_with_backdrop(
                 background,
                 // Drive the otherwise-idle P2 with the baseline CPU AI (T018),
                 // seeded deterministically (P2's derived per-player seed) so the
-                // demo replays identically. A second human controller, when
-                // present, overrides it per-frame in `tick_match_run`.
-                cpu_ai: Some(CpuAi::new(
+                // demo replays identically, in the Setup/Options- or CLI-selected
+                // teaching `BehaviorMode` (T070; default `Ladder` = the plain
+                // difficulty ladder, unchanged from before). A second human
+                // controller, when present, overrides it per-frame in
+                // `tick_match_run`.
+                cpu_ai: Some(CpuAi::with_mode(
                     derive_player_seed(DEFAULT_MATCH_SEED, 1),
-                    AiDifficulty::Normal,
+                    cpu_difficulty,
+                    cpu_mode,
                 )),
+                dummy_mode: DummyMode::default(),
+                dummy_tick: 0,
             }))
         }
         Err(e) => {
             tracing::warn!("match failed to load: {e}; showing test pattern");
+            let (s, p) = generate_test_pattern(renderer);
+            Mode::TestPattern(s, p)
+        }
+    }
+}
+
+/// The replay-study viewer (T076): a live [`MatchRun`] driven through a recorded
+/// [`fp_engine::ReplayLog`]'s inputs, with VCR-style transport controls.
+///
+/// Wraps a freshly-loaded `MatchRun` (built from the *same* two characters the log
+/// was recorded with) and steps it through the recorded `(p1, p2)` input pairs.
+/// Because the engine tick is forward-only + deterministic, seeking restores the
+/// nearest cached keyframe ([`fp_engine::TeamMatch::snapshot_active`]) and
+/// re-simulates forward — exactly the engine-tested
+/// [`fp_engine::ReplayPlayer`] algorithm, applied over the renderer-bearing
+/// `MatchRun`. The F026 overlays (`F1`/`F3` hitboxes, `F8`/`F9` input + frame data)
+/// are pure draw layers over the live match, so they apply to the replay unchanged.
+///
+/// Transport keys are sampled in the run loop separately from match input
+/// (recorded inputs are fixed): Space toggles play/pause, `,`/`.` step ∓1 frame,
+/// Left/Right arrows seek ∓10 frames, Home/End jump to the start/end.
+struct ReplayViewer {
+    /// The live match the recorded inputs drive — the render/HUD/overlay surface.
+    run: Box<MatchRun>,
+    /// The recorded log being replayed (owned; never blocks on I/O after load).
+    log: fp_engine::ReplayLog,
+    /// The current playhead frame (recorded input pairs applied), in `0..=len`.
+    frame: u32,
+    /// Whether the transport is advancing (play) vs. holding (pause).
+    playing: bool,
+    /// Cached inner-match keyframes `(frame, snapshot)`, sorted ascending and always
+    /// containing frame 0 — the seek bases for restore + re-sim.
+    keyframes: Vec<(u32, fp_engine::MatchSnapshot)>,
+}
+
+impl ReplayViewer {
+    /// Builds a viewer for `log`, loading a `MatchRun` from `p1_def`/`p2_def` (the
+    /// characters the log was recorded with), seeding it from the log's seed, and
+    /// capturing frame 0. Returns `None` (logged) if the match fails to load or the
+    /// log's character fingerprints do not match the loaded characters.
+    fn load(
+        log: fp_engine::ReplayLog,
+        p1_def: &Path,
+        p2_def: &Path,
+        renderer: &Renderer,
+    ) -> Option<Self> {
+        // Reuse the standard match-load path (assets, stage, screenpack, HUD), then
+        // unwrap the MatchRun. The CPU AI it installs is irrelevant — the viewer
+        // feeds recorded inputs directly, bypassing P2 resolution.
+        let mode = load_match_or_fallback(
+            p1_def,
+            p2_def,
+            None,
+            PalSelection::default(),
+            TeamMode::Single,
+            BehaviorMode::default(),
+            renderer,
+        );
+        let mut run = match mode {
+            Mode::Match(run) => run,
+            _ => {
+                tracing::warn!(
+                    "replay: characters {} / {} failed to load a match; cannot open viewer",
+                    p1_def.display(),
+                    p2_def.display()
+                );
+                return None;
+            }
+        };
+        // Validate fingerprints + seed exactly as `replay_match` does, via the engine
+        // primitives, then capture frame 0.
+        run.team.seed_players(log.match_seed);
+        let frame0 = run.team.snapshot_active();
+        // A fingerprint mismatch surfaces on the first restore; verify up-front by a
+        // round-trip restore of frame 0 (cheap, never ticks).
+        if run.team.restore_active(&frame0).is_err() {
+            tracing::warn!("replay: snapshot/restore self-check failed; cannot open viewer");
+            return None;
+        }
+        Some(Self {
+            run,
+            log,
+            frame: 0,
+            playing: false,
+            keyframes: vec![(0, frame0)],
+        })
+    }
+
+    /// The total number of recorded frames (seekable range `0..=len`).
+    fn len(&self) -> u32 {
+        self.log.inputs.len() as u32
+    }
+
+    /// Whether the playhead is at the end of the log.
+    fn at_end(&self) -> bool {
+        self.frame >= self.len()
+    }
+
+    /// Drives the inner team one tick with the **exact** given inputs (no CPU/dummy
+    /// resolution — the recorded inputs are authoritative), then advances audio +
+    /// stage scroll, mirroring [`tick_match_run`] minus P2 resolution.
+    fn raw_tick(&mut self, p1: MatchInput, p2: MatchInput) {
+        self.run.dummy_tick = self.run.dummy_tick.wrapping_add(1);
+        self.run.team.tick(p1, p2);
+        self.run.p1_audio.play_requests(
+            &mut self.run.audio,
+            self.run.team.active().p1(),
+            self.run.team.active().p1_sound_requests(),
+        );
+        self.run.p2_audio.play_requests(
+            &mut self.run.audio,
+            self.run.team.active().p2(),
+            self.run.team.active().p2_sound_requests(),
+        );
+        if let Some(stage) = self.run.stage.as_mut() {
+            stage.advance_scroll();
+            stage.advance_anim();
+        }
+    }
+
+    /// Caches an inner-match keyframe at the current frame if it lands on a
+    /// [`fp_engine::DEFAULT_KEYFRAME_INTERVAL`] boundary and is not already cached.
+    fn cache_keyframe_if_due(&mut self) {
+        if !self
+            .frame
+            .is_multiple_of(fp_engine::DEFAULT_KEYFRAME_INTERVAL)
+        {
+            return;
+        }
+        if let Err(pos) = self
+            .keyframes
+            .binary_search_by_key(&self.frame, |(f, _)| *f)
+        {
+            let snap = self.run.team.snapshot_active();
+            self.keyframes.insert(pos, (self.frame, snap));
+        }
+    }
+
+    /// Advances exactly one recorded frame (the play step). Auto-pauses at the end.
+    /// Returns whether a frame was consumed.
+    fn advance(&mut self) -> bool {
+        if self.at_end() {
+            self.playing = false;
+            return false;
+        }
+        let (p1, p2) = self.log.inputs[self.frame as usize];
+        self.raw_tick(p1, p2);
+        self.frame += 1;
+        self.cache_keyframe_if_due();
+        true
+    }
+
+    /// Seeks (scrubs) the playhead to `target` (clamped to `0..=len`) by restoring
+    /// the nearest earlier keyframe and re-simulating forward. Seeking pauses.
+    fn seek(&mut self, target: u32) {
+        let target = target.min(self.len());
+        let (kf_frame, kf_snap) = self
+            .keyframes
+            .iter()
+            .rev()
+            .find(|(f, _)| *f <= target)
+            .map(|(f, s)| (*f, s.clone()))
+            .expect("frame-0 keyframe always present");
+        // Restore is infallible for a snapshot from this same match; on the
+        // impossible mismatch, re-seed from frame 0 rather than panic.
+        if self.run.team.restore_active(&kf_snap).is_err() {
+            self.run.team.seed_players(self.log.match_seed);
+            self.frame = 0;
+        } else {
+            self.frame = kf_frame;
+        }
+        while self.frame < target {
+            let (p1, p2) = self.log.inputs[self.frame as usize];
+            self.raw_tick(p1, p2);
+            self.frame += 1;
+            self.cache_keyframe_if_due();
+        }
+        self.playing = false;
+    }
+
+    /// Steps the playhead back one frame (seek to current − 1). No-op at 0.
+    fn step_back(&mut self) {
+        if self.frame > 0 {
+            self.seek(self.frame - 1);
+        }
+    }
+
+    /// Toggles play/pause.
+    fn toggle_play(&mut self) {
+        self.playing = !self.playing;
+    }
+}
+
+/// Loads a replay log from disk and opens a [`ReplayViewer`] over it (T076),
+/// degrading to the test pattern on any failure (never a panic).
+///
+/// Reads + decodes the `.bin` log, then builds the viewer from the named character
+/// `.def`s (one `.def` reused on both sides when `p2` is `None`). A missing/bad log
+/// or a character/log mismatch logs and falls back to the test pattern.
+fn load_replay_mode(log_path: &Path, p1_def: &Path, p2_def: &Path, renderer: &Renderer) -> Mode {
+    let bytes = match std::fs::read(log_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("replay: cannot read log {}: {e}", log_path.display());
+            let (s, p) = generate_test_pattern(renderer);
+            return Mode::TestPattern(s, p);
+        }
+    };
+    let log = match fp_engine::ReplayLog::decode(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("replay: cannot decode log {}: {e}", log_path.display());
+            let (s, p) = generate_test_pattern(renderer);
+            return Mode::TestPattern(s, p);
+        }
+    };
+    tracing::info!(
+        "replay: opening viewer over {} ({} frames)",
+        log_path.display(),
+        log.inputs.len()
+    );
+    match ReplayViewer::load(log, p1_def, p2_def, renderer) {
+        Some(v) => Mode::Replay(Box::new(v)),
+        None => {
             let (s, p) = generate_test_pattern(renderer);
             Mode::TestPattern(s, p)
         }
@@ -3638,6 +5139,8 @@ fn match_hud_state(m: &Match) -> MatchHudState {
         timer_seconds: Some(timer_frames_to_seconds(m.timer())),
         round_text: round_readout(m),
         combo_count: active_combo_count(m),
+        // The caller sets `frame` (drives the T074 max-power flash) after building.
+        frame: 0,
     }
 }
 
@@ -3992,6 +5495,15 @@ enum RunScreen {
     Title(screens::TitleMenu),
     /// The character-select grid.
     Select(screens::SelectScreen),
+    /// The movelist / character-info screen (T071), shown when the player presses
+    /// Info on a character cell. Carries the info to display plus the
+    /// character-select screen to resume when dismissed.
+    CharacterInfo {
+        /// The character-info / movelist data to draw.
+        info: screens::InfoScreen,
+        /// The character-select screen to return to on dismiss (unchanged).
+        select: screens::SelectScreen,
+    },
     /// The stage-select list (T041), shown after character-select and before the
     /// fight. Carries the already-chosen [`screens::MatchPick`] so the match can
     /// be built once a stage is confirmed; cancelling returns to character-select.
@@ -4100,6 +5612,26 @@ impl MenuApp {
         self.screen = RunScreen::Setup(screens::SetupScreen::new());
     }
 
+    /// Enters the movelist / character-info screen (T071) for the character at
+    /// `def_path`, carrying the character-select screen forward to resume on
+    /// dismiss. The character is loaded here (off the hot path); a load failure
+    /// degrades to a [`screens::InfoScreen::load_failed`] fallback that still
+    /// shows the roster label, so Info never crashes or traps the player.
+    fn enter_character_info(&mut self, def_path: &Path, select: screens::SelectScreen) {
+        let info = match fp_character::LoadedCharacter::load(def_path) {
+            Ok(loaded) => screens::InfoScreen::from_loaded(&loaded),
+            Err(e) => {
+                tracing::warn!("character info: failed to load {}: {e}", def_path.display());
+                let label = def_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("???");
+                screens::InfoScreen::load_failed(label)
+            }
+        };
+        self.screen = RunScreen::CharacterInfo { info, select };
+    }
+
     /// Enters the stage-select screen (T041) for a completed character pick,
     /// carrying the pick forward so the match can be assembled once a stage is
     /// confirmed. Seeds the stage list from the loaded motif (the dojo backdrop
@@ -4116,10 +5648,15 @@ impl MenuApp {
         &mut self,
         pick: &screens::MatchPick,
         stage: &screens::StageChoice,
+        mode: screens::SelectMode,
+        cpu_difficulty: AiDifficulty,
+        cpu_mode: BehaviorMode,
         renderer: &Renderer,
     ) {
+        let game_mode = game_mode_for(mode);
         tracing::info!(
-            "Starting match: P1={} ({}) vs P2={} ({}) on stage {} ({})",
+            "Starting match ({:?}): P1={} ({}) vs P2={} ({}) on stage {} ({})",
+            game_mode,
             pick.p1_name,
             pick.p1_def.display(),
             pick.p2_name,
@@ -4127,8 +5664,19 @@ impl MenuApp {
             stage.name,
             stage.path.display(),
         );
-        match build_match_run(&pick.p1_def, &pick.p2_def, stage, renderer) {
+        match build_match_run(
+            &pick.p1_def,
+            &pick.p2_def,
+            stage,
+            cpu_difficulty,
+            cpu_mode,
+            renderer,
+        ) {
             Some(mut run) => {
+                // (T066) Flag the match's mode so Training disables round
+                // termination (no timeout, no auto-KO end) while Versus runs the
+                // normal round flow. A no-op for Versus (the engine default).
+                run.team.set_game_mode(game_mode);
                 // Apply the player's HUD-customization overrides (T046) to the
                 // match's screenpack HUD, if one loaded. With the default (no-op)
                 // config this leaves the HUD byte-for-byte unchanged.
@@ -4181,6 +5729,17 @@ impl MenuApp {
     }
 }
 
+/// Maps a character-select [`screens::SelectMode`] to the match-time
+/// [`GameMode`] it implies (T066): the Training select flow enters a
+/// [`GameMode::Training`] match (round termination disabled — the Lab), while
+/// the Versus flow enters a normal [`GameMode::Versus`] match.
+fn game_mode_for(mode: screens::SelectMode) -> GameMode {
+    match mode {
+        screens::SelectMode::Training => GameMode::Training,
+        screens::SelectMode::Versus => GameMode::Versus,
+    }
+}
+
 /// Builds a [`MatchRun`] (match + per-run render/audio/HUD resources) for two
 /// character `.def`s over the player-chosen stage (T041), mirroring the
 /// direct-CLI match path. A [`screens::StageKind::Def`] stage loads its MUGEN
@@ -4189,10 +5748,16 @@ impl MenuApp {
 /// degrades to the flat clear color — the match still runs. Returns `None` on a
 /// character load failure so the caller can fall back to the title menu. Never
 /// panics.
+// `build_match_run` threads the player's stage, palette, difficulty, and teaching
+// mode selections plus the renderer into the loader; bundling them would only move
+// the same flat fields elsewhere, so the arg count is allowed.
+#[allow(clippy::too_many_arguments)]
 fn build_match_run(
     p1_def: &Path,
     p2_def: &Path,
     stage: &screens::StageChoice,
+    cpu_difficulty: AiDifficulty,
+    cpu_mode: BehaviorMode,
     renderer: &Renderer,
 ) -> Option<MatchRun> {
     // A `.def` stage becomes a MUGEN `[BGdef]` stage; a backdrop stage has no
@@ -4210,6 +5775,10 @@ fn build_match_run(
         // The in-app menu fights 1v1; the team modes are reachable via the
         // `--simul`/`--turns` direct-CLI flag (T027).
         TeamMode::Single,
+        // P2's CPU difficulty as chosen on the Setup/Options screen (T069).
+        cpu_difficulty,
+        // P2's CPU teaching mode as chosen on the Setup/Options screen (T070).
+        cpu_mode,
         renderer,
     ) {
         Mode::Match(run) => Some(*run),
@@ -4315,6 +5884,107 @@ fn draw_select_screen(
         screens::SelectMode::Training => "PICK FIGHTER",
     };
     draw_centered_text(frame, font, hint, win_w, y + 20.0, 2.0, 0.8);
+    // Tab opens the character-info / movelist screen (T071) for the highlighted
+    // character.
+    draw_centered_text(frame, font, "TAB  INFO", win_w, y + 44.0, 1.5, 0.6);
+}
+
+/// Draws the movelist / character-info screen (T071): the character's display
+/// name and author as a header, then the movelist as a left-aligned list of
+/// `NAME   MOTION` lines, with a dismiss hint. A no-op when no font is loaded
+/// (the screen still functions and dismisses; nothing is drawn).
+///
+/// Renders cleanly for a sparse/malformed character: an empty movelist shows a
+/// "NO MOVES LISTED" note rather than a blank panel, and every string is folded
+/// into the font's glyph set ([`to_info_text`]) so unrenderable symbols
+/// degrade rather than vanish.
+fn draw_character_info_screen(
+    frame: &mut fp_render::RenderFrame<'_>,
+    font: &GlyphFont,
+    info: &screens::InfoScreen,
+    win_w: f32,
+) {
+    // Header: display name (large) + author credit (small), both centered.
+    let title = if info.display_name.is_empty() {
+        "CHARACTER".to_string()
+    } else {
+        to_menu_text(&info.display_name)
+    };
+    draw_centered_text(frame, font, &title, win_w, 36.0, 3.0, 1.0);
+    if !info.author.is_empty() {
+        let author = format!("BY {}", to_menu_text(&info.author));
+        draw_centered_text(frame, font, &author, win_w, 80.0, 1.5, 0.8);
+    }
+    draw_centered_text(frame, font, "MOVELIST", win_w, 112.0, 2.0, 0.9);
+
+    // The movelist, left-aligned. Each line is "NAME   MOTION"; an empty motion
+    // (button-only / unparseable) just shows the name.
+    const SCALE: f32 = 2.0;
+    let line_h = font.line_height() as f32 * SCALE;
+    let x = (win_w * 0.12).max(16.0);
+    let mut y = 152.0;
+    if info.moves.is_empty() {
+        draw_centered_text(frame, font, "NO MOVES LISTED", win_w, y, 1.5, 0.7);
+    } else {
+        for mv in &info.moves {
+            let name = to_info_text(&mv.name);
+            let line = if mv.motion.is_empty() {
+                name
+            } else {
+                format!("{name}   {}", to_info_text(&mv.motion))
+            };
+            frame.draw_text(
+                font,
+                &line,
+                &TextDrawParams {
+                    x,
+                    y,
+                    scale: SCALE,
+                    alpha: 1.0,
+                    blend: BlendMode::Normal,
+                },
+            );
+            y += line_h + 4.0;
+        }
+    }
+
+    draw_centered_text(
+        frame,
+        font,
+        "TAB OR BACK TO RETURN",
+        win_w,
+        y + 28.0,
+        1.5,
+        0.6,
+    );
+}
+
+/// Folds a movelist string into the menu font's glyph set for display (T071).
+///
+/// The shipped FNT covers `0-9 A-Z`, space, and colon. The movelist uses a few
+/// symbols the font can't draw — `+` (simultaneous press) and the unicode arrows
+/// used by the literal-motion fallback. Map them to renderable letters/spaces so
+/// the line stays legible (e.g. `QCF+a` -> `QCF A`, `\u{2192}\u{2193}+x` ->
+/// `FD X`) instead of dropping glyphs. The underlying movelist data keeps the
+/// proper symbols; only the on-screen text is folded.
+fn to_info_text(s: &str) -> String {
+    let mapped: String = s
+        .chars()
+        .map(|c| match c {
+            '+' => ' ',
+            '\u{2191}' => 'U', // ↑
+            '\u{2193}' => 'D', // ↓
+            '\u{2192}' => 'F', // →
+            '\u{2190}' => 'B', // ←
+            '\u{2197}' => 'U', // ↗ (approx; diagonals collapse to nearest cardinal)
+            '\u{2196}' => 'U', // ↖
+            '\u{2198}' => 'D', // ↘
+            '\u{2199}' => 'D', // ↙
+            '[' | ']' => ' ',  // charge brackets -> spaces
+            other => other,
+        })
+        .collect();
+    to_menu_text(&mapped)
 }
 
 /// Draws the stage-select screen (T041): a header, the available stages as a
@@ -4372,6 +6042,10 @@ fn draw_setup_screen(
     // customization row, or an action).
     let focus = if setup.on_device_row() {
         "DEVICE".to_string()
+    } else if setup.on_cpu_difficulty_row() {
+        "CPU".to_string()
+    } else if setup.on_cpu_mode_row() {
+        "CPU MODE".to_string()
     } else if setup.on_hud_row() {
         "HUD".to_string()
     } else {
@@ -4394,6 +6068,14 @@ fn draw_setup_screen(
             // The device-preference row.
             screens::SetupRowKind::Device => {
                 format!("{marker} DEVICE: {}", config.device.label())
+            }
+            // The CPU-difficulty selector row (T069): Left/Right step it.
+            screens::SetupRowKind::CpuDifficulty => {
+                format!("{marker} CPU: {}", config.cpu_difficulty.label())
+            }
+            // The CPU teaching-mode selector row (T070): Left/Right step it.
+            screens::SetupRowKind::CpuMode => {
+                format!("{marker} CPU MODE: {}", config.cpu_mode.label())
             }
             // The HUD-customization entry row (T046).
             screens::SetupRowKind::HudCustomize => format!("{marker} HUD CUSTOMIZE..."),
@@ -4542,6 +6224,24 @@ fn pick_p2_input(
 fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
     // Observe BEFORE borrowing the AI mutably (both live on `run`).
     let obs = run.team.active().ai_observation_for_p2();
+    // Training-mode dummy control (F027 / T067): in the Lab, a non-CPU dummy
+    // stance drives P2 with a fixed held-state (stand/crouch/jump/block) computed
+    // from the live opponent side and the dummy's "was hit" signal — unless a
+    // human second controller asserts something this frame, which always wins.
+    // `DummyMode::Cpu` (and any non-Training match) falls through to the baseline
+    // CPU AI exactly as before.
+    if run.team.game_mode() == GameMode::Training
+        && !run.dummy_mode.is_cpu()
+        && match_input_is_idle(p2_human)
+    {
+        let active = run.team.active();
+        let opponent_on_right = obs.opponent_on_right();
+        // Use the sticky per-combo latch (not the per-tick `p2_was_hit` edge):
+        // BlockAfterFirst must keep guarding across the non-damage frames between
+        // a combo's hits, not drop its guard on the gap and eat the next hit.
+        let was_hit = active.p2_hit_latched();
+        return dummy_input(run.dummy_mode, opponent_on_right, was_hit, run.dummy_tick);
+    }
     pick_p2_input(p2_human, run.cpu_ai.as_mut(), obs)
 }
 
@@ -4554,8 +6254,53 @@ fn resolve_p2_input(run: &mut MatchRun, p2_human: MatchInput) -> MatchInput {
 /// tick is taken from the AI instead — so the otherwise-idle P2 approaches,
 /// attacks, blocks, and jumps. A human second controller therefore transparently
 /// overrides the AI on any frame it presses something.
+/// Applies this frame's training quick-keys (F027 / T067) to a live [`MatchRun`].
+///
+/// All four are no-ops unless the match is in [`GameMode::Training`] (the Lab),
+/// so the keys are inert in a Versus match:
+/// - `cycle_dummy` (F4): rotate the P2 dummy stance
+///   (`Stand → Crouch → JumpLoop → BlockAll → BlockAfterFirst → Cpu → …`).
+/// - `toggle_inf_life` (F5): flip "infinite life" for **both** fighters together.
+/// - `toggle_inf_meter` (F6): flip "infinite meter" for both fighters.
+/// - `reset_positions` (F7): return both fighters to their round-start positions,
+///   facing, and full life without advancing the round.
+fn apply_training_keys(
+    run: &mut MatchRun,
+    cycle_dummy: bool,
+    toggle_inf_life: bool,
+    toggle_inf_meter: bool,
+    reset_positions: bool,
+) {
+    if run.team.game_mode() != GameMode::Training {
+        return;
+    }
+    if cycle_dummy {
+        run.dummy_mode = run.dummy_mode.cycle_next();
+        tracing::info!(mode = run.dummy_mode.label(), "training: dummy stance");
+    }
+    if toggle_inf_life {
+        let on = !run.team.infinite_life(Side::P1);
+        run.team.set_infinite_life(Side::P1, on);
+        run.team.set_infinite_life(Side::P2, on);
+        tracing::info!(on, "training: infinite life (both fighters)");
+    }
+    if toggle_inf_meter {
+        let on = !run.team.infinite_meter(Side::P1);
+        run.team.set_infinite_meter(Side::P1, on);
+        run.team.set_infinite_meter(Side::P2, on);
+        tracing::info!(on, "training: infinite meter (both fighters)");
+    }
+    if reset_positions {
+        run.team.reset_positions();
+        run.dummy_tick = 0;
+        tracing::info!("training: reset positions");
+    }
+}
+
 fn tick_match_run(run: &mut MatchRun, p1_input: MatchInput, p2_input: MatchInput) {
     let p2_input = resolve_p2_input(run, p2_input);
+    // Advance the dummy's jump-cadence clock once per tick (F027 / T067).
+    run.dummy_tick = run.dummy_tick.wrapping_add(1);
     // Drive the whole team (in 1v1 / Single this is exactly one pair). The renderer
     // and audio below read the active pair through `run.m()`.
     run.team.tick(p1_input, p2_input);
@@ -4614,9 +6359,10 @@ fn draw_match_run(
     frame: &mut fp_render::RenderFrame<'_>,
     run: &MatchRun,
     hud: &Hud,
-    overlay_enabled: bool,
+    overlays: MatchOverlays,
     win_wf: f32,
     win_hf: f32,
+    tick: u64,
 ) {
     // Camera follows the fighters' midpoint, clamped to the stage's bounds — X
     // horizontally and Y vertically (scaled by `[Camera] verticalfollow`). With no
@@ -4718,19 +6464,35 @@ fn draw_match_run(
         stage.draw_layer(frame, BgLayer::Front, camera_x, camera_y, win_wf, win_hf);
     }
 
-    // Optional Clsn debug overlay (F1).
-    if overlay_enabled {
+    // Optional Clsn debug overlay (F1) — the raw dev toggle, always both sides.
+    if overlays.dev_clsn {
         draw_player_clsn(frame, run.m().p1(), camera_x, win_wf, win_hf);
         draw_player_clsn(frame, run.m().p2(), camera_x, win_wf, win_hf);
     }
 
+    // Player-facing training overlay (T063): styled, per-side-scopable, with a
+    // legend. Independent of the raw F1 dev toggle above; reuses the same box
+    // math. Drawn under the HUD so the legend text reads over the boxes.
+    overlays
+        .training
+        .draw(frame, run.m(), hud.font(), camera_x, win_wf, win_hf);
+
+    // Player-facing input display (T064): per-side input-history strip + command
+    // flash. Off by default; toggled with F3. Drawn under
+    // the HUD so the strip text reads over the stage but below lifebars.
+    overlays
+        .input_display
+        .draw(frame, run.m(), hud.font(), win_wf);
+
     // HUD on top: a loaded screenpack draws real lifebars/text, else the quad HUD.
+    // `tick` drives the deterministic max-power flash (T074) for both paths.
     match run.screenpack.as_ref() {
         Some(screenpack) => {
-            let state = match_hud_state(run.m());
+            let mut state = match_hud_state(run.m());
+            state.frame = tick;
             screenpack.draw(frame, &state);
         }
-        None => hud.draw(frame, win_wf, run.m()),
+        None => hud.draw(frame, win_wf, run.m(), tick),
     }
 
     // Intro/ending storyboard overlay (audit #32), drawn LAST and only while one
@@ -4799,6 +6561,10 @@ fn run() -> fp_core::FpResult<()> {
     // Team mode (T027): `--simul`/`--turns` select a multi-fighter match on the
     // direct-CLI path; the default is the classic 1v1 (`TeamMode::Single`).
     let (team_mode, args) = parse_team_flag(&args);
+    // CPU teaching mode (T070): `--ai-mode <token>` picks which teaching CPU drives
+    // P2 on the direct-CLI match path (default `Ladder` = the plain difficulty
+    // ladder). The menu flow instead reads the Setup/Options CPU-mode selector.
+    let (cli_cpu_mode, args) = parse_ai_mode_flag(&args);
 
     // The top-level launch route: no file args (or an explicit `menu`) launches
     // the in-app Title menu; a directory argument scans it for a character roster
@@ -4819,11 +6585,16 @@ fn run() -> fp_core::FpResult<()> {
             motif_selector.as_deref(),
             Some(dir.as_path()),
         )),
-        CliRoute::Direct => None,
+        CliRoute::Direct | CliRoute::Replay { .. } => None,
     };
-    // The direct-CLI content mode, only built on the Direct route.
+    // The direct-CLI content mode, only built on the Direct route; the Replay route
+    // builds the replay-study viewer (T076).
     let mut mode = match &route {
-        CliRoute::Direct => Some(select_mode(&args, pal, team_mode, &renderer)),
+        CliRoute::Direct => Some(select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)),
+        CliRoute::Replay { log, p1, p2 } => {
+            let p2_def = p2.as_deref().unwrap_or(p1.as_path());
+            Some(load_replay_mode(log, p1, p2_def, &renderer))
+        }
         CliRoute::Menu | CliRoute::Directory(_) => None,
     };
 
@@ -4844,6 +6615,12 @@ fn run() -> fp_core::FpResult<()> {
     // A monotonic frame counter, used as the deterministic-friendly RNG seed for
     // RandomSelect on the character-select screen.
     let mut frame_counter: u64 = 0;
+    // How many ticks the direct-CLI match has held the decided-winner screen.
+    // Counts up once the engine reports a `match_winner`; when it reaches
+    // [`MATCH_OVER_HOLD_FRAMES`] the app rebuilds a fresh match (auto-rematch) and
+    // this resets. Inert in every non-direct-CLI mode (the menu Fight path returns
+    // to the title instead).
+    let mut match_over_held: u32 = 0;
 
     // --- Main loop ---
     let mut event_pump = sdl
@@ -4853,10 +6630,12 @@ fn run() -> fp_core::FpResult<()> {
     let mut previous = Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut running = true;
-    // Clsn hitbox/hurtbox debug overlay (audit #34), toggled with F1. Off by
-    // default; when on, both fighters' current-frame Clsn1 (red) and Clsn2
-    // (blue) boxes are drawn over the sprites in the two-player match mode.
-    let mut overlay_enabled = false;
+    // Player-facing match overlays, all off by default and persisting for the
+    // session:
+    //   - `dev_clsn` (F1, audit #34): raw both-sides Clsn1/Clsn2 debug boxes.
+    //   - `training` (F2, T063): styled per-side (Off → P1 → P2 → Both) hitbox view.
+    //   - `input_display` (F3, T064): per-side input-history strip + command flash.
+    let mut overlays = MatchOverlays::default();
 
     while running {
         // Per-frame edge flags driven from discrete key events (below).
@@ -4866,10 +6645,30 @@ fn run() -> fp_core::FpResult<()> {
         // physical press), complementing the held-state directions sampled below.
         let mut esc_pressed = false;
         let mut confirm_key_pressed = false;
+        // Menu "info" edge (T071): opens the character-info / movelist screen on
+        // the character-select screen, and dismisses it. Bound to Tab so it never
+        // collides with the confirm (Enter/Space) or back (Esc) keys.
+        let mut info_key_pressed = false;
         // The first physical key pressed this frame (its scancode), excluding
         // Escape. Used by the setup screen's key-capture mode (T042) to bind the
         // pressed key to the action being remapped; ignored in every other mode.
         let mut captured_scancode: Option<Scancode> = None;
+        // Training-mode quick-key edges (F027 / T067), applied to the active
+        // match after the event loop. Each is a one-shot press this frame.
+        let mut cycle_dummy_pressed = false;
+        let mut toggle_inf_life_pressed = false;
+        let mut toggle_inf_meter_pressed = false;
+        let mut reset_positions_pressed = false;
+        // Replay-study transport edges (T076), applied to a `Mode::Replay` viewer
+        // after the event loop; inert in every other mode. Net seek delta this
+        // frame (frames; − = rewind), and the discrete play/pause + step + jump
+        // edges.
+        let mut replay_play_toggle = false;
+        let mut replay_step_back = false;
+        let mut replay_step_fwd = false;
+        let mut replay_seek_delta: i64 = 0;
+        let mut replay_jump_start = false;
+        let mut replay_jump_end = false;
         // Poll events
         for event in event_pump.poll_iter() {
             match event {
@@ -4892,20 +6691,126 @@ fn run() -> fp_core::FpResult<()> {
                     confirm_key_pressed = true;
                 }
                 Event::KeyDown {
+                    keycode: Some(Keycode::Tab),
+                    repeat: false,
+                    ..
+                } => {
+                    // Menu "info" action (T071). Outside the menu it is inert.
+                    info_key_pressed = true;
+                }
+                Event::KeyDown {
                     keycode: Some(Keycode::F1),
                     repeat: false,
                     ..
                 } => {
-                    overlay_enabled = !overlay_enabled;
+                    overlays.dev_clsn = !overlays.dev_clsn;
                     tracing::info!(
                         "Clsn debug overlay {}",
-                        if overlay_enabled { "ON" } else { "OFF" }
+                        if overlays.dev_clsn { "ON" } else { "OFF" }
                     );
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F2),
+                    repeat: false,
+                    ..
+                } => {
+                    // Player-facing training overlay (T063): cycle Off → P1 → P2
+                    // → Both → Off. Independent of the F1 dev overlay.
+                    overlays.training.cycle();
+                    tracing::info!("Training Clsn overlay: {}", overlays.training.scope.label());
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F3),
+                    repeat: false,
+                    ..
+                } => {
+                    // Player-facing input display (T064): cycle Off → P1 → P2 →
+                    // Both → Off. Independent of the F1/F2 overlays.
+                    overlays.input_display.cycle();
+                    tracing::info!("Input display: {}", overlays.input_display.scope.label());
+                }
+                // Training quick-keys (F027 / T067). These set edge flags applied
+                // to the active match below; they are no-ops outside Training.
+                Event::KeyDown {
+                    keycode: Some(Keycode::F4),
+                    repeat: false,
+                    ..
+                } => {
+                    cycle_dummy_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F5),
+                    repeat: false,
+                    ..
+                } => {
+                    toggle_inf_life_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F6),
+                    repeat: false,
+                    ..
+                } => {
+                    toggle_inf_meter_pressed = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F7),
+                    repeat: false,
+                    ..
+                } => {
+                    reset_positions_pressed = true;
+                }
+                // Replay-study transport (T076): play/pause, step ∓1, seek ∓10,
+                // jump to start/end. Inert outside `Mode::Replay`. Key repeat is
+                // allowed on step/seek so a held key scrubs.
+                Event::KeyDown {
+                    keycode: Some(Keycode::P),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_play_toggle = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Comma),
+                    ..
+                } => {
+                    replay_step_back = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Period),
+                    ..
+                } => {
+                    replay_step_fwd = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    ..
+                } => {
+                    replay_seek_delta -= 10;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    ..
+                } => {
+                    replay_seek_delta += 10;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Home),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_jump_start = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::End),
+                    repeat: false,
+                    ..
+                } => {
+                    replay_jump_end = true;
                 }
                 // Any other physical key press: record the first one this frame so
                 // the setup screen's remap-capture can bind it. (Esc/Return/Space/
-                // F1 are handled above; this catches the rest, e.g. a new key for
-                // an action.) Only the first press per frame is kept.
+                // F1/F2 are handled above; this catches the rest, e.g. a new key
+                // for an action.) Only the first press per frame is kept.
                 Event::KeyDown {
                     scancode: Some(scancode),
                     repeat: false,
@@ -4986,14 +6891,17 @@ fn run() -> fp_core::FpResult<()> {
                 left: p1_input.left,
                 right: p1_input.right,
                 // A held confirm/back is also fine — edge detection makes it
-                // one-shot. Map controller A (a) to confirm, B (b) to back.
+                // one-shot. Map controller A (a) to confirm, B (b) to back, C (c)
+                // to info (the character-info / movelist action, T071).
                 confirm: p1_input.a,
                 back: p1_input.b,
+                info: p1_input.c,
             };
             let mut menu_in = screens::MenuInput::from_edges(held, prev_menu_held);
             // Fold in the discrete key-event edges (these are already one-shot).
             menu_in.confirm = menu_in.confirm || confirm_key_pressed;
             menu_in.back = menu_in.back || esc_pressed;
+            menu_in.info = menu_in.info || info_key_pressed;
             prev_menu_held = held;
 
             // Drive the active menu screen. The Fight screen is driven by the
@@ -5050,12 +6958,34 @@ fn run() -> fp_core::FpResult<()> {
                 }
                 RunScreen::Select(ref mut select) => {
                     let mode = select.mode;
-                    match select.update(menu_in, frame_counter) {
+                    let outcome = select.update(menu_in, frame_counter);
+                    // Snapshot the select screen for outcomes that need to leave it
+                    // and come back (Info), so the `&mut app.screen` borrow ends
+                    // before reassigning the screen.
+                    let select_snapshot = select.clone();
+                    match outcome {
                         screens::SelectOutcome::Pending => {}
                         screens::SelectOutcome::Cancelled => app.return_to_title(),
                         // Characters chosen: advance to stage-select (T041), not
                         // straight to the fight.
                         screens::SelectOutcome::Done(pick) => app.enter_stage_select(pick, mode),
+                        // Info pressed: open the movelist / character-info screen
+                        // (T071), keeping the select screen to resume on dismiss.
+                        screens::SelectOutcome::ShowInfo(def_path) => {
+                            app.enter_character_info(&def_path, select_snapshot)
+                        }
+                    }
+                }
+                RunScreen::CharacterInfo { ref info, .. } => {
+                    // Any dismiss returns to the snapshotted character-select.
+                    if info.update(menu_in) == screens::InfoOutcome::Dismissed {
+                        // Move the saved select screen back out (take ownership by
+                        // replacing the whole screen).
+                        if let RunScreen::CharacterInfo { select, .. } =
+                            std::mem::replace(&mut app.screen, RunScreen::Quit)
+                        {
+                            app.screen = RunScreen::Select(select);
+                        }
                     }
                 }
                 RunScreen::StageSelect {
@@ -5073,7 +7003,14 @@ fn run() -> fp_core::FpResult<()> {
                         // Cancel from stage-select goes back to character-select.
                         screens::StageOutcome::Cancelled => app.return_to_select(mode),
                         screens::StageOutcome::Done(stage) => {
-                            app.enter_fight(&pick, &stage, &renderer);
+                            app.enter_fight(
+                                &pick,
+                                &stage,
+                                mode,
+                                input_config.cpu_difficulty,
+                                input_config.cpu_mode,
+                                &renderer,
+                            );
                         }
                     }
                 }
@@ -5088,14 +7025,81 @@ fn run() -> fp_core::FpResult<()> {
             running = false;
         }
 
+        // Apply this frame's training quick-keys (F027 / T067) to whichever match
+        // is live (direct-CLI or the menu Fight screen). No-ops outside Training.
+        if cycle_dummy_pressed
+            || toggle_inf_life_pressed
+            || toggle_inf_meter_pressed
+            || reset_positions_pressed
+        {
+            if let Some(Mode::Match(run)) = mode.as_mut() {
+                apply_training_keys(
+                    run,
+                    cycle_dummy_pressed,
+                    toggle_inf_life_pressed,
+                    toggle_inf_meter_pressed,
+                    reset_positions_pressed,
+                );
+            }
+            if let Some(RunScreen::Fight(run)) = menu_app.as_mut().map(|a| &mut a.screen) {
+                apply_training_keys(
+                    run,
+                    cycle_dummy_pressed,
+                    toggle_inf_life_pressed,
+                    toggle_inf_meter_pressed,
+                    reset_positions_pressed,
+                );
+            }
+        }
+
+        // Apply this frame's replay-study transport edges (T076) to a viewer; inert
+        // in every other mode. Seek/step happen here (outside the tick loop), so a
+        // scrub is one discrete restore-and-re-sim per real frame; play advances in
+        // the fixed-timestep loop below.
+        if let Some(Mode::Replay(v)) = mode.as_mut() {
+            if replay_play_toggle {
+                v.toggle_play();
+            }
+            if replay_jump_start {
+                v.seek(0);
+            }
+            if replay_jump_end {
+                v.seek(v.len());
+            }
+            if replay_step_back {
+                v.step_back();
+            }
+            if replay_step_fwd {
+                v.advance();
+            }
+            if replay_seek_delta != 0 {
+                let cur = v.frame as i64;
+                let target = (cur + replay_seek_delta).clamp(0, v.len() as i64) as u32;
+                v.seek(target);
+            }
+        }
+
         // --- Fixed-timestep tick (catch-up loop) ---
         // Both the direct-CLI match and the menu Fight screen drive their match at
         // a fixed 60Hz here; the Title/Select menu screens are event-driven (no
         // per-tick simulation), so they only need a render below. Viewer/Static/
         // TestPattern tick as before.
-        while accumulator >= TICK_DURATION {
+        // Spiral-of-death guard (T051): cap the sub-ticks per rendered frame. If a
+        // tick is so expensive that it overruns the frame budget every frame, an
+        // uncapped loop would never drain the accumulator — the window would stop
+        // pumping events and hard-freeze at 100% CPU. The cap degrades to
+        // slow-motion under overload instead, keeping the window responsive.
+        let mut catchup = 0u32;
+        while accumulator >= TICK_DURATION && catchup < MAX_CATCHUP_TICKS {
             match mode.as_mut() {
                 Some(Mode::Match(run)) => tick_match_run(run, p1_input, p2_input),
+                // A replay viewer advances one recorded frame per tick only while
+                // playing; paused, it holds the current frame (transport seeks above).
+                Some(Mode::Replay(v)) => {
+                    if v.playing {
+                        v.advance();
+                    }
+                }
                 Some(Mode::Viewer(v)) => v.tick(),
                 Some(Mode::Static(..)) | Some(Mode::TestPattern(..)) | None => {}
             }
@@ -5104,6 +7108,19 @@ fn run() -> fp_core::FpResult<()> {
                 tick_match_run(run, p1_input, p2_input);
             }
             accumulator -= TICK_DURATION;
+            catchup += 1;
+        }
+        // If we hit the catch-up cap there is still unspent time in the
+        // accumulator; drop it so the clock cannot keep snowballing into an
+        // ever-growing backlog (the simulation simply runs slow under sustained
+        // overload rather than trying — and failing — to catch up forever).
+        if catchup >= MAX_CATCHUP_TICKS && accumulator >= TICK_DURATION {
+            tracing::warn!(
+                "tick catch-up cap ({MAX_CATCHUP_TICKS}) hit; dropping {} ms of backlog to keep \
+                 the window responsive (simulation running slow — the match is overloaded)",
+                accumulator.as_millis()
+            );
+            accumulator = Duration::ZERO;
         }
 
         // After the catch-up loop: if the menu's match is over, return to the
@@ -5118,11 +7135,40 @@ fn run() -> fp_core::FpResult<()> {
             }
         }
 
+        // Direct-CLI auto-rematch: the direct-CLI match (`fp-app <p1.def>
+        // <p2.def>`) has no menu to fall back to, so once the engine decides a
+        // winner the app holds the readable "P_ WINS" screen for a short window
+        // (the existing winner HUD keeps rendering during the hold), then rebuilds
+        // a fresh identical match from the same CLI args so play continues — rather
+        // than freezing on a permanent static winner frame. Done here, after the
+        // tick loop and once per real frame, so the window keeps pumping events
+        // (Esc-to-quit stays responsive) throughout the hold. Inert outside the
+        // direct-CLI `Mode::Match` path.
+        if let Some(Mode::Match(run)) = mode.as_ref() {
+            if run.m().match_winner().is_none() {
+                match_over_held = 0;
+            } else if match_over_held >= MATCH_OVER_HOLD_FRAMES {
+                tracing::info!("Direct-CLI match over; auto-rematching");
+                // Rebuild from the same parsed CLI args used at startup. A rebuild
+                // that doesn't yield a match (shouldn't happen — the original args
+                // already produced one) leaves the current mode in place.
+                if let Mode::Match(fresh) =
+                    select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)
+                {
+                    mode = Some(Mode::Match(fresh));
+                }
+                match_over_held = 0;
+            } else {
+                match_over_held += 1;
+            }
+        }
+
         // Ensure the current animation frame's sprite is cached before rendering.
         // Caching needs `&Renderer`, which a live `RenderFrame` would hold
         // borrowed, so it must happen before `begin_frame`.
         match mode.as_mut() {
             Some(Mode::Match(run)) => cache_match_run(run, &renderer),
+            Some(Mode::Replay(v)) => cache_match_run(&mut v.run, &renderer),
             Some(Mode::Viewer(v)) => {
                 if let Some(sid) = v.current_frame().map(|f| f.sprite) {
                     v.get_or_create_sprite(sid, &renderer);
@@ -5145,7 +7191,38 @@ fn run() -> fp_core::FpResult<()> {
         // Direct-CLI content modes render exactly as before.
         match mode.as_ref() {
             Some(Mode::Match(run)) => {
-                draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
+                draw_match_run(
+                    &mut frame,
+                    run,
+                    &hud,
+                    overlays,
+                    win_wf,
+                    win_hf,
+                    frame_counter,
+                );
+            }
+            // Replay-study viewer (T076): the live match + its overlays draw through
+            // the exact same path as a normal match (the F026 overlays "just work"
+            // over the live state), with a transport status line on top.
+            Some(Mode::Replay(v)) => {
+                draw_match_run(
+                    &mut frame,
+                    &v.run,
+                    &hud,
+                    overlays,
+                    win_wf,
+                    win_hf,
+                    frame_counter,
+                );
+                if let Some(font) = hud.font() {
+                    let status = format!(
+                        "REPLAY {} {}/{}  P:PLAY ,/.:STEP <>:SEEK10",
+                        if v.playing { "PLAY" } else { "PAUSE" },
+                        v.frame,
+                        v.len()
+                    );
+                    draw_centered_text(&mut frame, font, &status, win_wf, 8.0, 1.0, 1.0);
+                }
             }
             Some(Mode::Viewer(v)) => {
                 if let Some(anim_frame) = v.current_frame() {
@@ -5195,6 +7272,11 @@ fn run() -> fp_core::FpResult<()> {
                         draw_select_screen(&mut frame, font, select, win_wf);
                     }
                 }
+                RunScreen::CharacterInfo { info, .. } => {
+                    if let Some(font) = app.font.as_ref() {
+                        draw_character_info_screen(&mut frame, font, info, win_wf);
+                    }
+                }
                 RunScreen::StageSelect { stages, .. } => {
                     if let Some(font) = app.font.as_ref() {
                         draw_stage_select_screen(&mut frame, font, stages, win_wf);
@@ -5211,7 +7293,15 @@ fn run() -> fp_core::FpResult<()> {
                     }
                 }
                 RunScreen::Fight(run) => {
-                    draw_match_run(&mut frame, run, &hud, overlay_enabled, win_wf, win_hf);
+                    draw_match_run(
+                        &mut frame,
+                        run,
+                        &hud,
+                        overlays,
+                        win_wf,
+                        win_hf,
+                        frame_counter,
+                    );
                 }
                 RunScreen::Quit => {}
             }
@@ -5347,6 +7437,90 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-assets")
             .join(rel)
+    }
+
+    /// Builds a synthetic SFF carrying exactly the given sprites (group, image,
+    /// width, height). Starts from [`synth_sff`] (a valid v1 header, no sprites)
+    /// and pushes [`fp_formats::sff::SffSprite::placeholder`]-derived entries with
+    /// the requested `(group, image)` and dimensions. Asset-free.
+    fn sff_with_sprites(specs: &[(u16, u16, u16, u16)]) -> SffFile {
+        let mut sff = synth_sff();
+        sff.sprites.clear();
+        for (idx, &(group, image, width, height)) in specs.iter().enumerate() {
+            let mut s = fp_formats::sff::SffSprite::placeholder(idx);
+            s.group = group;
+            s.image = image;
+            s.width = width;
+            s.height = height;
+            sff.sprites.push(s);
+        }
+        sff
+    }
+
+    #[test]
+    fn resolve_drawable_sprite_reports_misses_and_hits() {
+        // A normal sprite, a zero-width sprite, and a zero-height sprite.
+        let sff = sff_with_sprites(&[(0, 0, 32, 48), (5000, 0, 0, 0), (5000, 10, 12, 0)]);
+
+        // Resolvable sprite -> its index, no miss.
+        assert_eq!(resolve_drawable_sprite(&sff, SpriteId::new(0, 0)), Ok(0));
+
+        // Zero-dimension sprites -> ZeroDimension miss carrying the dims (this is
+        // the clark 5000-series case that drove the per-frame warn flood).
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(5000, 0)),
+            Err(SpriteMiss::ZeroDimension {
+                width: 0,
+                height: 0
+            })
+        );
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(5000, 10)),
+            Err(SpriteMiss::ZeroDimension {
+                width: 12,
+                height: 0
+            })
+        );
+
+        // Absent id -> NotFound miss.
+        assert_eq!(
+            resolve_drawable_sprite(&sff, SpriteId::new(9999, 9999)),
+            Err(SpriteMiss::NotFound)
+        );
+    }
+
+    #[test]
+    fn fighter_render_negative_cache_records_unresolvable_ids() {
+        // The negative cache (`FighterRender::missing`) is what turns the per-frame
+        // rescan + warn flood into a once-per-id event. Drive the resolve decision
+        // for each draw of a zero-dim id and confirm the id is recorded exactly
+        // once, so subsequent frames short-circuit.
+        let sff = sff_with_sprites(&[(0, 0, 32, 48), (5000, 0, 0, 0)]);
+        let mut render = FighterRender::default();
+        let zero_dim = SpriteId::new(5000, 0);
+        let good = SpriteId::new(0, 0);
+
+        // Simulate the early-return logic of `get_or_create_sprite` for the cases
+        // that never need a GPU: an id already known missing is skipped, and an
+        // unresolvable id gets recorded on first sight.
+        for _frame in 0..120 {
+            if render.missing.contains(&zero_dim) {
+                continue; // short-circuit: no scan, no warn
+            }
+            match resolve_drawable_sprite(&sff, zero_dim) {
+                Ok(_) => unreachable!("zero-dim sprite must not resolve"),
+                Err(_) => {
+                    render.missing.insert(zero_dim);
+                }
+            }
+        }
+        // Recorded once; every later frame short-circuited.
+        assert!(render.missing.contains(&zero_dim));
+        assert_eq!(render.missing.len(), 1);
+
+        // A resolvable id is never recorded as missing.
+        assert!(resolve_drawable_sprite(&sff, good).is_ok());
+        assert!(!render.missing.contains(&good));
     }
 
     /// A neutral input frame.
@@ -5571,6 +7745,7 @@ mod tests {
             right: p1.right,
             confirm: p1.a,
             back: p1.b,
+            info: p1.c,
         };
         screens::MenuInput::from_edges(held, screens::HeldMenuInput::default())
     }
@@ -5706,9 +7881,11 @@ mod tests {
 
         // Rebind `a` to `P` through the setup screen's capture path.
         let mut setup = screens::SetupScreen::new();
-        // Walk to the `A` action row (device, HUD-customize, Up, Down, Left,
-        // Right, A — the HUD-customization row (T046) sits between device and Up).
-        for _ in 0..6 {
+        // Walk to the `A` action row (device, CPU-difficulty, CPU-mode,
+        // HUD-customize, Up, Down, Left, Right, A — the CPU-difficulty (T069),
+        // CPU teaching-mode (T070), and HUD-customization (T046) rows sit between
+        // device and Up).
+        for _ in 0..8 {
             setup.update(
                 screens::MenuInput {
                     down: true,
@@ -6092,6 +8269,56 @@ mod tests {
         assert_eq!(power_fraction(100, -10), 0.0, "negative power_max yields 0");
     }
 
+    /// T074: the quad HUD picks its life-bar color from the SAME shared
+    /// `fp_ui::low_life_tint` threshold the screenpack HUD uses, so a fighter
+    /// below 25% life reads red and a healthy fighter reads green. This mirrors
+    /// the exact decision in `Hud::draw_life_bar`.
+    #[test]
+    fn quad_life_bar_red_shifts_below_25_percent() {
+        // Pick "red" exactly when the shared threshold tint is non-neutral.
+        let picks_red = |frac: f32| !fp_ui::low_life_tint(frac).is_neutral();
+        assert!(!picks_red(life_fraction(1000, 1000)), "full life is green");
+        assert!(!picks_red(life_fraction(500, 1000)), "half life is green");
+        assert!(
+            !picks_red(life_fraction(260, 1000)),
+            "just above 25% stays green"
+        );
+        assert!(
+            picks_red(life_fraction(250, 1000)),
+            "at 25% red-shifts (matches the screenpack threshold)"
+        );
+        assert!(picks_red(life_fraction(100, 1000)), "10% life is red");
+        assert!(picks_red(life_fraction(0, 1000)), "dead reads red");
+    }
+
+    /// T074: the quad HUD power bar flashes (swaps blue↔yellow) ONLY at max meter,
+    /// driven by the deterministic frame-keyed `fp_ui::max_power_flash_tint`. The
+    /// decision mirrors `Hud::draw_power_bar`.
+    #[test]
+    fn quad_power_bar_flashes_only_at_max() {
+        // "yellow" (flash accent) exactly when the shared flash tint is non-neutral.
+        let picks_yellow =
+            |frac: f32, tick: u64| !fp_ui::max_power_flash_tint(frac, tick).is_neutral();
+        // Below max: never flashes, at every frame across a full period.
+        for tick in 0..(fp_ui::POWER_FLASH_PERIOD * 2) {
+            assert!(
+                !picks_yellow(power_fraction(1500, 3000), tick),
+                "half meter never flashes"
+            );
+            assert!(
+                !picks_yellow(power_fraction(2900, 3000), tick),
+                "nearly-but-not-full never flashes"
+            );
+        }
+        // At max meter: the bar flashes on at least one phase within a period and
+        // is back to blue on another — a visible, deterministic pulse.
+        let full = power_fraction(3000, 3000);
+        let flashed = (0..fp_ui::POWER_FLASH_PERIOD).any(|t| picks_yellow(full, t));
+        let blued = (0..fp_ui::POWER_FLASH_PERIOD).any(|t| !picks_yellow(full, t));
+        assert!(flashed, "max meter must flash (yellow) on some frame");
+        assert!(blued, "max meter must show blue on some frame (it pulses)");
+    }
+
     /// AC2: world X maps into the window centered on the midpoint, with the origin
     /// landing at the window center and signs preserved.
     #[test]
@@ -6298,6 +8525,26 @@ mod tests {
             }
         }
         m.round_state() == RoundState::Fight
+    }
+
+    /// Drives `m` (no input) until P1 is actually controllable in the neutral
+    /// stand — i.e. it has finished the round-init intro (common1 5900 -> the
+    /// character's `[Statedef 191]` intro animation) and handed control back to
+    /// state [`STATE_STAND`]. Returns whether P1 became controllable in the stand
+    /// within the budget.
+    ///
+    /// `RoundState::Fight` alone does not imply P1 can move: KFM's authored intro
+    /// keeps the fighter in state 191 (no control) while its intro animation plays
+    /// out, only then `ChangeState`-ing to the stand. Tests that want to prove
+    /// locomotion must wait for this, not merely for the fight to go live.
+    fn run_until_p1_can_walk(m: &mut Match) -> bool {
+        for _ in 0..240 {
+            if m.p1().character.state_no == STATE_STAND && m.p1().character.ctrl {
+                return true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        m.p1().character.state_no == STATE_STAND && m.p1().character.ctrl
     }
 
     /// AC3 (the headline headless integration test): build the same two-KFM Match
@@ -7562,6 +9809,21 @@ mod tests {
             run_until_fight(&mut m),
             "fight must go live before driving input"
         );
+        // The fight going live (RoundState::Fight) is necessary but not sufficient
+        // to drive locomotion: KFM's round-init (common1 5900 -> 190 -> its own
+        // [Statedef 191] intro) legitimately plays a finite intro animation before
+        // handing control back to the neutral stand (state 0). During that intro the
+        // fighter has no control and cannot walk — exactly as in MUGEN. So drive past
+        // the intro until P1 is actually controllable in the stand before asserting
+        // movement; otherwise the test would assert walking while the character is
+        // mid-intro (the T056 round-init <-> R2 regression).
+        assert!(
+            run_until_p1_can_walk(&mut m),
+            "P1 must hand back control from the round-init intro into a controllable \
+             stand within budget; got state {} ctrl {}",
+            m.p1().character.state_no,
+            m.p1().character.ctrl
+        );
 
         // P1 faces right (toward P2); holding right is "fwd". The gap between the
         // two must shrink as P1 closes in (they start ~120px apart, well outside
@@ -8005,6 +10267,313 @@ mod tests {
         assert!((b.w - 30.0).abs() < 1e-4, "width magnitude preserved");
         // Mirrored edges: anchor - 15 .. anchor + 15 => 35..65, so x = 35.
         assert!((b.x - 35.0).abs() < 1e-4);
+    }
+
+    // ---- T063: collect_clsn_boxes — shared box math + push box + facing. ----
+
+    /// A synthetic, asset-free [`SffFile`] (one empty SFF v1 sprite). Mirrors the
+    /// fp-engine test helper so these tests need no `test-assets/`.
+    fn synth_sff() -> SffFile {
+        const SUBHEADER_OFFSET: usize = 64;
+        let mut buf = vec![0u8; SUBHEADER_OFFSET + 32];
+        buf[0..12].copy_from_slice(b"ElecbyteSpr\0");
+        buf[15] = 1; // SFF v1
+        buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // num_groups
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // num_images
+        buf[24..28].copy_from_slice(&(SUBHEADER_OFFSET as u32).to_le_bytes());
+        SffFile::from_bytes(&buf).expect("synthetic SFF v1 must parse")
+    }
+
+    /// Builds a headless [`Player`] whose action 0 has exactly one frame with one
+    /// known Clsn1 (hit) and one known Clsn2 (hurt) box, positioned at the axis,
+    /// facing `facing`, with the default `[Size]` push half-widths. Asset-free —
+    /// no `test-assets/` required — so the T063 verification runs on CI.
+    fn synth_clsn_player(facing: fp_character::Facing) -> Player {
+        let hurt = fp_core::Rect::new(-10.0, -60.0, 20.0, 60.0); // centered hurtbox
+        let hit = fp_core::Rect::new(20.0, -50.0, 30.0, 10.0); // forward attack box
+        let frame = fp_formats::air::AnimFrame {
+            sprite: SpriteId::new(0, 0),
+            ticks: -1,
+            clsn1: vec![hit],
+            clsn2: vec![hurt],
+            ..Default::default()
+        };
+        let action = AnimAction {
+            action_number: 0,
+            frames: vec![frame],
+            loopstart: 0,
+        };
+        let mut actions = HashMap::new();
+        actions.insert(0, action);
+        let loaded = LoadedCharacter {
+            name: "synth".to_string(),
+            displayname: "synth".to_string(),
+            author: String::new(),
+            localcoord: (320, 240),
+            constants: fp_character::CharacterConstants::default(),
+            states: HashMap::new(),
+            sff: synth_sff(),
+            air: AirFile { actions },
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        };
+        let mut c = Character::new();
+        c.pos = Vec2::new(0.0, 0.0);
+        c.facing = facing;
+        c.anim = 0;
+        c.anim_elem = 0;
+        Player::new(c, loaded)
+    }
+
+    #[test]
+    fn collect_clsn_boxes_tags_hit_hurt_and_push_kinds() {
+        // Facing right, axis at screen x=160 (win_w=320 -> world_to_screen_x(0)).
+        let player = synth_clsn_player(fp_character::Facing::Right);
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        // Exactly one of each kind: one Clsn2, one Clsn1, one push box.
+        let hurts = boxes.iter().filter(|(_, k)| *k == ClsnKind::Hurt).count();
+        let hits = boxes.iter().filter(|(_, k)| *k == ClsnKind::Hit).count();
+        let pushes = boxes.iter().filter(|(_, k)| *k == ClsnKind::Push).count();
+        assert_eq!(hurts, 1, "one hurtbox (Clsn2)");
+        assert_eq!(hits, 1, "one hitbox (Clsn1)");
+        assert_eq!(pushes, 1, "one push/Width box");
+        assert_eq!(boxes.len(), 3, "exactly hurt + hit + push");
+        // Draw order: hurt first, then hit, then push (push reads over the rest).
+        assert_eq!(boxes[0].1, ClsnKind::Hurt);
+        assert_eq!(boxes[1].1, ClsnKind::Hit);
+        assert_eq!(boxes[2].1, ClsnKind::Push);
+        // Colors are the per-kind constants (red hit, blue hurt, green push).
+        assert_eq!(boxes[0].0.color, CLSN2_COLOR);
+        assert_eq!(boxes[1].0.color, CLSN1_COLOR);
+        assert_eq!(boxes[2].0.color, PUSH_COLOR);
+    }
+
+    /// Builds a headless [`Player`] whose `.air` holds two actions: action 200 is
+    /// a deterministic attack (3 startup / 4 active / 5 recovery, mirroring the
+    /// shipped trainingdummy basic attack), action 0 is a plain idle (no Clsn1).
+    /// The character is parked on `anim` so `format_frame_data` reads it. Asset-free.
+    fn synth_frame_data_player(anim: i32) -> Player {
+        use fp_formats::air::AnimFrame;
+        let attack = AnimAction {
+            action_number: 200,
+            loopstart: 0,
+            frames: vec![
+                AnimFrame {
+                    ticks: 3,
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 4,
+                    clsn1: vec![fp_core::Rect::new(20.0, -50.0, 30.0, 10.0)],
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 5,
+                    ..Default::default()
+                },
+            ],
+        };
+        let idle = AnimAction {
+            action_number: 0,
+            loopstart: 0,
+            frames: vec![AnimFrame {
+                ticks: 10,
+                ..Default::default()
+            }],
+        };
+        let mut actions = HashMap::new();
+        actions.insert(0, idle);
+        actions.insert(200, attack);
+        let loaded = LoadedCharacter {
+            name: "synth".to_string(),
+            displayname: "synth".to_string(),
+            author: String::new(),
+            localcoord: (320, 240),
+            constants: fp_character::CharacterConstants::default(),
+            states: HashMap::new(),
+            sff: synth_sff(),
+            air: AirFile { actions },
+            cmd: None,
+            snd: None,
+            palettes: Vec::new(),
+        };
+        let mut c = Character::new();
+        c.anim = anim;
+        Player::new(c, loaded)
+    }
+
+    #[test]
+    fn format_frame_data_shows_startup_active_recovery_for_attack() {
+        let player = synth_frame_data_player(200);
+        // A freshly-built (non-connecting) player carries no advantage => `ADV —`.
+        assert_eq!(format_frame_data(&player), "S3 A4 R5  ADV —");
+    }
+
+    #[test]
+    fn format_frame_data_shows_dash_for_non_attack_action() {
+        // Idle action (no Clsn1) is not countable -> the "—" form, never numbers.
+        let player = synth_frame_data_player(0);
+        assert_eq!(format_frame_data(&player), "S/A/R —  ADV —");
+    }
+
+    #[test]
+    fn format_frame_data_shows_dash_for_missing_action() {
+        // An action absent from the .air table also degrades to "—", never panics.
+        let player = synth_frame_data_player(999);
+        assert_eq!(format_frame_data(&player), "S/A/R —  ADV —");
+    }
+
+    #[test]
+    fn format_frame_advantage_shows_signed_value_when_connected() {
+        // On a connecting hit the readout shows the signed advantage: `+` when the
+        // attacker recovers first, U+2212 MINUS when the defender does (the
+        // `+3 / −5` form of T065 acceptance criterion #2).
+        assert_eq!(format_frame_advantage(Some(3)), "ADV +3");
+        assert_eq!(format_frame_advantage(Some(0)), "ADV +0");
+        assert_eq!(format_frame_advantage(Some(-5)), "ADV \u{2212}5");
+    }
+
+    #[test]
+    fn format_frame_advantage_shows_dash_without_a_connection() {
+        // No connection this tick => no advantage number (never a stale one).
+        assert_eq!(format_frame_advantage(None), "ADV —");
+    }
+
+    #[test]
+    fn format_frame_data_appends_advantage_when_present() {
+        // The full readout splices the S/A/R count and the advantage segment, so a
+        // connecting attack reads e.g. `S3 A4 R5  ADV +6`. Asserted via the segment
+        // composer to avoid scripting a whole match (the engine's
+        // `frame_advantage_surfaced_on_scripted_connecting_hit` proves the live
+        // value reaches the player; this proves the readout shows it).
+        let sar = "S3 A4 R5";
+        let composed = format!("{sar}  {}", format_frame_advantage(Some(6)));
+        assert_eq!(composed, "S3 A4 R5  ADV +6");
+    }
+
+    #[test]
+    fn collect_clsn_boxes_mirrors_hitbox_when_facing_left() {
+        // The forward hitbox (local x in 20..50) lands on the +X side when facing
+        // right and the -X side when facing left, mirrored about the axis.
+        let right = collect_clsn_boxes(
+            &synth_clsn_player(fp_character::Facing::Right),
+            0.0,
+            320.0,
+            240.0,
+        );
+        let left = collect_clsn_boxes(
+            &synth_clsn_player(fp_character::Facing::Left),
+            0.0,
+            320.0,
+            240.0,
+        );
+        let rhit = right.iter().find(|(_, k)| *k == ClsnKind::Hit).unwrap().0;
+        let lhit = left.iter().find(|(_, k)| *k == ClsnKind::Hit).unwrap().0;
+        // Axis maps to the same screen X for both (facing doesn't move the axis).
+        let axis = world_to_screen_x(0.0, 320.0);
+        // Facing right: hitbox to the right of the axis. Facing left: to the left.
+        assert!(
+            rhit.x >= axis,
+            "right-facing hitbox is forward (+X) of the axis"
+        );
+        assert!(
+            lhit.x + lhit.w <= axis,
+            "left-facing hitbox is forward (-X) of the axis"
+        );
+        // Widths are preserved under the mirror; the two are reflections about the
+        // axis (their centers are equidistant from it).
+        assert!(
+            (rhit.w - lhit.w).abs() < 1e-4,
+            "width preserved under mirror"
+        );
+        let rc = rhit.x + rhit.w / 2.0;
+        let lc = lhit.x + lhit.w / 2.0;
+        assert!(
+            ((rc - axis) - (axis - lc)).abs() < 1e-4,
+            "hitbox is mirrored about the axis between facings"
+        );
+    }
+
+    #[test]
+    fn collect_clsn_boxes_push_box_reflects_facing_relative_widths() {
+        // The default [Size] half-widths are front=16, back=15 (asymmetric), so the
+        // push box is NOT centered: it must reflect when facing flips.
+        let player = synth_clsn_player(fp_character::Facing::Right);
+        let (front, back) = player.push_widths();
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        let push = boxes.iter().find(|(_, k)| *k == ClsnKind::Push).unwrap().0;
+        let axis = world_to_screen_x(0.0, 320.0);
+        // Total width spans front + back regardless of facing.
+        assert!(
+            (push.w - (front + back)).abs() < 1e-4,
+            "push box spans front+back half-widths"
+        );
+        // Facing right: front extends to +X. Right edge = axis + front.
+        assert!(
+            (push.x + push.w - (axis + front)).abs() < 1e-4,
+            "right-facing push box extends `front` toward +X"
+        );
+        assert!(
+            (push.x - (axis - back)).abs() < 1e-4,
+            "right-facing push box extends `back` toward -X"
+        );
+        // Facing left: the front/back swap sides (mirror about the axis).
+        let lplayer = synth_clsn_player(fp_character::Facing::Left);
+        let lboxes = collect_clsn_boxes(&lplayer, 0.0, 320.0, 240.0);
+        let lpush = lboxes.iter().find(|(_, k)| *k == ClsnKind::Push).unwrap().0;
+        assert!(
+            (lpush.x - (axis - front)).abs() < 1e-4,
+            "left-facing push box extends `front` toward -X"
+        );
+    }
+
+    #[test]
+    fn collect_clsn_boxes_yields_push_box_even_with_no_anim_frame() {
+        // A player pointed at a nonexistent anim has no Clsn frame, but the push
+        // box (derived from size, not AIR) is still produced — never a panic.
+        let mut player = synth_clsn_player(fp_character::Facing::Right);
+        player.character.anim = 987_654; // no such action
+        let boxes = collect_clsn_boxes(&player, 0.0, 320.0, 240.0);
+        assert_eq!(
+            boxes.len(),
+            1,
+            "only the push box when no Clsn frame resolves"
+        );
+        assert_eq!(boxes[0].1, ClsnKind::Push);
+    }
+
+    // ---- T063: TrainingOverlay scope cycling + per-side selection. ----
+
+    #[test]
+    fn overlay_scope_cycles_off_p1_p2_both_and_back() {
+        assert_eq!(OverlayScope::Off.next(), OverlayScope::P1);
+        assert_eq!(OverlayScope::P1.next(), OverlayScope::P2);
+        assert_eq!(OverlayScope::P2.next(), OverlayScope::Both);
+        assert_eq!(OverlayScope::Both.next(), OverlayScope::Off);
+    }
+
+    #[test]
+    fn overlay_scope_per_side_visibility() {
+        assert!(!OverlayScope::Off.shows_p1() && !OverlayScope::Off.shows_p2());
+        assert!(OverlayScope::P1.shows_p1() && !OverlayScope::P1.shows_p2());
+        assert!(!OverlayScope::P2.shows_p1() && OverlayScope::P2.shows_p2());
+        assert!(OverlayScope::Both.shows_p1() && OverlayScope::Both.shows_p2());
+    }
+
+    #[test]
+    fn training_overlay_cycle_and_active_track_scope() {
+        let mut ov = TrainingOverlay::default();
+        assert!(!ov.is_active(), "default overlay is off");
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::P1);
+        assert!(ov.is_active());
+        ov.cycle();
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::Both);
+        ov.cycle();
+        assert_eq!(ov.scope, OverlayScope::Off);
+        assert!(!ov.is_active());
     }
 
     // ---- #16: two-fighter draw-order decision from `sprpriority` ----
@@ -8519,6 +11088,75 @@ mod tests {
 
     /// No file argument routes to the Title menu; an explicit `menu` token does
     /// too. Any direct content path keeps the legacy direct route (no menu), so
+    /// Resolves a path under the workspace repo root (`CARGO_MANIFEST_DIR` is
+    /// `crates/fp-app`; go up two levels).
+    fn repo_path(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    #[test]
+    fn synth_success_event_satisfies_each_condition() {
+        use training::tutorial::{LessonEvent, SuccessCond, TutorialRunner};
+        // Every non-`Unsatisfiable` condition has a synthesizable event that
+        // actually advances a runner whose sole lesson uses that condition.
+        for cond in [
+            SuccessCond::LandCommand("fireball".to_string()),
+            SuccessCond::BlockNHits(1),
+            SuccessCond::ComboCount(2),
+            SuccessCond::AntiAir,
+            SuccessCond::ThrowConnected,
+        ] {
+            let ev = synth_success_event(&cond).expect("satisfiable cond has an event");
+            let mut r = TutorialRunner::new(vec![training::tutorial::Lesson {
+                title: "x".to_string(),
+                instruction: String::new(),
+                dummy: training::tutorial::DummyMode::Stand,
+                overlays: training::tutorial::OverlayFlags::default(),
+                success: cond,
+                timeout_hint: None,
+            }]);
+            let outcome = r.observe(std::slice::from_ref(&ev));
+            assert_eq!(
+                outcome,
+                training::tutorial::TickOutcome::TrialComplete,
+                "event {ev:?} should complete its lesson"
+            );
+        }
+        // `Unsatisfiable` has no synth event (the runner auto-skips it).
+        assert!(synth_success_event(&SuccessCond::Unsatisfiable).is_none());
+        // Touch the type so the import is genuinely exercised.
+        let _: LessonEvent = LessonEvent::ThrowConnected;
+    }
+
+    #[test]
+    fn shipped_tutorial_assets_load_and_run_to_completion() {
+        use training::tutorial::{load_lessons, TickOutcome, TutorialRunner};
+        let dir = repo_path("assets/data/tutorial");
+        // The on-disk clean-room lesson scripts must parse (not fall back).
+        let lessons = load_lessons(&dir);
+        assert_eq!(lessons.len(), 5, "ships exactly the 5 required lessons");
+        assert_eq!(lessons[0].title, "Block High and Low");
+        assert_eq!(lessons[2].title, "Throw a Fireball");
+
+        // Driving the runner with each lesson's synthesized success advances
+        // through the whole list to completion — the flow never soft-locks.
+        let mut r = TutorialRunner::new(lessons);
+        while let Some(lesson) = r.current() {
+            let ev = synth_success_event(&lesson.success).expect("shipped lessons are satisfiable");
+            let mut outcome = TickOutcome::InProgress;
+            for _ in 0..64 {
+                outcome = r.observe(std::slice::from_ref(&ev));
+                if outcome != TickOutcome::InProgress {
+                    break;
+                }
+            }
+            assert_ne!(outcome, TickOutcome::InProgress, "lesson must advance");
+        }
+        assert!(r.is_complete());
+    }
+
     /// the existing CLI is preserved.
     #[test]
     fn cli_route_menu_vs_direct() {
@@ -8551,6 +11189,51 @@ mod tests {
         assert_eq!(
             cli_route(&["fp-app".to_string(), "kfm.sff".to_string()]),
             CliRoute::Direct
+        );
+    }
+
+    /// `replay <log> <p1.def> [p2.def]` routes to the replay-study viewer (T076),
+    /// absolutizing each path; a missing log/character degrades to the Menu.
+    #[test]
+    fn cli_route_replay() {
+        // Full form: log + two characters.
+        match cli_route(&[
+            "fp-app".to_string(),
+            "replay".to_string(),
+            "match.bin".to_string(),
+            "p1.def".to_string(),
+            "p2.def".to_string(),
+        ]) {
+            CliRoute::Replay { log, p1, p2 } => {
+                assert!(log.is_absolute(), "log path absolutized");
+                assert!(log.ends_with("match.bin"));
+                assert!(p1.ends_with("p1.def"));
+                assert_eq!(p2.as_ref().map(|p| p.ends_with("p2.def")), Some(true));
+            }
+            other => panic!("expected Replay route, got {other:?}"),
+        }
+        // One-character form: P2 reuses P1 (p2 is None).
+        match cli_route(&[
+            "fp-app".to_string(),
+            "REPLAY".to_string(), // case-insensitive
+            "m.bin".to_string(),
+            "kfm.def".to_string(),
+        ]) {
+            CliRoute::Replay { p2, .. } => assert!(p2.is_none(), "single-def replay reuses P1"),
+            other => panic!("expected Replay route, got {other:?}"),
+        }
+        // Missing args degrade to the Menu (no panic).
+        assert_eq!(
+            cli_route(&["fp-app".to_string(), "replay".to_string()]),
+            CliRoute::Menu
+        );
+        assert_eq!(
+            cli_route(&[
+                "fp-app".to_string(),
+                "replay".to_string(),
+                "only-a-log.bin".to_string()
+            ]),
+            CliRoute::Menu
         );
     }
 
@@ -8646,6 +11329,64 @@ mod tests {
             "kfm.def".to_string(),
         ]);
         assert_eq!(mode, TeamMode::Turns);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+    }
+
+    /// T070: `--ai-mode <token>` selects the CPU teaching mode for the direct-CLI
+    /// match path and strips the flag (+value); a bad/missing token keeps the
+    /// default Ladder; other args pass through untouched; the last flag wins.
+    #[test]
+    fn parse_ai_mode_flag_selects_teaching_mode_and_strips_it() {
+        // No flag -> default Ladder, args untouched (CLI unchanged from before).
+        let (mode, rest) = parse_ai_mode_flag(&["fp-app".to_string(), "kfm.def".to_string()]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // --ai-mode dp -> Reactive DP, flag+value stripped, the .def passes through.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "dp".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::ReactiveDP);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // Case-insensitive flag + an alias token resolve.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--AI-MODE".to_string(),
+            "blocker".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::PureBlocker);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // An unknown token keeps the default (Ladder) but still strips flag+value.
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "nonsense".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
+
+        // A trailing `--ai-mode` with no value is dropped (default kept).
+        let (mode, rest) = parse_ai_mode_flag(&["fp-app".to_string(), "--ai-mode".to_string()]);
+        assert_eq!(mode, BehaviorMode::Ladder);
+        assert_eq!(rest, vec!["fp-app".to_string()]);
+
+        // The last --ai-mode wins if repeated (both flag+value pairs stripped).
+        let (mode, rest) = parse_ai_mode_flag(&[
+            "fp-app".to_string(),
+            "--ai-mode".to_string(),
+            "dp".to_string(),
+            "--ai-mode".to_string(),
+            "punisher".to_string(),
+            "kfm.def".to_string(),
+        ]);
+        assert_eq!(mode, BehaviorMode::WhiffPunisher);
         assert_eq!(rest, vec!["fp-app".to_string(), "kfm.def".to_string()]);
     }
 
@@ -9153,11 +11894,7 @@ mod tests {
             x: true,
             ..MatchInput::none()
         };
-        let got = pick_p2_input(
-            human,
-            Some(&mut ai),
-            fp_input::AiObservation { opponent_dx: 5.0 },
-        );
+        let got = pick_p2_input(human, Some(&mut ai), fp_input::AiObservation::at(5.0));
         assert_eq!(got, human, "a pressed human input must override the AI");
     }
 
@@ -9172,7 +11909,7 @@ mod tests {
         let got = pick_p2_input(
             MatchInput::none(),
             Some(&mut ai),
-            fp_input::AiObservation { opponent_dx: 300.0 },
+            fp_input::AiObservation::at(300.0),
         );
         assert!(
             got.right && !got.left,
@@ -9182,11 +11919,27 @@ mod tests {
 
     #[test]
     fn pick_p2_input_no_ai_idle_human_stays_idle() {
-        let got = pick_p2_input(
-            MatchInput::none(),
-            None,
-            fp_input::AiObservation { opponent_dx: 5.0 },
-        );
+        let got = pick_p2_input(MatchInput::none(), None, fp_input::AiObservation::at(5.0));
         assert_eq!(got, MatchInput::none(), "no AI + idle human => P2 idle");
+    }
+
+    // ---- T066: select-mode -> match-time GameMode mapping -----------------
+
+    #[test]
+    fn training_select_maps_to_training_game_mode() {
+        assert_eq!(
+            game_mode_for(screens::SelectMode::Training),
+            GameMode::Training,
+            "the Training select flow enters a Training match"
+        );
+    }
+
+    #[test]
+    fn versus_select_maps_to_versus_game_mode() {
+        assert_eq!(
+            game_mode_for(screens::SelectMode::Versus),
+            GameMode::Versus,
+            "the Versus select flow enters a normal match"
+        );
     }
 }

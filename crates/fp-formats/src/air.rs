@@ -25,14 +25,18 @@ use std::path::Path;
 use fp_core::{FpError, FpResult, Rect, SpriteId, Vec2};
 
 /// A complete parsed AIR file containing all animation actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AirFile {
     /// Map from action number to animation action.
+    ///
+    /// Serialized through [`crate::sorted_map`] so the IR-cache encoding is
+    /// deterministic (the in-memory `HashMap` iteration order is not).
+    #[serde(serialize_with = "crate::sorted_map::serialize")]
     pub actions: HashMap<i32, AnimAction>,
 }
 
 /// A single animation action (sequence of frames).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimAction {
     /// The action number identifying this animation.
     pub action_number: i32,
@@ -47,7 +51,7 @@ pub struct AnimAction {
 /// Implements [`Default`] (an empty sprite-0 frame with no transforms) so
 /// callers can build a frame and override only the fields they care about via
 /// `AnimFrame { ..Default::default() }`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnimFrame {
     /// Which sprite to display (group, image).
     pub sprite: SpriteId,
@@ -77,6 +81,18 @@ pub struct AnimFrame {
     pub clsn2: Vec<Rect>,
 }
 
+impl AnimFrame {
+    /// Returns `true` if this frame carries at least one attack box (Clsn1),
+    /// i.e. it is an *active* attack frame.
+    ///
+    /// Used by frame-data analysis to delimit a move's active window (the
+    /// contiguous run of attack frames between startup and recovery).
+    #[must_use]
+    pub fn is_attack(&self) -> bool {
+        !self.clsn1.is_empty()
+    }
+}
+
 /// Which transforms a frame interpolates from the previous frame.
 ///
 /// MUGEN AIR allows standalone `Interpolate Offset` / `Interpolate Scale` /
@@ -85,7 +101,7 @@ pub struct AnimFrame {
 /// frame's duration into the frame that follows the line. All fields default to
 /// `false`, so a plain AIR with no `Interpolate` lines is byte-for-byte
 /// unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Interpolate {
     /// Interpolate the position offset (`Interpolate Offset`).
     pub offset: bool,
@@ -105,7 +121,7 @@ impl Interpolate {
 }
 
 /// Sprite blending mode for rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     /// Standard rendering (no blending).
     #[default]
@@ -121,7 +137,11 @@ pub enum BlendMode {
 impl AirFile {
     /// Loads and parses an AIR file from the given path.
     pub fn load(path: &Path) -> FpResult<Self> {
-        let text = std::fs::read_to_string(path)?;
+        // Route through the encoding-tolerant reader so non-UTF-8 (Shift-JIS)
+        // community `.air` files decode instead of erroring — consistent with
+        // the `.def`/`.cns`/`.cmd` parsers and the never-crash philosophy.
+        // `read_text_file` also strips a leading BOM, which `from_str` tolerates.
+        let text = crate::text::read_text_file(path)?;
         Self::from_str(&text)
     }
 
@@ -598,6 +618,94 @@ fn parse_blend_mode(s: &str) -> BlendMode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public helpers for the content-import AIR overlay (T084)
+// ---------------------------------------------------------------------------
+
+/// A frame line's parsed sprite reference plus its salvaged column form.
+///
+/// Produced by [`salvage_frame_columns`] for use by the content-import AIR
+/// overlay. It carries the `(group, image)` the frame references (so the overlay
+/// can check the sprite's presence in the `.sff`) and a `salvaged` rewrite of the
+/// line in which any **trailing-junk** columns (e.g. the `2..A` ticks column seen
+/// in real content) have been replaced by their leading integer (`2`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRef {
+    /// The sprite group the frame references (column 0).
+    pub group: u16,
+    /// The sprite image-within-group the frame references (column 1).
+    pub image: u16,
+    /// The line rewritten with any junk columns salvaged to their leading
+    /// integer. Equal to the input (modulo nothing) when no column had junk.
+    pub salvaged: String,
+    /// `true` when at least one column carried trailing junk that was salvaged
+    /// (so the overlay should record a `JunkColumn` repair).
+    pub had_junk: bool,
+}
+
+/// Classifies a single AIR line: returns `Some(FrameRef)` when the line is a
+/// frame line (`group, image, x, y, ticks[, ...]`), or `None` for any other line
+/// (headers, `Clsn` declarations, `Interpolate`/`Loopstart`, comments, blanks).
+///
+/// The salvage uses the **same** leading-integer rule the AIR parser applies at
+/// load time, so the overlay and the parser agree on every column: a column like
+/// `2..A` salvages to `2`, and the salvaged line re-parses with no
+/// trailing-junk warning. Comments and surrounding whitespace are preserved —
+/// only the numeric span of each junk column is rewritten in place.
+///
+/// Returns `None` (not a frame line) when the line does not have at least five
+/// comma-separated columns or when any of the first five columns has no leading
+/// integer at all (a fully-invalid column the parser would also reject).
+#[must_use]
+pub fn salvage_frame_columns(line: &str) -> Option<FrameRef> {
+    let body = strip_comment(line);
+    // A frame line is recognized purely structurally: >= 5 comma columns whose
+    // first five each carry a leading integer. Headers / Clsn / Interpolate lines
+    // never have this shape (they start with `[`, `Clsn`, a keyword, etc.).
+    let parts: Vec<&str> = body.split(',').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    // Reject lines whose first column is clearly a directive keyword (defensive:
+    // these never contain a leading integer, so the checks below catch them too).
+    let mut salvaged_parts: Vec<String> = parts.iter().map(|s| (*s).to_string()).collect();
+    let mut had_junk = false;
+    let mut group_image = [0u16; 2];
+    for (i, part) in parts.iter().enumerate().take(5) {
+        let n = parse_leading_i32(part)?;
+        // Detect and rewrite trailing junk: keep the column's leading/trailing
+        // whitespace, replacing only the numeric token with its salvaged value.
+        let trimmed = part.trim();
+        if trimmed.parse::<i32>().is_err() {
+            // Had junk — rebuild the column as "<leading ws><n><trailing ws>".
+            let lead_ws = &part[..part.len() - part.trim_start().len()];
+            let trail_ws = &part[part.trim_end().len()..];
+            salvaged_parts[i] = format!("{lead_ws}{n}{trail_ws}");
+            had_junk = true;
+        }
+        if i == 0 {
+            group_image[0] = n as u16;
+        } else if i == 1 {
+            group_image[1] = n as u16;
+        }
+    }
+    Some(FrameRef {
+        group: group_image[0],
+        image: group_image[1],
+        salvaged: salvaged_parts.join(","),
+        had_junk,
+    })
+}
+
+/// Returns the action number if `line` is a `[Begin Action N]` header, else
+/// `None`. Exposes the parser's own header rule for the import AIR overlay so it
+/// can track which action each frame belongs to (and never empty an action's
+/// last frame when pruning).
+#[must_use]
+pub fn begin_action_number(line: &str) -> Option<i32> {
+    parse_begin_action(strip_comment(line).trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +718,42 @@ mod tests {
 0,2, 0,0, 7
 0,3, 0,0, 40
 ";
+
+    /// Regression test for the community-content load bug: `AirFile::load` used
+    /// strict `std::fs::read_to_string`, so a non-UTF-8 (Shift-JIS) `.air` —
+    /// common in real MUGEN content — failed with "stream did not contain valid
+    /// UTF-8". `load` now routes through the encoding-tolerant reader. This test
+    /// synthesizes its own Shift-JIS bytes (clean-room: no external content) and
+    /// asserts the file loads instead of erroring.
+    #[test]
+    fn load_shift_jis_air_file_decodes_instead_of_erroring() {
+        // A `.air` with a non-ASCII (Japanese) comment, encoded as Shift-JIS so
+        // the raw bytes are NOT valid UTF-8.
+        let src = "; 波動拳アニメ\n[Begin Action 0]\n0,0, 0,0, 7\n";
+        let (sjis, _enc, had_errors) = encoding_rs::SHIFT_JIS.encode(src);
+        assert!(!had_errors, "fixture must be Shift-JIS-encodable");
+        assert!(
+            std::str::from_utf8(&sjis).is_err(),
+            "fixture must be invalid UTF-8 to exercise the fallback"
+        );
+
+        // Write to a unique temp path and load through the real `load` entry point.
+        let path = std::env::temp_dir().join(format!(
+            "fp_air_sjis_{}_{}.air",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &sjis).expect("write temp .air");
+        let result = AirFile::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let air = result.expect("Shift-JIS .air must load, not error on UTF-8");
+        assert_eq!(air.actions.len(), 1);
+        assert_eq!(air.action(0).unwrap().frames.len(), 1);
+    }
 
     #[test]
     fn parse_simple_action() {
@@ -1098,5 +1242,61 @@ Clsn2Defaultf: 1
         let action = air.action(0).expect("action 0 must parse despite BOM/CRLF");
         assert_eq!(action.frames.len(), 2);
         assert_eq!(action.frames[0].ticks, 7);
+    }
+
+    #[test]
+    fn salvage_frame_columns_clean_frame() {
+        let fr = salvage_frame_columns("2650, 1, 0,0, 7").expect("a clean frame line");
+        assert_eq!(fr.group, 2650);
+        assert_eq!(fr.image, 1);
+        assert!(!fr.had_junk, "a clean frame has no junk");
+        assert_eq!(fr.salvaged, "2650, 1, 0,0, 7");
+    }
+
+    #[test]
+    fn salvage_frame_columns_junk_ticks() {
+        // The real-content `2..A` ticks column salvages to `2`, preserving the
+        // surrounding column whitespace and the rest of the line verbatim.
+        let fr = salvage_frame_columns("2650, 1, 0,0, 2..A").expect("a frame line");
+        assert!(fr.had_junk, "the `2..A` column carries junk");
+        assert_eq!(fr.salvaged, "2650, 1, 0,0, 2");
+        assert_eq!(fr.group, 2650);
+        assert_eq!(fr.image, 1);
+        // The salvaged line re-parses with no junk left.
+        let again = salvage_frame_columns(&fr.salvaged).expect("salvaged line is a frame");
+        assert!(!again.had_junk, "salvaged line has no remaining junk");
+    }
+
+    #[test]
+    fn salvage_frame_columns_preserves_indentation() {
+        let fr = salvage_frame_columns("  0, 0, 0,0, 2..A  ").expect("a frame line");
+        assert!(fr.had_junk);
+        // Leading frame whitespace and the junk column's whitespace are kept.
+        assert_eq!(fr.salvaged, "  0, 0, 0,0, 2  ");
+    }
+
+    #[test]
+    fn salvage_frame_columns_rejects_non_frame_lines() {
+        // Headers, Clsn declarations, keywords, comments, blanks -> None.
+        assert!(salvage_frame_columns("[Begin Action 0]").is_none());
+        assert!(salvage_frame_columns("Clsn2Default: 1").is_none());
+        assert!(salvage_frame_columns("Clsn2[0] = -10, -80, 10, 0").is_none());
+        assert!(salvage_frame_columns("Loopstart").is_none());
+        assert!(salvage_frame_columns("Interpolate Scale").is_none());
+        assert!(salvage_frame_columns("; just a comment").is_none());
+        assert!(salvage_frame_columns("").is_none());
+        // Too few columns.
+        assert!(salvage_frame_columns("0, 0, 0").is_none());
+    }
+
+    #[test]
+    fn begin_action_number_matches_parser() {
+        assert_eq!(begin_action_number("[Begin Action 2650]"), Some(2650));
+        assert_eq!(
+            begin_action_number("[Begin Action 12010, Tornado]"),
+            Some(12010)
+        );
+        assert_eq!(begin_action_number("0, 0, 0,0, 7"), None);
+        assert_eq!(begin_action_number("Clsn2Default: 1"), None);
     }
 }

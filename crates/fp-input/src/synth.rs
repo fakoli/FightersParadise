@@ -85,7 +85,10 @@ fn element_is_strict(element: &CommandElement) -> bool {
 fn emit_element(frames: &mut Vec<InputState>, element: &CommandElement, facing_right: bool) {
     match element {
         CommandElement::Dir {
-            token, modifier, ..
+            token,
+            modifier,
+            min_hold,
+            ..
         } => {
             let dir = dir_token_to_direction(*token, facing_right);
             match modifier {
@@ -93,21 +96,29 @@ fn emit_element(frames: &mut Vec<InputState>, element: &CommandElement, facing_r
                     frames.push(state_with_direction(dir));
                 }
                 InputModifier::Release => {
-                    // Hold the direction, then release it: the release edge lands
-                    // on the (neutral) frame after the held one.
-                    frames.push(state_with_direction(dir));
+                    // Hold the direction (long enough to satisfy any charge),
+                    // then release it: the release edge lands on the (neutral)
+                    // frame after the held run.
+                    for _ in 0..charge_hold_frames(*min_hold) {
+                        frames.push(state_with_direction(dir));
+                    }
                     frames.push(InputState::default());
                 }
             }
         }
         CommandElement::Button {
-            button, modifier, ..
+            button,
+            modifier,
+            min_hold,
+            ..
         } => match modifier {
             InputModifier::Press | InputModifier::Hold => {
                 frames.push(state_with_buttons(&[*button]));
             }
             InputModifier::Release => {
-                frames.push(state_with_buttons(&[*button]));
+                for _ in 0..charge_hold_frames(*min_hold) {
+                    frames.push(state_with_buttons(&[*button]));
+                }
                 frames.push(InputState::default());
             }
         },
@@ -161,6 +172,16 @@ fn emit_simultaneous(frames: &mut Vec<InputState>, parts: &[CommandElement], fac
     if any_release {
         frames.push(InputState::default());
     }
+}
+
+/// Number of held frames to emit before a release edge for a given charge
+/// `min_hold`.
+///
+/// A non-charge release (`min_hold == 0`) emits a single held frame so the
+/// release edge is real. A charge release emits `min_hold` held frames so the
+/// matcher's consecutive-hold count is satisfied.
+fn charge_hold_frames(min_hold: u32) -> u32 {
+    min_hold.max(1)
 }
 
 /// All game buttons, used to merge simultaneous-group frames.
@@ -299,6 +320,16 @@ mod tests {
     fn synth_charge_back_forward() {
         // Charge motion: hold Back, then Forward + button (e.g. sonic boom).
         assert!(synth_is_recognized("charge_a", "~B, F, a", true));
+    }
+
+    #[test]
+    fn synth_charge_with_min_hold() {
+        // A charge with an explicit hold duration (`~30$B, F, a`) synthesizes
+        // enough held frames to satisfy the charge and is recognized by the
+        // same matcher — the synthesizer honors min_hold.
+        assert!(synth_is_recognized("charge30_a", "~30$B, F, a", true));
+        // The same motion synthesizes correctly facing left, too.
+        assert!(synth_is_recognized("charge30_a_left", "~30$B, F, a", false));
     }
 
     #[test]

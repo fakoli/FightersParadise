@@ -43,6 +43,13 @@ pub enum CommandElement {
         /// the input frame directly preceding the *next* element in the
         /// sequence, with no other distinct input frame between them.
         strict: bool,
+        /// MUGEN charge hold-duration: the minimum number of consecutive ticks
+        /// the input must have been held immediately before the
+        /// [`Release`](InputModifier::Release) edge (e.g. `~60B` requires Back
+        /// held for at least 60 ticks before it is let go). `0` means no charge
+        /// requirement. Only meaningful with [`InputModifier::Release`]; the
+        /// 60-frame ring buffer clamps the effective maximum to 60.
+        min_hold: u32,
     },
     /// A button input with a modifier.
     Button {
@@ -54,6 +61,13 @@ pub enum CommandElement {
         /// the input frame directly preceding the *next* element in the
         /// sequence, with no other distinct input frame between them.
         strict: bool,
+        /// MUGEN charge hold-duration: the minimum number of consecutive ticks
+        /// the button must have been held immediately before the
+        /// [`Release`](InputModifier::Release) edge (e.g. `~30a` requires the A
+        /// button held for at least 30 ticks before it is let go). `0` means no
+        /// charge requirement. Only meaningful with [`InputModifier::Release`];
+        /// the 60-frame ring buffer clamps the effective maximum to 60.
+        min_hold: u32,
     },
     /// Multiple inputs that must occur on the same frame.
     Simultaneous(Vec<CommandElement>),
@@ -116,6 +130,48 @@ pub struct CommandMatcherSnapshot {
     active: Vec<(String, u32)>,
 }
 
+/// Input-leniency configuration for a [`CommandMatcher`] (T075).
+///
+/// Buffering is a deterministic, input-layer concern: the same inputs always
+/// produce the same buffered commands, so versus determinism is unchanged. All
+/// fields default to *off* (`jump_buffer_frames = 0`) so the matcher behaves
+/// exactly as before unless leniency is explicitly enabled — existing content,
+/// replays, and tests are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeniencyConfig {
+    /// How many frames before the actionable frame an up-press is buffered so a
+    /// jump still fires. `0` disables the jump buffer entirely.
+    pub jump_buffer_frames: u32,
+    /// The command name kept active by a buffered up-press. This is the engine's
+    /// built-in jump gate (`holdup`); a buffered jump is intentionally applied
+    /// only to that built-in locomotion command, never to authored content
+    /// motions (the variable jump height of an authored arc stays the
+    /// character's concern).
+    pub jump_command: String,
+}
+
+impl Default for LeniencyConfig {
+    fn default() -> Self {
+        Self {
+            jump_buffer_frames: 0,
+            jump_command: "holdup".to_string(),
+        }
+    }
+}
+
+impl LeniencyConfig {
+    /// A leniency config with the jump buffer enabled over the standard `holdup`
+    /// gate, using a 3-frame (~50ms at 60Hz) window — short enough that a stale
+    /// up-press never resurrects a jump.
+    #[must_use]
+    pub fn with_jump_buffer() -> Self {
+        Self {
+            jump_buffer_frames: 3,
+            ..Self::default()
+        }
+    }
+}
+
 /// Matches input buffer contents against command definitions.
 ///
 /// Call [`CommandMatcher::check_commands`] once per tick to scan for newly
@@ -126,14 +182,40 @@ pub struct CommandMatcher {
     commands: Vec<CommandDef>,
     /// Currently active (matched and not yet expired) commands.
     active: Vec<CommandResult>,
+    /// Input-leniency configuration (jump buffer). Defaults to off.
+    leniency: LeniencyConfig,
+    /// Names of commands that transitioned from inactive to active on the most
+    /// recent [`check_commands`](Self::check_commands) call (i.e. were
+    /// *recognized this frame*). Rebuilt every tick; read via
+    /// [`just_matched`](Self::just_matched) to flash a command name in the
+    /// on-screen input display (T064). An already-active command that merely
+    /// stays active is **not** listed — only the frame of recognition.
+    just_matched: Vec<String>,
 }
 
 impl CommandMatcher {
     /// Creates a new matcher with the given command definitions.
+    ///
+    /// Input leniency is **off** by default ([`LeniencyConfig::default`]); enable
+    /// the jump buffer with [`with_leniency`](Self::with_leniency).
     pub fn new(commands: Vec<CommandDef>) -> Self {
         Self {
             commands,
             active: Vec::new(),
+            leniency: LeniencyConfig::default(),
+            just_matched: Vec::new(),
+        }
+    }
+
+    /// Builder variant of [`new`](Self::new) that also installs a
+    /// [`LeniencyConfig`] (e.g. [`LeniencyConfig::with_jump_buffer`]).
+    #[must_use]
+    pub fn with_leniency(commands: Vec<CommandDef>, leniency: LeniencyConfig) -> Self {
+        Self {
+            commands,
+            active: Vec::new(),
+            leniency,
+            just_matched: Vec::new(),
         }
     }
 
@@ -141,7 +223,18 @@ impl CommandMatcher {
     ///
     /// Decrements active command timers, removes expired ones, then attempts
     /// to match each command definition by scanning backward through the buffer.
+    ///
+    /// Finally, when the jump buffer is enabled ([`LeniencyConfig`]), a fresh
+    /// up-press within the leniency window keeps the configured `jump_command`
+    /// (the engine built-in `holdup` gate) active even if up is no longer held
+    /// this exact frame — so a jump tapped a few frames before the player became
+    /// actionable still comes out (T075). This is applied *after* normal matching
+    /// and only re-arms the single jump gate, so it cannot turn one motion into
+    /// another (a `QCF` never becomes a `DP`).
     pub fn check_commands(&mut self, buffer: &InputBuffer, facing_right: bool) {
+        // Fresh per tick: only commands recognized *this* frame are recorded.
+        self.just_matched.clear();
+
         // Decrement active timers and remove expired
         for result in &mut self.active {
             result.remaining = result.remaining.saturating_sub(1);
@@ -158,7 +251,59 @@ impl CommandMatcher {
                     name: cmd.name.clone(),
                     remaining: cmd.buffer_time,
                 });
+                self.just_matched.push(cmd.name.clone());
             }
+        }
+
+        self.apply_jump_buffer(buffer);
+    }
+
+    /// Names of commands recognized on the most recent
+    /// [`check_commands`](Self::check_commands) call — the commands that
+    /// transitioned from inactive to active *this frame*.
+    ///
+    /// Used by the on-screen input display (T064) to flash a special-move name
+    /// the instant its motion completes. A command that was already active and
+    /// merely stayed active is **not** included; the list is rebuilt every tick
+    /// (empty on a frame with no new recognition).
+    #[must_use]
+    pub fn just_matched(&self) -> &[String] {
+        &self.just_matched
+    }
+
+    /// Re-arms the configured jump command from a buffered up-press (T075).
+    ///
+    /// No-op when the jump buffer is disabled (`jump_buffer_frames == 0`), when
+    /// the jump command is not in this matcher's vocabulary, or when it is
+    /// already active this tick. Otherwise, if [`InputBuffer::up_pressed_within`]
+    /// finds a fresh up-press inside the window, the jump command is activated
+    /// with its own `buffer_time` so downstream code reads it exactly as a
+    /// freshly-matched `holdup`.
+    fn apply_jump_buffer(&mut self, buffer: &InputBuffer) {
+        let window = self.leniency.jump_buffer_frames;
+        if window == 0 {
+            return;
+        }
+        // Bound the scan to the configured jump gate only — never authored motions.
+        let Some(cmd) = self
+            .commands
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&self.leniency.jump_command))
+        else {
+            return;
+        };
+        if self.active.iter().any(|r| r.name == cmd.name) {
+            return; // already live this tick (real hold or prior buffer)
+        }
+        if buffer.up_pressed_within(window as usize) {
+            // Keep the jump alive for the gate command's own buffer_time so the
+            // engine's `command = "holdup"` ChangeState can fire on the first
+            // actionable frame. A minimum of 1 ensures a `buffer_time = 0` gate
+            // (KFM's instantaneous holds) is still observable this tick.
+            let remaining = cmd.buffer_time.max(1);
+            let name = cmd.name.clone();
+            self.just_matched.push(name.clone());
+            self.active.push(CommandResult { name, remaining });
         }
     }
 
@@ -313,6 +458,7 @@ impl CommandMatcher {
                 token,
                 modifier,
                 detect,
+                min_hold,
                 ..
             } => {
                 let Some(current) = buffer.get(frame_offset) else {
@@ -327,6 +473,14 @@ impl CommandMatcher {
                     } else {
                         dir_matches(l, *token)
                     }
+                };
+                // Per-frame "held" predicate used both for the release edge and
+                // for counting the charge run before it.
+                let held_at = |ago: usize| -> bool {
+                    buffer
+                        .get(ago)
+                        .map(|s| dir_hit(&logical_direction(&s.direction, facing_right)))
+                        .unwrap_or(false)
                 };
 
                 match modifier {
@@ -347,23 +501,29 @@ impl CommandMatcher {
                         if dir_hit(&logical) {
                             return false;
                         }
-                        // For release, the previous frame SHOULD match
-                        if let Some(prev) = buffer.get(frame_offset + 1) {
-                            let prev_logical = logical_direction(&prev.direction, facing_right);
-                            dir_hit(&prev_logical)
-                        } else {
-                            false
+                        // For release, the previous frame SHOULD match.
+                        if !held_at(frame_offset + 1) {
+                            return false;
                         }
+                        // Charge: require the direction held for >= min_hold
+                        // consecutive ticks immediately before the release.
+                        charge_satisfied(*min_hold, frame_offset + 1, held_at, buffer.len())
                     }
                 }
             }
             CommandElement::Button {
-                button, modifier, ..
+                button,
+                modifier,
+                min_hold,
+                ..
             } => {
                 let Some(current) = buffer.get(frame_offset) else {
                     return false;
                 };
                 let pressed = current.button(*button);
+                let held_at = |ago: usize| -> bool {
+                    buffer.get(ago).map(|s| s.button(*button)).unwrap_or(false)
+                };
 
                 match modifier {
                     InputModifier::Hold => pressed,
@@ -382,12 +542,13 @@ impl CommandMatcher {
                         if pressed {
                             return false;
                         }
-                        // Previous frame SHOULD have the button pressed
-                        if let Some(prev) = buffer.get(frame_offset + 1) {
-                            prev.button(*button)
-                        } else {
-                            false
+                        // Previous frame SHOULD have the button pressed.
+                        if !held_at(frame_offset + 1) {
+                            return false;
                         }
+                        // Charge: require the button held for >= min_hold
+                        // consecutive ticks immediately before the release.
+                        charge_satisfied(*min_hold, frame_offset + 1, held_at, buffer.len())
                     }
                 }
             }
@@ -396,6 +557,52 @@ impl CommandMatcher {
                 .all(|e| Self::element_matches(e, buffer, frame_offset, facing_right)),
         }
     }
+}
+
+/// Returns whether a charge hold-duration is satisfied at a release edge.
+///
+/// `release_held_offset` is the buffer offset of the *held* frame immediately
+/// preceding the release (i.e. `frame_offset + 1` for the matched release). The
+/// `held` predicate reports whether the charged input was held at a given
+/// buffer offset. The function walks backward from `release_held_offset`,
+/// counting consecutive held frames, and returns `true` once the run reaches
+/// `min_hold`.
+///
+/// `min_hold == 0` is the no-charge case and returns `true` immediately (the
+/// caller has already verified the release edge).
+///
+/// Boundary behaviour (the documented 60-tick ring clamp): the buffer holds at
+/// most 60 frames, so a long charge can run off the oldest recorded frame. When
+/// the consecutive-held run reaches the end of the buffer (the oldest frame is
+/// still held and there is no earlier frame to disprove the charge), the charge
+/// is treated as satisfied — the input was held since before the window opened.
+/// This is what lets a buffer saturated with the charged direction fire a
+/// `~60`-class command; a charge that is interrupted by a non-held frame within
+/// the window is bounded by that gap and must reach `min_hold` to count.
+fn charge_satisfied(
+    min_hold: u32,
+    release_held_offset: usize,
+    held: impl Fn(usize) -> bool,
+    buffer_len: usize,
+) -> bool {
+    if min_hold == 0 {
+        return true;
+    }
+    let mut count: u32 = 0;
+    let mut ago = release_held_offset;
+    while held(ago) {
+        count += 1;
+        if count >= min_hold {
+            return true;
+        }
+        // Ran off the oldest recorded frame while still held: the charge began
+        // before the window, so it cannot be disproven — treat it as charged.
+        if ago + 1 >= buffer_len {
+            return true;
+        }
+        ago += 1;
+    }
+    false
 }
 
 /// Parses a MUGEN command string into a vector of command elements.
@@ -408,6 +615,10 @@ impl CommandMatcher {
 /// - Button tokens: `a`, `b`, `c`, `x`, `y`, `z`, `s` (case-insensitive)
 /// - `~` prefix: release modifier
 /// - `/` prefix: hold modifier
+/// - `~NN`/`/NN` prefix: charge hold-duration — the input must have been held
+///   for at least `NN` consecutive ticks immediately before the release/hold
+///   edge (e.g. `~60B` = release Back after holding it ≥60 ticks). The 60-frame
+///   ring buffer clamps the effective maximum to 60.
 /// - `$` prefix (directions only): direction-detect — the token only requires
 ///   its component axis to be held, so `$F` matches F, UF, or DF. This is the
 ///   basis of MUGEN's `holdfwd`/`holdback`/etc. commands (`/$F`, `/$B`, ...).
@@ -473,6 +684,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
     let mut detect = false;
     let mut strict = false;
     let mut have_modifier = false;
+    let mut min_hold: u32 = 0;
 
     // Consume any leading prefix symbols. Order is not enforced (real `.cmd`
     // files vary), but each prefix may appear at most once.
@@ -506,6 +718,25 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
                 };
                 have_modifier = true;
                 chars.next();
+
+                // MUGEN charge syntax: a `~`/`/` prefix may be followed by a
+                // run of digits giving the minimum hold duration in ticks
+                // (e.g. `~60B`). Parse them here so the charge count enforces
+                // the hold window in the matcher.
+                let mut digits = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        digits.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !digits.is_empty() {
+                    // Saturating parse: an absurdly large charge clamps to the
+                    // ring-buffer cap during matching rather than erroring.
+                    min_hold = digits.parse::<u32>().unwrap_or(u32::MAX);
+                }
             }
             _ => break,
         }
@@ -536,6 +767,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
             button,
             modifier,
             strict,
+            min_hold,
         });
     }
 
@@ -565,6 +797,7 @@ fn parse_single_token(token: &str) -> FpResult<CommandElement> {
             modifier,
             detect,
             strict,
+            min_hold,
         }),
         None => Err(FpError::parse(
             "CMD",
@@ -587,6 +820,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -602,6 +836,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -611,6 +846,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -620,6 +856,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -628,6 +865,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -642,6 +880,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Release,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -656,6 +895,7 @@ mod tests {
                 button: Button::X,
                 modifier: InputModifier::Hold,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -673,6 +913,7 @@ mod tests {
                         button: Button::A,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
                 assert_eq!(
@@ -681,6 +922,7 @@ mod tests {
                         button: Button::B,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -700,6 +942,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -716,6 +959,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -732,6 +976,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: true,
+                min_hold: 0,
             }
         );
     }
@@ -747,6 +992,7 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Release,
                 strict: true,
+                min_hold: 0,
             }
         );
     }
@@ -892,6 +1138,358 @@ mod tests {
         buffer.push(InputState::default());
         matcher.check_commands(&buffer, true);
         assert!(!matcher.command_active("test_expire"));
+    }
+
+    // ---- T059: charge hold-duration enforcement ----
+
+    /// `~60$B` must parse into a Release direction element carrying
+    /// `min_hold == 60` and `detect == true`, the canonical charge form.
+    #[test]
+    fn compile_charge_token() {
+        let elements = compile_command("~60$B").unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+        // A plain release (no digits) keeps min_hold == 0 (unchanged behaviour).
+        assert_eq!(
+            compile_command("~B").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+        // Charge on a button (`~30a`) parses too.
+        assert_eq!(
+            compile_command("~30a").unwrap()[0],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Release,
+                strict: false,
+                min_hold: 30,
+            }
+        );
+    }
+
+    /// T058 acceptance: `~NN`/`/NN` charge tokens parse the digit run into
+    /// `min_hold` instead of gluing it onto the token and hitting the
+    /// `unknown command token` error.
+    ///
+    /// Covers every acceptance criterion of T058:
+    /// - `~60$B` → a `Release` direction element with `min_hold == 60` on `$B`.
+    /// - `~D` (no digits) keeps `min_hold == 0` (negative-edge behaviour intact).
+    /// - `command = ~60$B, F, x` compiles to a real (non-empty) element list, so
+    ///   it never falls back to the const-0 "unknown command token" path.
+    #[test]
+    fn parse_charge_token() {
+        // `~60$B` parses to a charged Release on `$B` carrying `min_hold == 60`.
+        assert_eq!(
+            compile_command("~60$B").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+
+        // `~D` (release, no digits) keeps `min_hold == 0`.
+        assert_eq!(
+            compile_command("~D").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::D,
+                modifier: InputModifier::Release,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+
+        // The `/NN` (hold) form parses its digit run too, e.g. `/40F`.
+        assert_eq!(
+            compile_command("/40F").unwrap()[0],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Hold,
+                detect: false,
+                strict: false,
+                min_hold: 40,
+            }
+        );
+
+        // A charge on a button (`~30a`) parses its digits too.
+        assert_eq!(
+            compile_command("~30a").unwrap()[0],
+            CommandElement::Button {
+                button: Button::A,
+                modifier: InputModifier::Release,
+                strict: false,
+                min_hold: 30,
+            }
+        );
+
+        // The full `command = ~60$B, F, x` compiles without the
+        // `unknown command token` error: three elements, none a fallback.
+        let cmd = compile_command("~60$B, F, x").unwrap();
+        assert_eq!(cmd.len(), 3, "~60$B, F, x must compile to three elements");
+        assert_eq!(
+            cmd[0],
+            CommandElement::Dir {
+                token: DirToken::B,
+                modifier: InputModifier::Release,
+                detect: true,
+                strict: false,
+                min_hold: 60,
+            }
+        );
+        assert_eq!(
+            cmd[1],
+            CommandElement::Dir {
+                token: DirToken::F,
+                modifier: InputModifier::Press,
+                detect: false,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+        assert_eq!(
+            cmd[2],
+            CommandElement::Button {
+                button: Button::X,
+                modifier: InputModifier::Press,
+                strict: false,
+                min_hold: 0,
+            }
+        );
+    }
+
+    /// Builds a hardware Back direction (logical Back when facing right).
+    fn back_dir() -> Direction {
+        Direction {
+            left: true,
+            ..Default::default()
+        }
+    }
+
+    /// Builds a hardware Forward direction (logical Forward when facing right).
+    fn fwd_dir() -> Direction {
+        Direction {
+            right: true,
+            ..Default::default()
+        }
+    }
+
+    /// Pushes a `gap?`-Back-release-Forward-x charge sequence onto `buffer`:
+    /// optionally a leading non-held (neutral) frame that *bounds* the charge
+    /// run, then `hold` ticks of Back held, a neutral frame (the Back release
+    /// edge), a Forward frame (the F press), then a Forward+x frame (button).
+    /// The release edge sits on its own frame so it does not collide with F.
+    ///
+    /// With `lead_gap = true`, the run is bounded to exactly `hold` ticks (the
+    /// charge count cannot exceed it). With `lead_gap = false`, the Back run
+    /// runs off the start of the buffer (held since before the window) — the
+    /// documented saturated-ring case.
+    fn push_charge_seq(buffer: &mut InputBuffer, hold: u32, lead_gap: bool) {
+        if lead_gap {
+            buffer.push(InputState::default());
+        }
+        for _ in 0..hold {
+            buffer.push(make_state(back_dir(), &[]));
+        }
+        buffer.push(InputState::default());
+        buffer.push(make_state(fwd_dir(), &[]));
+        buffer.push(make_state(fwd_dir(), &[Button::X]));
+    }
+
+    /// `~60$B, F, x` fires when Back is held for the full charge (a ring
+    /// saturated with Back, then F, x). This is the literal acceptance case.
+    /// The exact 60-vs-59 boundary needs a non-held frame to bound the run, and
+    /// a 60-tick run + release + F + x cannot all fit the 60-frame ring (the
+    /// documented clamp), so the strict N-vs-(N-1) boundary is exercised at a
+    /// sub-ring charge in [`charge_boundary_is_exact`].
+    #[test]
+    fn charge_requires_hold() {
+        let cmd = CommandDef {
+            name: "charge".into(),
+            elements: compile_command("~60$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Ring saturated with Back (held since before the window) -> fires.
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 60, false);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge"),
+            "Back held for the full charge then F, x must fire ~60$B,F,x"
+        );
+
+        // No charge at all (Back tapped once, bounded, then released) -> no fire.
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 1, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge"),
+            "a single-tick Back must NOT fire a 60-tick charge"
+        );
+    }
+
+    /// The charge boundary is exact: at a sub-ring charge `N` (so a bounding
+    /// non-held frame fits in the 60-frame ring), `N` held ticks fire and
+    /// `N - 1` do not. `min_hold == 0` is unchanged (a plain release fires
+    /// after a single held tick).
+    #[test]
+    fn charge_boundary_is_exact() {
+        let cmd = CommandDef {
+            name: "charge50".into(),
+            elements: compile_command("~50$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Exactly 50 held ticks (bounded by a leading gap) -> fires.
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 50, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge50"),
+            "exactly 50 held ticks must fire ~50$B"
+        );
+
+        // 49 held ticks (bounded) -> does NOT fire (one short).
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 49, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge50"),
+            "49 held ticks must NOT fire ~50$B (one short of the charge)"
+        );
+
+        // min_hold == 0 unchanged: a plain `~B, F, x` fires after a single
+        // bounded Back tick.
+        let plain = CommandDef {
+            name: "plain".into(),
+            elements: compile_command("~B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![plain]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 1, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("plain"),
+            "a plain (min_hold==0) ~B release must be unchanged"
+        );
+    }
+
+    /// Direction-detect: a `~$B` charge counts diagonal Back-down (DB) frames
+    /// toward the hold, since `$B` matches B / DB / UB.
+    #[test]
+    fn charge_dollar_directiondetect() {
+        let cmd = CommandDef {
+            name: "charge_detect".into(),
+            // Lower charge so the whole sequence fits the 60-frame ring with
+            // room for the post-release frames.
+            elements: compile_command("~20$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+
+        buffer.push(InputState::default());
+        // Charge held as Down-Back (DB) the whole time — only counts because
+        // `$B` is direction-detect (axis held), not an exact-cardinal Back.
+        for _ in 0..20 {
+            buffer.push(make_state(
+                Direction {
+                    left: true,
+                    down: true,
+                    ..Default::default()
+                },
+                &[],
+            ));
+        }
+        // Release the back axis (neutral edge), then forward, then the button.
+        buffer.push(InputState::default());
+        buffer.push(make_state(fwd_dir(), &[]));
+        buffer.push(make_state(fwd_dir(), &[Button::X]));
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("charge_detect"),
+            "DB held should count toward the ~$B charge via direction-detect"
+        );
+
+        // Negative control: a plain `~20B` (no `$`) does NOT accept DB as the
+        // charge, because exact-cardinal Back is never satisfied by DB.
+        let cmd_exact = CommandDef {
+            name: "charge_exact".into(),
+            elements: compile_command("~20B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd_exact]);
+        // Same DB-held buffer.
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("charge_exact"),
+            "DB must NOT satisfy an exact (non-$) Back charge"
+        );
+    }
+
+    /// Documented 60-frame ring clamp. A charge larger than the ring cannot be
+    /// distinguished from a saturated ring: when the held run runs off the
+    /// oldest recorded frame, the charge is treated as satisfied (held since
+    /// before the window) — so a ring saturated with Back fires even a
+    /// `~120`-class charge. But a charge run that is *bounded* by a non-held
+    /// frame within the window and falls short of `min_hold` never fires,
+    /// regardless of how large `min_hold` is.
+    #[test]
+    fn charge_above_ring_clamp() {
+        let cmd = CommandDef {
+            name: "huge".into(),
+            elements: compile_command("~120$B, F, x").unwrap(),
+            time: 12,
+            buffer_time: 3,
+        };
+
+        // Saturated ring (Back since before the window) -> fires (clamp).
+        let mut matcher = CommandMatcher::new(vec![cmd.clone()]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 120, false);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("huge"),
+            "a ring saturated with Back satisfies any charge (held since before window)"
+        );
+
+        // Bounded run shorter than the charge -> never fires.
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        push_charge_seq(&mut buffer, 30, true);
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("huge"),
+            "a bounded 30-tick run must not fire a 120-tick charge"
+        );
     }
 
     #[test]
@@ -1221,6 +1819,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
         assert_eq!(
@@ -1230,6 +1829,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1261,6 +1861,7 @@ mod tests {
                 button: Button::B,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             }
         );
         // Uppercase B = Back direction.
@@ -1271,6 +1872,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1286,6 +1888,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1300,6 +1903,7 @@ mod tests {
             modifier: InputModifier::Hold,
             detect: true,
             strict: true,
+            min_hold: 0,
         };
         for src in [">/$F", ">$/F", "/$>F", "$/>F", "/>$F"] {
             let got = compile_command(src).unwrap();
@@ -1318,6 +1922,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1342,6 +1947,7 @@ mod tests {
                     modifier: InputModifier::Press,
                     detect: false,
                     strict: false,
+                    min_hold: 0,
                 },
                 "reversed-diagonal `{src}` should alias to {want:?}"
             );
@@ -1360,6 +1966,7 @@ mod tests {
                     modifier: InputModifier::Press,
                     detect: false,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` should alias to UF regardless of case"
             );
@@ -1377,6 +1984,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1395,6 +2003,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "the third element `FU` must alias to UF"
         );
@@ -1408,6 +2017,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "the third element `BU` must alias to UB"
         );
@@ -1433,6 +2043,7 @@ mod tests {
                         button: Button::X,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
                 assert_eq!(
@@ -1441,6 +2052,7 @@ mod tests {
                         button: Button::Y,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -1454,6 +2066,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -1789,6 +2402,80 @@ mod tests {
     }
 
     #[test]
+    fn just_matched_reports_only_the_recognition_frame() {
+        // T064: a special recognized *this* frame appears in `just_matched`;
+        // on the next tick (while still active but not freshly matched) it does
+        // not. This is what lets the input display flash a name once.
+        let cmd = CommandDef {
+            name: "qcf".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 8,
+        };
+        let mut matcher = CommandMatcher::new(vec![cmd]);
+        let mut buffer = InputBuffer::new();
+        // Feed D, DF, F, +x.
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[Button::X],
+        ));
+        matcher.check_commands(&buffer, true);
+        assert!(matcher.command_active("qcf"));
+        assert_eq!(
+            matcher.just_matched(),
+            ["qcf"],
+            "the move is recognized on this frame"
+        );
+
+        // Next tick: still active (buffer_time not expired) but NOT freshly
+        // matched, so `just_matched` is empty.
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        matcher.check_commands(&buffer, true);
+        assert!(matcher.command_active("qcf"), "still buffered");
+        assert!(
+            matcher.just_matched().is_empty(),
+            "not recognized again this frame"
+        );
+    }
+
+    #[test]
+    fn just_matched_empty_before_any_check() {
+        let matcher = CommandMatcher::new(vec![]);
+        assert!(matcher.just_matched().is_empty());
+    }
+
+    #[test]
     fn matcher_does_not_rematch_while_active() {
         // Once active, a command is not re-pushed (no duplicate stacking), and
         // it stays active for exactly `buffer_time` ticks of holding.
@@ -2057,6 +2744,7 @@ mod tests {
                 modifier: InputModifier::Hold,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
 
@@ -2124,6 +2812,7 @@ mod tests {
                     modifier: InputModifier::Hold,
                     detect: true,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` must be hold + direction-detect {token:?}"
             );
@@ -2191,6 +2880,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
 
@@ -2599,6 +3289,7 @@ mod tests {
                         button: Button::A,
                         modifier: InputModifier::Press,
                         strict: true,
+                        min_hold: 0,
                     },
                     "first member of `>a+b` must carry the strict flag"
                 );
@@ -2608,6 +3299,7 @@ mod tests {
                         button: Button::B,
                         modifier: InputModifier::Press,
                         strict: false,
+                        min_hold: 0,
                     }
                 );
             }
@@ -2635,6 +3327,7 @@ mod tests {
                     button: btn,
                     modifier: InputModifier::Press,
                     strict: false,
+                    min_hold: 0,
                 },
                 "`{src}` should compile to button {btn:?}"
             );
@@ -2670,6 +3363,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -2702,6 +3396,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: true,
                 strict: false,
+                min_hold: 0,
             }
         );
     }
@@ -2729,6 +3424,7 @@ mod tests {
                 modifier: InputModifier::Release,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 0 must be ~D (release Down)"
         );
@@ -2740,6 +3436,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 1 must be DF"
         );
@@ -2751,6 +3448,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 2 must be F"
         );
@@ -2761,6 +3459,7 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             },
             "element 3 must be the A button"
         );
@@ -2784,6 +3483,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 0 must be F"
         );
@@ -2794,6 +3494,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 1 must be D"
         );
@@ -2804,6 +3505,7 @@ mod tests {
                 modifier: InputModifier::Press,
                 detect: false,
                 strict: false,
+                min_hold: 0,
             },
             "element 2 must be DF"
         );
@@ -2813,8 +3515,248 @@ mod tests {
                 button: Button::A,
                 modifier: InputModifier::Press,
                 strict: false,
+                min_hold: 0,
             },
             "element 3 must be the A button"
         );
+    }
+
+    // ====================================================================
+    // T075: input leniency — jump buffer + command-window regression
+    // ====================================================================
+
+    /// Builds the engine `holdup` jump gate as authored by trainingdummy/KFM:
+    /// hold + direction-detect up (`/$U`), instantaneous window.
+    fn holdup_cmd() -> CommandDef {
+        CommandDef {
+            name: "holdup".into(),
+            elements: compile_command("/$U").unwrap(),
+            time: 1,
+            buffer_time: 1,
+        }
+    }
+
+    /// Push an up-held or neutral (default) frame.
+    fn push_up(buffer: &mut InputBuffer, up: bool) {
+        buffer.push(make_state(
+            Direction {
+                up,
+                ..Default::default()
+            },
+            &[],
+        ));
+    }
+
+    #[test]
+    fn leniency_defaults_to_off() {
+        // Default leniency must be the old behavior: no jump buffer.
+        let def = LeniencyConfig::default();
+        assert_eq!(def.jump_buffer_frames, 0);
+        assert_eq!(def.jump_command, "holdup");
+        assert_eq!(LeniencyConfig::with_jump_buffer().jump_buffer_frames, 3);
+    }
+
+    #[test]
+    fn jump_buffer_fires_on_actionable_frame_after_release() {
+        // Player taps up, then RELEASES it 2 frames before becoming actionable
+        // (the actionable frame is the most recent / offset 0, where up is no
+        // longer held). With the jump buffer on, `holdup` must still be active on
+        // that frame.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false); // neutral
+        push_up(&mut buffer, true); // <- up pressed (the buffered tap)
+        push_up(&mut buffer, false); // released, still in recovery
+        push_up(&mut buffer, false); // actionable frame, up no longer held
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("holdup"),
+            "a jump tapped 2 frames before the actionable frame must still fire"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_off_does_not_revive_released_jump() {
+        // Same input, jump buffer DISABLED (default matcher): on the actionable
+        // frame up is not held, so plain `holdup` is NOT active — proving the new
+        // behavior is opt-in and the baseline is unchanged.
+        let mut matcher = CommandMatcher::new(vec![holdup_cmd()]);
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, true);
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, false);
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("holdup"),
+            "without the jump buffer, a released up-press must not fire holdup"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_respects_window_size() {
+        // An up-press OLDER than the window must not be buffered.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, true); // up press, far back
+        for _ in 0..5 {
+            push_up(&mut buffer, false); // 5 neutral frames (> 3-frame window)
+        }
+        matcher.check_commands(&buffer, true);
+        assert!(
+            !matcher.command_active("holdup"),
+            "an up-press older than the buffer window must not fire holdup"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_does_not_invent_jump_without_press() {
+        // No up at all => no buffered jump, even with the buffer enabled.
+        let mut matcher =
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer());
+        let mut buffer = InputBuffer::new();
+        for _ in 0..6 {
+            push_up(&mut buffer, false);
+        }
+        matcher.check_commands(&buffer, true);
+        assert!(!matcher.command_active("holdup"));
+    }
+
+    #[test]
+    fn jump_buffer_only_touches_its_own_command_not_qcf_or_dp() {
+        // REGRESSION (task gotcha): the jump buffer must re-arm ONLY `holdup`.
+        // It must never cause an unrelated motion to misfire — a QCF must not eat
+        // a DP, and a stray up-press must not conjure either. We register holdup,
+        // a QCF, and a DP; feed only a buffered up-press; and assert holdup fires
+        // while QCF and DP stay silent.
+        let qcf = CommandDef {
+            name: "fireball".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 3,
+        };
+        let dp = CommandDef {
+            name: "dp".into(),
+            elements: compile_command("F, D, DF, a").unwrap(),
+            time: 20,
+            buffer_time: 3,
+        };
+        let mut matcher = CommandMatcher::with_leniency(
+            vec![holdup_cmd(), qcf, dp],
+            LeniencyConfig::with_jump_buffer(),
+        );
+        let mut buffer = InputBuffer::new();
+        push_up(&mut buffer, false);
+        push_up(&mut buffer, true); // the only meaningful input: an up tap
+        push_up(&mut buffer, false);
+
+        matcher.check_commands(&buffer, true);
+        assert!(
+            matcher.command_active("holdup"),
+            "buffered up must fire jump"
+        );
+        assert!(
+            !matcher.command_active("fireball"),
+            "the jump buffer must NOT make a QCF misfire"
+        );
+        assert!(
+            !matcher.command_active("dp"),
+            "the jump buffer must NOT make a DP misfire"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_no_false_positives_for_real_motions() {
+        // Replay a genuine QCF+x with the jump buffer ON over a matcher that knows
+        // QCF, DP and holdup. The buffer must not add spurious commands: exactly
+        // the QCF should fire (no up was pressed, so holdup stays off; DP stays
+        // off). This is the "no new false matches" acceptance check against a
+        // real-shaped motion.
+        let qcf = CommandDef {
+            name: "fireball".into(),
+            elements: compile_command("D, DF, F, x").unwrap(),
+            time: 15,
+            buffer_time: 3,
+        };
+        let dp = CommandDef {
+            name: "dp".into(),
+            elements: compile_command("F, D, DF, a").unwrap(),
+            time: 20,
+            buffer_time: 3,
+        };
+        let mut lenient = CommandMatcher::with_leniency(
+            vec![holdup_cmd(), qcf.clone(), dp.clone()],
+            LeniencyConfig::with_jump_buffer(),
+        );
+        let mut strict = CommandMatcher::new(vec![holdup_cmd(), qcf, dp]);
+
+        let mut buffer = InputBuffer::new();
+        for _ in 0..5 {
+            buffer.push(InputState::default());
+        }
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                down: true,
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(
+            Direction {
+                right: true,
+                ..Default::default()
+            },
+            &[],
+        ));
+        buffer.push(make_state(Direction::default(), &[Button::X]));
+
+        lenient.check_commands(&buffer, true);
+        strict.check_commands(&buffer, true);
+
+        // The lenient matcher matches exactly what the strict one does for this
+        // up-free motion: the QCF and nothing else.
+        assert!(lenient.command_active("fireball"));
+        assert!(strict.command_active("fireball"));
+        assert!(
+            !lenient.command_active("holdup"),
+            "no up pressed => no jump"
+        );
+        assert!(!lenient.command_active("dp"), "QCF must not become a DP");
+        assert_eq!(
+            lenient.active_command_names().len(),
+            strict.active_command_names().len(),
+            "jump buffer added no extra command matches for a real QCF"
+        );
+    }
+
+    #[test]
+    fn jump_buffer_is_deterministic() {
+        // Determinism: identical input sequences yield identical active sets.
+        let build = || {
+            CommandMatcher::with_leniency(vec![holdup_cmd()], LeniencyConfig::with_jump_buffer())
+        };
+        let mut a = build();
+        let mut b = build();
+        let mut buf_a = InputBuffer::new();
+        let mut buf_b = InputBuffer::new();
+        for up in [false, true, false, false, false] {
+            push_up(&mut buf_a, up);
+            push_up(&mut buf_b, up);
+            a.check_commands(&buf_a, true);
+            b.check_commands(&buf_b, true);
+            assert_eq!(a.active_command_names(), b.active_command_names());
+        }
     }
 }

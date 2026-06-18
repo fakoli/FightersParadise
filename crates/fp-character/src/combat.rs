@@ -30,7 +30,7 @@ use fp_combat::{detect_hit, resolve_hit, ClsnBox, ClsnFacing, DefenderState, Hit
 use fp_core::{Rect, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 
-use crate::{Character, Facing, StateType};
+use crate::{Character, Facing, MoveType, StateType};
 
 /// What [`resolve_attack`] decided and applied for one attacker → defender tick.
 ///
@@ -58,6 +58,14 @@ pub struct AttackResolution {
     pub attacker_hitpause: i32,
     /// Hit-pause ticks set on the defender (`pausetime.p2`).
     pub defender_hitpause: i32,
+    /// The defender's induced stun in ticks — the hit-stun on a clean
+    /// [`HitResult::Hit`] or the guard-stun on a [`HitResult::Guard`] (the
+    /// `outcome.hittime` written onto the defender's
+    /// [`GetHitVars::hittime`](crate::GetHitVars::hittime)). This is the
+    /// "defender held for N frames" number the frame-advantage readout subtracts
+    /// the attacker's remaining recovery from; see
+    /// [`crate::framedata::frame_advantage`].
+    pub stun: i32,
     /// The attacker's `HitDef` sound to play for this connection: the `hitsound`
     /// on a clean [`HitResult::Hit`], the `guardsound` on a [`HitResult::Guard`].
     /// [`None`] when the relevant sound is unset on the `HitDef`. (A miss never
@@ -179,6 +187,16 @@ pub fn resolve_attack(
         return None;
     }
 
+    // (2b·T080) SuperPause `unhittable` invulnerability. The `SuperPause` triggerer
+    // carries a [`SuperPauseEffect`](crate::SuperPauseEffect) for the pause window;
+    // while it is active and `unhittable = 1`, the triggerer cannot be hit. Drop the
+    // hit exactly like a `NotHitBy` block (it passes through — no damage, no state
+    // change, no hit-pause, NOT marked connected), matching MUGEN's behavior of a
+    // super's startup flash protecting the attacker.
+    if defender.superpause_effect.blocks_incoming() {
+        return None;
+    }
+
     // (2c) HitOverride (audit #9b). BEFORE the normal get-hit, consult the
     // DEFENDER's armed override slots against the ATTACKER's HitDef `attr`. On the
     // first matching active slot MUGEN redirects the defender to the slot's
@@ -193,6 +211,10 @@ pub fn resolve_attack(
     if let Some((slot, override_state)) = defender.hit_overrides.matching(&hitdef.attr) {
         defender.hit_overrides.consume(slot);
         defender.change_state(defender_states, override_state);
+        // T061: the defender's current get-hit reaction is now an override-redirected
+        // one, so `HitOverridden` reads 1 for the duration of that reaction. A later
+        // *normal* get-hit (below) clears the flag again.
+        defender.hit_overridden = true;
         // The attacker still connected: flag move-contact + target and consume
         // hitonce so the same HitDef cannot fire the override again.
         attacker.move_connect.hit = true;
@@ -212,6 +234,9 @@ pub fn resolve_attack(
             defender_state: override_state,
             attacker_hitpause: 0,
             defender_hitpause: 0,
+            // The override state takes over the defender's reaction entirely, so
+            // there is no engine-imposed hit/guard stun to count here.
+            stun: 0,
             hit_sound: None,
             attacker_state: hitdef.p1stateno,
         });
@@ -266,18 +291,60 @@ pub fn resolve_attack(
 
     // Scale damage by the attacker's attack multiplier and the defender's defence
     // multiplier (MUGEN AttackMulSet / DefenceMulSet; both default 1.0, so the base
-    // damage is unchanged when neither is set). final = round(base * atk * def).
-    let applied_damage = (outcome.damage as f32 * attacker.attack_mul * defender.defence_mul)
-        .round()
-        .clamp(0.0, i32::MAX as f32) as i32;
+    // damage is unchanged when neither is set). The attacker's active SuperPause
+    // `p2defmul` (T080) folds in here too: it scales the OPPONENT's (the defender's)
+    // effective defence for the pause window, so it multiplies the damage the
+    // defender takes. It lives on the attacker (the triggerer) and is the neutral
+    // `1.0` outside an active SuperPause window, so the base damage is unchanged for
+    // ordinary hits. final = round(base * atk * def * p2defmul).
+    let applied_damage = (outcome.damage as f32
+        * attacker.attack_mul
+        * defender.defence_mul
+        * attacker.superpause_effect.active_p2defmul())
+    .round()
+    .clamp(0.0, i32::MAX as f32) as i32;
 
     defender.life = (defender.life - applied_damage).max(0);
     defender.vel = knockback;
+    // T061: a normal (non-overridden) hit landed and now drives the reaction, so
+    // any prior `HitOverridden` state is no longer current.
+    defender.hit_overridden = false;
 
     // Populate the defender's GetHitVars from the resolved outcome before the
     // ChangeState, so the get-hit state's entry expressions can read them.
     let guarded = matches!(outcome.result, HitResult::Guard);
+
+    // GetHitVar(hitcount): the running combo count on this defender (T079). A
+    // combo is "live" while the defender is still in hit-stun — its `move_type`
+    // is `BeingHit` at this point, since the get-hit `change_state` that would
+    // refresh it has not run yet. So a hit that connects while the defender is
+    // already being hit increments the running count; a hit that lands on a
+    // neutral (recovered) defender starts a fresh combo at `1`. A *guarded* hit
+    // never combos, so it neither starts nor extends the count. This is the
+    // single source of truth the HUD combo counter reads (`active_combo_count`).
+    let combo_live = defender.move_type == MoveType::BeingHit;
+    let new_hitcount = if guarded {
+        defender.get_hit_vars.hitcount
+    } else if combo_live {
+        defender.get_hit_vars.hitcount.saturating_add(1)
+    } else {
+        1
+    };
+
+    // GetHitVar(isbound): non-zero while the defender is held by a binder's
+    // `TargetBind` (T079). `bound_time` is set by the engine when a Bind op is
+    // applied and counts down per tick, so a positive value means "still bound".
+    let isbound = i32::from(defender.bound_time != 0);
+
+    // GetHitVar(type): the ground hit-reaction type code of the hit
+    // (`None=0`, `High=1`, `Low=2`, `Trip=3`) — what the defender reads to know
+    // whether it was hit high, low, or tripped (T079).
+    let hit_type = hitdef.ground_type.code();
+
     let gh = &mut defender.get_hit_vars;
+    gh.hitcount = new_hitcount;
+    gh.isbound = isbound;
+    gh.hit_type = hit_type;
     gh.xvel = knockback.x;
     gh.yvel = knockback.y;
     // On a guard there is no fall/airborne arc (yvel and fall are forced to 0), so
@@ -332,6 +399,14 @@ pub fn resolve_attack(
     // already-running freeze (a multi-hit move that re-arms mid-pause keeps the
     // longer of the two). A miss never reaches this point (it returns `None`
     // above), so a miss pauses NEITHER participant — exactly the required rule.
+    //
+    // HITSTOP STRENGTH-SCALING (T073): the attacker's hit-stop is surfaced
+    // verbatim from the connecting `HitDef`'s `pausetime.p1`, so a heavy move
+    // (large authored `pausetime`) freezes the attacker longer than a light one
+    // and "reads heavier" — no separate strength system is invented; the freeze
+    // is data-driven straight from the HitDef. The executor counts this freeze
+    // down one tick at a time (see `Character::hitpause`), so a hit with
+    // `pausetime.p1 = 0` imparts no attacker hit-stop at all.
     //
     // GUARD PAUSETIME FALLBACK: MUGEN's `HitDef` can carry a distinct
     // `guard.pausetime`; [`fp_combat::HitDef`] does not model that field yet, so
@@ -389,6 +464,7 @@ pub fn resolve_attack(
         defender_state: outcome.gethit_state,
         attacker_hitpause: outcome.pausetime,
         defender_hitpause: outcome.shaketime,
+        stun: outcome.hittime,
         hit_sound,
         // `p1stateno` is parsed onto the HitDef but applied to the attacker
         // downstream (P8b), since the attacker's state graph is not in hand here.
@@ -611,6 +687,96 @@ mod tests {
         assert!(a.move_connect.contact());
     }
 
+    /// T079: the three formerly-unpopulated GetHitVars (`type`, `hitcount`,
+    /// `isbound`) are now written by `resolve_attack`, completing the 15-member
+    /// set. Exercises:
+    /// - `GetHitVar(type)` mirrors the HitDef's `ground.type` code.
+    /// - `GetHitVar(hitcount)` runs a 3-hit combo to `3` (only while the defender
+    ///   stays in hit-stun) and resets to `1` once it recovers to neutral.
+    /// - `GetHitVar(isbound)` is `1` when the defender is target-bound, `0` otherwise.
+    #[test]
+    fn gethitvar_completeness() {
+        let states = HashMap::new();
+
+        // ---- GetHitVar(type): High (default ground.type) -> code 1 ----
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("first hit connects");
+        assert_eq!(
+            d.get_hit_vars.hit_type,
+            fp_combat::HitType::High.code(),
+            "GetHitVar(type) mirrors the HitDef ground.type code"
+        );
+        // First hit on a neutral defender starts a fresh combo at 1, unbound.
+        assert_eq!(d.get_hit_vars.hitcount, 1, "fresh combo starts at 1");
+        assert_eq!(
+            d.get_hit_vars.isbound, 0,
+            "an unbound defender reports isbound = 0"
+        );
+
+        // ---- GetHitVar(hitcount): 3-hit combo while in hit-stun ----
+        // Simulate the defender still being in its get-hit state (the empty
+        // `states` map above means `change_state(5000)` didn't set movetype, so we
+        // pin it explicitly — exactly what a real common1 5000 state does).
+        for expected in [2, 3] {
+            d.move_type = MoveType::BeingHit;
+            // Re-arm a fresh HitDef and clear the prior connection so the next hit
+            // is allowed (hitonce resets between distinct HitDefs).
+            a.active_hitdef = Some(sample_hitdef());
+            a.move_connect = MoveConnect::default();
+            resolve_attack(&mut a, &a_air, &mut d, &d_air, &states)
+                .expect("combo hit connects while defender is in hit-stun");
+            assert_eq!(
+                d.get_hit_vars.hitcount, expected,
+                "combo count increments while the defender stays in hit-stun"
+            );
+        }
+
+        // Recover to neutral, then a fresh hit restarts the combo at 1.
+        d.move_type = MoveType::Idle;
+        a.active_hitdef = Some(sample_hitdef());
+        a.move_connect = MoveConnect::default();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("post-neutral hit connects");
+        assert_eq!(
+            d.get_hit_vars.hitcount, 1,
+            "combo count resets to 1 once the defender recovers to neutral"
+        );
+
+        // ---- GetHitVar(isbound): set when the defender is bound ----
+        let (mut a2, a2_air) = make_attacker();
+        let (mut d2, d2_air) = make_defender();
+        d2.bound_time = 5; // a binder's TargetBind would set this
+        resolve_attack(&mut a2, &a2_air, &mut d2, &d2_air, &states)
+            .expect("hit on a bound defender connects");
+        assert_eq!(
+            d2.get_hit_vars.isbound, 1,
+            "GetHitVar(isbound) is 1 while the defender is target-bound"
+        );
+
+        // A "bind forever" (-1) also reads as bound.
+        let (mut a3, a3_air) = make_attacker();
+        let (mut d3, d3_air) = make_defender();
+        d3.bound_time = -1;
+        resolve_attack(&mut a3, &a3_air, &mut d3, &d3_air, &states)
+            .expect("hit on a forever-bound defender connects");
+        assert_eq!(
+            d3.get_hit_vars.isbound, 1,
+            "a forever-bind (-1) also reports isbound = 1"
+        );
+
+        // Guarded hits never extend the combo count (sanity: a block isn't a combo).
+        let (mut ag, ag_air) = make_attacker();
+        let (mut dg, dg_air) = make_defender();
+        dg.holding_back = true; // guardflag MA admits a standing block
+        let pre = dg.get_hit_vars.hitcount;
+        resolve_attack(&mut ag, &ag_air, &mut dg, &dg_air, &states).expect("guarded hit connects");
+        assert!(dg.get_hit_vars.guarded != 0, "the defender blocked");
+        assert_eq!(
+            dg.get_hit_vars.hitcount, pre,
+            "a guarded hit does not increment the combo count"
+        );
+    }
+
     #[test]
     fn attack_and_defence_multipliers_scale_damage() {
         // base hit damage = 30 (make_attacker HitDef); multipliers default 1.0.
@@ -640,6 +806,81 @@ mod tests {
         d.defence_mul = 0.5;
         let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
         assert_eq!(res.damage, 30, "2.0 * 0.5 leaves base damage");
+    }
+
+    #[test]
+    fn superpause_unhittable_defender_blocks_hit() {
+        // T080: an active `unhittable` SuperPause window on the defender drops the
+        // hit entirely (pass-through, like NotHitBy): no damage, no connection.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states);
+        assert!(res.is_none(), "unhittable window blocks the hit");
+        assert_eq!(d.life, 1000, "no damage applied");
+        assert!(!a.move_connect.contact(), "the move did not connect");
+    }
+
+    #[test]
+    fn superpause_unhittable_zero_does_not_block() {
+        // Negative control: an active window with `unhittable = 0` lets the hit land.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 30, "hit lands at base damage");
+    }
+
+    #[test]
+    fn superpause_p2defmul_on_attacker_scales_defender_damage() {
+        // T080: the attacker's (triggerer's) active `p2defmul` multiplies the
+        // damage the defender takes; an inactive window leaves the base damage.
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        a.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 10,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 60, "p2defmul 2.0 doubles defender damage");
+        assert_eq!(d.life, 1000 - 60);
+    }
+
+    #[test]
+    fn superpause_inactive_window_is_inert() {
+        // A window with `remaining = 0` neither blocks nor scales (the default state
+        // every character carries outside a SuperPause).
+        let states = HashMap::new();
+        let (mut a, a_air) = make_attacker();
+        let (mut d, d_air) = make_defender();
+        d.life = 1000;
+        a.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 5.0,
+            remaining: 0,
+        };
+        d.superpause_effect = crate::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 0,
+        };
+        let res = resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("connects");
+        assert_eq!(res.damage, 30, "inactive windows leave base damage");
     }
 
     #[test]
@@ -1552,6 +1793,36 @@ mod tests {
             "inactive override slot is ignored"
         );
         assert_eq!(d.life, 1000 - 30, "normal damage applied");
+    }
+
+    // ---- T061: HitOverride sets/clears the `hit_overridden` flag (HitOverridden) -
+
+    /// T061: a matching `HitOverride` sets the defender's `hit_overridden` flag (the
+    /// state behind the `HitOverridden` trigger); a subsequent normal
+    /// (non-overridden) hit clears it. This is the `HitOverridden` acceptance
+    /// criterion exercised through the real `resolve_attack` pipeline.
+    #[test]
+    fn target_and_hit_triggers_hit_overridden_set_then_cleared() {
+        use crate::invuln::AttackAttrSet;
+        let (mut a, a_air) = make_attacker(); // HitDef attr defaults to S, NA
+        let (mut d, d_air) = make_defender();
+        assert!(!d.hit_overridden, "no hit taken yet → flag clear");
+
+        // Arm a matching override and connect: the flag latches on.
+        d.hit_overrides
+            .arm(0, AttackAttrSet::parse("S, NA"), 700, 30);
+        let states = HashMap::new();
+        resolve_attack(&mut a, &a_air, &mut d, &d_air, &states).expect("override fires");
+        assert!(
+            d.hit_overridden,
+            "an override-redirected get-hit sets HitOverridden"
+        );
+
+        // A second, normal (non-overridden) hit replaces the reaction and clears
+        // the flag — the slot was consumed, so this hit is no longer overridden.
+        let (mut a2, a_air2) = make_attacker();
+        resolve_attack(&mut a2, &a_air2, &mut d, &d_air, &states).expect("normal hit");
+        assert!(!d.hit_overridden, "a normal get-hit clears HitOverridden");
     }
 
     // ---- #23: fall.damage / fall.xvelocity flow from HitDef -> GetHitVars --

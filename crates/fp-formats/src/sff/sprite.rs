@@ -23,7 +23,7 @@ pub const SPRITE_SUBHEADER_SIZE: usize = 28;
 const SPRITE_COUNT_SLACK: usize = 256;
 
 /// Compression format used to encode sprite pixel data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum SpriteFormat {
     /// Uncompressed raw pixel data.
@@ -62,7 +62,7 @@ impl SpriteFormat {
 }
 
 /// A parsed sprite sub-header from an SFF v2 file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SffSprite {
     /// Sprite group number.
     pub group: u16,

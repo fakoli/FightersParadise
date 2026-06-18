@@ -1,0 +1,13 @@
+; Fighters Paradise — Trials / Tutorial index (original clean-room content, MIT).
+; Lists the ordered lesson scripts the TutorialRunner walks. Each lessonN points
+; at a one-[Lesson]-section .def in this directory. Lessons target the shipped
+; trainingdummy command set (fireball = QCF+P). The runner auto-skips any lesson
+; a loaded character cannot satisfy, so this trial loads against any character.
+
+[Trial]
+name    = "Fundamentals"
+lesson1 = block.def
+lesson2 = throw.def
+lesson3 = fireball.def
+lesson4 = antiair.def
+lesson5 = combo.def

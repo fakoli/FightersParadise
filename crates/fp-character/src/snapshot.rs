@@ -139,6 +139,10 @@ pub struct CharacterSnapshot {
     pub move_connect: MoveConnect,
     /// Whether the character has a hit-established target.
     pub has_target: bool,
+    /// Whether a `HitOverride` reaction is currently active (the
+    /// `HitOverridden` trigger), so an override armed when the snapshot was
+    /// taken stays armed across restore/replay.
+    pub hit_overridden: bool,
     /// Per-projectile-id contact/hit/guard timing (the `Proj*<id>` triggers),
     /// captured as a key-sorted `Vec` so the snapshot bytes stay deterministic
     /// (the live field is a `HashMap`).
@@ -173,6 +177,10 @@ pub struct CharacterSnapshot {
     // ---- RNG + round clock -------------------------------------------------
     /// Raw Park–Miller RNG state (the `Cell<i32>` read out as a plain `i32`).
     pub rng_seed: i32,
+    /// The engine-assigned AI difficulty level (`0` = human, `1..=8` = CPU), the
+    /// value the `AILevel` trigger reads (T052). Stored as a plain `u8` alongside
+    /// the RNG seed so a snapshot round-trips a fighter's CPU identity.
+    pub ai_level: u8,
     /// The engine-global round / match clock view.
     pub round_view: RoundView,
 }
@@ -235,6 +243,7 @@ impl CharacterSnapshot {
             shaketime: ch.shaketime,
             move_connect: ch.move_connect,
             has_target: ch.has_target,
+            hit_overridden: ch.hit_overridden,
             proj_events,
             attack_mul: ch.attack_mul,
             defence_mul: ch.defence_mul,
@@ -249,6 +258,7 @@ impl CharacterSnapshot {
             afterimage: ch.afterimage.clone(),
             hit_overrides: ch.hit_overrides.clone(),
             rng_seed: ch.rng_seed.get(),
+            ai_level: ch.ai_level,
             round_view: ch.round_view,
         }
     }
@@ -297,6 +307,7 @@ impl CharacterSnapshot {
         ch.shaketime = self.shaketime;
         ch.move_connect = self.move_connect;
         ch.has_target = self.has_target;
+        ch.hit_overridden = self.hit_overridden;
         ch.proj_events = self.proj_events.iter().copied().collect();
         ch.attack_mul = self.attack_mul;
         ch.defence_mul = self.defence_mul;
@@ -311,6 +322,7 @@ impl CharacterSnapshot {
         ch.afterimage = self.afterimage.clone();
         ch.hit_overrides = self.hit_overrides.clone();
         ch.rng_seed.set(self.rng_seed);
+        ch.ai_level = self.ai_level;
         ch.round_view = self.round_view;
     }
 }
@@ -360,8 +372,10 @@ mod tests {
         ch.fvars[2] = 1.25;
         ch.sysvars[1] = -4;
         ch.hitpause = 6;
+        ch.hit_overridden = true;
         ch.juggle_points = 9;
         ch.attack_mul = 1.5;
+        ch.set_ai_level(7);
         ch.seed_rng(12345);
         // Advance the RNG so the stored seed is non-default.
         let _ = fp_vm::EvalContext::random(&ch);

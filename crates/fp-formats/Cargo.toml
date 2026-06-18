@@ -12,7 +12,15 @@ png.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 encoding_rs.workspace = true
+# Content-import IR cache seam (F034 T086): the parsed asset containers
+# (`SffFile`/`AirFile`/`CmdFile`/`SndFile`/`ActPalette`) derive
+# Serialize/Deserialize so a character's compiled IR (which embeds them) can be
+# cached losslessly — including the SFF index-0-transparent pixel buffers.
+serde.workspace = true
 
 [dev-dependencies]
 # Used by tests/real_content.rs to synthesize an SFF v2 PNG8 sprite end to end.
 png.workspace = true
+# Serde round-trip tests (T086): bincode-encode an `SffFile`/`AirFile`/`CmdFile`
+# and assert a lossless, byte-identical round-trip.
+bincode.workspace = true

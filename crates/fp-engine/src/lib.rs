@@ -56,9 +56,10 @@
 #![warn(missing_docs)]
 
 use fp_character::{
-    combat::resolve_attack, ActiveCommands, Character, CharacterFingerprint, EntityGraph, ExplodOp,
-    ExplodPosType, ExplodSpawn, Facing, HelperPosType, HelperSpawn, LoadedCharacter, MoveType,
-    ProjectileSpawn, RoundView, StageView, StateType, TickReport,
+    combat::resolve_attack, framedata::frame_advantage, ActiveCommands, Character,
+    CharacterFingerprint, EntityGraph, ExplodOp, ExplodPosType, ExplodSpawn, Facing, HelperPosType,
+    HelperSpawn, LoadedCharacter, MoveFrameData, MoveType, ProjectileSpawn, RoundView, StageView,
+    StateType, TickReport,
 };
 use fp_combat::{
     detect_hit, detect_hit_contact, resolve_clash, ClashOutcome, ClsnBox, ClsnFacing, SparkSource,
@@ -66,17 +67,23 @@ use fp_combat::{
 use fp_core::{Rect, SpriteId, Vec2};
 use fp_formats::air::{AirFile, AnimAction};
 use fp_input::{
-    logical_direction, AiObservation, Button, CommandDef, CommandMatcher, Direction, InputBuffer,
-    InputState,
+    logical_direction, AiDifficulty, AiObservation, BehaviorMode, Button, CommandDef,
+    CommandMatcher, Direction, InputBuffer, InputState, LeniencyConfig,
 };
 use fp_physics::{clamp_to_bounds, resolve_push, Facing as PhysFacing, PushBody};
 use serde::{Deserialize, Serialize};
 
+mod dummy;
+mod record;
 mod replay;
 mod snapshot;
 mod team;
 
-pub use replay::{replay_match, MatchRecorder, ReplayError, ReplayLog};
+pub use dummy::{dummy_input, DummyMode};
+pub use record::{TrainingPlayback, TrainingRecorder, TrainingRecording, RECORDING_FORMAT_VERSION};
+pub use replay::{
+    replay_match, MatchRecorder, ReplayError, ReplayLog, ReplayPlayer, DEFAULT_KEYFRAME_INTERVAL,
+};
 pub use snapshot::{MatchSnapshot, PlayerSnapshot};
 pub use team::{Side, TeamMatch, TeamMatchState, TeamMode, TeamOutcome};
 
@@ -92,30 +99,77 @@ pub struct StageBounds {
     pub left: f32,
     /// Rightmost world X a character body may reach.
     pub right: f32,
+    /// `GameWidth` — the stage's logical screen width in localcoord units (the
+    /// 320×240-class space the edge / `ScreenPos` triggers measure in, T060).
+    /// Threaded onto the [`StageView`] for `GameWidth`/`LeftEdge`/`RightEdge`.
+    /// Defaults to MUGEN's classic `320`; `#[serde(default)]` keeps older
+    /// serialized bounds (which lacked this field) loadable.
+    #[serde(default = "default_game_width")]
+    pub game_width: f32,
+    /// `GameHeight` — the stage's logical screen height in localcoord units
+    /// (T060). Threaded onto the [`StageView`] for `GameHeight`/`TopEdge`/
+    /// `BottomEdge`. Defaults to `240`; `#[serde(default)]` keeps older
+    /// serialized bounds loadable.
+    #[serde(default = "default_game_height")]
+    pub game_height: f32,
+}
+
+/// serde default for [`StageBounds::game_width`] — MUGEN's classic `320`.
+fn default_game_width() -> f32 {
+    StageView::DEFAULT_GAME_WIDTH
+}
+
+/// serde default for [`StageBounds::game_height`] — MUGEN's classic `240`.
+fn default_game_height() -> f32 {
+    StageView::DEFAULT_GAME_HEIGHT
 }
 
 impl StageBounds {
-    /// Creates stage bounds from a left and right world X.
+    /// Creates stage bounds from a left and right world X, using MUGEN's classic
+    /// `320×240` logical screen dimensions for `GameWidth`/`GameHeight`.
     #[must_use]
     pub const fn new(left: f32, right: f32) -> Self {
-        Self { left, right }
+        Self {
+            left,
+            right,
+            game_width: StageView::DEFAULT_GAME_WIDTH,
+            game_height: StageView::DEFAULT_GAME_HEIGHT,
+        }
+    }
+
+    /// Creates stage bounds with explicit left/right world-X limits **and**
+    /// logical `GameWidth`/`GameHeight` (localcoord) dimensions, so the
+    /// game-dimension and screen-edge triggers (T060) report the stage's real
+    /// `[StageInfo] localcoord` instead of the `320×240` default.
+    #[must_use]
+    pub const fn with_dims(left: f32, right: f32, game_width: f32, game_height: f32) -> Self {
+        Self {
+            left,
+            right,
+            game_width,
+            game_height,
+        }
     }
 
     /// Converts these bounds into the [`StageView`] the character executor's
-    /// cross-entity eval context consumes for the screen-edge distance triggers.
+    /// cross-entity eval context consumes for the screen-edge distance and
+    /// game-dimension triggers (carrying `GameWidth`/`GameHeight` through).
     #[must_use]
     pub const fn view(self) -> StageView {
-        StageView::new(self.left, self.right)
+        StageView::with_dims(self.left, self.right, self.game_width, self.game_height)
     }
 }
 
 impl Default for StageBounds {
     /// A symmetric default playfield centered on the origin, wide enough that two
-    /// default-sized characters start comfortably inside it.
+    /// default-sized characters start comfortably inside it, with the classic
+    /// `320×240` logical screen.
     fn default() -> Self {
         Self {
             left: -200.0,
             right: 200.0,
+            game_width: StageView::DEFAULT_GAME_WIDTH,
+            game_height: StageView::DEFAULT_GAME_HEIGHT,
         }
     }
 }
@@ -253,6 +307,36 @@ impl RoundState {
     }
 }
 
+/// How the round flow behaves — the **match-time mode** selected from the menu
+/// (F027 / T066).
+///
+/// This is a *configuration* flag (not part of the per-tick simulation state):
+/// it changes only which round-flow side-effects fire, never the tick/snapshot
+/// machinery. It is deliberately **not** captured in
+/// [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so the deterministic
+/// record/playback fingerprint is unaffected and the Versus path stays
+/// byte-equal.
+///
+/// - [`GameMode::Versus`] (the default) — the normal best-of-N round flow: the
+///   round timer counts down and expires, and a KO ends the round.
+/// - [`GameMode::Training`] — the Lab: the round timer does **not** expire and a
+///   KO does **not** auto-end the round, so both fighters keep ticking
+///   indefinitely (the dummy-control, infinite-life, and record/playback layers
+///   in F027 build on top of this). The tick and snapshot machinery is otherwise
+///   identical to Versus, so record/playback still works in Training.
+// ponytail: no serde derive — GameMode is a config flag, deliberately excluded
+// from MatchSnapshot and not serialized anywhere. Upgrade path: add
+// `Serialize, Deserialize` if it ever needs to round-trip through a save format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GameMode {
+    /// Normal versus play: the timer expires and a KO decides the round.
+    #[default]
+    Versus,
+    /// Training / the Lab: round termination (timeout + KO) is disabled so the
+    /// fight runs indefinitely; the tick/snapshot machinery is unchanged.
+    Training,
+}
+
 /// Which player won the round, once it reaches [`RoundState::Win`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Winner {
@@ -296,6 +380,19 @@ const DEFAULT_ROUND_SECONDS: i32 = 99;
 
 /// Ticks per second; the engine runs at a fixed 60Hz (see the architecture KB).
 const TICKS_PER_SECOND: i32 = 60;
+
+/// The MUGEN engine-common **round-initialisation** state ([Statedef 5900],
+/// authored in `common1.cns`). MUGEN drives every fighter through 5900 at the
+/// start of each round to re-seed its resources / var defaults, then hand it
+/// back to the neutral stand.
+///
+/// The engine `Match` owns the authoritative round reset
+/// ([`Match::reset_for_next_round`] / the initial seeding), so 5900 is
+/// **advisory** and authored to *converge* with that reset (re-asserting full
+/// life on the same value, then `ChangeState 0`) rather than fight it. When a
+/// character defines 5900 it is entered at round init so that convergence runs;
+/// a character that omits it is unaffected (the engine's field reset stands).
+const ROUND_INIT_STATE: i32 = 5900;
 
 /// The default number of round wins required to win the match. MUGEN's default
 /// `rounds.to.win` is `2` — best of three rounds. Override per-match with
@@ -713,6 +810,73 @@ struct RedirectRelations<'a> {
     players: &'a [(i32, &'a Character)],
 }
 
+/// What drives one side of a [`Match`]: a human input device or the baseline CPU
+/// AI at a chosen difficulty and teaching [`BehaviorMode`] (T052 / T070).
+///
+/// The coordinator uses this to derive each fighter's
+/// [`Character::ai_level`](fp_character::Character::ai_level) at construction — a
+/// human ([`Human`](PlayerDriver::Human)) maps to level `0` and a
+/// [`Cpu`](PlayerDriver::Cpu) maps to its [`AiDifficulty::ai_level`] (`1..=8`) —
+/// and it also declares which teaching [`BehaviorMode`] the CPU plays (so a caller
+/// can read both knobs back off the driver when it builds the side's
+/// [`fp_input::CpuAi`]). It does **not** itself produce inputs (the caller still
+/// feeds inputs each tick); it is a one-time identity declaration so the CNS
+/// `AILevel` trigger reads the right value and the right teaching mode is wired in.
+/// [`Human`](PlayerDriver::Human) is the [`Default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayerDriver {
+    /// A human player (keyboard or gamepad). AI level `0`.
+    #[default]
+    Human,
+    /// The baseline CPU AI at the given difficulty and teaching [`BehaviorMode`].
+    /// AI level `1..=8`. The mode selects what the CPU tries to *teach* (the
+    /// default [`BehaviorMode::Ladder`] is the plain difficulty ladder).
+    Cpu(AiDifficulty, BehaviorMode),
+}
+
+impl PlayerDriver {
+    /// A CPU driver at `difficulty` playing the default [`BehaviorMode::Ladder`]
+    /// (the plain difficulty ladder) — the common case, so callers that don't pick
+    /// a teaching mode need not name [`BehaviorMode`].
+    #[must_use]
+    pub fn cpu(difficulty: AiDifficulty) -> Self {
+        PlayerDriver::Cpu(difficulty, BehaviorMode::Ladder)
+    }
+
+    /// The [`Character::ai_level`](fp_character::Character::ai_level) this driver
+    /// implies: `0` for a [`Human`](Self::Human), or the CPU difficulty's
+    /// [`AiDifficulty::ai_level`] (`1..=8`) for [`Cpu`](Self::Cpu). The teaching
+    /// [`BehaviorMode`] does not change the level.
+    #[must_use]
+    pub fn ai_level(self) -> u8 {
+        match self {
+            PlayerDriver::Human => 0,
+            PlayerDriver::Cpu(difficulty, _) => difficulty.ai_level(),
+        }
+    }
+
+    /// The CPU difficulty this driver carries, or `None` for a human.
+    #[must_use]
+    pub fn difficulty(self) -> Option<AiDifficulty> {
+        match self {
+            PlayerDriver::Human => None,
+            PlayerDriver::Cpu(difficulty, _) => Some(difficulty),
+        }
+    }
+
+    /// The CPU teaching [`BehaviorMode`] this driver carries, or `None` for a
+    /// human. The caller uses it to construct the side's
+    /// [`fp_input::CpuAi`](fp_input::CpuAi) via
+    /// [`CpuAi::with_mode`](fp_input::CpuAi::with_mode) (T070).
+    #[must_use]
+    pub fn behavior_mode(self) -> Option<BehaviorMode> {
+        match self {
+            PlayerDriver::Human => None,
+            PlayerDriver::Cpu(_, mode) => Some(mode),
+        }
+    }
+}
+
 /// One side of a [`Match`]: a live [`Character`], the assets it ticks against,
 /// and the input/command source feeding its state machine.
 ///
@@ -752,6 +916,14 @@ pub struct Player {
     /// The compiled command definitions, kept to enumerate which command names to
     /// snapshot into the character's command source each tick.
     command_defs: Vec<CommandDef>,
+    /// On-block / on-hit frame advantage (in ticks) for the attack this player
+    /// landed on the opponent on the most recent tick, or [`None`] when it did
+    /// not connect that tick (T065). Mirrors the value the engine writes onto the
+    /// attacker's [`TickReport::frame_advantage`] at the connecting-hit moment, and
+    /// is the surface the frame-data readout reads (a fresh value is computed each
+    /// tick; it is cleared to [`None`] on a tick with no connection). Read it via
+    /// [`Player::frame_advantage`].
+    frame_advantage: Option<i32>,
 }
 
 impl Player {
@@ -775,7 +947,14 @@ impl Player {
     #[must_use]
     pub fn new(character: Character, loaded: LoadedCharacter) -> Self {
         let command_defs = loaded.command_defs();
-        let matcher = CommandMatcher::new(command_defs.clone());
+        // Input leniency (T075): give the built-in jump gate (`holdup`) a small
+        // pre-actionable buffer so a jump tapped a few frames before the player
+        // can act still comes out on the first actionable frame. Buffering is
+        // deterministic and in the input layer, so versus determinism is
+        // unchanged, and it re-arms only the `holdup` gate the engine's built-in
+        // ground locomotion reads — never authored content motions.
+        let matcher =
+            CommandMatcher::with_leniency(command_defs.clone(), LeniencyConfig::with_jump_buffer());
         Self {
             character,
             loaded,
@@ -785,7 +964,22 @@ impl Player {
             input_buffer: InputBuffer::new(),
             matcher,
             command_defs,
+            frame_advantage: None,
         }
+    }
+
+    /// The on-block / on-hit frame advantage (in 60Hz ticks) for the attack this
+    /// player landed on the opponent on the most recent tick, or [`None`] when it
+    /// did not connect that tick (T065).
+    ///
+    /// A positive value means this player recovers first (advantage); a negative
+    /// value means the opponent recovers first (this player is at disadvantage).
+    /// The value is recomputed every tick by the [`Match`] at the connecting-hit
+    /// moment and cleared to [`None`] on a tick with no connection, so a stale
+    /// number never lingers on screen.
+    #[must_use]
+    pub fn frame_advantage(&self) -> Option<i32> {
+        self.frame_advantage
     }
 
     /// The live helper entities this player currently owns (T012), in spawn
@@ -1213,12 +1407,30 @@ impl Player {
         // `NumProj` trigger — built from the projectile slot-map, an id-only slice
         // threaded through the `Copy` graph exactly like `own_helper_ids`.
         let own_proj_ids: Vec<i32> = self.projectiles.iter().map(|p| p.proj_id).collect();
+        // (T061) The owning player's currently-bound target ids, for the root's
+        // `NumTarget` / `NumTarget(id)` triggers. In this flat 1-v-1 model the only
+        // bound target is the opponent the player most recently hit
+        // (`relations.target`); its id is its MUGEN player id, recovered from the
+        // `playerid` lookup table (which carries the opponent by id). An empty list
+        // means "no target bound", so bare `NumTarget` reports `0`.
+        let own_target_ids: Vec<i32> = relations
+            .target
+            .and_then(|t| {
+                relations
+                    .players
+                    .iter()
+                    .find(|(_, c)| std::ptr::eq(*c, t))
+                    .map(|(id, _)| *id)
+            })
+            .into_iter()
+            .collect();
         let graph = EntityGraph::new(None, None, &lookup)
             .with_target(relations.target)
             .with_partner(relations.partner)
             .with_players(relations.players)
             .with_own_helper_ids(&own_helper_ids)
-            .with_own_proj_ids(&own_proj_ids);
+            .with_own_proj_ids(&own_proj_ids)
+            .with_own_target_ids(&own_target_ids);
         self.character
             .tick_as_helper(&self.loaded, opponent, stage, graph)
     }
@@ -1313,6 +1525,27 @@ impl Player {
         self.character.facing
     }
 
+    /// This player's rolling raw-input history, for the on-screen input display
+    /// (T064).
+    ///
+    /// Index `0` of the returned [`InputBuffer`] is the input read this frame.
+    /// The buffer holds absolute directions (left/right, not facing-relative);
+    /// the display layer folds them to forward/back using [`facing`](Self::facing).
+    #[must_use]
+    pub fn input_buffer(&self) -> &InputBuffer {
+        &self.input_buffer
+    }
+
+    /// The command names this player's recognizer matched *this* frame, for the
+    /// on-screen input display's command flash (T064).
+    ///
+    /// Empty on a frame with no fresh recognition; a command that merely stays
+    /// buffered is not repeated. See [`CommandMatcher::just_matched`].
+    #[must_use]
+    pub fn just_matched_commands(&self) -> &[String] {
+        self.matcher.just_matched()
+    }
+
     /// The character's current animation (action) id.
     #[must_use]
     pub fn anim(&self) -> i32 {
@@ -1391,7 +1624,12 @@ impl Player {
     /// `ground.back` constants. KFM asserts `Width 16, x` on crouch/attack and its
     /// throw-bind state (810) to change how it pushes; with no override the
     /// behaviour is unchanged.
-    fn push_widths(&self) -> (f32, f32) {
+    ///
+    /// Exposed publicly so the app's training/Clsn overlay (T063) can draw the
+    /// player-push box alongside the Clsn1/Clsn2 hit/hurt boxes; the engine's own
+    /// push/bounds logic calls it internally too.
+    #[must_use]
+    pub fn push_widths(&self) -> (f32, f32) {
         let w = self.character.cur_width;
         if w.active {
             (w.front, w.back)
@@ -1400,6 +1638,72 @@ impl Player {
             (size.ground_front as f32, size.ground_back as f32)
         }
     }
+}
+
+/// Builds the [`AiObservation`] a CPU brain controlling `me` sees of its
+/// `opponent` this frame, populating both the relative position and the
+/// situational flags the teaching [`fp_input::BehaviorMode`]s react to (T070).
+///
+/// The flags are derived from the live characters:
+/// - `opponent_attacking` — opponent's `MoveType` is `Attack` (it is committed to
+///   an offensive state, the cue [`PureBlocker`](fp_input::BehaviorMode::PureBlocker)
+///   guards against);
+/// - `opponent_airborne` — opponent's `StateType` is `Air` (the anti-air cue for
+///   [`ReactiveDP`](fp_input::BehaviorMode::ReactiveDP));
+/// - `opponent_recovering` — opponent is in attack recovery: its current move is
+///   past its active frames (the punish window for
+///   [`WhiffPunisher`](fp_input::BehaviorMode::WhiffPunisher));
+/// - `self_waking_up` — `me` is in the engine-common downed/getup window
+///   (states `5120`/`5160`), the wakeup-reversal cue for `ReactiveDP`.
+///
+/// All reads are cheap field reads; the function never mutates and never panics.
+fn observe(me: &Player, opponent: &Player) -> AiObservation {
+    let opp = &opponent.character;
+    AiObservation {
+        opponent_dx: opponent.pos().x - me.pos().x,
+        opponent_attacking: opp.move_type == MoveType::Attack,
+        opponent_airborne: opp.state_type == StateType::Air,
+        opponent_recovering: opponent_is_recovering(opponent),
+        self_waking_up: is_waking_up(&me.character),
+    }
+}
+
+/// Whether `p` is in the **recovery** phase of an attack — committed to an attack
+/// state (`MoveType = A`) but past its active frames, so it can be whiff-punished.
+///
+/// Best-effort from the per-move [`MoveFrameData`] of the current animation: if
+/// the action carries no countable attack frame (not really an attack) or the
+/// action is missing, it is not treated as recovering. Conservatively avoids
+/// false positives so the punisher only strikes a genuinely committed, recovering
+/// opponent.
+fn opponent_is_recovering(p: &Player) -> bool {
+    let c = &p.character;
+    if c.move_type != MoveType::Attack {
+        return false;
+    }
+    let Some(action) = p.loaded.air.action(c.anim) else {
+        return false;
+    };
+    let Some(fd) = MoveFrameData::compute(action) else {
+        return false;
+    };
+    // Elapsed ticks within the current action: the start offset of the current
+    // element (precomputed by the executor for AnimElemTime) plus time spent in
+    // it. Falls back to the current-element time alone if the table is empty.
+    let prior_ticks = c
+        .anim_elem_start_offsets
+        .get(c.anim_elem.max(0) as usize)
+        .copied()
+        .unwrap_or(0);
+    let elapsed = prior_ticks.saturating_add(c.anim_elem_time.max(0));
+    elapsed >= fd.startup.saturating_add(fd.active)
+}
+
+/// Whether `c` is in the engine-common downed/getup window (waking up), the cue
+/// for a wakeup reversal. Matches the common1 lying-down (`5120`) and get-up
+/// (`5160`) states.
+fn is_waking_up(c: &Character) -> bool {
+    matches!(c.state_no, 5120 | 5160)
 }
 
 /// Converts an [`fp_character::Facing`] to the [`fp_physics::Facing`] the push /
@@ -1559,6 +1863,58 @@ pub struct Match {
     /// fighter. The bare 1v1 [`Match`] leaves it `false`, so 1v1 behaviour is
     /// unchanged.
     single_round: bool,
+    /// The match-time mode (F027 / T066). [`GameMode::Versus`] (the default) runs
+    /// the normal round flow; [`GameMode::Training`] disables round termination
+    /// (timeout + KO) so the fight runs indefinitely in the Lab. A *configuration*
+    /// flag, not simulation state: it is not captured in
+    /// [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so the Versus path stays
+    /// byte-equal. Set with [`Match::set_game_mode`]; read via
+    /// [`Match::game_mode`].
+    game_mode: GameMode,
+
+    // ---- Training-mode aids (F027 / T067) ---------------------------------
+    /// When `true`, P1's `life` is restored to `life_max` after each tick's combat
+    /// resolution (the Lab's "infinite life"). A *config* flag like
+    /// [`game_mode`](Match::game_mode), not snapshotted, so the Versus path stays
+    /// byte-equal. Default `false`; toggle with [`Match::set_infinite_life`].
+    p1_infinite_life: bool,
+    /// When `true`, P2's `life` is restored to `life_max` after each tick. See
+    /// [`p1_infinite_life`](Match::p1_infinite_life).
+    p2_infinite_life: bool,
+    /// When `true`, P1's `power` (super meter) is restored to `power_max` after
+    /// each tick (the Lab's "infinite meter"). Toggle with
+    /// [`Match::set_infinite_meter`].
+    p1_infinite_meter: bool,
+    /// When `true`, P2's `power` is restored to `power_max` after each tick.
+    p2_infinite_meter: bool,
+    /// Whether P2 took a connecting hit on the most recent [`Match::tick`]
+    /// (recomputed every tick — true ONLY on a frame P2's life dropped). Read via
+    /// [`Match::p2_was_hit`]. A per-tick edge signal, NOT a combo latch; the
+    /// training dummy uses [`Match::p2_hit_latched`] instead. P1 is always the
+    /// controller, so no symmetric P1 signal is tracked.
+    p2_was_hit: bool,
+    /// Sticky "P2 has been hit this combo" latch (F027 / T067). Set the first
+    /// frame P2's life drops and stays set across the non-damage frames between a
+    /// combo's hits; cleared only on [`Match::reset_positions`] and at the start
+    /// of each round. Read via [`Match::p2_hit_latched`]; the training dummy
+    /// ([`DummyMode::BlockAfterFirst`], always P2) latches on it to start guarding
+    /// once the first hit lands and keep guarding the rest of the combo — unlike
+    /// the per-tick [`Match::p2_was_hit`], which goes false on combo gaps.
+    p2_hit_latched: bool,
+
+    /// Whether a `LifebarAction` controller fired on the most recent
+    /// [`Match::tick`] (MUGEN `LifebarAction`; T081).
+    ///
+    /// A per-tick edge signal: recomputed every tick from either player's
+    /// [`fp_character::TickReport::lifebar_action`], it is `true` ONLY on a frame a
+    /// fighter cued its lifebar/announcer round-flow action (the win-pose / "round
+    /// over" announcer beat) and goes false again the next tick. The presentation
+    /// layer (`fp-app`'s HUD / announcer) reads it via
+    /// [`Match::lifebar_action_announced`] to play that cosmetic beat. Cleared at
+    /// the start of each tick (and so reset between rounds). A *cosmetic* signal —
+    /// it never affects the simulation, and (like the other per-tick edge signals)
+    /// is not captured in a [`MatchSnapshot`](crate::snapshot::MatchSnapshot).
+    lifebar_action_announced: bool,
 }
 
 /// The per-fighter state captured at match construction and restored at the
@@ -1693,11 +2049,17 @@ impl Match {
     ) -> Self {
         // Seed facing so the two start looking at each other (baseline facep2).
         face_each_other(&mut p1.character, &mut p2.character);
+        // Stamp each fighter's roster side for the `TeamSide` trigger (T062): P1
+        // is the left team (1), P2 the right team (2). This is fixed at side
+        // assignment and independent of facing (a fighter may turn around without
+        // changing teams).
+        p1.character.set_team_side(1);
+        p2.character.set_team_side(2);
         // Capture each fighter's seeded opener so every round can reset to it.
         let p1_reset = RoundResetState::capture(&p1.character);
         let p2_reset = RoundResetState::capture(&p2.character);
         let round_frames = round_seconds.max(0).saturating_mul(TICKS_PER_SECOND);
-        Self {
+        let mut m = Self {
             p1,
             p2,
             bounds,
@@ -1721,7 +2083,19 @@ impl Match {
             effects: Vec::new(),
             common_fx: None,
             single_round: false,
-        }
+            game_mode: GameMode::Versus,
+            p1_infinite_life: false,
+            p2_infinite_life: false,
+            p1_infinite_meter: false,
+            p2_infinite_meter: false,
+            p2_was_hit: false,
+            p2_hit_latched: false,
+            lifebar_action_announced: false,
+        };
+        // Drive each fighter through its round-init state (5900) for round 1, the
+        // same way [`Match::reset_for_next_round`] does for every later round.
+        m.run_round_init();
+        m
     }
 
     /// Installs the shared common-effects (`fightfx`) animation set used to
@@ -1784,6 +2158,155 @@ impl Match {
         self.single_round
     }
 
+    /// Sets the match-time [`GameMode`] (F027 / T066).
+    ///
+    /// [`GameMode::Versus`] (the default) runs the normal round flow;
+    /// [`GameMode::Training`] disables round termination (the timer never expires
+    /// and a KO does not auto-end the round) so the fight runs indefinitely in the
+    /// Lab. This is a configuration flag, not simulation state: it is not captured
+    /// in [`MatchSnapshot`](crate::snapshot::MatchSnapshot), so leaving it
+    /// [`GameMode::Versus`] keeps the deterministic record/playback path
+    /// byte-equal.
+    pub fn set_game_mode(&mut self, mode: GameMode) {
+        self.game_mode = mode;
+    }
+
+    /// The match-time [`GameMode`] (F027 / T066). See [`Match::set_game_mode`].
+    #[must_use]
+    pub fn game_mode(&self) -> GameMode {
+        self.game_mode
+    }
+
+    /// Sets the per-side "infinite life" training toggle (F027 / T067).
+    ///
+    /// When enabled for a side, that fighter's `life` is restored to its `life_max`
+    /// after each [`Match::tick`]'s combat resolution, so a player rehearsing a
+    /// combo never KOs the dummy (or themselves). A configuration flag, not
+    /// simulation state — not snapshotted, so leaving both `false` (the default)
+    /// keeps the Versus path byte-equal.
+    pub fn set_infinite_life(&mut self, side: Side, enabled: bool) {
+        match side {
+            Side::P1 => self.p1_infinite_life = enabled,
+            Side::P2 => self.p2_infinite_life = enabled,
+        }
+    }
+
+    /// Whether "infinite life" is enabled for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_life(&self, side: Side) -> bool {
+        match side {
+            Side::P1 => self.p1_infinite_life,
+            Side::P2 => self.p2_infinite_life,
+        }
+    }
+
+    /// Sets the per-side "infinite meter" training toggle (F027 / T067).
+    ///
+    /// When enabled, that fighter's `power` (super meter) is restored to
+    /// `power_max` after each [`Match::tick`], so supers can be rehearsed without
+    /// rebuilding meter. See [`Match::set_infinite_life`] for the config-flag
+    /// semantics.
+    pub fn set_infinite_meter(&mut self, side: Side, enabled: bool) {
+        match side {
+            Side::P1 => self.p1_infinite_meter = enabled,
+            Side::P2 => self.p2_infinite_meter = enabled,
+        }
+    }
+
+    /// Whether "infinite meter" is enabled for the given side (F027 / T067).
+    #[must_use]
+    pub fn infinite_meter(&self, side: Side) -> bool {
+        match side {
+            Side::P1 => self.p1_infinite_meter,
+            Side::P2 => self.p2_infinite_meter,
+        }
+    }
+
+    /// Whether player 2 took a connecting hit on the most recent [`Match::tick`]
+    /// (F027 / T067). Recomputed every tick; the training dummy's
+    /// [`DummyMode::BlockAfterFirst`] latches off it to start guarding once the
+    /// first hit lands. P1 is always the controller, so there is no P1 signal.
+    #[must_use]
+    pub fn p2_was_hit(&self) -> bool {
+        self.p2_was_hit
+    }
+
+    /// Whether player 2 has been hit at least once in the current combo /
+    /// since the last reset (F027 / T067). Unlike [`Match::p2_was_hit`] (a
+    /// per-tick edge that goes false on the non-damage frames between a combo's
+    /// hits), this is a **sticky latch**: it is set the first frame P2's life
+    /// drops and stays set until [`Match::reset_positions`] or the next round.
+    /// The training dummy's [`DummyMode::BlockAfterFirst`] reads this so it keeps
+    /// guarding the rest of a multi-hit combo instead of dropping its guard on the
+    /// gap between active frames and eating the next hit. P1 is always the
+    /// controller, so there is no P1 signal.
+    #[must_use]
+    pub fn p2_hit_latched(&self) -> bool {
+        self.p2_hit_latched
+    }
+
+    /// Whether a `LifebarAction` controller fired on the most recent
+    /// [`Match::tick`] (MUGEN `LifebarAction`; T081).
+    ///
+    /// A per-tick edge signal, `true` ONLY on the frame either fighter cued its
+    /// lifebar/announcer round-flow action (the win-pose / "round over" announcer
+    /// beat), and false again the next tick. The presentation layer (`fp-app`'s
+    /// HUD / announcer) reads this to play that cosmetic beat. Cosmetic — it never
+    /// affects the simulation.
+    #[must_use]
+    pub fn lifebar_action_announced(&self) -> bool {
+        self.lifebar_action_announced
+    }
+
+    /// Resets both fighters to their round-start positions, facing, full life, and
+    /// neutral stand **without** advancing the round counter or wins — the training
+    /// "reset position" key (F027 / T067).
+    ///
+    /// Restores the captured opener ([`RoundResetState`]) for each side, re-seeds
+    /// the face-each-other facing, clears transient combat state (active hitdefs,
+    /// hit-sparks, live projectiles/explods), and clears the per-side
+    /// "was hit this combo" latches — but leaves the round phase, round number,
+    /// timer, and accumulated round wins untouched, so the player can re-stage a
+    /// setup mid-round as many times as they like. Idempotent and panic-free.
+    pub fn reset_positions(&mut self) {
+        reset_fighter_for_round(&mut self.p1.character, self.p1_reset);
+        reset_fighter_for_round(&mut self.p2.character, self.p2_reset);
+        face_each_other(&mut self.p1.character, &mut self.p2.character);
+
+        // Clear transient cross-tick combat state so the re-staged setup starts
+        // clean (mirrors the round-reset sweep, minus the round bookkeeping).
+        self.effects.clear();
+        self.p1.projectiles.clear();
+        self.p2.projectiles.clear();
+        self.p1.explods.clear();
+        self.p2.explods.clear();
+        self.freeze = Freeze::inactive();
+        self.p1_sound_requests.clear();
+        self.p2_sound_requests.clear();
+        self.p2_was_hit = false;
+        self.p2_hit_latched = false;
+
+        tracing::info!("training: reset fighters to start positions");
+    }
+
+    /// Applies the per-side training infinite-life / infinite-meter clamps
+    /// (F027 / T067). A no-op unless a toggle is enabled, so the Versus path is
+    /// unaffected. `life` is restored to `life_max`, `power` to `power_max`.
+    fn apply_training_clamps(&mut self) {
+        if self.p1_infinite_life {
+            self.p1.character.life = self.p1.character.life_max;
+        }
+        if self.p2_infinite_life {
+            self.p2.character.life = self.p2.character.life_max;
+        }
+        if self.p1_infinite_meter {
+            self.p1.character.power = self.p1.character.power_max;
+        }
+        if self.p2_infinite_meter {
+            self.p2.character.power = self.p2.character.power_max;
+        }
+    }
+
     /// Seeds the two fighters' `random` streams **distinctly** from a single match
     /// seed (#38 — the deferred #28 follow-up).
     ///
@@ -1806,6 +2329,20 @@ impl Match {
         self.p2
             .character
             .seed_rng(derive_player_seed(match_seed, 1));
+    }
+
+    /// Assigns each player's [`Character::ai_level`](fp_character::Character::ai_level)
+    /// from its input [`PlayerDriver`] (T052).
+    ///
+    /// A human driver ([`PlayerDriver::Human`]) sets level `0`; a
+    /// [`PlayerDriver::Cpu`] sets the difficulty's [`AiDifficulty::ai_level`]
+    /// (`1..=8`). This is a one-time identity assignment (the level never changes
+    /// mid-match), so the CNS `AILevel` trigger reads the correct value for each
+    /// side. Call it once right after construction. With no call, both fighters
+    /// keep the human default (`0`), so a bare match is a two-human match.
+    pub fn set_drivers(&mut self, p1_driver: PlayerDriver, p2_driver: PlayerDriver) {
+        self.p1.character.set_ai_level(p1_driver.ai_level());
+        self.p2.character.set_ai_level(p2_driver.ai_level());
     }
 
     /// Constructs a match (default round length / best-of-N) and immediately seeds
@@ -1842,9 +2379,7 @@ impl Match {
     /// glue that lets an idle P2 slot be driven by the baseline AI.
     #[must_use]
     pub fn ai_observation_for_p2(&self) -> AiObservation {
-        AiObservation {
-            opponent_dx: self.p1.pos().x - self.p2.pos().x,
-        }
+        observe(&self.p2, &self.p1)
     }
 
     /// The [`fp_input::AiObservation`] a CPU AI controlling **player 1** sees this
@@ -1852,9 +2387,7 @@ impl Match {
     /// [`Match::ai_observation_for_p2`], for an AI-vs-AI / demo match).
     #[must_use]
     pub fn ai_observation_for_p1(&self) -> AiObservation {
-        AiObservation {
-            opponent_dx: self.p2.pos().x - self.p1.pos().x,
-        }
+        observe(&self.p1, &self.p2)
     }
 
     /// Consumes the match and returns its two [`Player`]s as `(p1, p2)`, dropping
@@ -2250,6 +2783,12 @@ impl Match {
             .p2
             .tick_root(Some(&self.p1.character), stage, p2_relations);
         let p2_freeze = p2_report.freeze_request;
+        // (T081) Surface a `LifebarAction` cue from EITHER fighter this tick as the
+        // announcer/round-flow signal. A per-tick edge: recomputed every tick (true
+        // ONLY on a frame the cue fired), so it resets to false the next tick and
+        // between rounds. Cosmetic — read by the HUD/announcer, never affects the
+        // simulation.
+        self.lifebar_action_announced = p1_report.lifebar_action || p2_report.lifebar_action;
         let p2_helper_spawns = std::mem::take(&mut p2_report.helper_spawns);
         let p2_projectile_spawns = std::mem::take(&mut p2_report.projectile_spawns);
         let p2_explod_spawns = std::mem::take(&mut p2_report.explod_spawns);
@@ -2341,6 +2880,20 @@ impl Match {
         //     hit channel) at full volume (volume_scale 100); `common` is carried
         //     from the `SoundId` so a common-file hitsound (one authored with no
         //     `S` prefix) resolves against the fight.snd downstream.
+        //
+        //     Frame-advantage readout (T065): clear last tick's value on both
+        //     players up front (unconditionally, even outside the fight phase) so a
+        //     tick with no connection shows `—` rather than a stale number. Each
+        //     connecting resolve below recomputes and sets the ATTACKER's value
+        //     (mirrored onto the attacker's `TickReport::frame_advantage`).
+        self.p1.frame_advantage = None;
+        self.p2.frame_advantage = None;
+        // (3·T067) Snapshot P2's life BEFORE combat so the per-tick "was hit"
+        // signal can be recomputed by comparing afterwards. This covers every
+        // damage path (melee, projectile, chip) without threading a flag through
+        // each resolve branch; the training dummy (always P2) `BlockAfterFirst`
+        // latches off it.
+        let p2_life_before = self.p2.character.life;
         if fighting {
             // (3a) Priority / trade clash arbitration (audit #20). BEFORE the two
             //      independent resolve_attack passes, detect the SIMULTANEOUS-hit
@@ -2380,6 +2933,13 @@ impl Match {
                 p2_states,
             );
             if let Some(res) = p1_attack {
+                // (3a') Frame advantage (T065): compute from the defender's induced
+                //       stun and P1's remaining recovery BEFORE `p1stateno` may move
+                //       P1 out of its attack action below. Stash on P1 (the readout
+                //       surface) and mirror onto P1's TickReport.
+                let adv = compute_frame_advantage(&self.p1, res.stun);
+                self.p1.frame_advantage = adv;
+                p1_report.frame_advantage = adv;
                 if let Some(s) = res.hit_sound {
                     self.p1_sound_requests.push(hit_sound_request(s));
                 }
@@ -2418,6 +2978,12 @@ impl Match {
                 p1_states,
             );
             if let Some(res) = p2_attack {
+                // (3a') Frame advantage (T065) for P2's connecting attack, mirroring
+                //       the P1 branch: defender stun minus P2's remaining recovery,
+                //       computed before `p1stateno` may move P2 out of its action.
+                let adv = compute_frame_advantage(&self.p2, res.stun);
+                self.p2.frame_advantage = adv;
+                p2_report.frame_advantage = adv;
                 if let Some(s) = res.hit_sound {
                     self.p2_sound_requests.push(hit_sound_request(s));
                 }
@@ -2442,6 +3008,18 @@ impl Match {
             resolve_projectile_hits(&mut self.p1, &mut self.p2);
             resolve_projectile_hits(&mut self.p2, &mut self.p1);
         }
+
+        // (3·T067) Recompute the per-tick "was hit" signal from P2's life delta
+        // (the dummy lost life this tick ⇒ took a hit), THEN apply the training
+        // infinite-life / infinite-meter clamps. Order matters: the signal is read
+        // before the heal so `BlockAfterFirst` still latches even with infinite
+        // life on, and the heal then masks the damage as intended.
+        self.p2_was_hit = self.p2.character.life < p2_life_before;
+        // Sticky combo latch: once set, stays set across the non-damage frames
+        // between a combo's hits (cleared only on reset / round start), so the
+        // dummy keeps guarding the rest of a multi-hit combo.
+        self.p2_hit_latched |= self.p2_was_hit;
+        self.apply_training_clamps();
 
         // (3c) Advance the live hit-spark effects (audit #17): step each spark's
         //      animation cursor against its owning side's AIR action and drop any
@@ -2484,6 +3062,16 @@ impl Match {
             remaining: req.time,
             exempt,
         };
+        // T080: install the triggerer's SuperPause defence/invuln window for the
+        // pause duration. A `Pause` (`FreezeExempt::None`) has no triggerer, so it
+        // carries the inert window and installs nothing. The window is aged down in
+        // lockstep with the freeze (`tick_frozen`) and cleared when it ends, so
+        // `unhittable` / `p2defmul` apply for exactly the pause window.
+        match exempt {
+            FreezeExempt::P1 => self.p1.character.superpause_effect = req.effect,
+            FreezeExempt::P2 => self.p2.character.superpause_effect = req.effect,
+            FreezeExempt::None => {}
+        }
         tracing::debug!(
             ?req.kind,
             time = req.time,
@@ -2543,6 +3131,14 @@ impl Match {
             // A `Pause` exempts no one — nothing ticks this frame.
             FreezeExempt::None => {}
         }
+
+        // T080: age the SuperPause defence/invuln window in lockstep with the
+        // freeze. The triggerer (exempt player) carries it; it is cleared back to
+        // the inert default when it reaches `0`, so `unhittable`/`p2defmul` hold for
+        // exactly the pause window. A `Pause` exempts no one and installs no window,
+        // so ticking both sides is a harmless no-op for the frozen player.
+        self.p1.character.superpause_effect.tick_down();
+        self.p2.character.superpause_effect.tick_down();
 
         // Count the freeze down; `GameTime` and the round timer do NOT advance.
         self.freeze.remaining -= 1;
@@ -2703,6 +3299,15 @@ impl Match {
                 }
             }
             RoundState::Fight => {
+                // (T066) Training / the Lab disables round termination entirely:
+                // the round timer does not count down (so it never expires) and a
+                // KO does not auto-end the round, so both fighters keep ticking
+                // indefinitely. Only the round-flow side-effects are gated — the
+                // tick/snapshot machinery above is untouched, so record/playback
+                // still works in Training. The Versus path is unchanged.
+                if self.game_mode == GameMode::Training {
+                    return;
+                }
                 if self.timer > 0 {
                     self.timer -= 1;
                 }
@@ -2871,12 +3476,54 @@ impl Match {
         self.p1.explods.clear();
         self.p2.explods.clear();
 
+        // Clear the training "was hit" signal + combo latch so the dummy starts
+        // the new round un-hit (BlockAfterFirst stands again until the first hit).
+        self.p2_was_hit = false;
+        self.p2_hit_latched = false;
+
+        // Drive each fighter through its round-init state (5900) so its authored
+        // convergence runs on top of the field reset just applied (see
+        // [`Match::run_round_init`]).
+        self.run_round_init();
+
         tracing::info!(
             round = self.round_number,
             p1_round_wins = self.p1_round_wins,
             p2_round_wins = self.p2_round_wins,
             "round reset: starting next round"
         );
+    }
+
+    /// Drives each fighter into the engine-common round-init state
+    /// ([`ROUND_INIT_STATE`], `common1.cns` [Statedef 5900]) **iff it defines
+    /// one**, so the authored round-init logic runs at the top of every round.
+    ///
+    /// This is how 5900 *integrates with* the engine's authoritative round reset
+    /// without fighting it: the field reset
+    /// ([`reset_fighter_for_round`]) has already restored full life, the start
+    /// position/facing, and the neutral stand; entering 5900 then re-asserts
+    /// those (its `LifeSet value = Const(data.life)` writes the same full-life
+    /// value, and its `ChangeState 0` returns to the same neutral stand the reset
+    /// selected). Because the round opens in [`RoundState::Intro`] — where both
+    /// fighters still tick their state machines (so idle/intro animations play)
+    /// but receive no commands — 5900's controllers run on the intro's first tick
+    /// and converge it back to state `0`. The net effect on a converging 5900 is
+    /// nil; a character can override 5900 (the loader's first-wins merge keeps its
+    /// version) to seed per-round vars, and that runs here instead.
+    ///
+    /// A fighter that does **not** define 5900 is left exactly where the field
+    /// reset put it (state `0`); the lookup is a safe no-op. Never panics.
+    fn run_round_init(&mut self) {
+        if self.p1.loaded.states.contains_key(&ROUND_INIT_STATE) {
+            self.p1
+                .character
+                .change_state(&self.p1.loaded.states, ROUND_INIT_STATE);
+        }
+        if self.p2.loaded.states.contains_key(&ROUND_INIT_STATE) {
+            self.p2
+                .character
+                .change_state(&self.p2.loaded.states, ROUND_INIT_STATE);
+        }
     }
 
     /// Enters [`RoundState::Ko`], freezing the round clock and removing control
@@ -3441,8 +4088,19 @@ fn reset_fighter_for_round(c: &mut Character, reset: RoundResetState) {
     c.anim_elem_time = 0;
     c.anim_time = 0;
 
+    // Variable banks zero-init at round start (T054 cheap-AI var-init safety).
+    // MUGEN clears `var`/`fvar`/`sysvar`/`sysfvar` to 0 at the top of every round
+    // (we do not yet model the per-var `IntPersist`/`FloatPersist` opt-out, so
+    // every var is treated as non-persistent — the safe, conservative default).
+    // This guarantees no magic value seeded in a prior round (e.g. the evilken
+    // cheap-AI `Var(30)=59` trap) survives into the next round for any player.
+    c.clear_vars();
+
     // Transient combat state must not leak across the round boundary.
     c.active_hitdef = None;
+    // T080: a SuperPause defence/invuln window does not survive a round boundary
+    // (the freeze that drove it is cleared too, above in `next_round`).
+    c.superpause_effect = fp_character::SuperPauseEffect::inactive();
     c.hitpause = 0;
     c.shaketime = 0;
     c.get_hit_vars = fp_character::GetHitVars::default();
@@ -3615,6 +4273,59 @@ fn current_frame_clsn(air: &AirFile, anim: i32, elem: i32, attack: bool) -> Vec<
     rects.iter().map(rect_to_clsn).collect()
 }
 
+/// Computes the on-block / on-hit frame advantage for an attack the `attacker`
+/// just landed on the opponent, in 60Hz ticks (T065, feature F026).
+///
+/// Advantage is the **defender's induced stun** (`stun` — the hit-stun on a clean
+/// hit, the guard-stun on a block, straight from the resolved
+/// [`AttackResolution::stun`](fp_character::AttackResolution::stun)) minus the
+/// **attacker's frames-until-actionable** (the frames the attacker still owes
+/// before it can act again — its current move's recovery measured from where the
+/// move's frame cursor currently sits). A positive result means the attacker
+/// recovers first (advantage); a negative one means the defender recovers first.
+///
+/// "Frames-until-actionable" is the attacker's remaining move time: its current
+/// action's static [`total`](fp_character::MoveFrameData::total) frame count minus
+/// the frames already elapsed in that action (`startup + active` already spent on
+/// reaching/holding the active window, so what is left is the recovery the
+/// attacker must still sit through). It is read from the attacker's own AIR action
+/// so it reflects the move actually being thrown, not a fixed guess.
+///
+/// Returns [`None`] (the readout shows `—`) when the attacker's current action is
+/// not a countable attack ([`MoveFrameData::compute`] returned [`None`]) — there
+/// is no honest recovery to subtract — so a wrong number is never shown. Never
+/// panics: a missing action or an uncountable one both fall to [`None`], and the
+/// arithmetic is saturating via [`frame_advantage`].
+fn compute_frame_advantage(attacker: &Player, stun: i32) -> Option<i32> {
+    let action = attacker.loaded.air.action(attacker.character.anim)?;
+    let fd = MoveFrameData::compute(action)?;
+    let elapsed = elapsed_in_action(action, attacker.character.anim_elem).min(fd.total);
+    // Frames the attacker still owes before it can act: the remainder of the move.
+    let frames_until_actionable = (fd.total - elapsed).max(0);
+    Some(frame_advantage(stun, frames_until_actionable))
+}
+
+/// Sums the AIR frame durations of the elements strictly before the (zero-based)
+/// `elem` cursor, giving the ticks elapsed in the action up to the start of the
+/// current element — the static "where the move cursor sits" used by
+/// [`compute_frame_advantage`].
+///
+/// A `-1` (infinite-hold) duration in the elapsed span is treated as `0` (it
+/// contributes no measured time toward recovery rather than poisoning the count);
+/// a negative `elem` clamps to `0`; an over-large `elem` clamps to the frame count
+/// (the whole action elapsed). Never panics.
+fn elapsed_in_action(action: &AnimAction, elem: i32) -> i32 {
+    let upto = if elem < 0 {
+        0
+    } else {
+        (elem as usize).min(action.frames.len())
+    };
+    action.frames[..upto]
+        .iter()
+        .map(|f| f.ticks.max(0))
+        .fold(0i32, i32::saturating_add)
+}
+
 /// Builds the [`fp_character::SoundRequest`] for a `HitDef` impact sound (the
 /// hit or guard sound chosen by [`fp_character::AttackResolution::hit_sound`]).
 ///
@@ -3687,6 +4398,13 @@ fn apply_target_ops(
                 );
                 tracing::trace!(time, x = new_pos.x, y = new_pos.y, "target bound to binder");
                 target.pos = new_pos;
+                // Mark the target as bound for `time` ticks so `GetHitVar(isbound)`
+                // reports it (T079). The executor counts this down per tick; a
+                // `time` of `-1` ("bind forever") is stored verbatim and never
+                // counts down. KFM's throws re-emit `TargetBind` every frame of the
+                // hold, so the timer is continually refreshed for the grab's
+                // duration.
+                target.bound_time = time;
             }
             TargetOp::LifeAdd { value, kill } => {
                 let floor = if kill { 0 } else { 1 };
@@ -3782,6 +4500,8 @@ pub(crate) mod tests_support {
     fn simple_loaded() -> LoadedCharacter {
         LoadedCharacter {
             name: "test".to_string(),
+            displayname: "test".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: CharacterConstants::default(),
             states: HashMap::new(),
@@ -3944,6 +4664,8 @@ time = 1
     fn loaded_with(air: AirFile) -> LoadedCharacter {
         LoadedCharacter {
             name: "test".to_string(),
+            displayname: "test".to_string(),
+            author: String::new(),
             localcoord: (320, 240),
             constants: CharacterConstants::default(),
             states: HashMap::new(),
@@ -4146,6 +4868,228 @@ time = 1
             m.round_state()
         );
         assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    // ---- Hitstop strength-scaling (T073, feature F030) -------------------
+
+    /// Arms a single connecting punch on a fresh fight-phase match, with the
+    /// given attacker `pausetime.p1`, and returns the attacker's `hitpause`
+    /// (the impact-freeze duration) observed on the connecting tick.
+    ///
+    /// This drives the *real* coordinator pipeline (`Match::tick` →
+    /// `resolve_attack` → the attacker's `hitpause` set from the HitDef's
+    /// `pausetime.p1`), so the value it reports is the genuine end-to-end
+    /// hit-stop, not a unit shortcut.
+    fn attacker_hitpause_for_pause(p1_pause: i32) -> i32 {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        // High life so the hit connects without KO-ing and ending the round.
+        p2c.life = 1000;
+
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+
+        // Pin the attacker on its punch frame and arm the single HitDef once.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        // Vary only the attacker's pausetime.p1; hold pausetime.p2 constant.
+        m.p1.character.active_hitdef = Some(HitDef {
+            pausetime: PauseTime {
+                p1: p1_pause,
+                p2: 8,
+            },
+            ..sample_hitdef()
+        });
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        let life_before = m.p2().life();
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        assert!(
+            m.p2().life() < life_before,
+            "the punch must connect for the hit-stop reading to be meaningful \
+             (pausetime.p1 = {p1_pause})"
+        );
+        m.p1().character.hitpause
+    }
+
+    /// AC: the attacker's hit-stop duration scales with the connecting HitDef's
+    /// `pausetime.p1`, surfaced from existing data through the live coordinator —
+    /// a heavy-`pausetime` hit freezes the attacker longer than a light one, so
+    /// heavy hits read heavier. This is the readability payoff of T073.
+    #[test]
+    fn attacker_hitstop_scales_with_hitdef_pausetime() {
+        let light = attacker_hitpause_for_pause(4);
+        let heavy = attacker_hitpause_for_pause(16);
+
+        // The freeze is surfaced verbatim from `pausetime.p1` (minus the one tick
+        // this connecting frame already consumes is NOT applied here — the value
+        // is read on the connecting tick before any freeze elapses).
+        assert_eq!(
+            light, 4,
+            "light hit freezes the attacker for pausetime.p1 = 4"
+        );
+        assert_eq!(
+            heavy, 16,
+            "heavy hit freezes the attacker for pausetime.p1 = 16"
+        );
+        assert!(
+            heavy > light,
+            "a heavy-pausetime hit must yield a longer attacker hit-stop than a \
+             light one (heavy {heavy} vs light {light})"
+        );
+    }
+
+    /// Negative control: a `pausetime.p1 = 0` hit imparts NO attacker hit-stop —
+    /// the freeze is genuinely driven by the data, not a constant baseline. This
+    /// guards against a regression that would flatten light/heavy distinction by
+    /// always applying some fixed pause.
+    #[test]
+    fn zero_pausetime_hit_gives_no_attacker_hitstop() {
+        assert_eq!(
+            attacker_hitpause_for_pause(0),
+            0,
+            "pausetime.p1 = 0 must leave the attacker un-paused (no invented baseline)"
+        );
+    }
+
+    // ---- Frame-advantage readout (T065, feature F026) --------------------
+
+    /// An attacker whose action 200 has a real startup / active / recovery shape so
+    /// the frame-advantage readout has a non-trivial "frames-until-actionable" to
+    /// subtract. Layout: 3 startup frames (no Clsn1), 2 active frames (Clsn1 attack
+    /// box), 4 recovery frames (no Clsn1) — `MoveFrameData::compute` =>
+    /// startup=3, active=2, recovery=4, total=9. Action 0 keeps a hurt box so the
+    /// character is hittable.
+    fn fa_attacker_loaded() -> LoadedCharacter {
+        let attack = Rect::new(10.0, -60.0, 60.0, 20.0);
+        let hurt = Rect::new(-18.0, -70.0, 36.0, 70.0);
+        let mk = |clsn1: Vec<Rect>, clsn2: Vec<Rect>, ticks: i32| AnimFrame {
+            sprite: SpriteId::new(0, 0),
+            offset: Vec2::new(0, 0),
+            ticks,
+            flip_h: false,
+            flip_v: false,
+            blend: BlendMode::Normal,
+            clsn1,
+            clsn2,
+            ..Default::default()
+        };
+        let mut actions = HashMap::new();
+        actions.insert(
+            200,
+            AnimAction {
+                action_number: 200,
+                // Each element holds 10 ticks so a single `Match::tick` advance
+                // (1 tick) stays WITHIN the element it started on — the anim-elem
+                // cursor the readout reads is therefore deterministic across the
+                // tick. startup = 30, active = 20, recovery = 40, total = 90.
+                frames: vec![
+                    mk(Vec::new(), Vec::new(), 10),   // startup 0
+                    mk(Vec::new(), Vec::new(), 10),   // startup 1
+                    mk(Vec::new(), Vec::new(), 10),   // startup 2
+                    mk(vec![attack], Vec::new(), 10), // active 0 (elem 3)
+                    mk(vec![attack], Vec::new(), 10), // active 1 (elem 4)
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 0
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 1
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 2
+                    mk(Vec::new(), Vec::new(), 10),   // recovery 3
+                ],
+                loopstart: 0,
+            },
+        );
+        actions.insert(
+            0,
+            AnimAction {
+                action_number: 0,
+                frames: vec![mk(Vec::new(), vec![hurt], 1)],
+                loopstart: 0,
+            },
+        );
+        loaded_with(AirFile { actions })
+    }
+
+    /// Poses two fighters with P1's punch (action 200) overlapping P2's hurt box on
+    /// action 0, returns a fight-phase match. P1 is the attacker with the
+    /// startup/active/recovery action above; P2 is a plain hittable defender.
+    fn fa_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(-20.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(20.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, fa_attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// On a scripted CONNECTING hit, the attacker's frame advantage is surfaced
+    /// (the whole point of T065 acceptance criterion #2): it equals the defender's
+    /// induced ground hit-stun minus the attacker's frames-until-actionable, and is
+    /// exposed both on the attacker `Player` and rendered by `format_frame_data`.
+    #[test]
+    fn frame_advantage_surfaced_on_scripted_connecting_hit() {
+        let mut m = fa_match();
+        // Pin P1 on the FIRST active frame of action 200 (zero-based elem 3) with a
+        // fresh HitDef, and keep P2 on its standing hurt frame so the punch lands.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 3;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.state_type = StateType::Standing;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.p2.character.holding_back = false;
+
+        m.tick(MatchInput::none(), MatchInput::none());
+
+        // The hit connected (P2 took damage).
+        assert!(m.p2().life() < 1000, "scripted attack must connect");
+
+        // Expected: defender ground hit-stun (sample_hitdef ground hittime = 12)
+        // minus the attacker's frames-until-actionable. P1 sat on elem 3 (the first
+        // active frame); a single tick advances only WITHIN that 10-tick element, so
+        // the anim-elem cursor is still 3 when combat reads it. elapsed before
+        // elem 3 = 30 (3 startup frames @10), total = 90 =>
+        // frames-until-actionable = 90 - 30 = 60 => advantage = 12 - 60 = -48.
+        let adv = m
+            .p1()
+            .frame_advantage()
+            .expect("a connecting attack surfaces a frame advantage");
+        assert_eq!(adv, -48, "12 hit-stun minus 60 remaining recovery = -48");
+    }
+
+    /// On a tick with NO connection, the advantage is cleared to `None` (the
+    /// readout shows `—`), so a stale number never lingers on screen.
+    #[test]
+    fn frame_advantage_is_none_without_a_connection() {
+        let mut m = fa_match();
+        // P1 idle on action 0, no active HitDef -> nothing connects.
+        m.p1.character.anim = 0;
+        m.p1.character.active_hitdef = None;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().frame_advantage(),
+            None,
+            "no connection => no advantage shown"
+        );
     }
 
     // ---- Priority / trade clash resolution (audit #20) -------------------
@@ -4576,6 +5520,120 @@ time = 1
         assert_eq!(m.winner(), Some(Winner::P1));
     }
 
+    // ---- T066: GameMode::Training round-flow gating -----------------------
+
+    #[test]
+    fn default_game_mode_is_versus() {
+        let m = basic_match();
+        assert_eq!(m.game_mode(), GameMode::Versus);
+        assert_eq!(GameMode::default(), GameMode::Versus);
+    }
+
+    #[test]
+    fn set_game_mode_round_trips() {
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Training);
+        assert_eq!(m.game_mode(), GameMode::Training);
+        m.set_game_mode(GameMode::Versus);
+        assert_eq!(m.game_mode(), GameMode::Versus);
+    }
+
+    #[test]
+    fn training_timer_never_expires() {
+        // A 1-second round (60 frames) would normally time out almost immediately
+        // once the fight begins; in Training the timer must not count down at all.
+        let p1 = tests_support::make_player(-50.0);
+        let p2 = tests_support::make_player(50.0);
+        let mut m = Match::with_round_seconds(p1, p2, StageBounds::new(-200.0, 200.0), 1);
+        m.set_game_mode(GameMode::Training);
+        into_fight(&mut m);
+        let timer_at_fight = m.timer();
+        // Tick well past the 60-frame clock; a Versus match would have timed out.
+        for _ in 0..600 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.round_state(),
+            RoundState::Fight,
+            "Training mode keeps the round in Fight indefinitely"
+        );
+        assert_eq!(
+            m.timer(),
+            timer_at_fight,
+            "Training mode freezes the round timer (no time-over)"
+        );
+        assert_eq!(m.winner(), None, "no winner is decided in Training");
+    }
+
+    #[test]
+    fn training_ko_does_not_end_round() {
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Training);
+        into_fight(&mut m);
+        // Force a lethal life on P2: in Versus this is an immediate KO that ends
+        // the round; in Training the round must stay live.
+        m.p2.character.life = 0;
+        for _ in 0..120 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.round_state(),
+            RoundState::Fight,
+            "a KO does not auto-end the round in Training"
+        );
+        assert_eq!(m.winner(), None, "no round winner is credited in Training");
+    }
+
+    #[test]
+    fn versus_path_unchanged_with_explicit_versus_mode() {
+        // Explicitly setting Versus (the default) must leave the normal round flow
+        // intact: the timer counts down and a KO ends the round.
+        let mut m = basic_match();
+        m.set_game_mode(GameMode::Versus);
+        into_fight(&mut m);
+        let timer_at_fight = m.timer();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.timer(),
+            timer_at_fight - 1,
+            "Versus mode still counts the round timer down"
+        );
+        m.p2.character.life = 0;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.round_state(),
+            RoundState::Ko,
+            "Versus mode still ends the round on a KO"
+        );
+        assert_eq!(m.winner(), Some(Winner::P1));
+    }
+
+    #[test]
+    fn training_does_not_leak_into_snapshot_fingerprint() {
+        // The Versus and Training matches start from identical state; because
+        // GameMode is a config flag (not captured in MatchSnapshot), their initial
+        // snapshots are byte-identical — Training must not perturb the
+        // deterministic fingerprint.
+        let versus = {
+            let p1 = tests_support::make_player(-50.0);
+            let p2 = tests_support::make_player(50.0);
+            Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+        };
+        let training = {
+            let p1 = tests_support::make_player(-50.0);
+            let p2 = tests_support::make_player(50.0);
+            let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+            m.set_game_mode(GameMode::Training);
+            m
+        };
+        let vb = versus.snapshot().expect("versus snapshot");
+        let tb = training.snapshot().expect("training snapshot");
+        assert_eq!(
+            vb, tb,
+            "GameMode must not leak into the MatchSnapshot fingerprint"
+        );
+    }
+
     // ---- Audit #21: RoundState / GameTime / MatchOver threaded to triggers ----
 
     /// The coordinator maps each round phase to MUGEN's `RoundState` code.
@@ -4924,6 +5982,183 @@ time = 1
         }
         assert_ne!(m.round_state(), RoundState::Fight, "timer ran out");
         assert_eq!(m.winner(), Some(Winner::P1), "more life wins on time over");
+    }
+
+    /// Regression (round-flow): a round decided by TIME OVER (not a KO) — with both
+    /// fighters at FULL life when the clock expires — must run the round clock its
+    /// full configured length, decide the round on the timer hitting `0`, and then
+    /// ADVANCE out of [`RoundState::Win`] just like a KO does. This locks in the
+    /// fix for the live "round ends instantly + freezes on P2 WINS" report: the
+    /// timer must start at `round_seconds * 60`, count down only during Fight, reach
+    /// `0` only after that many fight ticks, and the Win phase must transition to the
+    /// next round (and ultimately match-over) rather than sticking.
+    ///
+    /// P1 keeps strictly more life than P2 (no hits land in this neutral sim, so
+    /// "full life" is asymmetric only by the characters' configured maxima — here we
+    /// force P2 a hair lower so every timeout is a clean P1 win and the best-of-N
+    /// reaches a winner). A `Draw` (equal life) would credit neither side, so we
+    /// avoid it deliberately to prove the *advance-and-terminate* path.
+    #[test]
+    fn full_life_time_over_advances_through_win_to_match_over() {
+        // One-second rounds so the full clock is cheap to burn down; best-of-1 so a
+        // single decided round ends the match (the simplest match-over proof).
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::with_config(p1, p2, StageBounds::new(-200.0, 200.0), 1, 1);
+
+        // The clock starts at round_seconds * 60 and does NOT move during Intro.
+        assert_eq!(
+            m.timer(),
+            TICKS_PER_SECOND,
+            "timer initialises to round_seconds * 60"
+        );
+        // Drive the intro to its last frame manually so we can assert the clock is
+        // still full at the exact moment Fight begins (before any fight tick burns
+        // it). The Intro lasts INTRO_FRAMES ticks; the INTRO_FRAMES-th tick is the
+        // transition into Fight and does not yet count the clock down.
+        for _ in 0..INTRO_FRAMES {
+            assert_eq!(m.round_state(), RoundState::Intro);
+            assert_eq!(
+                m.timer(),
+                TICKS_PER_SECOND,
+                "the intro must not consume the round clock"
+            );
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.round_state(), RoundState::Fight, "intro ends -> Fight");
+        assert_eq!(
+            m.timer(),
+            TICKS_PER_SECOND,
+            "the round clock is full when Fight begins"
+        );
+
+        // Give P1 strictly more life so the time-over verdict is a clean P1 win, and
+        // make the win deterministic regardless of the characters' default maxima.
+        m.p1.character.life = 1000;
+        m.p2.character.life = 900;
+
+        // Burn the clock down. The round must stay live for exactly the configured
+        // number of fight ticks, then leave Fight on the timer reaching 0 — NOT
+        // earlier (the live bug was an instant timeout) and with both fighters still
+        // at the life we set (no KO; this is a genuine time over).
+        for tick in 0..TICKS_PER_SECOND {
+            assert_eq!(
+                m.round_state(),
+                RoundState::Fight,
+                "still fighting at {tick}"
+            );
+            assert_eq!(
+                m.timer(),
+                TICKS_PER_SECOND - tick,
+                "timer counts down one per fight tick"
+            );
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.timer(),
+            0,
+            "the clock reached zero after exactly N fight ticks"
+        );
+        assert_eq!(
+            m.round_state(),
+            RoundState::Ko,
+            "time over enters the KO/results hold"
+        );
+        assert_eq!(m.winner(), Some(Winner::P1), "more life wins on time over");
+        assert!(
+            m.p1().life() > 0 && m.p2().life() > 0,
+            "this is a time over, not a KO — both fighters are still alive"
+        );
+
+        // Hold through the KO results phase into Win, then prove Win ADVANCES: the
+        // match must terminate (best-of-1) rather than freezing on Win.
+        let mut reached_win = false;
+        for _ in 0..(KO_FRAMES + 5) {
+            if m.round_state() == RoundState::Win {
+                reached_win = true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+            if m.match_state() == MatchState::Over {
+                break;
+            }
+        }
+        assert!(reached_win, "the round passed through the Win phase");
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "Win must advance to match-over on a time-over-decided round (never stick)"
+        );
+        assert_eq!(
+            m.match_winner(),
+            Some(Winner::P1),
+            "the time-over winner wins the match"
+        );
+        // The match terminated (MatchState::Over) on the round-decision frame rather
+        // than looping the round-flow forever. A terminal match holds its final
+        // round's RoundState (here Win) by design — the anti-freeze guarantee is that
+        // the *match* is Over, and that further ticks are inert no-ops (below), not
+        // that round_state leaves Win on a best-of-1 finisher.
+        let terminal_round = m.round_number();
+        for _ in 0..10 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "a terminated match stays terminated under further ticks"
+        );
+        assert_eq!(
+            m.round_number(),
+            terminal_round,
+            "no new round starts after the match is over"
+        );
+    }
+
+    /// Regression (round-flow): a multi-round, all-time-over match still reaches a
+    /// winner. Every round is decided by the clock (full-life-ish time over) rather
+    /// than a KO; the best-of-N must advance round-by-round and finally end with a
+    /// match winner — never looping rounds forever or sticking on Win.
+    #[test]
+    fn best_of_n_time_over_match_reaches_a_winner() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, defender_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        // One-second rounds, best of three.
+        let mut m = Match::with_config(p1, p2, StageBounds::new(-200.0, 200.0), 1, 2);
+
+        // Bound the whole simulation generously; each round is intro + 60 fight + KO
+        // hold + transition, and best-of-three needs at most three rounds.
+        for _ in 0..(10 * (INTRO_FRAMES + TICKS_PER_SECOND + KO_FRAMES + 2)) {
+            if m.match_state() == MatchState::Over {
+                break;
+            }
+            // Keep P1 ahead on life each fight frame so every time over is a P1 win
+            // (no KO — life never hits 0).
+            if m.round_state() == RoundState::Fight {
+                m.p1.character.life = 1000;
+                m.p2.character.life = 900;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+
+        assert_eq!(
+            m.match_state(),
+            MatchState::Over,
+            "a best-of-N all-time-over match must terminate with a winner"
+        );
+        assert_eq!(
+            m.match_winner(),
+            Some(Winner::P1),
+            "P1 wins every time over"
+        );
+        assert_eq!(m.p1_round_wins(), 2, "P1 took the needed two rounds");
     }
 
     #[test]
@@ -6181,6 +7416,31 @@ time = 1
         ))
     }
 
+    /// Drives `m` (no input) until BOTH fighters are controllable in the neutral
+    /// stand (state 0 with `ctrl`) — i.e. they have finished the round-init intro
+    /// (common1 5900 -> the character's `[Statedef 191]` intro animation, T056) and
+    /// handed control back. Returns whether both became controllable within budget.
+    ///
+    /// `RoundState::Fight` alone is not enough to drive locomotion: KFM's authored
+    /// intro keeps a fighter in state 191 (no control) while its intro animation
+    /// plays out before `ChangeState`-ing to the stand. A test that wants to prove
+    /// walking must wait for this, not merely for the fight to go live.
+    fn run_until_both_can_walk(m: &mut Match) -> bool {
+        let ready = |m: &Match| {
+            m.p1().character.state_no == 0
+                && m.p1().character.ctrl
+                && m.p2().character.state_no == 0
+                && m.p2().character.ctrl
+        };
+        for _ in 0..240 {
+            if ready(m) {
+                return true;
+            }
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        ready(m)
+    }
+
     /// Drives `m` through the intro into the live fight, returning whether it
     /// became live within the budget.
     fn run_until_fight(m: &mut Match) -> bool {
@@ -6201,9 +7461,14 @@ time = 1
     #[test]
     fn p1_walks_toward_opponent_via_real_commands() {
         let Some(mut m) = two_kfm_match() else { return };
+        // Drive past the round-init intro (T056): the fight going live is not enough,
+        // KFM plays a finite intro (state 191) before handing control to the stand.
         assert!(
-            run_until_fight(&mut m),
-            "fight must go live before driving input"
+            run_until_both_can_walk(&mut m),
+            "fighters must hand control back from the round-init intro before walking; \
+             p1 state {} ctrl {}",
+            m.p1().character.state_no,
+            m.p1().character.ctrl
         );
         assert_eq!(m.p1().facing(), Facing::Right, "P1 faces P2 (to its right)");
 
@@ -6245,9 +7510,13 @@ time = 1
     #[test]
     fn p2_walks_toward_opponent_facing_left() {
         let Some(mut m) = two_kfm_match() else { return };
+        // Drive past the round-init intro (T056) before asserting locomotion.
         assert!(
-            run_until_fight(&mut m),
-            "fight must go live before driving input"
+            run_until_both_can_walk(&mut m),
+            "fighters must hand control back from the round-init intro before walking; \
+             p2 state {} ctrl {}",
+            m.p2().character.state_no,
+            m.p2().character.ctrl
         );
         assert_eq!(m.p2().facing(), Facing::Left, "P2 faces P1 (to its left)");
 
@@ -6412,6 +7681,74 @@ time = 1
         );
     }
 
+    /// Builds a parameterless [`CompiledController`] of type `LifebarAction` that
+    /// fires unconditionally (`trigger1 = 1`).
+    fn lifebar_action_controller() -> fp_character::CompiledController {
+        fp_character::CompiledController {
+            state_number: 0,
+            label: String::new(),
+            controller_type: Some("LifebarAction".to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![fp_character::CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![fp_character::CompiledExpr::compile("1")],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A `Match` whose P1 fires a `LifebarAction` every tick and whose P2 is idle.
+    fn lifebar_action_match() -> Match {
+        let mut p1_loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        p1_loaded
+            .states
+            .insert(0, state0_with(lifebar_action_controller()));
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        p1c.state_no = 0;
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        let p1 = Player::new(p1c, p1_loaded);
+        let p2 = Player::new(p2c, defender_loaded());
+        Match::new(p1, p2, StageBounds::new(-200.0, 200.0))
+    }
+
+    /// AC (T081): a fighter's `LifebarAction` controller surfaces the announcer cue
+    /// on [`Match::lifebar_action_announced`] after `tick` — the real arm signals
+    /// the round-flow/HUD instead of a no-op.
+    #[test]
+    fn lifebar_action_surfaces_announcer_signal() {
+        let mut m = lifebar_action_match();
+        assert!(
+            !m.lifebar_action_announced(),
+            "no announcer cue before any LifebarAction fires"
+        );
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.lifebar_action_announced(),
+            "P1's LifebarAction surfaces the announcer cue on the match"
+        );
+    }
+
+    /// AC (T081): the announcer cue is a per-tick edge — a tick with no
+    /// `LifebarAction` clears it again, so a stale cue never lingers.
+    #[test]
+    fn lifebar_action_signal_is_per_tick_edge() {
+        // A plain match (neither side fires LifebarAction) never raises the cue.
+        let mut m = play_snd_match();
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            !m.lifebar_action_announced(),
+            "no LifebarAction → the announcer cue stays clear"
+        );
+    }
+
     /// AC: the per-player request slice is REPLACED each tick, not accumulated —
     /// a tick with no PlaySnd leaves it empty again.
     #[test]
@@ -6457,6 +7794,38 @@ time = 1
         }
     }
 
+    /// A converging round-init state ([`ROUND_INIT_STATE`], 5900) that hands
+    /// straight back to the neutral stand (state 0) on `Time = 0` — the same shape
+    /// the shipped clean-room `common1.cns` 5900 has. Inserted into a loaded graph
+    /// so the engine's round-init ([`Match::run_round_init`], T056) converges in a
+    /// single tick to state 0 rather than into a character's multi-tick intro
+    /// animation. This keeps the round-init mechanism exercised while leaving a
+    /// single-tick cross-entity probe (which lives at state 0) free to run.
+    fn converging_round_init_state() -> CompiledState {
+        CompiledState {
+            number: ROUND_INIT_STATE,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("N".to_string()),
+            controllers: vec![CompiledController {
+                state_number: ROUND_INIT_STATE,
+                label: String::new(),
+                controller_type: Some("ChangeState".to_string()),
+                triggerall: Vec::new(),
+                triggers: vec![CompiledTriggerGroup {
+                    number: 1,
+                    conditions: vec![CompiledExpr::compile("Time = 0")],
+                }],
+                persistent: None,
+                ignorehitpause: None,
+                params: [("value".to_string(), CompiledParam::compile("0"))]
+                    .into_iter()
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// A state 0 that, every tick, records what this character's cross-entity
     /// triggers see about its opponent into its integer var bank:
     /// - `var(0)` = `p2dist X` (facing-relative gap to the opponent),
@@ -6496,8 +7865,13 @@ time = 1
         let Some((mut lc1, lc2)) = two_kfm_loaded() else {
             return;
         };
-        // Replace P1's state 0 with the cross-entity probe.
+        // Replace P1's state 0 with the cross-entity probe, and override its
+        // round-init 5900 with a converging stub so the engine's round-init (T056)
+        // lands directly on the probe at state 0 in the single tick below, rather
+        // than into KFM's multi-tick intro animation (states 190/191).
         lc1.states.insert(0, cross_entity_probe_state());
+        lc1.states
+            .insert(ROUND_INIT_STATE, converging_round_init_state());
 
         // P1 at x=-60 facing right, P2 at x=60 facing left, with a known life.
         let mut p1c = Character::with_constants(lc1.constants);
@@ -6568,6 +7942,10 @@ time = 1
         let mut probe = cross_entity_probe_state();
         probe.controllers.push(gated);
         lc1.states.insert(0, probe);
+        // Converge round-init (T056) straight to state 0 so the gated probe runs in
+        // the single tick below, instead of KFM's multi-tick intro (190/191).
+        lc1.states
+            .insert(ROUND_INIT_STATE, converging_round_init_state());
 
         let mut p1c = Character::with_constants(lc1.constants);
         p1c.pos = Vec2::new(-60.0, 0.0);
@@ -7110,6 +8488,50 @@ time = 1
             "the reset clears stale sound requests"
         );
         assert!(m.p2_sound_requests().is_empty());
+    }
+
+    /// T054 (cheap-AI var-init safety): the per-round reset zeroes EVERY variable
+    /// bank for both fighters, so no value seeded in a prior round (the evilken
+    /// cheap-AI `Var(30)=59` trap among them) leaks into the next round — for the
+    /// CPU OR the human. `ai_level` itself is identity, not a per-round var, so it
+    /// is intentionally untouched by the reset.
+    #[test]
+    fn round_reset_clears_seeded_vars_for_both_fighters() {
+        let mut m = basic_match();
+        m.p1.character.set_ai_level(5); // P1 is the CPU; P2 stays human (0)
+
+        // Seed the cheap-AI buff var (and a few others) on both sides as if a
+        // prior round wrote them.
+        m.p1.character.vars[30] = 59;
+        m.p1.character.fvars[1] = 3.5;
+        m.p1.character.sysvars[2] = -7;
+        m.p2.character.vars[30] = 59;
+        m.p2.character.sysfvars[0] = 1.25;
+
+        m.reset_for_next_round();
+
+        for (label, c) in [("P1(cpu)", &m.p1.character), ("P2(human)", &m.p2.character)] {
+            assert!(c.vars.iter().all(|&v| v == 0), "{label}: var(0..) cleared");
+            assert!(
+                c.fvars.iter().all(|&v| v == 0.0),
+                "{label}: fvar(0..) cleared"
+            );
+            assert!(
+                c.sysvars.iter().all(|&v| v == 0),
+                "{label}: sysvar(0..) cleared"
+            );
+            assert!(
+                c.sysfvars.iter().all(|&v| v == 0.0),
+                "{label}: sysfvar(0..) cleared"
+            );
+        }
+        // The CPU identity bit survives the reset (it is not a per-round var).
+        assert_eq!(
+            m.p1.character.ai_level(),
+            5,
+            "ai_level survives round reset"
+        );
+        assert_eq!(m.p2.character.ai_level(), 0, "human stays a human");
     }
 
     /// AC2: a time-over decided round in a best-of-N match still resets and the
@@ -8288,6 +9710,160 @@ time = 1
         assert!(!m.p2_frozen());
     }
 
+    // ---- SuperPause defence / invuln windows (T080) ----------------------
+
+    /// Builds a fight-phase match with P1 (attacker, action 200 punch) overlapping a
+    /// standing, open P2 (defender) so P1's HitDef connects this tick. Both at full
+    /// life. Mirrors the geometry of `connecting_attack_drops_life_and_ko_advances_round`.
+    fn superpause_attack_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        p1c.life = 1000;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Poses P1 on its punch frame with a fresh HitDef and P2 open on its hurt
+    /// frame, then runs one `Match::tick` so P1's attack resolves against P2.
+    fn run_one_attack(m: &mut Match) {
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+        m.tick(MatchInput::none(), MatchInput::none());
+    }
+
+    #[test]
+    fn superpause_unhittable_blocks_incoming_hit() {
+        // T080 acceptance: with an active SuperPause `unhittable` window on the
+        // DEFENDER (P2), an incoming hit during the pause deals no damage (it passes
+        // through like a NotHitBy block).
+        let mut m = superpause_attack_match();
+        m.p2.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 1.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        assert_eq!(
+            m.p2().life(),
+            life_before,
+            "unhittable SuperPause window blocks the hit entirely"
+        );
+    }
+
+    #[test]
+    fn superpause_unhittable_zero_does_not_block() {
+        // Negative control: `unhittable = 0` (window active) does NOT protect — the
+        // hit lands normally, proving the gate keys off the flag, not mere activity.
+        let mut m = superpause_attack_match();
+        m.p2.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        assert!(
+            m.p2().life() < life_before,
+            "a non-unhittable window must not block the hit"
+        );
+    }
+
+    #[test]
+    fn superpause_p2defmul_scales_opponent_damage() {
+        // T080 acceptance: `p2defmul = 2.0` on the ATTACKER (the triggerer) doubles
+        // the damage its opponent takes for the pause window. Compare against an
+        // identical hit with no window (the neutral baseline).
+        let mut baseline = superpause_attack_match();
+        let baseline_life = baseline.p2().life();
+        run_one_attack(&mut baseline);
+        let baseline_damage = baseline_life - baseline.p2().life();
+        assert!(baseline_damage > 0, "baseline hit must deal damage");
+
+        let mut m = superpause_attack_match();
+        m.p1.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 30,
+        };
+        let life_before = m.p2().life();
+        run_one_attack(&mut m);
+        let scaled_damage = life_before - m.p2().life();
+        assert_eq!(
+            scaled_damage,
+            baseline_damage * 2,
+            "p2defmul = 2.0 doubles the opponent's damage taken"
+        );
+    }
+
+    #[test]
+    fn superpause_window_installed_on_triggerer_and_cleared_with_pause() {
+        // End-to-end: a real `SuperPause` controller (default unhittable, time = 5)
+        // installs the defence/invuln window on the triggering player (P1, exempt)
+        // for exactly the pause duration, leaves the opponent's window inert, and
+        // clears it when the freeze ends.
+        let mut m = freeze_match("SuperPause", "5");
+        m.p1.character.vars[0] = 1;
+        m.tick(MatchInput::none(), MatchInput::none()); // fire tick: freeze armed
+        assert_eq!(m.freeze_time(), 5, "5-tick SuperPause armed");
+        assert!(
+            m.p1().character.superpause_effect.active(),
+            "the triggerer (P1) carries an active window"
+        );
+        assert!(
+            m.p1().character.superpause_effect.unhittable,
+            "default SuperPause is unhittable"
+        );
+        assert!(
+            !m.p2().character.superpause_effect.active(),
+            "the opponent (P2) has no window"
+        );
+
+        // Run the whole freeze; the window ages down in lockstep with the pause.
+        for _ in 0..5 {
+            m.tick(MatchInput::none(), MatchInput::none());
+        }
+        assert_eq!(m.freeze_time(), 0, "freeze expired");
+        assert!(
+            !m.p1().character.superpause_effect.active(),
+            "the window ends with the pause"
+        );
+    }
+
+    #[test]
+    fn superpause_window_does_not_survive_round_reset() {
+        // A SuperPause window must not leak across a round boundary.
+        let mut m = superpause_attack_match();
+        m.p1.character.superpause_effect = fp_character::SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 30,
+        };
+        m.reset_positions();
+        assert!(
+            !m.p1.character.superpause_effect.active(),
+            "round reset clears the SuperPause window"
+        );
+        assert!(
+            (m.p1.character.superpause_effect.active_p2defmul() - 1.0).abs() < 1e-6,
+            "round reset restores the neutral p2defmul"
+        );
+    }
+
     // ---- Hit-spark effects (audit #17) -----------------------------------
 
     /// An attacker-style loaded character (punch on action 200, hurt on action 0)
@@ -8572,6 +10148,125 @@ time = 1
         // Reset to the next round directly; sparks must be cleared.
         m.reset_for_next_round();
         assert!(m.effects().is_empty(), "round reset clears live sparks");
+    }
+
+    // ---- T056: round-init common state (5900) ------------------------------
+
+    /// A [`CompiledController`] of the given `type`, with `value = <expr>` and a
+    /// `trigger1 = <trigger>` gate. Mirrors the shape an authored `common1.cns`
+    /// 5900 controller compiles to.
+    fn value_controller(ty: &str, value: &str, trigger: &str) -> CompiledController {
+        CompiledController {
+            state_number: ROUND_INIT_STATE,
+            label: String::new(),
+            controller_type: Some(ty.to_string()),
+            triggerall: Vec::new(),
+            triggers: vec![CompiledTriggerGroup {
+                number: 1,
+                conditions: vec![CompiledExpr::compile(trigger)],
+            }],
+            persistent: None,
+            ignorehitpause: None,
+            params: [("value".to_string(), CompiledParam::compile(value))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A [`LoadedCharacter`] whose state graph defines the engine-common round-init
+    /// state ([`ROUND_INIT_STATE`], 5900): on `Time = 0` it re-asserts full life
+    /// (`LifeSet value = Const(data.life)`) and hands back to the neutral stand
+    /// (`ChangeState value = 0`) — the converging shape the authored 5900 has.
+    /// Also defines a (no-op) state 0 so the convergence target exists.
+    fn round_init_loaded() -> LoadedCharacter {
+        let mut loaded = loaded_with(air_with(
+            0,
+            Vec::new(),
+            vec![Rect::new(-18.0, -70.0, 36.0, 70.0)],
+        ));
+        let s5900 = CompiledState {
+            number: ROUND_INIT_STATE,
+            state_type: Some("S".to_string()),
+            movetype: Some("I".to_string()),
+            physics: Some("S".to_string()),
+            controllers: vec![
+                value_controller("LifeSet", "Const(data.life)", "Time = 0"),
+                value_controller("ChangeState", "0", "Time = 0"),
+            ],
+            ..Default::default()
+        };
+        loaded.states.insert(ROUND_INIT_STATE, s5900);
+        // A trivial state 0 so the 5900 ChangeState target is a defined state.
+        loaded.states.insert(
+            0,
+            CompiledState {
+                number: 0,
+                state_type: Some("S".to_string()),
+                movetype: Some("I".to_string()),
+                physics: Some("S".to_string()),
+                ..Default::default()
+            },
+        );
+        loaded
+    }
+
+    /// AC (T056): the engine drives a fighter through its round-init state (5900)
+    /// at the start of each round, and 5900 *converges* with the engine's
+    /// authoritative field reset rather than fighting it.
+    ///
+    /// - At construction (round 1) a character that defines 5900 is entered into
+    ///   it (it is NOT left in state 0).
+    /// - Ticking the intro runs 5900, which re-asserts full life and `ChangeState`s
+    ///   back to the neutral stand (state 0) — so the net effect converges.
+    /// - The same happens on a `reset_for_next_round`.
+    /// - A character that defines NO 5900 is left in state 0 (safe no-op).
+    #[test]
+    fn round_init_uses_5900() {
+        let mut p1c = Character::new();
+        p1c.pos = Vec2::new(-50.0, 0.0);
+        let mut p2c = Character::new();
+        p2c.pos = Vec2::new(50.0, 0.0);
+        // P1 defines 5900; P2 does not (the no-op control).
+        let p1 = Player::new(p1c, round_init_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-200.0, 200.0));
+
+        // Round 1: the engine drove P1 into its round-init state, and left the
+        // 5900-less P2 in the neutral stand.
+        assert_eq!(
+            m.p1.character.state_no, ROUND_INIT_STATE,
+            "a fighter that defines 5900 is entered into it at round init"
+        );
+        assert_eq!(
+            m.p2.character.state_no, 0,
+            "a fighter with no 5900 is left in the neutral stand (no-op)"
+        );
+
+        // Drive 5900 to convergence: drop P1 below full life first to prove the
+        // LifeSet re-asserts it, then tick once (the intro still ticks the state
+        // machine). 5900 runs on Time = 0 → full life + ChangeState 0.
+        m.p1.character.life = 1;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1.character.life, m.p1.character.life_max,
+            "5900's LifeSet re-asserts full life on round init"
+        );
+        assert_eq!(
+            m.p1.character.state_no, 0,
+            "5900 hands back to the neutral stand — it converges with the reset"
+        );
+
+        // A between-round reset re-runs round init the same way.
+        m.p1.character.state_no = 42; // pretend it ended the round elsewhere
+        m.reset_for_next_round();
+        assert_eq!(
+            m.p1.character.state_no, ROUND_INIT_STATE,
+            "reset_for_next_round re-enters 5900 for the fighter that defines it"
+        );
+        assert_eq!(
+            m.p2.character.state_no, 0,
+            "the 5900-less fighter is reset to the neutral stand, not 5900"
+        );
     }
 
     /// AC (gated, skip-if-missing): drive a REAL KFM punch through the actual
@@ -11701,6 +13396,469 @@ time = 1
             fired * 2 >= attempted,
             "fewer than half of evilken's from-neutral declared moves were performable \
              ({fired}/{attempted}); the synthesizer→Match move-execution path regressed"
+        );
+    }
+
+    // ---- T052: ai_level entity field + match/CPU plumbing -------------------
+
+    /// `PlayerDriver::ai_level` maps humans to 0 and CPU difficulties to 1..=8,
+    /// independent of the teaching `BehaviorMode` the CPU carries.
+    #[test]
+    fn player_driver_ai_level_mapping() {
+        assert_eq!(PlayerDriver::Human.ai_level(), 0);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Easy).ai_level(), 2);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Normal).ai_level(), 4);
+        assert_eq!(PlayerDriver::cpu(AiDifficulty::Hard).ai_level(), 7);
+        // The teaching mode does not change the AI level.
+        assert_eq!(
+            PlayerDriver::Cpu(AiDifficulty::Hard, BehaviorMode::ReactiveDP).ai_level(),
+            7
+        );
+        // The human default is level 0 (a human is never mistaken for the CPU).
+        assert_eq!(PlayerDriver::default().ai_level(), 0);
+    }
+
+    /// `PlayerDriver` round-trips its difficulty and teaching mode so a caller can
+    /// read both knobs back off the driver to construct the side's CPU AI (T070).
+    #[test]
+    fn player_driver_carries_difficulty_and_mode() {
+        let d = PlayerDriver::Cpu(AiDifficulty::Hard, BehaviorMode::WhiffPunisher);
+        assert_eq!(d.difficulty(), Some(AiDifficulty::Hard));
+        assert_eq!(d.behavior_mode(), Some(BehaviorMode::WhiffPunisher));
+        // The `cpu` shorthand defaults to the plain difficulty ladder.
+        assert_eq!(
+            PlayerDriver::cpu(AiDifficulty::Normal).behavior_mode(),
+            Some(BehaviorMode::Ladder)
+        );
+        // A human carries neither.
+        assert_eq!(PlayerDriver::Human.difficulty(), None);
+        assert_eq!(PlayerDriver::Human.behavior_mode(), None);
+    }
+
+    /// A bare, freshly-built `Character` (no coordinator) defaults to `ai_level == 0`.
+    #[test]
+    fn bare_character_ai_level_defaults_to_zero() {
+        assert_eq!(Character::new().ai_level(), 0);
+    }
+
+    /// `Match::set_drivers` assigns each side's `ai_level` from its driver:
+    /// human P1 stays level 0, CPU(Hard) P2 reads 7.
+    #[test]
+    fn match_with_drivers_sets_ai_level_per_side() {
+        let mut m = Match::new(
+            tests_support::make_player(-50.0),
+            tests_support::make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        m.set_drivers(PlayerDriver::Human, PlayerDriver::cpu(AiDifficulty::Hard));
+        assert_eq!(m.p1().character.ai_level(), 0, "human P1 must be level 0");
+        assert_eq!(
+            m.p2().character.ai_level(),
+            7,
+            "CPU(Hard) P2 must be level 7"
+        );
+    }
+
+    /// A plain `Match::new` (no driver declared) leaves both sides at the human
+    /// default (`0`), so a bare two-human match is unaffected.
+    #[test]
+    fn match_without_drivers_keeps_human_default_ai_level() {
+        let m = Match::new(
+            tests_support::make_player(-50.0),
+            tests_support::make_player(50.0),
+            StageBounds::new(-200.0, 200.0),
+        );
+        assert_eq!(m.p1().character.ai_level(), 0);
+        assert_eq!(m.p2().character.ai_level(), 0);
+    }
+
+    /// `TeamMatch::set_drivers` propagates each side's driver to its whole roster:
+    /// the active lead AND every reserve inherit the side's `ai_level`.
+    #[test]
+    fn team_match_drivers_propagate_to_whole_roster() {
+        let mut tm = TeamMatch::with_mode(
+            vec![
+                tests_support::make_player(-60.0),
+                tests_support::make_player(-90.0),
+            ],
+            vec![
+                tests_support::make_player(60.0),
+                tests_support::make_player(90.0),
+            ],
+            StageBounds::new(-200.0, 200.0),
+            TeamMode::Simul,
+        );
+        tm.set_drivers(PlayerDriver::Human, PlayerDriver::cpu(AiDifficulty::Normal));
+
+        // P1 side (human): active lead + reserve both level 0.
+        assert_eq!(tm.active_player(Side::P1).character.ai_level(), 0);
+        for r in tm.reserves(Side::P1) {
+            assert_eq!(r.character.ai_level(), 0, "human reserve must stay level 0");
+        }
+        // P2 side (CPU Normal -> 4): active lead + reserve both level 4.
+        assert_eq!(tm.active_player(Side::P2).character.ai_level(), 4);
+        for r in tm.reserves(Side::P2) {
+            assert_eq!(
+                r.character.ai_level(),
+                4,
+                "CPU reserve must inherit level 4"
+            );
+        }
+    }
+
+    /// `ai_level` is part of `CharacterSnapshot` and survives a bincode round-trip
+    /// (the snapshot path the whole-Match replay / rollback proofs depend on).
+    #[test]
+    fn ai_level_survives_character_snapshot_bincode_round_trip() {
+        let mut ch = Character::new();
+        ch.set_ai_level(7);
+        let snap = ch.snapshot();
+        assert_eq!(snap.ai_level, 7);
+
+        let bytes = bincode::serialize(&snap).expect("serialize snapshot");
+        let decoded: fp_character::CharacterSnapshot =
+            bincode::deserialize(&bytes).expect("deserialize snapshot");
+        assert_eq!(
+            decoded.ai_level, 7,
+            "ai_level must survive a bincode round-trip"
+        );
+
+        // And applying the decoded snapshot restores ai_level onto a fresh character.
+        let mut restored = Character::new();
+        assert_eq!(restored.ai_level(), 0);
+        restored.restore_from_snapshot(&decoded);
+        assert_eq!(restored.ai_level(), 7);
+    }
+
+    // ====================================================================
+    // T065: frame-data readout — static startup/active/recovery from an AIR
+    // action, plus on-block / on-hit frame advantage derived from the
+    // defender's induced stun and the attacker's remaining recovery.
+    // ====================================================================
+
+    /// A deterministic attack action's static frame data must decompose to the
+    /// hand-counted startup / active / recovery, and the on-block / on-hit frame
+    /// advantage must equal `defender_stun − attacker_recovery`.
+    ///
+    /// This ties the engine's combat numbers to the player-facing readout: the
+    /// attacker's frames-until-actionable at contact is its move recovery (the
+    /// static tail computed from the AIR), and the defender's stun is the
+    /// block-/hit-stun the engine induces.
+    #[test]
+    fn frame_advantage_on_block_equals_blockstun_minus_recovery() {
+        use fp_character::{frame_advantage, MoveFrameData};
+
+        // A simple attack: 4-tick startup, 3-tick active (Clsn1), 8-tick recovery.
+        let action = AnimAction {
+            action_number: 200,
+            loopstart: 0,
+            frames: vec![
+                AnimFrame {
+                    ticks: 4,
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 3,
+                    clsn1: vec![Rect::new(0.0, -40.0, 30.0, -10.0)],
+                    ..Default::default()
+                },
+                AnimFrame {
+                    ticks: 8,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let fd = MoveFrameData::compute(&action).expect("countable attack");
+        assert_eq!((fd.startup, fd.active, fd.recovery), (4, 3, 8));
+
+        // On block: the defender is held in 5 frames of blockstun while the
+        // attacker still owes its 8-frame recovery → 5 − 8 = −3 (disadvantage).
+        let on_block = frame_advantage(5, fd.recovery);
+        assert_eq!(on_block, -3, "on-block advantage = blockstun − recovery");
+
+        // On hit: 12 frames of hitstun vs the same 8 recovery → +4 (advantage).
+        let on_hit = frame_advantage(12, fd.recovery);
+        assert_eq!(on_hit, 4, "on-hit advantage = hitstun − recovery");
+    }
+
+    // ---- Training dummy control (F027 / T067) -----------------------------
+
+    /// Builds a fight-ready attacker (P1) vs defender (P2) match, advanced into
+    /// the Fight phase, with the defender at full life. P1 sits left, P2 right.
+    fn dummy_match() -> Match {
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(0.0, 0.0);
+        p1c.facing = Facing::Right;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(60.0, 0.0);
+        p2c.facing = Facing::Left;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        m
+    }
+
+    /// Poses P1 on its punch frame with a fresh blockable HitDef for this tick.
+    fn arm_p1_punch(m: &mut Match) {
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+    }
+
+    #[test]
+    fn blockall_dummy_guards_attack_chip_only() {
+        let mut m = dummy_match();
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        // The dummy in BlockAll holds away from the opponent every tick, computed
+        // from the live opponent side — so it guards a clean hit (chip only).
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let p2_in = dummy_input(DummyMode::BlockAll, on_right, m.p2_was_hit(), 0);
+        m.tick(MatchInput::none(), p2_in);
+        // sample_hitdef: hit = 30, guard = 5. A block deals only the guard chip.
+        assert_eq!(
+            m.p2().life(),
+            before - 5,
+            "BlockAll guards the attack: guard chip only, not full hit damage"
+        );
+        assert!(
+            m.p2_was_hit(),
+            "even a blocked hit registers the chip as a hit"
+        );
+    }
+
+    #[test]
+    fn stand_dummy_takes_full_hit() {
+        // Negative control: a standing (non-blocking) dummy eats the full hit.
+        let mut m = dummy_match();
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        let p2_in = dummy_input(DummyMode::Stand, true, false, 0);
+        assert_eq!(p2_in, MatchInput::none(), "Stand holds nothing");
+        m.tick(MatchInput::none(), p2_in);
+        assert_eq!(
+            m.p2().life(),
+            before - 30,
+            "a standing dummy takes the full hit damage (30), not the guard chip"
+        );
+    }
+
+    #[test]
+    fn blockall_is_crossup_correct_after_a_side_swap() {
+        // Put the opponent on the dummy's LEFT (P1 to the right of P2). The dummy's
+        // block direction must follow the live side: guard right, not the stale left.
+        let mut p1c = Character::with_constants(CharacterConstants::default());
+        p1c.pos = Vec2::new(60.0, 0.0);
+        p1c.facing = Facing::Left;
+        let mut p2c = Character::with_constants(CharacterConstants::default());
+        p2c.pos = Vec2::new(0.0, 0.0);
+        p2c.facing = Facing::Right;
+        p2c.life = 1000;
+        let p1 = Player::new(p1c, attacker_loaded());
+        let p2 = Player::new(p2c, defender_loaded());
+        let mut m = Match::new(p1, p2, StageBounds::new(-300.0, 300.0));
+        into_fight(&mut m);
+        let before = m.p2().life();
+        // P1 (on the right) attacks toward the left.
+        m.p1.character.anim = 200;
+        m.p1.character.anim_elem = 0;
+        m.p1.character.facing = Facing::Left;
+        m.p1.character.move_type = MoveType::Attack;
+        m.p1.character.active_hitdef = Some(sample_hitdef());
+        m.p1.character.move_connect.reset();
+        m.p2.character.anim = 0;
+        m.p2.character.anim_elem = 0;
+        m.p2.character.state_type = StateType::Standing;
+
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        // This layout mirrors `dummy_match`: here P1 is on the dummy's RIGHT, so
+        // the crossup-correct guard direction is the opposite — hold LEFT.
+        assert!(
+            on_right,
+            "opponent is on the dummy's right in this (mirrored) layout"
+        );
+        let p2_in = dummy_input(DummyMode::BlockAll, on_right, m.p2_was_hit(), 0);
+        assert!(
+            p2_in.left && !p2_in.right,
+            "guard direction follows the opponent: hold LEFT when opponent is right"
+        );
+        m.tick(MatchInput::none(), p2_in);
+        assert_eq!(
+            m.p2().life(),
+            before - 5,
+            "crossup-correct block guards the hit from the other side (chip only)"
+        );
+    }
+
+    #[test]
+    fn block_after_first_lets_first_hit_land_then_guards() {
+        let mut m = dummy_match();
+        let start = m.p2().life();
+        // Tick 1: not yet hit, so BlockAfterFirst stands and eats the first hit.
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 0);
+        assert_eq!(in1, MatchInput::none(), "stands before the first hit lands");
+        m.tick(MatchInput::none(), in1);
+        assert_eq!(
+            m.p2().life(),
+            start - 30,
+            "the first hit lands cleanly (full 30 damage)"
+        );
+        assert!(m.p2_hit_latched(), "the first hit sets the combo latch");
+
+        // Tick 2: now hit — BlockAfterFirst guards, so the second hit is chip only.
+        let after_first = m.p2().life();
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 1);
+        assert!(in2.left || in2.right, "guards after the first hit");
+        m.tick(MatchInput::none(), in2);
+        assert_eq!(
+            m.p2().life(),
+            after_first - 5,
+            "the second hit is blocked: guard chip only"
+        );
+    }
+
+    #[test]
+    fn block_after_first_keeps_guarding_across_a_combo_gap() {
+        // Regression for the per-tick-vs-latch bug: real combos have non-damage
+        // frames between active frames. The dummy must keep guarding across that
+        // gap (driven by the sticky `p2_hit_latched`), not drop its guard the
+        // instant `p2_was_hit` (per-tick) goes false and eat the next hit fully.
+        let mut m = dummy_match();
+        let start = m.p2().life();
+
+        // Hit 1 lands cleanly (BlockAfterFirst stands until first hit).
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in1 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 0);
+        assert_eq!(in1, MatchInput::none(), "stands before the first hit lands");
+        m.tick(MatchInput::none(), in1);
+        assert_eq!(m.p2().life(), start - 30, "first hit lands full");
+        assert!(m.p2_hit_latched(), "combo latch is set after the first hit");
+
+        // Combo GAP: a few non-damage frames (no active HitDef on P1). The per-tick
+        // signal goes false, but the latch must stay set and the dummy keep guarding.
+        let after_first = m.p2().life();
+        for tick in 1..4u64 {
+            m.p1.character.active_hitdef = None;
+            m.p1.character.move_type = MoveType::Idle;
+            let on_right = m.ai_observation_for_p2().opponent_on_right();
+            let gap_in = dummy_input(
+                DummyMode::BlockAfterFirst,
+                on_right,
+                m.p2_hit_latched(),
+                tick,
+            );
+            assert!(
+                gap_in.left || gap_in.right,
+                "STILL guarding on a non-damage combo-gap frame (latch holds)"
+            );
+            m.tick(MatchInput::none(), gap_in);
+            assert!(!m.p2_was_hit(), "per-tick signal is false on a gap frame");
+            assert!(m.p2_hit_latched(), "combo latch survives the gap");
+            assert_eq!(m.p2().life(), after_first, "no damage during the gap");
+        }
+
+        // Hit 2 arrives after the gap — the still-raised guard blocks it (chip only).
+        arm_p1_punch(&mut m);
+        let on_right = m.ai_observation_for_p2().opponent_on_right();
+        let in2 = dummy_input(DummyMode::BlockAfterFirst, on_right, m.p2_hit_latched(), 4);
+        assert!(in2.left || in2.right, "guards the post-gap hit");
+        m.tick(MatchInput::none(), in2);
+        assert_eq!(
+            m.p2().life(),
+            after_first - 5,
+            "post-gap hit is blocked (guard chip only), not eaten full"
+        );
+    }
+
+    #[test]
+    fn infinite_life_keeps_life_at_max_after_a_hit() {
+        let mut m = dummy_match();
+        m.set_infinite_life(Side::P2, true);
+        let max = m.p2().character.life_max;
+        assert_eq!(m.p2().life(), max, "starts at max");
+        arm_p1_punch(&mut m);
+        // A standing dummy takes the hit, but infinite life restores it to max.
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(m.p2_was_hit(), "the hit still registers");
+        assert_eq!(
+            m.p2().life(),
+            max,
+            "infinite life clamps the defender back to life_max after the hit"
+        );
+        assert!(m.infinite_life(Side::P2));
+        assert!(!m.infinite_life(Side::P1));
+    }
+
+    #[test]
+    fn infinite_meter_keeps_power_at_max() {
+        let mut m = dummy_match();
+        m.set_infinite_meter(Side::P1, true);
+        m.p1.character.power = 0;
+        let pmax = m.p1.character.power_max;
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert_eq!(
+            m.p1().character.power,
+            pmax,
+            "infinite meter clamps power up to power_max each tick"
+        );
+        assert!(m.infinite_meter(Side::P1));
+    }
+
+    #[test]
+    fn no_infinite_toggle_leaves_combat_unchanged() {
+        // Regression guard: with both toggles off, a hit drops life as normal.
+        let mut m = dummy_match();
+        assert!(!m.infinite_life(Side::P1) && !m.infinite_life(Side::P2));
+        let before = m.p2().life();
+        arm_p1_punch(&mut m);
+        m.tick(MatchInput::none(), MatchInput::none());
+        assert!(
+            m.p2().life() < before,
+            "without the toggle, life drops normally"
+        );
+    }
+
+    #[test]
+    fn reset_positions_restores_start_pos_and_life_without_advancing_round() {
+        let mut m = dummy_match();
+        let p1_start = m.p1().pos();
+        let p2_start = m.p2().pos();
+        let round_before = m.round_number();
+        // Damage and shove the fighters around.
+        m.p2.character.life = 100;
+        m.p1.character.pos = Vec2::new(-150.0, 0.0);
+        m.p2.character.pos = Vec2::new(150.0, 0.0);
+        m.p2_was_hit = true;
+        m.p2_hit_latched = true;
+
+        m.reset_positions();
+
+        assert_eq!(m.p1().pos(), p1_start, "P1 back to its start position");
+        assert_eq!(m.p2().pos(), p2_start, "P2 back to its start position");
+        assert_eq!(
+            m.p2().life(),
+            m.p2().character.life_max,
+            "reset restores full life"
+        );
+        assert!(!m.p2_was_hit(), "reset clears the was-hit signal");
+        assert!(!m.p2_hit_latched(), "reset clears the combo latch");
+        assert_eq!(
+            m.round_number(),
+            round_before,
+            "reset_positions does NOT advance the round counter"
         );
     }
 }

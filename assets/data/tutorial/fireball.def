@@ -1,0 +1,8 @@
+; Trials lesson 3 — Throw a Fireball (original clean-room content, MIT).
+[Lesson]
+title       = "Throw a Fireball"
+instruction = "Quarter-circle forward, then punch. Throw a fireball."
+dummy       = stand
+overlays    = input
+success     = landcommand fireball
+timeout     = 600

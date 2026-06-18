@@ -330,6 +330,25 @@ testing, and the long-term customizable-engine vision.
   lexer, parser, and evaluator, hardening the never-panic contract beyond the
   hardcoded adversarial smoke tests.
 
+### Content import overlays are text-only (F034 T088) — By design
+
+- **What it is:** `fp-app import --out <dir>` writes a repaired, **loadable**
+  overlay of a character (`fp-app <dir>` discovers and runs it; see
+  [content-guide.md §3.5](content-guide.md)). The overlay repairs **text** only —
+  `CNS`/`CMD`/`AIR` are written as repaired copies; the binary assets
+  (`SFF`/`SND`/`ACT`) are **reported, never modified**: the overlay `.def`
+  references them at their original absolute paths.
+- **Why:** binary repair (e.g. re-encoding an `.sff`, fabricating a missing
+  sprite) is out of scope and would risk altering content the author shipped. A
+  flagged missing/zero-dim sprite is surfaced in the report for a human to fix at
+  the source, not auto-rewritten.
+- **Clean-room rule (restated):** an overlay (and the `.fp-cache/` IR cache) is
+  **derived, local-only engine output — never committed**. The write-guard
+  *refuses* any output destination inside the tracked `assets/` tree
+  (canonicalised + prefix-matched), and `*.imported/` + `.fp-cache/` are
+  git-ignored. The clean-room license reminder prints on **every** import run. Only
+  ship content you have the right to distribute.
+
 ### No replay / determinism / rollback (#38) — Missing
 
 - **What's missing:** No state serialization (no `serde`/`bincode`), no replay

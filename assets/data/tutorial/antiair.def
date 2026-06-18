@@ -1,0 +1,8 @@
+; Trials lesson 4 — Anti-air / Dragon Punch (original clean-room content, MIT).
+[Lesson]
+title       = "Anti-air / DP"
+instruction = "The dummy is jumping. Hit it out of the air with a rising attack."
+dummy       = jump
+overlays    = hitboxes
+success     = antiair
+timeout     = 600

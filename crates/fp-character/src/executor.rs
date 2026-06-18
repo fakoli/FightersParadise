@@ -122,6 +122,7 @@ use std::collections::HashMap;
 use fp_core::Vec2;
 use fp_formats::air::AirFile;
 use fp_vm::{eval, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::loader::{
     CompiledController, CompiledExpr, CompiledParam, CompiledState, CompiledTriggerGroup,
@@ -401,7 +402,7 @@ pub enum FreezeKind {
 /// matching the single-effect nature of the controller. Sound/anim spawning that
 /// MUGEN's `SuperPause` also performs (the flash sprite + sound) is out of scope
 /// here — this models only the freeze mechanic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FreezeRequest {
     /// Whether to freeze everyone ([`Pause`](FreezeKind::Pause)) or everyone but
     /// the triggerer ([`SuperPause`](FreezeKind::SuperPause)).
@@ -410,6 +411,99 @@ pub struct FreezeRequest {
     /// non-positive `time` is clamped to `0` (no freeze) before being emitted, so
     /// a consumer never sees a negative duration.
     pub time: i32,
+    /// `SuperPause` defence/invuln window for the triggerer (T080). Carries the
+    /// controller's `unhittable` / `p2defmul` so the coordinator can install a
+    /// [`SuperPauseEffect`] on the triggerer for the pause duration. For a
+    /// [`Pause`](FreezeKind::Pause) (which has no such parameters) this is the
+    /// inert default ([`SuperPauseEffect::inactive`] values: not unhittable,
+    /// `p2defmul = 1.0`).
+    pub effect: SuperPauseEffect,
+}
+
+/// The `SuperPause` defence / invulnerability window that holds on the triggering
+/// player for the duration of a `SuperPause` freeze (T080).
+///
+/// MUGEN's `SuperPause` controller takes two combat-affecting parameters beyond
+/// the freeze itself:
+///
+/// - `unhittable` (`0`/`1`, default `1`): while the pause holds, the triggerer
+///   cannot be hit — incoming attacks pass through it, exactly like a `NotHitBy`
+///   window, dealing no damage and forcing no reaction.
+/// - `p2defmul` (float, default `1.0`): the **opponent's** effective defence is
+///   multiplied by this for the pause window, so a super that connects during its
+///   own flash can be tuned to deal more (`<1.0` raises the opponent's defence,
+///   `>1.0` lowers it — i.e. it scales damage *taken* by the opponent).
+///
+/// `fp-character` only *classifies* the request (parses these off the controller
+/// and emits them on [`FreezeRequest::effect`]); the match coordinator
+/// (`fp-engine`) installs the live effect on the triggerer with a tick countdown
+/// matching the freeze, and clears it when the freeze ends. Hit resolution
+/// ([`crate::combat::resolve_attack`]) consults the **defender's** effect for
+/// `unhittable` and the **attacker's** effect for `p2defmul` (the attacker is the
+/// triggerer whose super scales the opponent's defence). An inactive effect
+/// (`remaining == 0`) blocks nothing and scales by `1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SuperPauseEffect {
+    /// Whether the triggerer is invulnerable while the window is active
+    /// (`unhittable`; MUGEN default `1`).
+    pub unhittable: bool,
+    /// Multiplier applied to the **opponent's** effective defence while the window
+    /// is active (`p2defmul`; MUGEN default `1.0`).
+    pub p2defmul: f32,
+    /// Ticks of the window remaining; `0` (the inactive default) means no window —
+    /// the effect blocks nothing and scales damage by `1.0`. Aged down one per
+    /// frozen frame by the coordinator and cleared with the freeze.
+    pub remaining: i32,
+}
+
+impl SuperPauseEffect {
+    /// The inactive window: not unhittable, neutral (`1.0`) defence multiplier, no
+    /// ticks remaining. Blocks nothing and scales damage by `1.0`.
+    #[must_use]
+    pub const fn inactive() -> Self {
+        Self {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 0,
+        }
+    }
+
+    /// Whether the window is currently holding (one or more ticks remaining).
+    #[must_use]
+    pub const fn active(self) -> bool {
+        self.remaining > 0
+    }
+
+    /// Whether this window makes its owner unhittable **right now** (active *and*
+    /// `unhittable = 1`). Consulted on the **defender** in hit resolution.
+    #[must_use]
+    pub const fn blocks_incoming(self) -> bool {
+        self.active() && self.unhittable
+    }
+
+    /// The opponent-defence multiplier in effect **right now**: `p2defmul` while
+    /// active, else the neutral `1.0`. Consulted on the **attacker** (the
+    /// triggerer) in hit resolution so the opponent's effective defence is scaled
+    /// for the pause window only.
+    #[must_use]
+    pub fn active_p2defmul(self) -> f32 {
+        if self.active() {
+            self.p2defmul
+        } else {
+            1.0
+        }
+    }
+
+    /// Ages the window down by one tick, clearing it (back to
+    /// [`inactive`](Self::inactive)) when it expires. Idempotent once inactive.
+    pub fn tick_down(&mut self) {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            if self.remaining <= 0 {
+                *self = Self::inactive();
+            }
+        }
+    }
 }
 
 /// How a [`Helper`](HelperSpawn)'s spawn position is interpreted, mirroring
@@ -782,6 +876,33 @@ pub struct TickReport {
     /// documented no-op (the root cannot remove itself mid-match); the coordinator
     /// only honors it for helper entities.
     pub destroy_self: bool,
+    /// On-block / on-hit frame advantage (in 60Hz ticks) for an attack this
+    /// character landed on the opponent this tick, or [`None`] when it did not
+    /// connect this tick (T065, feature F026).
+    ///
+    /// This is the **dynamic** half of the frame-data readout: it can only be known
+    /// at the moment a move connects, from the defender's induced stun and the
+    /// attacker's remaining recovery, neither of which is static AIR data. Unlike
+    /// the other request fields, `Character::tick` never populates this — the match
+    /// coordinator (`fp-engine`) computes it at the connecting-hit moment (after the
+    /// per-tick attack passes resolve) via
+    /// [`crate::framedata::frame_advantage`] and writes it onto the **attacker's**
+    /// report. A positive value means the attacker recovers first (advantage on the
+    /// opponent), a negative value means the defender recovers first (the attacker
+    /// is at disadvantage). It defaults to [`None`] and, like every other field,
+    /// never carries across ticks (a fresh [`TickReport`] is built per tick).
+    pub frame_advantage: Option<i32>,
+    /// `true` if a `LifebarAction` controller fired this tick (T081).
+    ///
+    /// MUGEN's `LifebarAction` cues the lifebar/announcer to play its scripted
+    /// round-flow action (the win-pose / "round over" announcer beat). A
+    /// `Character` tick cannot reach into the round-flow/HUD owner, so — exactly
+    /// like the other request fields — the controller only *records* that the cue
+    /// fired here. The match coordinator (`fp-engine`) reads this
+    /// after the tick and surfaces it as its announcer signal. It defaults to
+    /// `false` and, like every other request field, never carries across ticks (a
+    /// fresh [`TickReport`] is built per tick).
+    pub lifebar_action: bool,
 }
 
 impl Character {
@@ -964,6 +1085,12 @@ impl Character {
         }
         // Not hit-paused: both invuln slots count down this tick.
         self.invuln.tick(false);
+        // Target-bind window (T079): a positive `bound_time` (set by a binder's
+        // `TargetBind`) counts down one per tick, so `GetHitVar(isbound)` is true
+        // only while the bind is live. A `-1` ("bind forever") is left untouched.
+        if self.bound_time > 0 {
+            self.bound_time -= 1;
+        }
         // Armed `HitOverride` slots (#9b) count down their `time` window alongside
         // the other per-tick timers (the `< 0` "forever" slots are untouched).
         self.hit_overrides.tick();
@@ -1354,12 +1481,29 @@ impl Character {
 
         // CB6: consider groups in ascending number from 1, stopping at the first
         // gap. A controller fires if any *contiguous* group is fully true.
-        for group in contiguous_groups(&ctrl.triggers) {
+        //
+        // Hot path: `gating_passes` runs for every controller of every entity every
+        // tick (and a busy match has dozens of helpers, each with many controllers),
+        // so it must not allocate. The previous `contiguous_groups` helper built two
+        // `Vec`s per call — a real per-tick allocation hotspot (R1). Instead, walk
+        // the contiguous run `1, 2, 3, …` directly: for each expected number find the
+        // matching group by a linear scan (group counts are tiny — usually a single
+        // `trigger1`), short-circuit the OR on the first satisfied group, and stop at
+        // the first missing number. This is the exact CB6 semantics of
+        // `fp_vm::triggers::active_group_indices` (ascending number, first-gap stop,
+        // duplicate numbers collapse to the first occurrence) with no heap traffic.
+        let mut expected: u32 = 1;
+        loop {
+            // First group carrying `expected` (duplicates collapse to the first,
+            // matching `active_group_indices`). `None` => a gap: stop (CB6).
+            let Some(group) = ctrl.triggers.iter().find(|g| g.number == expected) else {
+                return false;
+            };
             if self.group_is_true(group, env) {
                 return true;
             }
+            expected += 1;
         }
-        false
     }
 
     /// Returns `true` if every condition in a numbered group is true (AND).
@@ -1624,6 +1768,8 @@ impl Character {
             self.ctrl_remove_explod(ctrl, env, report);
         } else if kind.eq_ignore_ascii_case("DestroySelf") {
             self.ctrl_destroy_self(ctrl, report);
+        } else if kind.eq_ignore_ascii_case("LifebarAction") {
+            self.ctrl_lifebar_action(report);
         } else if is_tracked_deferred_controller(kind) {
             // A documented MUGEN controller that this engine cannot yet faithfully
             // run because it depends on an unbuilt subsystem (the bind / hit-count
@@ -3562,6 +3708,20 @@ impl Character {
         }
     }
 
+    /// `LifebarAction`: cue the lifebar / announcer round-flow action (T081).
+    ///
+    /// MUGEN's `LifebarAction` is a parameterless controller a character fires
+    /// (typically from its win state) to tell the lifebar/HUD to play its scripted
+    /// round-flow beat — the win-pose / "round over" announcer cue. A `Character`
+    /// tick cannot reach the round-flow/HUD owner, so (deferred-effects pattern,
+    /// like `PlaySnd` / `Pause`) this only *records* the cue: it sets the per-tick
+    /// [`TickReport::lifebar_action`] flag for the match coordinator (`fp-engine`)
+    /// to consume after the tick. Cosmetic — it never affects the simulation.
+    /// Never panics.
+    fn ctrl_lifebar_action(&self, report: &mut TickReport) {
+        report.lifebar_action = true;
+    }
+
     /// `PosFreeze`: hold the character's position for this tick (T015).
     ///
     /// MUGEN's `PosFreeze` (optional `value`, default `1`/true) skips the position
@@ -3863,7 +4023,35 @@ impl Character {
             .and_then(|p| self.eval_param(p, env))
             .map_or(30, |v| v.to_int())
             .max(0);
-        report.freeze_request = Some(FreezeRequest { kind, time });
+        // T080: a `SuperPause` also carries the triggerer's defence/invuln window
+        // (`unhittable`, MUGEN default 1; `p2defmul`, default 1.0). A plain `Pause`
+        // has neither, so it emits the inert default window. The window is only
+        // *meaningful* for `SuperPause` (a `Pause` freezes everyone, so there is no
+        // exempt triggerer to make unhittable), but reading the params for both is
+        // harmless — a `Pause` author never sets them.
+        let effect = match kind {
+            FreezeKind::SuperPause => {
+                let unhittable = ctrl
+                    .params
+                    .get("unhittable")
+                    .and_then(|p| self.eval_param(p, env))
+                    .is_none_or(|v| v.to_int() != 0);
+                let p2defmul = ctrl
+                    .params
+                    .get("p2defmul")
+                    .and_then(|p| self.eval_param(p, env))
+                    .map_or(1.0, |v| v.to_float());
+                SuperPauseEffect {
+                    unhittable,
+                    p2defmul,
+                    // The window lasts exactly the freeze duration; the coordinator
+                    // installs `remaining = time` when it arms the freeze.
+                    remaining: time,
+                }
+            }
+            FreezeKind::Pause => SuperPauseEffect::inactive(),
+        };
+        report.freeze_request = Some(FreezeRequest { kind, time, effect });
     }
 
     /// `HitVelSet`: (re)set the character's velocity from its `GetHitVar` x/y
@@ -4261,11 +4449,29 @@ impl Character {
     /// Applies the statedef `physics` to velocity for this tick: stand/crouch
     /// physics multiply x-velocity by the matching friction coefficient; air
     /// physics adds gravity (`yaccel`) to y-velocity; none/unchanged do nothing.
+    ///
+    /// For stand/crouch, after the friction multiply the residual x-velocity is
+    /// snapped to `0` once its magnitude falls below the per-mode friction
+    /// threshold (`stand_friction_threshold` / `crouch_friction_threshold`).
+    /// This is MUGEN's stop-floor: without it geometric friction decay leaves a
+    /// tiny non-zero velocity that drifts the character forever. A threshold of
+    /// `0` disables the snap (nothing is `< 0`), preserving the pure-decay
+    /// behavior. Air/None/Unchanged modes never snap.
     fn apply_physics(&mut self) {
         let mv = &self.constants.movement;
         match self.physics {
-            Physics::Stand => self.vel.x *= mv.stand_friction,
-            Physics::Crouch => self.vel.x *= mv.crouch_friction,
+            Physics::Stand => {
+                self.vel.x *= mv.stand_friction;
+                if self.vel.x.abs() < mv.stand_friction_threshold {
+                    self.vel.x = 0.0;
+                }
+            }
+            Physics::Crouch => {
+                self.vel.x *= mv.crouch_friction;
+                if self.vel.x.abs() < mv.crouch_friction_threshold {
+                    self.vel.x = 0.0;
+                }
+            }
             // Y increases downward, so gravity (a downward acceleration) is a
             // positive addition to y-velocity.
             Physics::Air => self.vel.y += mv.yaccel,
@@ -4517,6 +4723,11 @@ fn interpolate_anim_transform(
 /// so the executor, validators, and any other trigger consumer share one
 /// definition; this wrapper just maps the active indices back to the original
 /// [`CompiledTriggerGroup`] references in ascending-number order.
+///
+/// Retained as the oracle the `gating_passes` zero-alloc walk is tested against:
+/// the hot path no longer calls this (it would allocate per controller per tick),
+/// but the test suite asserts the inline walk reproduces this reference behaviour.
+#[cfg(test)]
 fn contiguous_groups(groups: &[CompiledTriggerGroup]) -> Vec<&CompiledTriggerGroup> {
     let numbers: Vec<u32> = groups.iter().map(|g| g.number).collect();
     fp_vm::triggers::active_group_indices(&numbers)
@@ -5337,6 +5548,92 @@ mod tests {
         lcn.tick(&mut ch2);
         assert!((ch2.vel.x - 2.0).abs() < 1e-6);
         assert!((ch2.vel.y - 3.0).abs() < 1e-6);
+    }
+
+    // ---- T057: friction snap-to-zero stop-floor ----------------------------
+
+    /// After the friction multiply, residual x-velocity below the per-mode
+    /// friction threshold snaps to exactly `0` (the stop-floor), while a
+    /// threshold of `0` disables the snap (pure decay), and Air/None modes are
+    /// never affected.
+    #[test]
+    fn friction_snaps_to_zero() {
+        // Stand: vel.x=1.0, threshold 2.0 -> 1.0*0.85=0.85, |0.85|<2.0 -> snap 0.
+        let mut ch = Character::new();
+        ch.physics = Physics::Stand;
+        ch.constants = CharacterConstants::default();
+        ch.constants.movement.stand_friction = 0.85;
+        ch.constants.movement.stand_friction_threshold = 2.0;
+        ch.vel = Vec2::new(1.0, 0.0);
+        ch.apply_physics();
+        assert_eq!(ch.vel.x, 0.0, "stand: below-threshold residual snaps to 0");
+
+        // Stand above threshold: vel.x=10.0 -> 8.5, |8.5|>=2.0 -> decays only.
+        let mut ch_big = Character::new();
+        ch_big.physics = Physics::Stand;
+        ch_big.constants = CharacterConstants::default();
+        ch_big.constants.movement.stand_friction = 0.85;
+        ch_big.constants.movement.stand_friction_threshold = 2.0;
+        ch_big.vel = Vec2::new(10.0, 0.0);
+        ch_big.apply_physics();
+        assert!(
+            (ch_big.vel.x - 8.5).abs() < 1e-6,
+            "stand: above-threshold velocity decays without snapping, got {}",
+            ch_big.vel.x
+        );
+
+        // Threshold 0 means "never snap": pure geometric decay, never reaches 0.
+        let mut ch_zero = Character::new();
+        ch_zero.physics = Physics::Stand;
+        ch_zero.constants = CharacterConstants::default();
+        ch_zero.constants.movement.stand_friction = 0.85;
+        ch_zero.constants.movement.stand_friction_threshold = 0.0;
+        ch_zero.vel = Vec2::new(1.0, 0.0);
+        ch_zero.apply_physics();
+        assert!(
+            (ch_zero.vel.x - 0.85).abs() < 1e-6,
+            "threshold 0 disables snap (decay only), got {}",
+            ch_zero.vel.x
+        );
+
+        // Crouch uses the crouch threshold: vel.x=0.05 -> 0.05*0.82=0.041,
+        // |0.041| < 0.05 -> snap 0.
+        let mut ch_c = Character::new();
+        ch_c.physics = Physics::Crouch;
+        ch_c.constants = CharacterConstants::default();
+        ch_c.constants.movement.crouch_friction = 0.82;
+        ch_c.constants.movement.crouch_friction_threshold = 0.05;
+        ch_c.vel = Vec2::new(0.05, 0.0);
+        ch_c.apply_physics();
+        assert_eq!(
+            ch_c.vel.x, 0.0,
+            "crouch: below-threshold residual snaps to 0"
+        );
+
+        // Air must never snap, even with a tiny x-velocity below any threshold.
+        let mut ch_air = Character::new();
+        ch_air.physics = Physics::Air;
+        ch_air.constants = CharacterConstants::default();
+        ch_air.constants.movement.stand_friction_threshold = 2.0;
+        ch_air.vel = Vec2::new(0.5, -8.0);
+        ch_air.apply_physics();
+        assert!(
+            (ch_air.vel.x - 0.5).abs() < 1e-6,
+            "air physics leaves x-velocity untouched (no snap), got {}",
+            ch_air.vel.x
+        );
+
+        // None must never snap either.
+        let mut ch_none = Character::new();
+        ch_none.physics = Physics::None;
+        ch_none.constants = CharacterConstants::default();
+        ch_none.vel = Vec2::new(0.5, 0.0);
+        ch_none.apply_physics();
+        assert!(
+            (ch_none.vel.x - 0.5).abs() < 1e-6,
+            "none physics leaves velocity untouched, got {}",
+            ch_none.vel.x
+        );
     }
 
     // ---- A.P15: ground-plane Y clamp (falling characters land) -------------
@@ -6401,6 +6698,59 @@ mod tests {
         assert!(report.transition_cap_hit, "cyclic graph must hit the cap");
         // The character is left in a valid state (0 or 1), never panicking.
         assert!(ch.state_no == 0 || ch.state_no == 1);
+    }
+
+    #[test]
+    fn cyclic_change_state_is_bounded_on_helper_path() {
+        // T051 regression: the SAME A ↔ B infinite ChangeState loop, but driven
+        // through the HELPER tick path (`tick_as_helper` -> `tick_with_graph` ->
+        // `run_current_with_transitions`) instead of the root `tick`. A community
+        // character whose helper carries a ChangeState cycle must NOT hang the
+        // per-tick simulation — the helper path shares the same
+        // `MAX_TRANSITIONS_PER_TICK` guard the root path uses, so this terminates
+        // (cap hit) instead of spinning forever. Asset-free and runs in the normal
+        // suite, so a future change that lets the helper path bypass the cap would
+        // turn this test into a hang and be caught immediately.
+        let a = ctrl(
+            0,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "1")],
+        );
+        let b = ctrl(
+            1,
+            "ChangeState",
+            &[],
+            &[(1, &["1"])],
+            None,
+            &[("value", "0")],
+        );
+        let lc = loaded(
+            vec![stand_n(0, vec![a]), stand_n(1, vec![b])],
+            tiny_air(0, &[5]),
+        );
+        let mut helper = Character::new();
+        helper.state_no = 0;
+        // Drive the graph-aware executor core directly with a non-empty spawning
+        // graph — this is exactly the entry point `tick_as_helper` delegates to
+        // (`tick_with_graph`), so it exercises the live helper tick path. The graph
+        // identity is irrelevant to the cap; what matters is that this entry point
+        // shares the bounded transition loop (`run_current_with_transitions`)
+        // rather than running a state machine unguarded.
+        let report = helper.tick_with_graph(
+            &lc.states,
+            &lc.air,
+            None,
+            StageView::default(),
+            EntityGraph::default(),
+        );
+        assert!(
+            report.transition_cap_hit,
+            "cyclic helper graph must hit the cap on the helper tick path, not hang"
+        );
+        assert!(helper.state_no == 0 || helper.state_no == 1);
     }
 
     // ---- helper-fn unit coverage ------------------------------------------
@@ -7568,6 +7918,73 @@ mod tests {
         ch.state_no = 0;
         assert_eq!(lc.tick(&mut ch).transitions, 1);
         assert_eq!(ch.state_no, 9);
+    }
+
+    #[test]
+    fn gating_walk_matches_contiguous_groups_oracle() {
+        // R1 zero-alloc refactor lock: `gating_passes` no longer allocates a
+        // `contiguous_groups` Vec per controller per tick — it walks the contiguous
+        // run inline. This pins the inline walk's fire/no-fire decision to the
+        // `contiguous_groups` + `group_is_true` reference for a spread of layouts
+        // (gaps, out-of-order, no-trigger1, post-gap-true). For each layout we both
+        // (a) compute the oracle decision directly and (b) observe the real engine
+        // decision through `lc.tick`, and assert they agree — so a future tweak to
+        // the walk that drifts from CB6 semantics fails here.
+        //
+        // `"1"`/`"0"` are const-true/false trigger conditions; a fired controller
+        // is observed via `report.controllers_fired` on a single-controller state.
+        let layouts: &[&[(u32, &str)]] = &[
+            &[(1, "1")],                     // trigger1 true -> fire
+            &[(1, "0")],                     // trigger1 false -> no fire
+            &[(1, "0"), (2, "1")],           // OR across contiguous -> fire
+            &[(1, "0"), (2, "0")],           // both false -> no fire
+            &[(1, "0"), (3, "1")],           // gap after 1: group 3 dead -> no fire
+            &[(2, "1"), (3, "1")],           // no trigger1 -> cannot fire
+            &[(3, "0"), (1, "0"), (2, "1")], // out-of-order, contiguous -> fire on 2
+            &[(2, "1"), (1, "0"), (4, "1")], // out-of-order with gap (no 3): 4 dead -> no fire
+            &[(1, "0"), (2, "0"), (3, "1")], // fully contiguous, last true -> fire
+        ];
+
+        // Reference decision: the pre-refactor logic, built from the retained
+        // `contiguous_groups` oracle. A group's truth is its single const condition.
+        let oracle = |groups: &[CompiledTriggerGroup]| -> bool {
+            if groups.is_empty() {
+                return false;
+            }
+            contiguous_groups(groups).iter().any(|g| {
+                !g.conditions.is_empty()
+                    && g.conditions
+                        .iter()
+                        .all(|c| eval(&c.expr, &Character::new()).as_bool())
+            })
+        };
+
+        for layout in layouts {
+            // Each group carries a single const condition; rebuild it as the
+            // `&[(u32, &[&str])]` slice `ctrl` expects.
+            let cond_bufs: Vec<[&str; 1]> = layout.iter().map(|(_, c)| [*c]).collect();
+            let groups_arg: Vec<(u32, &[&str])> = layout
+                .iter()
+                .zip(&cond_bufs)
+                .map(|((n, _), buf)| (*n, &buf[..]))
+                .collect();
+
+            let c = ctrl(0, "VelAdd", &[], &groups_arg, None, &[("x", "1")]);
+            let compiled_groups = c.triggers.clone();
+            let expected = oracle(&compiled_groups);
+
+            let lc = loaded(vec![stand_n(0, vec![c])], tiny_air(0, &[5]));
+            let mut ch = Character::new();
+            ch.state_no = 0;
+            ch.physics = Physics::None;
+            ch.vel = Vec2::<f32>::ZERO;
+            let report = lc.tick(&mut ch);
+            let fired = report.controllers_fired > 0;
+            assert_eq!(
+                fired, expected,
+                "layout {layout:?}: inline gating walk disagreed with contiguous_groups oracle"
+            );
+        }
     }
 
     #[test]
@@ -10472,11 +10889,18 @@ mod tests {
     #[test]
     fn superpause_emits_freeze_request_with_time() {
         let report = pause_tick("SuperPause", &[("time", "30")]);
+        // T080: a `SuperPause` with no `unhittable`/`p2defmul` carries the MUGEN
+        // defaults (unhittable, neutral 1.0 multiplier) and a window matching `time`.
         assert_eq!(
             report.freeze_request,
             Some(FreezeRequest {
                 kind: FreezeKind::SuperPause,
                 time: 30,
+                effect: SuperPauseEffect {
+                    unhittable: true,
+                    p2defmul: 1.0,
+                    remaining: 30,
+                },
             })
         );
     }
@@ -10484,11 +10908,13 @@ mod tests {
     #[test]
     fn pause_emits_freeze_request_with_time() {
         let report = pause_tick("Pause", &[("time", "20")]);
+        // A plain `Pause` carries the inert window (no triggerer to make unhittable).
         assert_eq!(
             report.freeze_request,
             Some(FreezeRequest {
                 kind: FreezeKind::Pause,
                 time: 20,
+                effect: SuperPauseEffect::inactive(),
             })
         );
     }
@@ -10502,6 +10928,11 @@ mod tests {
             Some(FreezeRequest {
                 kind: FreezeKind::SuperPause,
                 time: 30,
+                effect: SuperPauseEffect {
+                    unhittable: true,
+                    p2defmul: 1.0,
+                    remaining: 30,
+                },
             })
         );
     }
@@ -10514,8 +10945,56 @@ mod tests {
             Some(FreezeRequest {
                 kind: FreezeKind::Pause,
                 time: 0,
+                effect: SuperPauseEffect::inactive(),
             })
         );
+    }
+
+    #[test]
+    fn superpause_effect_tick_down_clears_at_zero() {
+        let mut e = SuperPauseEffect {
+            unhittable: true,
+            p2defmul: 2.0,
+            remaining: 2,
+        };
+        assert!(e.active());
+        assert!(e.blocks_incoming());
+        assert!((e.active_p2defmul() - 2.0).abs() < 1e-6);
+        e.tick_down();
+        assert_eq!(e.remaining, 1);
+        e.tick_down();
+        // Reaching zero resets to the inert default.
+        assert!(!e.active());
+        assert!(!e.blocks_incoming());
+        assert!((e.active_p2defmul() - 1.0).abs() < 1e-6);
+        // Idempotent once inactive.
+        e.tick_down();
+        assert_eq!(e, SuperPauseEffect::inactive());
+    }
+
+    #[test]
+    fn superpause_effect_unhittable_zero_does_not_block_even_when_active() {
+        let e = SuperPauseEffect {
+            unhittable: false,
+            p2defmul: 1.0,
+            remaining: 5,
+        };
+        assert!(e.active());
+        assert!(!e.blocks_incoming(), "unhittable=0 never blocks");
+    }
+
+    #[test]
+    fn superpause_parses_unhittable_and_p2defmul() {
+        // T080: `unhittable = 0` opts the triggerer out of invuln; `p2defmul`
+        // scales the opponent's defence for the window.
+        let report = pause_tick(
+            "SuperPause",
+            &[("time", "10"), ("unhittable", "0"), ("p2defmul", "2.0")],
+        );
+        let req = report.freeze_request.expect("SuperPause emits a request");
+        assert!(!req.effect.unhittable);
+        assert!((req.effect.p2defmul - 2.0).abs() < 1e-6);
+        assert_eq!(req.effect.remaining, 10);
     }
 
     #[test]
@@ -16450,6 +16929,38 @@ mod tests {
         assert!(report.target_ops.is_empty());
     }
 
+    /// `LifebarAction` is recognized and routed to its real arm (T081): it is NOT
+    /// a tracked-deferred controller (so it never hits the WARN no-op), a firing
+    /// `LifebarAction` sets [`TickReport::lifebar_action`], and a tick with no
+    /// `LifebarAction` leaves the flag clear (the negative control).
+    #[test]
+    fn lifebaraction_recognized() {
+        // Not in the deferred set — it has a real arm now, not a tracked no-op.
+        assert!(
+            !is_tracked_deferred_controller("LifebarAction"),
+            "LifebarAction is handled, not deferred"
+        );
+
+        // A firing `LifebarAction` sets the per-tick report flag.
+        let lc = one_ctrl_synth("LifebarAction", &[]);
+        let mut ch = Character::new();
+        let report = lc.tick(&mut ch);
+        assert!(
+            report.lifebar_action,
+            "a firing LifebarAction sets TickReport::lifebar_action"
+        );
+
+        // Negative control: a tick whose only controller is NOT LifebarAction
+        // leaves the report flag clear (the per-tick edge does not fire on its own).
+        let other = one_ctrl_synth("Null", &[]);
+        let mut ch2 = Character::new();
+        let report2 = other.tick(&mut ch2);
+        assert!(
+            !report2.lifebar_action,
+            "no LifebarAction → TickReport::lifebar_action stays false"
+        );
+    }
+
     /// `Explod` emits an [`ExplodSpawn`] onto the report with the parsed
     /// anim / id / pos / postype / sprpriority / bindtime / removetime (T033, AC1).
     #[test]
@@ -16988,5 +17499,119 @@ mod tests {
         ch.anim_elem = 0;
         ch.anim_elem_time = 0;
         assert_eq!(ch.anim_transform(&air), AnimTransform::IDENTITY);
+    }
+
+    // ---- T054: cheap-AI var-init safety ------------------------------------
+    //
+    // The "cheap AI" idiom (the evilken `Var(30)=59` trap, mechanics-ref §4.2):
+    // a character seeds a variable behind a `triggerall = AILevel` gate during
+    // round-init so that ONLY a CPU-controlled copy (whose `AILevel > 0`) gets
+    // the buff, while a human (`AILevel = 0`) leaves the var at its zero default.
+    // These tests lock in that (a) the var banks zero-initialize and (b) the
+    // `AILevel` gate behaves as MUGEN's: false for a human, true for a CPU.
+    //
+    // BOUNDARY (documented, not a bug): the *legacy* WinMUGEN cheap-AI idiom set
+    // its flag down an input path (e.g. detecting `command = "holdfwd"` plus an
+    // impossible button mash on the very first tick) that a human literally
+    // cannot reproduce, WITHOUT using `AILevel`. We do not — and cannot fully —
+    // emulate that input-timing trick. With the modern `AILevel` trigger wired
+    // (T052), the *modern* idiom is fully safe, which is what matters for the
+    // evilken class of characters.
+
+    /// Builds the cheap-AI round-init fixture: a [Statedef 5900] whose sole
+    /// controller is `VarSet var(30) = 59` gated `triggerall = AILevel`. Returns
+    /// the synthetic state graph. Mirrors the evilken trap structure.
+    fn cheap_ai_round_init_fixture() -> Synth {
+        let trap = ctrl(
+            5900,
+            "VarSet",
+            &["AILevel"], // triggerall = AILevel — only true for a CPU (ai_level > 0)
+            &[(1, &["Time = 0"])],
+            None,
+            &[("var(30)", "59")],
+        );
+        let st5900 = stand_n(5900, vec![trap]);
+        loaded(vec![st5900], tiny_air(0, &[5, 5]))
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_all_banks_zero_at_construction() {
+        // A freshly-constructed (human) Character zero-inits every var bank; no
+        // engine path seeds a magic value.
+        let ch = Character::new();
+        assert_eq!(ch.ai_level(), 0, "a bare Character is a human (AILevel 0)");
+        assert!(ch.vars.iter().all(|&v| v == 0), "var(0..) all zero");
+        assert!(ch.fvars.iter().all(|&v| v == 0.0), "fvar(0..) all zero");
+        assert!(ch.sysvars.iter().all(|&v| v == 0), "sysvar(0..) all zero");
+        assert!(
+            ch.sysfvars.iter().all(|&v| v == 0.0),
+            "sysfvar(0..) all zero"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_human_never_satisfies_gate() {
+        // AC2 (human side): a human (ai_level = 0) runs the round-init state and
+        // ends with Var(30) == 0 — the `triggerall = AILevel` gate is false, so
+        // the VarSet never fires.
+        let synth = cheap_ai_round_init_fixture();
+        let mut ch = Character::new(); // ai_level defaults to 0 (human)
+        ch.change_state(&synth.states, 5900);
+        let _ = synth.tick(&mut ch); // Time = 0: the gated VarSet would fire IFF AILevel
+        ch.flush_var_assignments();
+        assert_eq!(
+            ch.vars[30], 0,
+            "human (AILevel 0) must NOT satisfy the cheap-AI var gate"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_cpu_satisfies_gate() {
+        // AC2 (CPU side): a CPU at ai_level = 5 runs the same round-init state and
+        // ends with Var(30) == 59 — the `triggerall = AILevel` gate is true.
+        let synth = cheap_ai_round_init_fixture();
+        let mut ch = Character::new();
+        ch.set_ai_level(5);
+        ch.change_state(&synth.states, 5900);
+        let _ = synth.tick(&mut ch);
+        ch.flush_var_assignments();
+        assert_eq!(
+            ch.vars[30], 59,
+            "CPU (AILevel 5) DOES satisfy the gate and gets the buffed var"
+        );
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_ailevel_trigger_reads_field() {
+        // The `AILevel` trigger reflects the entity field exactly: 0 for a human,
+        // the assigned level for a CPU. (The gate above depends on this.)
+        let mut ch = Character::new();
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(0));
+        ch.set_ai_level(8);
+        assert_eq!(ch.trigger("AILevel", &[]), Value::Int(8));
+    }
+
+    #[test]
+    fn cheap_ai_var_safety_clear_vars_zeroes_every_bank() {
+        // Round reset (`fp-engine`) calls `clear_vars`; it must wipe ALL banks so
+        // no value seeded in a prior round (the cheap-AI trap among them) leaks
+        // into the next round for any player.
+        let mut ch = Character::new();
+        ch.vars[30] = 59;
+        ch.vars[0] = 7;
+        ch.fvars[3] = 2.5;
+        ch.sysvars[1] = -4;
+        ch.sysfvars[2] = 1.25;
+        ch.clear_vars();
+        assert!(ch.vars.iter().all(|&v| v == 0), "all var(0..) cleared");
+        assert!(ch.fvars.iter().all(|&v| v == 0.0), "all fvar(0..) cleared");
+        assert!(
+            ch.sysvars.iter().all(|&v| v == 0),
+            "all sysvar(0..) cleared"
+        );
+        assert!(
+            ch.sysfvars.iter().all(|&v| v == 0.0),
+            "all sysfvar(0..) cleared"
+        );
     }
 }

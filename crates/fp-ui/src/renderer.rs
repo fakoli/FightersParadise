@@ -55,6 +55,11 @@ pub struct MatchHudState {
     /// only while this is `>= 2` (MUGEN shows the counter from the 2nd hit on);
     /// `0`/`1` hide it. See [`combo_text`].
     pub combo_count: i32,
+    /// A monotonically increasing frame counter, used purely to drive the
+    /// deterministic max-power flash (T074) — no RNG, so it is replay-safe.
+    /// Defaults to `0`; the first flash phase is the bright (no-op) phase, so a
+    /// caller that never sets it sees no flash artifact.
+    pub frame: u64,
 }
 
 /// A GPU-resident screenpack: the parsed layout, every referenced `fight.sff`
@@ -167,22 +172,45 @@ impl ScreenpackHud {
         let (ox, oy) = (dx as f32, dy as f32);
 
         // Life bars — gated on the Life element's visibility, tinted by the
-        // configured life color and globally scaled.
+        // configured life color, then nudged toward red at low life (T074), and
+        // globally scaled. The threshold tint is `WHITE` (a no-op) above 25%, so
+        // a healthy bar draws exactly as the screenpack styled it.
         if cfg.is_visible(HudElement::Life) {
-            let tint = cfg.life_color();
-            self.draw_lifebar(frame, &self.layout.p1_lifebar, state.p1_life, ox, oy, tint);
-            self.draw_lifebar(frame, &self.layout.p2_lifebar, state.p2_life, ox, oy, tint);
+            let base = cfg.life_color();
+            let p1_tint = base.combine(crate::low_life_tint(state.p1_life));
+            let p2_tint = base.combine(crate::low_life_tint(state.p2_life));
+            self.draw_lifebar(
+                frame,
+                &self.layout.p1_lifebar,
+                state.p1_life,
+                ox,
+                oy,
+                p1_tint,
+            );
+            self.draw_lifebar(
+                frame,
+                &self.layout.p2_lifebar,
+                state.p2_life,
+                ox,
+                oy,
+                p2_tint,
+            );
         }
-        // Power bars — gated on the Power element's visibility.
+        // Power bars — gated on the Power element's visibility. The configured
+        // tint flashes (T074) once the meter is full (a super is available); the
+        // flash is `WHITE` (a no-op) on its bright phase and below max, so an
+        // unfilled bar draws unchanged.
         if cfg.is_visible(HudElement::Power) {
-            let tint = cfg.power_color();
+            let base = cfg.power_color();
+            let p1_tint = base.combine(crate::max_power_flash_tint(state.p1_power, state.frame));
+            let p2_tint = base.combine(crate::max_power_flash_tint(state.p2_power, state.frame));
             self.draw_powerbar(
                 frame,
                 &self.layout.p1_powerbar,
                 state.p1_power,
                 ox,
                 oy,
-                tint,
+                p1_tint,
             );
             self.draw_powerbar(
                 frame,
@@ -190,7 +218,7 @@ impl ScreenpackHud {
                 state.p2_power,
                 ox,
                 oy,
-                tint,
+                p2_tint,
             );
         }
         // Fighter portraits ([Face]) — drawn with the bars (no separate toggle).
