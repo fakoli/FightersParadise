@@ -124,6 +124,17 @@ const TICK_DURATION: Duration = Duration::from_nanos(16_666_667);
 /// real-time pace) while bounding the worst case to a handful of ticks.
 const MAX_CATCHUP_TICKS: u32 = 5;
 
+/// How long (in 60Hz ticks) the direct-CLI match holds on the decided-winner
+/// screen before auto-rematching.
+///
+/// A direct-CLI match (`fp-app <p1.def> <p2.def>`) has no menu to return to, so
+/// once the engine reports a `match_winner` it would otherwise render the final
+/// "P_ WINS" frame forever (a static screen the player reads as a freeze).
+/// Instead the app keeps drawing that winner frame for this many ticks — long
+/// enough to read the result — then rebuilds a fresh identical match and play
+/// continues. `180` ticks ≈ 3s at 60Hz.
+const MATCH_OVER_HOLD_FRAMES: u32 = 180;
+
 /// Default character `.def` loaded when no CLI argument is given.
 const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 
@@ -6604,6 +6615,12 @@ fn run() -> fp_core::FpResult<()> {
     // A monotonic frame counter, used as the deterministic-friendly RNG seed for
     // RandomSelect on the character-select screen.
     let mut frame_counter: u64 = 0;
+    // How many ticks the direct-CLI match has held the decided-winner screen.
+    // Counts up once the engine reports a `match_winner`; when it reaches
+    // [`MATCH_OVER_HOLD_FRAMES`] the app rebuilds a fresh match (auto-rematch) and
+    // this resets. Inert in every non-direct-CLI mode (the menu Fight path returns
+    // to the title instead).
+    let mut match_over_held: u32 = 0;
 
     // --- Main loop ---
     let mut event_pump = sdl
@@ -7115,6 +7132,34 @@ fn run() -> fp_core::FpResult<()> {
                     tracing::info!("Match over; returning to title menu");
                     app.return_to_title();
                 }
+            }
+        }
+
+        // Direct-CLI auto-rematch: the direct-CLI match (`fp-app <p1.def>
+        // <p2.def>`) has no menu to fall back to, so once the engine decides a
+        // winner the app holds the readable "P_ WINS" screen for a short window
+        // (the existing winner HUD keeps rendering during the hold), then rebuilds
+        // a fresh identical match from the same CLI args so play continues — rather
+        // than freezing on a permanent static winner frame. Done here, after the
+        // tick loop and once per real frame, so the window keeps pumping events
+        // (Esc-to-quit stays responsive) throughout the hold. Inert outside the
+        // direct-CLI `Mode::Match` path.
+        if let Some(Mode::Match(run)) = mode.as_ref() {
+            if run.m().match_winner().is_none() {
+                match_over_held = 0;
+            } else if match_over_held >= MATCH_OVER_HOLD_FRAMES {
+                tracing::info!("Direct-CLI match over; auto-rematching");
+                // Rebuild from the same parsed CLI args used at startup. A rebuild
+                // that doesn't yield a match (shouldn't happen — the original args
+                // already produced one) leaves the current mode in place.
+                if let Mode::Match(fresh) =
+                    select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)
+                {
+                    mode = Some(Mode::Match(fresh));
+                }
+                match_over_held = 0;
+            } else {
+                match_over_held += 1;
             }
         }
 
