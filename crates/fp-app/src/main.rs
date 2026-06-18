@@ -135,17 +135,6 @@ const MAX_CATCHUP_TICKS: u32 = 5;
 /// continues. `180` ticks ≈ 3s at 60Hz.
 const MATCH_OVER_HOLD_FRAMES: u32 = 180;
 
-/// Pure decision for the direct-CLI auto-rematch (testable without a GUI loop):
-/// given whether the match is over and how many ticks the winner screen has been
-/// held, returns `true` when it is time to rebuild a fresh match.
-///
-/// Not over → never rematch (and the caller resets the held counter). Over but
-/// the hold has not yet elapsed → keep showing the winner. Over and the hold has
-/// elapsed → rematch.
-fn should_rematch(match_over: bool, frames_held: u32) -> bool {
-    match_over && frames_held >= MATCH_OVER_HOLD_FRAMES
-}
-
 /// Default character `.def` loaded when no CLI argument is given.
 const DEFAULT_DEF: &str = "test-assets/kfm/kfm.def";
 
@@ -6630,7 +6619,7 @@ fn run() -> fp_core::FpResult<()> {
     // Counts up once the engine reports a `match_winner`; when it reaches
     // [`MATCH_OVER_HOLD_FRAMES`] the app rebuilds a fresh match (auto-rematch) and
     // this resets. Inert in every non-direct-CLI mode (the menu Fight path returns
-    // to the title instead). See [`should_rematch`].
+    // to the title instead).
     let mut match_over_held: u32 = 0;
 
     // --- Main loop ---
@@ -7154,27 +7143,23 @@ fn run() -> fp_core::FpResult<()> {
         // than freezing on a permanent static winner frame. Done here, after the
         // tick loop and once per real frame, so the window keeps pumping events
         // (Esc-to-quit stays responsive) throughout the hold. Inert outside the
-        // direct-CLI `Mode::Match` path. See [`should_rematch`].
+        // direct-CLI `Mode::Match` path.
         if let Some(Mode::Match(run)) = mode.as_ref() {
-            if run.m().match_winner().is_some() {
-                if should_rematch(true, match_over_held) {
-                    tracing::info!("Direct-CLI match over; auto-rematching");
-                    // Rebuild from the same parsed CLI args used at startup. A
-                    // rebuild that doesn't yield a match (shouldn't happen — the
-                    // original args already produced one) leaves the current mode
-                    // in place; the hold counter resets so it isn't retried every
-                    // frame in a tight loop.
-                    if let Mode::Match(fresh) =
-                        select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)
-                    {
-                        mode = Some(Mode::Match(fresh));
-                    }
-                    match_over_held = 0;
-                } else {
-                    match_over_held = match_over_held.saturating_add(1);
-                }
-            } else {
+            if run.m().match_winner().is_none() {
                 match_over_held = 0;
+            } else if match_over_held >= MATCH_OVER_HOLD_FRAMES {
+                tracing::info!("Direct-CLI match over; auto-rematching");
+                // Rebuild from the same parsed CLI args used at startup. A rebuild
+                // that doesn't yield a match (shouldn't happen — the original args
+                // already produced one) leaves the current mode in place.
+                if let Mode::Match(fresh) =
+                    select_mode(&args, pal, team_mode, cli_cpu_mode, &renderer)
+                {
+                    mode = Some(Mode::Match(fresh));
+                }
+                match_over_held = 0;
+            } else {
+                match_over_held += 1;
             }
         }
 
@@ -11170,23 +11155,6 @@ mod tests {
             assert_ne!(outcome, TickOutcome::InProgress, "lesson must advance");
         }
         assert!(r.is_complete());
-    }
-
-    /// The direct-CLI auto-rematch decision: a live (not-over) match never
-    /// rematches; a decided match keeps showing the winner until the hold elapses,
-    /// then rematches. Asset-free — exercises only the pure gating helper.
-    #[test]
-    fn direct_cli_rematch_gating() {
-        // Not over -> never rematch, regardless of the held counter.
-        assert!(!should_rematch(false, 0));
-        assert!(!should_rematch(false, MATCH_OVER_HOLD_FRAMES));
-        assert!(!should_rematch(false, MATCH_OVER_HOLD_FRAMES + 10));
-        // Over but the hold has not yet elapsed -> keep showing the winner.
-        assert!(!should_rematch(true, 0));
-        assert!(!should_rematch(true, MATCH_OVER_HOLD_FRAMES - 1));
-        // Over and the hold has elapsed (or overshot) -> rematch.
-        assert!(should_rematch(true, MATCH_OVER_HOLD_FRAMES));
-        assert!(should_rematch(true, MATCH_OVER_HOLD_FRAMES + 1));
     }
 
     /// the existing CLI is preserved.
